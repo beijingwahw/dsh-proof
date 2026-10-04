@@ -1,0 +1,23 @@
+# Local development overlay — load the plugin straight from source:
+#
+#   pnpm dsh web --patch /absolute/path/to/dsh-proof/examples/cordis.yml
+#
+# NOTE: the patch loader resolves module paths relative to the *profile*, not to
+# this file, so the plugin `name` below MUST be an absolute path. Replace it.
+- insert:
+    - id: dsh-proof
+      name: '/ABSOLUTE/PATH/TO/dsh-proof/src/index.ts'
+      config:
+        evidenceDir: .proof
+        autoDiscover: true
+        checkTimeoutMs: 120000
+        verifyBudgetMs: 300000
+        concurrency: 2
+        impactGraph: true
+        impactGraphLimit: 20000
+        requireBaseline: warn
+        driftDetection: true
+        enforceOnTurnEnd: true
+        promptSection: true
+        promptScope: proof:policy
+        verbose: true

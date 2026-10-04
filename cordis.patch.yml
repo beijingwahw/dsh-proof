@@ -1,0 +1,47 @@
+# dsh-proof bundle layer.
+#
+# Applied when a profile lists `dsh-proof` in `dsh.profile.bundles`, after
+# `@deepseek-ai/dsh-base`. Later layers win per row, and a patch REPLACES a
+# row's whole `config` value rather than deep-merging — so if you override this
+# row in your own `cordis.patch.yml`, restate every key you still want.
+- insert:
+    - id: dsh-proof
+      name: dsh-proof
+      config:
+        # Where evidence lives, relative to the workspace root.
+        evidenceDir: .proof
+        # Discover objective checks from package.json / pyproject.toml /
+        # go.mod / Cargo.toml / Makefile / composer.json.
+        autoDiscover: true
+        # Explicit checks, merged over auto-discovery. Set `exclusive: true` on
+        # any entry to disable auto-discovery entirely.
+        #   checks:
+        #     - label: full test suite
+        #       command: [pnpm, test, --, --run]
+        #       kind: test
+        #       paths: ['src/**', 'test/**']
+        #       timeoutMs: 180000
+        checks: []
+        # Per-check cooperative timeout.
+        checkTimeoutMs: 120000
+        # Wall-clock budget for one verification batch.
+        verifyBudgetMs: 300000
+        # Concurrent check processes.
+        concurrency: 2
+        # Build the reverse-dependency graph for precise change-impact analysis.
+        impactGraph: true
+        impactGraphLimit: 20000
+        # off  = never gate
+        # warn = attach a corrective notice
+        # ask  = route the mutation through user approval until a baseline exists
+        requireBaseline: warn
+        # Detect workspace changes made outside the agent's tool stream.
+        driftDetection: true
+        # Inject a corrective message when a turn mutates the workspace but
+        # makes no proven completion claim.
+        enforceOnTurnEnd: true
+        # Publish the `proof:policy` system-prompt section.
+        promptSection: true
+        promptScope: proof:policy
+        headChars: 2000
+        verbose: false
