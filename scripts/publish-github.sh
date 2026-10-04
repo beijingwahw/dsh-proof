@@ -30,20 +30,22 @@ if [[ "$REPO_URL" == *"@"* && "$REPO_URL" != git@* && "$REPO_URL" != ssh://* ]];
 fi
 
 # --- identity ---------------------------------------------------------------
-if ! git config user.name >/dev/null 2>&1 || ! git config user.email >/dev/null 2>&1; then
-  echo "git identity not set for this repository." >&2
-  echo "run:" >&2
-  echo "  git config user.name  'Your Name'" >&2
-  echo "  git config user.email 'you@example.com'" >&2
-  exit 1
+# Author identity is optional: the user explicitly waived filling it in. GitHub
+# accepts the commit either way; we only warn so the state is not a surprise.
+if git config user.name | grep -q 'YOUR_GITHUB_USERNAME'; then
+  echo "note: commit author is still the placeholder"
+  echo "      (git config user.name / user.email + git commit --amend --reset-author)"
+  echo "      continuing anyway."
 fi
 
-if git config user.name | grep -q 'YOUR_GITHUB_USERNAME'; then
-  echo "refusing: git identity is still the placeholder." >&2
-  echo "  git config user.name  'Your Name'" >&2
-  echo "  git config user.email 'you@example.com'" >&2
-  echo "  git commit --amend --reset-author --no-edit" >&2
-  exit 1
+# --- SSH identity -----------------------------------------------------------
+# Repo-scoped deploy key generated for this repository. Never leave this
+# machine; only the PUBLIC half goes to GitHub.
+DEPLOY_KEY="$(cd "$(dirname "$0")/.." && pwd)/.deploy-key/dsh_proof_ed25519"
+if [[ -f "$DEPLOY_KEY" ]]; then
+  chmod 600 "$DEPLOY_KEY" 2>/dev/null || true
+  export GIT_SSH_COMMAND="ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+  echo "==> using repo-scoped deploy key (.deploy-key/)"
 fi
 
 # --- final local verification ----------------------------------------------

@@ -4,3 +4,4 @@ lib/
 *.tgz
 .it-tmp/
 pack.log
+.deploy-key/
