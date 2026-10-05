@@ -57,6 +57,11 @@ export {
 } from './changeset.ts'
 
 export {
+  excerptOutput, firstInformativeLine, isSalientLine,
+  type Excerpt, type ExcerptOptions, type ExcerptStrategy,
+} from './excerpt.ts'
+
+export {
   assembleBaseline, assembleProof, type AssembleInput, type AssembleResult,
 } from './report.ts'
 

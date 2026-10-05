@@ -18,6 +18,7 @@
 import type { CheckKind, CheckSpec, Clock, FsPort, SignerPort, WorkspacePort } from './ports.ts'
 import { addressOf, canonicalJson, merkleRoot, normalizeOutput, sha256 } from './hash.ts'
 import { GENESIS_PREV, checkpointSignedData, lineDigest, parseAnchor, walkChain } from './trust.ts'
+import { excerptOutput, type ExcerptOptions } from './excerpt.ts'
 
 export type CheckStatus = 'pass' | 'fail' | 'error' | 'timeout' | 'aborted' | 'skipped'
 
@@ -33,8 +34,12 @@ export interface Evidence {
   readonly durationMs: number
   /** sha256 of `normalizeOutput(output)` — content addressing without storing the noise. */
   readonly outputDigest: string
-  /** First `headChars` characters of normalised output, for humans. */
+  /** Excerpt of the normalised output under the configured budget (v0.5). */
   readonly outputHead: string
+  /** True when the excerpt dropped content (`[... N chars omitted ...]` markers account for it). */
+  readonly outputTruncated?: boolean
+  /** How many normalised characters are not in the excerpt. */
+  readonly outputOmittedChars?: number
   readonly recordedAt: string
   /** Workspace state when the evidence was produced. */
   readonly workspace: WorkspaceSnapshot
@@ -115,6 +120,7 @@ export interface ProofReport {
 }
 
 const HEAD_CHARS = 2000
+const DEFAULT_EXCERPT: ExcerptOptions = { budget: HEAD_CHARS, strategy: 'head' }
 
 // ---------------------------------------------------------------------------
 // Producing evidence
@@ -133,8 +139,10 @@ export function makeEvidence(
   outcome: RunOutcome,
   workspace: WorkspaceSnapshot,
   clock: Clock,
+  excerpt: ExcerptOptions = DEFAULT_EXCERPT,
 ): Evidence {
   const normalized = normalizeOutput(outcome.output, {})
+  const exc = excerptOutput(normalized, excerpt)
   const base = {
     checkId: spec.id,
     label: spec.label,
@@ -144,7 +152,8 @@ export function makeEvidence(
     exitCode: outcome.exitCode,
     durationMs: outcome.durationMs,
     outputDigest: sha256(normalized),
-    outputHead: normalized.slice(0, HEAD_CHARS),
+    outputHead: exc.text,
+    ...(exc.truncated ? { outputTruncated: true, outputOmittedChars: exc.omittedChars } : {}),
     recordedAt: new Date(clock.now()).toISOString(),
     workspace,
   }

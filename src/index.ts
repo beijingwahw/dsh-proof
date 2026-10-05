@@ -114,6 +114,7 @@ export function apply(ctx: Context, config: Config): void {
     checkpointEvery: config.checkpointEvery,
     fs: sharedFs,
     ...(lspResolver !== undefined ? { resolver: lspResolver } : {}),
+    excerptStrategy: config.excerptStrategy,
     autoDiscover: config.autoDiscover,
     checks: config.checks.map(c => ({
       ...(c.label !== undefined ? { label: c.label } : {}),

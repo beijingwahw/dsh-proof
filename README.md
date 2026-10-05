@@ -113,6 +113,12 @@ Impact analysis upgrades from regex approximation to a fusion of two edge source
 
 Union semantics keep soundness absolute: verified and approximate edges are unioned; a missing language server, a failed query, or an exhausted budget simply leaves the edge approximate — *precision degrades, coverage never does*. Results are cached per (file, content version, position) with a hard per-build budget (`lspQueryBudget`, default 400), and the regime is surfaced as `impactPrecision`: `lsp-verified` / `approximate` / `forced`.
 
+## Smart excerpting (v0.5): spend the budget where the failure lives
+
+`headChars` used to be a dead knob — the value reached the engine but never the domain layer. v0.5 wires it into a real excerpt budget and upgrades how it is spent. Naive head truncation has a structural flaw: test output opens with a banner ("✓ 50 passing") while the assertion, the diff, and the stack trace live in the middle or at the end — truncation cut exactly what the model needs to fix the bug.
+
+The default `balanced` strategy allocates in three segments: the **first salient failure line** (AssertionError / expected-received / Traceback / stack frames / ✖ / not ok / timed out …) is always kept when it fits within half the budget; a **line-aligned tail window** keeps stack traces intact (never cut mid-word); and `[... N chars omitted ...]` markers account for every dropped character (`outputTruncated` / `outputOmittedChars` ride on the evidence record). The hard clamp trims tail, never the salient middle. Everything is a pure function of (text, config), so content addressing is unaffected. Regression narratives and `proof_verify` failure details now quote the first *informative* line, not the first line. `excerptStrategy: head` preserves the legacy behaviour.
+
 ## Architecture
 
 ```
@@ -129,7 +135,7 @@ The domain core is framework-free on purpose: it is fully unit-testable offline,
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit
-npm test              # 88 tests, node:test
+npm test              # 95 tests, node:test
 npm run build
 npm run bundle:check  # packaging contract self-check
 ```

@@ -74,7 +74,13 @@ export interface Config {
   promptSection: boolean
   /** Namespace for the prompt section; lets a deployment shadow ours. */
   promptScope: string
-  /** Maximum evidence head retained per record, in characters. */
+  /**
+   * How check output is excerpted into evidence records. `balanced` (default)
+   * keeps head + salient failure lines + tail under the budget; `head` is the
+   * legacy first-N-characters behaviour.
+   */
+  excerptStrategy: 'head' | 'balanced'
+  /** Excerpt budget per evidence record, in characters. */
   headChars: number
   /** Emit plugin diagnostics to stdout. */
   verbose: boolean
@@ -107,6 +113,7 @@ export const Config: Schema<Config> = Schema.object({
   enforceOnTurnEnd: Schema.boolean().default(true),
   promptSection: Schema.boolean().default(true),
   promptScope: Schema.string().default('proof:policy'),
+  excerptStrategy: Schema.union(['head', 'balanced']).default('balanced'),
   headChars: Schema.number().default(2_000),
   verbose: Schema.boolean().default(false),
 }) as unknown as Schema<Config>

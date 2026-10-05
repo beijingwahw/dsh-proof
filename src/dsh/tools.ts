@@ -18,6 +18,7 @@ import type {
 import type { ProofEngine } from '../engine.ts'
 import type { ProofGrade, ProofReport } from '../core/evidence.ts'
 import { proofNarrative } from '../core/regression.ts'
+import { firstInformativeLine } from '../core/excerpt.ts'
 
 // ---------------------------------------------------------------------------
 // Canonical value shapes (the programmatic API Code Mode sees)
@@ -474,7 +475,7 @@ function toVerifyValue(
       .map(c => ({
         label: c.label,
         suspects: [...c.suspects].slice(0, 5),
-        detail: firstLine(c.current?.outputHead ?? ''),
+        detail: firstInformativeLine(c.current?.outputHead ?? ''),
       })),
     fixed: checks.filter(c => c.verdict === 'fixed').map(c => c.label),
     preExisting: checks.filter(c => c.verdict === 'still-failing').map(c => c.label),
@@ -575,11 +576,6 @@ function text(value: string): ContentBlock {
 function oneLine(value: unknown): string {
   if (typeof value !== 'string') return ''
   return truncate(value.replace(/\s+/g, ' ').trim(), 240)
-}
-
-function firstLine(value: unknown): string {
-  if (typeof value !== 'string') return ''
-  return truncate(value.split('\n').find(l => l.trim().length > 0) ?? '', 160)
 }
 
 function truncate(value: unknown, max: number): string {

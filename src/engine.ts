@@ -56,6 +56,8 @@ export interface EngineOptions {
   readonly resolver?: DefinitionResolverPort
   /** Maximum language-server round-trips per graph build. */
   readonly lspQueryBudget?: number
+  /** How output is excerpted into evidence records (v0.5). */
+  readonly excerptStrategy?: 'head' | 'balanced'
   readonly headChars?: number
   readonly clock?: Clock
   readonly fs?: FsPort
@@ -114,6 +116,7 @@ export class ProofEngine {
     impactGraph: boolean
     impactGraphLimit: number
     lspQueryBudget: number
+    excerptStrategy: 'head' | 'balanced'
     headChars: number
   }
 
@@ -142,7 +145,10 @@ export class ProofEngine {
         checkpointEvery: options.checkpointEvery ?? 25,
       },
     )
-    this.runner = new VerificationRunner(this.commands, this.workspace, this.clock)
+    this.runner = new VerificationRunner(this.commands, this.workspace, this.clock, {
+      budget: options.headChars ?? 2_000,
+      strategy: options.excerptStrategy ?? 'balanced',
+    })
     this.resolver = options.resolver
     this.options = {
       evidenceDir,
@@ -154,6 +160,7 @@ export class ProofEngine {
       impactGraph: options.impactGraph ?? true,
       impactGraphLimit: options.impactGraphLimit ?? 20_000,
       lspQueryBudget: options.lspQueryBudget ?? 400,
+      excerptStrategy: options.excerptStrategy ?? 'balanced',
       headChars: options.headChars ?? 2_000,
     }
   }

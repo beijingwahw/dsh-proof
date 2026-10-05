@@ -61,4 +61,5 @@
         promptSection: true
         promptScope: proof:policy
         headChars: 2000
+        excerptStrategy: balanced # head+salient failure lines+tail | head = legacy
         verbose: false

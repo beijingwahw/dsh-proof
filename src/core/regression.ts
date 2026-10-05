@@ -17,6 +17,7 @@ import type { RelPath } from './impact.ts'
 import { attributeChange, matchesAny } from './impact.ts'
 import type { DependencyGraph } from './impact.ts'
 import type { ChangeProvenance } from './changeset.ts'
+import { firstInformativeLine } from './excerpt.ts'
 
 /** The minimum a report needs to decide who owns a red check. */
 export interface AttributionInput {
@@ -147,7 +148,7 @@ export function regressionNarrative(checks: readonly AttributedCheck[]): string[
       ? ` Suspect files: ${check.suspects.slice(0, 5).join(', ')}.`
       : ''
     const detail = check.current?.outputHead
-      ? ` Last output: ${firstLine(check.current.outputHead)}`
+      ? ` Last output: ${firstInformativeLine(check.current.outputHead)}`
       : ''
     out.push(`${externalOnly ? '↗' : '✖'} ${check.label}: ${check.rationale}${owners}${detail}`)
   }
@@ -167,9 +168,4 @@ export function proofNarrative(report: ProofReport): string {
   if (s.preExisting > 0) parts.push(`${s.preExisting} pre-existing failure(s)`)
   if (report.unverified.length > 0) parts.push(`${report.unverified.length} stale/unrun`)
   return parts.join(' · ')
-}
-
-function firstLine(text: string): string {
-  const line = text.split('\n').find(l => l.trim().length > 0) ?? ''
-  return line.length > 200 ? `${line.slice(0, 200)}…` : line
 }
