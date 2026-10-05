@@ -405,3 +405,169 @@ test('NodeEd25519Signer: key persists across loads, signatures verify, forgeries
   assert.equal(audit.ok, true)
   assert.equal(audit.chain.mode, 'signed')
 })
+
+// -- the forged-checkpoint laundering family (v0.14.0) --------------------------
+//
+// The first ADVERSARY test closed "rewrite everything" with the anchor; the
+// second move is to *answer* the anchor from inside the rewritten log. The
+// attacker cannot sign, but it can append a checkpoint envelope under any
+// keyId it invents, and for a while the audit took the last checkpoint's
+// SELF-REPORTED count at face value when comparing against the anchor. These
+// tests pin the fix: the count is judged against the records the walk itself
+// counted, and the anchor is answered only by its own key.
+
+/** THE ADVERSARY's move verbatim: flip every failure to a pass, rebuild a perfectly chained, self-addressed log from genesis. */
+async function rewriteHidingFailures(fs: MemoryFs): Promise<string[]> {
+  const lines = await fs.readLines(LOG)
+  const payloads = lines
+    .map(line => JSON.parse(line) as { kind: string; payload: Record<string, unknown> })
+    .filter(envelope => envelope.kind === 'evidence')
+    .map(envelope => envelope.payload)
+  const forged = payloads.map((payload) => {
+    const { evidenceId, ...rest } = payload
+    const altered = { ...rest, status: 'pass' } as Record<string, unknown>
+    return { ...altered, evidenceId: addressOf(altered) }
+  })
+  let prev = GENESIS_PREV
+  return forged.map((payload) => {
+    const line = JSON.stringify({ v: 2, kind: 'evidence', at: '2026-10-05T00:00:00.000Z', prev, payload })
+    prev = lineDigest(line)
+    return line
+  })
+}
+
+/**
+ * A checkpoint line the attacker writes itself: valid JSON, correctly chained,
+ * honestly recomputed head — every field except a signature it cannot produce
+ * and a count only it chose. `countText` is spliced in as raw text so `1e999`
+ * (JSON's spelling of Infinity) survives where `JSON.stringify(Infinity)`
+ * would quietly emit `null`.
+ */
+function forgedCheckpointLine(prev: string, countText: string, keyId = 'attacker'): string {
+  const payload = `{"count":${countText},"head":${JSON.stringify(prev)},"workspaceKey":"ws","at":"2026-10-05T00:00:00.000Z"}`
+  return `{"v":2,"kind":"checkpoint","at":"2026-10-05T00:00:00.000Z","prev":${JSON.stringify(prev)},"payload":${payload},"sig":"x","keyId":${JSON.stringify(keyId)}}`
+}
+
+/** An honest audit's eye: same log and anchor, the host key in hand. */
+function auditor(fs: MemoryFs): EvidenceStore {
+  return new EvidenceStore(fs, LOG, BASE, new FakeClock(), { signer: async () => new FakeSigner(), anchorPath: ANCHOR })
+}
+
+test('THE ADVERSARY II: a forged checkpoint with an inflated count cannot launder a rewrite', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1', 'fail'))
+  await store.append(evidence('c2', 'fail'))
+  await store.checkpoint()
+  assert.equal((await store.audit()).ok, true)
+
+  // The full rewrite from THE ADVERSARY, plus the counter-move: append a
+  // checkpoint of the attacker's own with count 1e999 — JSON for Infinity —
+  // a correctly recomputed head and a junk signature. The old audit compared
+  // the anchor against this self-report: ∞ silenced the rewind check,
+  // `records - ∞` clamped to 0 erased the tail, and the rewrite audited
+  // clean. The walk now derives the count itself: Infinity is not a safe
+  // integer, and no forged number survives comparison with the records
+  // actually walked to that line.
+  const rebuilt = await rewriteHidingFailures(fs)
+  const prev = lineDigest(rebuilt[rebuilt.length - 1] as string)
+  fs.mutate(LOG, `${[...rebuilt, forgedCheckpointLine(prev, '1e999')].join('\n')}\n`)
+
+  const audit = await auditor(fs).audit()
+  assert.equal(audit.chain.malformedCheckpoints!.length, 1, 'the forged count is refuted by the walked record count, signatures aside')
+  assert.equal(audit.chain.rewind, true, 'no well-formed checkpoint the anchored key signed remains — the rewrite is a rewind')
+  assert.equal(audit.chain.tailRecords, 2, 'the true tail survives: both rewritten records are chain-covered only, not ∞-washed to 0')
+  assert.equal(audit.ok, false)
+})
+
+test('a forged checkpoint with a plausible count (anchor.count + 1) is equally malformed', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1', 'fail'))
+  await store.append(evidence('c2', 'fail'))
+  await store.checkpoint()
+
+  // Same rewrite, but the forged count is a boring safe integer one past the
+  // anchor: high enough to silence the old rewind comparison, plausible
+  // enough to pass any range check. Only the walked record count (two
+  // records walked, not three) can refute it.
+  const rebuilt = await rewriteHidingFailures(fs)
+  const prev = lineDigest(rebuilt[rebuilt.length - 1] as string)
+  const anchor = JSON.parse(await fs.readFile(ANCHOR) as string) as { count: number }
+  fs.mutate(LOG, `${[...rebuilt, forgedCheckpointLine(prev, String(anchor.count + 1))].join('\n')}\n`)
+
+  const audit = await auditor(fs).audit()
+  assert.equal(audit.chain.malformedCheckpoints!.length, 1, 'count 3 where the walk counted 2')
+  assert.equal(audit.chain.rewind, true, 'the foreign checkpoint cannot answer an anchor it never signed — best is undefined, not the forger')
+  assert.equal(audit.chain.tailRecords, 2)
+  assert.equal(audit.ok, false)
+})
+
+test('count is verified against the walked record count', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1'))
+  await store.append(evidence('c2'))
+  await store.checkpoint()
+  assert.equal((await store.audit()).ok, true)
+
+  // Nudge the checkpoint's count by one. It is the log's LAST line, so no
+  // later `prev` links into it and the chain stays intact — only the walk
+  // (and the signature, now covering bytes that no longer exist) can refute
+  // it. Two records were walked to this position; the checkpoint claims three.
+  const lines = await fs.readLines(LOG)
+  lines[lines.length - 1] = (lines[lines.length - 1] as string).replace('"count":2', '"count":3')
+  fs.mutate(LOG, `${lines.join('\n')}\n`)
+
+  const audit = await auditor(fs).audit()
+  assert.deepEqual(audit.chain.malformedCheckpoints, [2], 'the last line claims 3 records where the walk counted 2')
+  assert.equal(audit.ok, false)
+})
+
+test('Infinity, negative and fractional checkpoint counts are all malformed', async () => {
+  const cases: ReadonlyArray<[label: string, countText: string]> = [
+    ['count 1e999 (JSON Infinity)', '1e999'],
+    ['a negative count', '-5'],
+    ['a fractional count', '2.5'],
+  ]
+  for (const [label, countText] of cases) {
+    const fs = MemoryFs.of({})
+    const { store } = trustedStore(fs)
+    await store.append(evidence('c1'))
+    await store.append(evidence('c2'))
+    await store.checkpoint()
+
+    const lines = await fs.readLines(LOG)
+    lines[lines.length - 1] = (lines[lines.length - 1] as string).replace('"count":2', `"count":${countText}`)
+    fs.mutate(LOG, `${lines.join('\n')}\n`)
+
+    const audit = await auditor(fs).audit()
+    assert.equal(audit.chain.malformedCheckpoints!.length, 1, `${label}: must be malformed — no safe-integer match against the walked count`)
+    assert.equal(audit.ok, false, label)
+  }
+})
+
+test('the anchor answers to its own key: a later well-formed foreign checkpoint cannot stand in for it', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  for (const id of ['c1', 'c2', 'c3', 'c4', 'c5']) await store.append(evidence(id))
+  await store.checkpoint() // the host key's checkpoint: count 5, mirrored to the anchor
+  await store.append(evidence('c6'))
+
+  // A well-formed checkpoint under a foreign keyId lands at the tail: count 6
+  // matches the six records actually walked, the head is honestly recomputed,
+  // the chain is unbroken. The anchor remembers {keyId: 'fake-key', count: 5}.
+  // The log's answer to that anchor must be the HOST KEY's last well-formed
+  // checkpoint (count 5 ≥ 5, matching head) — not the positionally-last
+  // foreign one. Letting any well-shaped appendage answer for the anchor
+  // would hand the high-water mark to whoever appends last.
+  const lines = await fs.readLines(LOG)
+  const prev = lineDigest(lines[lines.length - 1] as string)
+  fs.mutate(LOG, `${[...lines, forgedCheckpointLine(prev, '6', 'foreign-key')].join('\n')}\n`)
+
+  const audit = await auditor(fs).audit()
+  assert.equal(audit.chain.rewind, false, 'the anchored key\'s own checkpoint (count 5) answers its anchor: no rewind')
+  assert.equal(audit.chain.anchorMismatch, false)
+  assert.equal(audit.chain.unverifiableCheckpoints.length, 1, 'the foreign checkpoint stays unverifiable — a missing capability, not a charge')
+  assert.equal(audit.ok, true, 'a well-formed foreign checkpoint must not fail the audit')
+})

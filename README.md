@@ -21,6 +21,8 @@ dsh plugin --profile web add ./dsh-proof      # from a local checkout
 
 📖 **[中文文档](./README.zh.md)** — full gap analysis, architecture and configuration reference.
 
+As of v0.14 the core is more than a plugin: it is an open standard plus a standalone server. The **Agent Proof Protocol (APP/1.0)** — see **[PROTOCOL.md](./PROTOCOL.md)** — pins the vocabulary, the content addressing, the signed chain and a portable bundle exchange format, and the package ships a **Proof MCP Server**: any agent on any harness (Claude Desktop, Cursor, anything speaking MCP) can call `proof_verify` against a workspace that has never installed DSH.
+
 ---
 
 ## The gap
@@ -179,12 +181,58 @@ The protocol is a two-tool pair. `proof_conjure(claim, paths)` freezes the reque
 
 Every decisively-passing evidence record attaches its own `coverage` split against the change set (`changedExecuted` / `changedUncovered`) — and like v0.12's `scriptDigest`, **the attachment participates in the `evidenceId` content address**: a record cannot claim to have exercised a change it never ran. Collection completes *before the first append*, so the chain never holds a plain record and its enriched twin; the staging tree (`${storeDir}/coverage/<nonce>` — the nonce is physical staging, never hash material) is removed after collection via a new optional `FsPort.removeDir`. The gate's demotion is deliberately a different word from `stale`: **`stale` is a process verdict** (verification did not finish; re-running rescues it) while the coverage **`unproven` is an evidence verdict** (the process finished, everything was green — and the green evidence never executed the change; re-running cannot help, what is missing is a check that actually reaches it). `regressed` and `stale` are never overwritten; the gate is pinned after the machine grade and before obligation/attestation fusion, so a claim coverage knocked to `unproven` cannot be endorsement-unlocked — missing work is not residual risk. Uncovered changes are named (first 3 files) with the remedy attached: `proof_conjure` can synthesize a test that executes them — v0.12's synthesis is the *prescription* for v0.13's blind spots, and fittingly the gate caught one of its own historical conjure fixtures being green while never touching the change on day one. Three modes (`coverage` config, default `observe`): `observe` gates only when data exists and shows `basis: 'none'` honestly when it does not (fake command ports and non-Node toolchains degrade visibly instead of failing a new way); `require` treats missing data itself as disqualifying (`no-coverage-data`) — strict deployments, not for non-node ecosystems; `off` injects nothing and gates nothing, byte-identical to v0.12. Narratives say it out loud — `PROVEN (p≈0.97, change-executed)` / `UNPROVEN (p≈0.97) — … — unexecuted change (src/feature.mjs) — proof_conjure can synthesize a test that executes them` — and baselines never inject: a baseline is a measurement, not a claim.
 
+## An open standard and an MCP server (v0.14): proof beyond this harness
+
+The verification core is now specified as the **Agent Proof Protocol (APP/1.0)** — an open standard ([PROTOCOL.md](./PROTOCOL.md), eight sections: Concepts, Vocabulary, Content addressing, Tamper evidence, Exchange format, Verification API, Security, Conformance) that any implementation can speak, not just this plugin. The dialect is fully named: the five wire vocabularies (8 verdicts, 5 grades, 6 check statuses, 3 chain modes, 5 claim kinds), the `sha256(canonicalJson(v))` addressing, the hash-chain / signed-checkpoint / out-of-band-anchor tamper evidence, and a **proof bundle** exchange format — a manifest (`protocol` / `appFingerprint` / `workspaceKey` / `createdAt` / `files[{path,sha256,bytes}]`) ahead of `evidence.jsonl` (plus `baseline.json` / `anchor.json` when they exist) — whose verifier owes the producer no trust: recompute every digest, walk the chain, re-check self-addressing, resolve anchor and baseline, and refuse anything that does not re-derive. `appFingerprint()` (`src/app/protocol.ts`) digests the vocabularies plus the three load-bearing rule strings, so any change to a value or a rule names a new dialect — a consumer refuses to interpret a bundle whose fingerprint it cannot reproduce against its own constants. Alongside the standard ships a **Proof MCP Server**: the `dsh-proof-mcp` bin (also `node --experimental-strip-types src/app/mcp-entry.ts` from a checkout) is a hand-written MCP JSON-RPC 2.0 server over stdio with **zero new npm dependencies** (the runtime still has exactly one) exposing exactly the five conformance tools — `proof_status` / `proof_baseline` / `proof_verify` / `proof_claim` / `proof_bundle` — configured entirely through environment variables; an invalid claim `kind` errors loudly instead of silently downgrading (a deliberate difference from the DSH tool face), and the jury/endorse/conjure families stay off the MCP surface because their host approval seam and session context are not an open server's to assume. The H1 trust hardening closes a real hole: a checkpoint's `count` must now be a safe integer equal to the records the walk actually counted (a new `malformedCheckpoints` audit channel), and the rewind/anchor comparison credits only checkpoints signed by the anchor's own key — a forged checkpoint (foreign keyId, inflated count) can no longer launder a chain rewrite (THE ADVERSARY II). Tests 388 → 424 (`test/21-protocol` pins the vocabulary, `test/22-bundle` attacks the exchange format, `test/23-mcp` drives the real server as a real subprocess, `09` gains five adversarial cases); `src/app/` adds five modules — protocol, bundle, mcp-server, mcp-entry, and an `index.ts` barrel for lib consumers.
+
+### Proof MCP Server quickstart
+
+Three steps — the server speaks plain MCP JSON-RPC 2.0 over stdio; no DSH installation required.
+
+**1 · Install**
+
+```sh
+npm i -g dsh-proof          # or use npx dsh-proof-mcp without installing
+```
+
+**2 · Point a host at it.** Claude Desktop (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "dsh-proof": {
+      "command": "dsh-proof-mcp",
+      "env": {
+        "DSH_PROOF_ROOT": "/path/to/your/project",
+        "DSH_PROOF_TRUST_DIR": "/path/to/trust/root",
+        "DSH_PROOF_EVIDENCE_STORE": "host"
+      }
+    }
+  }
+}
+```
+
+Generic command line (any MCP client that spawns a command):
+
+```sh
+DSH_PROOF_ROOT=/path/to/project dsh-proof-mcp
+# or straight from a checkout:
+node --experimental-strip-types src/app/mcp-entry.ts
+```
+
+The server reads **no `cordis.yml`** — every knob is an environment variable: `DSH_PROOF_ROOT` (the workspace root it verifies, default cwd), `DSH_PROOF_TRUST_DIR` (keys and anchors, default `$DSH_HOME/proof`), `DSH_PROOF_EVIDENCE_STORE` (`host` | `workspace`, default `host`). Protocol version negotiation accepts `2025-06-18` / `2025-03-26` / `2024-11-05`.
+
+**3 · First run.** Open any project directory and have the agent call `proof_baseline` — every discovered check runs once and the signed chain + anchor are established — then `proof_verify` for the graded verdict with regression attribution. `proof_claim` states a completion claim and proves it; `proof_bundle` packs the manifest + log for hand-off to another machine or a third party.
+
+Note: the testimony and synthesis tools are deliberately **not** on the MCP face — `proof_jury`, `proof_endorse` and `proof_conjure` need a host-held human approval seam and session context an open server cannot assume; those live in the DSH plugin, where the approval prompt belongs to the host.
+
 ## Architecture
 
 ```
 src/core/*      pure domain — zero @deepseek-ai/* imports, all I/O through ports
 src/engine.ts   ProofEngine — the imperative façade hosts call
 src/dsh/*       thin Cordis adapter — tools, hooks, prompt section
+src/app/*       APP/1.0 open-standard layer — protocol constants, bundle, MCP server
 src/vendor/     contract snapshot pinned to dsh v0.2.1-alpha.1
 ```
 
@@ -195,12 +243,12 @@ The domain core is framework-free on purpose: it is fully unit-testable offline,
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit
-npm test              # 388 tests, node:test
+npm test              # 424 tests, node:test
 npm run build
 npm run bundle:check  # packaging contract self-check
 ```
 
-The suite includes a **real-shell integration test** (`test/07-integration.test.ts`): it builds a throwaway project, actually runs `npm run --silent test`, breaks something, and asserts the pipeline reports `regressed` with the offending file attributed.
+The suite includes a **real-shell integration test** (`test/07-integration.test.ts`): it builds a throwaway project, actually runs `npm run --silent test`, breaks something, and asserts the pipeline reports `regressed` with the offending file attributed. Since v0.14 it also includes a **real-subprocess MCP integration test** (`test/23-mcp.test.ts`): it spawns the server over stdio, handshakes, and drives the whole baseline → verify → status → bundle chain with real npm runs — nothing stubbed.
 
 ## Configuration
 
@@ -245,6 +293,9 @@ Every tunable is a `cordis.yml` field — no hardcoded knobs. See [README.zh.md 
 - Execution coverage is file-granular (v0.13): "executed" means the file has at least one function range at `count > 0` — it does not distinguish the changed lines from the untouched function next door, so a test touching only unchanged code in the same file counts the same as one executing the change. Line/symbol-level verdicts (baseline content blobs or LSP symbol maps) are an evolution, not this version; read `change-executed` as "this file ran", never "this line ran".
 - Non-node ecosystems have no coverage data (v0.13): `NODE_V8_COVERAGE` is a Node runtime flag — pytest, `go test`, `cargo test` inherit the variable but write no V8 profile, so the dimension reads `basis: 'none'` for them. `observe` never gates such workspaces; `require` makes every claim `unproven`. That is a deployment decision, not a defect: pure-node toolchains can run `require`, mixed or non-node stacks should stay on `observe` (or `off`).
 - The loaded-not-executed bucket is parsed but unused (v0.13): V8 reports carry a third fact — files imported yet never run — which v1 buckets and reserves but does not consume for stronger verdicts (sharper suspect ranking, a more precise `new-paths-covered`). Recorded here as an honest edge of what the gate currently says.
+- The MCP face is the five conformance tools only (v0.14): `proof_jury`, `proof_jury_submit`, `proof_endorse`, `proof_conjure` and `proof_conjure_run` are deliberately not exposed over MCP — they lean on host-held seams (a human approval prompt, session context, an isolated deliberation model) an open server cannot assume. A client wanting testimony or synthesis runs the plugin inside DSH, where the approval seam lives.
+- Bundle verification is not a substitute for local audit (v0.14): a verifying party re-derives everything from the bundle's own bytes — file digests, chain linkage, per-record self-addressing, the baseline digest — but checkpoint signatures can be adjudicated only when the verifier holds (or is handed) the named key, and anchor monotonicity only when the anchor file is available. A missing adjudication capability is recorded as such, never rounded up to a forgery charge; an anchor-less bundle keeps its chain and addressing guarantees but loses rewind cover.
+- Checkpoint counts are normative as of v0.14 (H1): a checkpoint whose `count` is not a safe integer equal to the walked record count lands in `malformedCheckpoints` no matter who signed it, and the anchor comparison credits only checkpoints signed by the anchor's own key — a forged checkpoint (foreign keyId, inflated count) can no longer launder a truncation. The flip side is symmetric: an honest-but-buggy producer with a miscounted checkpoint is rejected the same way, and there is no override.
 - Checkpoint cadence leaves a window (v0.2): records after the last signed checkpoint are chain-covered but not checkpoint-covered. The window is bounded by `checkpointEvery`, closed at every baseline/verify/claim boundary, and *visible* — `proof_status` reports `tailRecords`, the count of records since the last checkpoint. The anchor protects against the audited agent, not against a fully compromised host.
 - On machines without the signing key, signed checkpoints cannot be adjudicated locally: the audit reports them as `unverifiableCheckpoints` (a missing capability, not a forgery charge — the audit does not fail on it; anchor count/head comparison still bounds rewind).
 - `proven` permits pre-existing red checks — they are reported prominently but not charged to the session. Deliberate, not a hole.

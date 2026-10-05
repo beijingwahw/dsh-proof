@@ -310,6 +310,16 @@ export interface AuditReport {
     readonly unverifiableCheckpoints: readonly number[]
     readonly unsignedCheckpoints: readonly number[]
     readonly headMismatches: readonly number[]
+    /**
+     * Checkpoints whose self-reported `count` the walk itself refutes — not a
+     * non-negative safe integer, or not equal to the records actually walked
+     * to that position (see `walkChain`). Signature-independent by design: a
+     * checkpoint can be perfectly cryptographic for a key this host cannot
+     * adjudicate and still be lying about its count. Optional in the type so
+     * hand-built reports from older surfaces keep satisfying it; `audit()`
+     * always emits it (empty when clean).
+     */
+    readonly malformedCheckpoints?: readonly number[]
     /** Records after the last checkpoint — chain-covered, not checkpoint-covered. */
     readonly tailRecords: number
     /** The log ends before the best checkpoint the anchor remembers. */
@@ -646,7 +656,20 @@ export class EvidenceStore {
     let anchorForged = false
     const anchor = parseAnchor(this.trust.anchorPath === undefined ? undefined : await this.fs.readFile(this.trust.anchorPath))
     if (anchor !== undefined) {
-      const best = walk.checkpoints[walk.checkpoints.length - 1]
+      // The anchor speaks for the key that wrote it, so the log's answer to
+      // the anchor is the last *well-formed* checkpoint that same key
+      // produced — not whichever checkpoint happens to sit last in the file.
+      // An attacker who rewrites the log can append a well-shaped checkpoint
+      // under any keyId it likes (count included); letting that stand in for
+      // the anchored key would let a forged self-report answer — and erase —
+      // the out-of-band high-water mark. Malformed checkpoints are excluded
+      // on every path: their count is a lie the walk already refuted. Legacy
+      // anchors that carry no keyId keep the last-well-formed semantics.
+      const malformed = new Set(walk.malformedCheckpoints)
+      const wellFormed = walk.checkpoints.filter(cp => !malformed.has(cp.index))
+      const best = anchor.keyId !== ''
+        ? wellFormed.findLast(cp => cp.keyId === anchor.keyId)
+        : wellFormed[wellFormed.length - 1]
       if (best === undefined || best.payload.count < anchor.count) rewind = true
       else if (best.payload.count === anchor.count && best.payload.head !== anchor.head) anchorMismatch = true
       // The anchor is signed data too, and it is the one artifact the agent
@@ -683,6 +706,7 @@ export class EvidenceStore {
       unverifiableCheckpoints,
       unsignedCheckpoints,
       headMismatches,
+      malformedCheckpoints: walk.malformedCheckpoints,
       tailRecords: walk.tailRecords,
       rewind,
       anchorMismatch,
@@ -692,13 +716,14 @@ export class EvidenceStore {
     // `unverifiableCheckpoints` deliberately does NOT fail the audit: a key we
     // no longer hold must not turn into a forgery verdict against the log.
     // Every *refutable* claim — corruption, breaks, forged signatures, head
-    // mismatches, unsigned-while-signed, rewind, anchor mismatch/forgery,
-    // baseline substitution — does.
+    // mismatches, malformed counts, unsigned-while-signed, rewind, anchor
+    // mismatch/forgery, baseline substitution — does.
     const ok = corrupt.length === 0
       && walk.corruptLines.length === 0
       && walk.chainBreaks.length === 0
       && badCheckpoints.length === 0
       && headMismatches.length === 0
+      && walk.malformedCheckpoints.length === 0
       && unsignedCheckpoints.length === 0
       && !rewind
       && !anchorMismatch

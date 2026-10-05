@@ -70,6 +70,16 @@ export interface WalkedCheckpoint {
   readonly keyId: string | null
   /** Chain head the walker expected at this position. */
   readonly expectedHead: string
+  /**
+   * Records (evidence + marker lines) the walker counted *before* this
+   * checkpoint line — exactly what an honest writer stamps into
+   * `payload.count` (`EvidenceStore` does not count checkpoints themselves).
+   * The self-reported count is judged against this walked count: an attacker
+   * who rewrites the log can recompute `head` with this package's own
+   * functions, but it cannot make a forged `count` survive comparison with
+   * the walk — the walked count is derived, not self-declared.
+   */
+  readonly expectedCount: number
 }
 
 export type ChainMode = 'signed' | 'unsigned' | 'legacy'
@@ -84,7 +94,16 @@ export interface ChainWalk {
   /** Lines that are not valid v1/v2 envelopes. */
   readonly corruptLines: readonly number[]
   readonly checkpoints: readonly WalkedCheckpoint[]
-  /** Records appended after the last checkpoint (0 when the tail is covered). */
+  /**
+   * Line indexes of checkpoints whose self-reported `count` the walk itself
+   * refutes: not a non-negative safe integer, or not equal to the records
+   * actually walked to that position. Purely structural failures (a non-number
+   * count, a non-string head) stay in `corruptLines` — this list is for counts
+   * that are well-shaped but *lying* (`1e999` parses to `Infinity` and passes
+   * any `typeof` check, which is exactly the laundering trick).
+   */
+  readonly malformedCheckpoints: readonly number[]
+  /** Records appended after the last well-formed checkpoint (0 when the tail is covered). */
   readonly tailRecords: number
 }
 
@@ -103,6 +122,7 @@ export function walkChain(lines: readonly string[]): ChainWalk {
   const chainBreaks: number[] = []
   const corruptLines: number[] = []
   const checkpoints: WalkedCheckpoint[] = []
+  const malformedCheckpoints: number[] = []
 
   let prevDigest = GENESIS_PREV
   lines.forEach((line, index) => {
@@ -128,6 +148,10 @@ export function walkChain(lines: readonly string[]): ChainWalk {
       if (envelope.kind === 'checkpoint') {
         const payload = envelope.payload as Partial<CheckpointPayload>
         if (typeof payload?.count === 'number' && typeof payload?.head === 'string') {
+          // Records walked to this line is the count an honest writer stamps
+          // (checkpoints are not themselves counted), so the self-report is
+          // judged against the walk, not against arithmetic the writer chose.
+          const expectedCount = records
           checkpoints.push({
             index,
             payload: {
@@ -139,7 +163,9 @@ export function walkChain(lines: readonly string[]): ChainWalk {
             sig: typeof envelope.sig === 'string' ? envelope.sig : null,
             keyId: typeof envelope.keyId === 'string' ? envelope.keyId : null,
             expectedHead: prevDigest,
+            expectedCount,
           })
+          if (!isWellFormedCount(payload.count, expectedCount)) malformedCheckpoints.push(index)
         } else {
           corruptLines.push(index)
         }
@@ -156,10 +182,27 @@ export function walkChain(lines: readonly string[]): ChainWalk {
   const mode: ChainMode = sawV2
     ? (checkpoints.some(cp => cp.sig !== null) ? 'signed' : 'unsigned')
     : (sawV1 ? 'legacy' : 'unsigned')
-  const last = checkpoints[checkpoints.length - 1]
-  const tailRecords = last === undefined ? records : Math.max(0, records - last.payload.count)
+  // Tail cover is measured from the last checkpoint whose count the walk
+  // corroborates. A forged count — inflated to Infinity or merely past the
+  // truth — used to zero out the tail (`records - ∞` clamped to 0) and
+  // launder a rewrite as "fully checkpoint-covered"; against the walked
+  // `expectedCount` the same forgery is malformed and the true tail survives.
+  // Honest logs are byte-identical: there `count === expectedCount`.
+  const malformed = new Set(malformedCheckpoints)
+  const lastGood = checkpoints.findLast(cp => !malformed.has(cp.index))
+  const tailRecords = lastGood === undefined ? records : Math.max(0, records - lastGood.expectedCount)
 
-  return { mode, records, chainBreaks, corruptLines, checkpoints, tailRecords }
+  return { mode, records, chainBreaks, corruptLines, checkpoints, malformedCheckpoints, tailRecords }
+}
+
+/**
+ * A checkpoint count is well-formed when it is a non-negative safe integer
+ * equal to the records the walk counted to that position. Out-of-range or
+ * fractional self-reports (`1e999` → `Infinity`, `-1`, `2.5`) and inflated or
+ * deflated ones fail alike — the walked count is the only admissible truth.
+ */
+function isWellFormedCount(count: number, expectedCount: number): boolean {
+  return Number.isSafeInteger(count) && count >= 0 && count === expectedCount
 }
 
 /** Parse and validate an anchor file's contents; `undefined` when unreadable. */

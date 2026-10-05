@@ -20,6 +20,8 @@ dsh plugin --profile web add dsh-proof
 dsh plugin --profile web add ./dsh-proof
 ```
 
+v0.14 起，核心不再只是一个插件：它同时是一个开放标准加一台独立服务器。**Agent Proof Protocol（APP/1.0）**（见 **[PROTOCOL.md](./PROTOCOL.md)**）把词表、内容寻址、签名链与可携带的 bundle 交换格式固化为任何实现都能说的规范，包内并随附 **Proof MCP Server**——任何 harness 上的任何 agent（Claude Desktop、Cursor、一切会说 MCP 的宿主）都能对着一个从未装过 DSH 的工作区调 `proof_verify`。
+
 ---
 
 ## 一、为什么是这个插件：市面空白分析
@@ -221,7 +223,7 @@ v0.6 在 `normalizeOutput` 落地双层归一：**root → `$WORKSPACE`（先具
 
 **信任三态**。audit 的签名裁定从二态改为三态。旧逻辑在**没有 signer 的机器**上（密钥丢失、换机器审计）会把带签名的检查点误读成可疑；现在只有本机实际持有的密钥、面对点名该密钥的检查点，才有资格**驳斥**（`badCheckpoints`，真正的伪造指控）；本机无法裁定的（`unverifiableCheckpoints`）是**能力缺失而非指控**，不再使 audit 失败。锚文件自身的签名现在也会被验证（`anchorForged`），且锚携带 `workspaceKey`——审计可以仅凭锚文件重导出被签名的字节。
 
-**引擎的诚实边界**。git 不可用时（WorkspacePort 新可选能力 `gitAvailable?()`），每条 git 查询各自失败返回空集——"什么都看不见"曾被吞成"什么都没变"，增量选择悄悄缩成空。现在变更集显式标记 `degraded`，引擎**强制全量跑**并在 `VerifyOutcome.degraded` 透出。中止的基线不再落盘——abort 的基线曾照常写盘，之后的回归判定对着半成品真值运行；现在已观测的证据仍全部入链、落 `baseline/aborted` 标记、检查点窗口照常闭合，返回值携带 `aborted` 标志，下一次 verify 诚实报告 `no-baseline`。signer 加载失败大声降级：链内 `trust/signer-unavailable` marker + verbose 日志——静默降级与诚实的 unsigned 部署从此可区分。`requireBaseline: 'warn'` 从"配置了但没接线"变成真通知：本轮动了工作区而没有基线时，回合结束经 `agent.inject` 注入纠正性提示。死配置 `driftNoticeMs` 删除（配置降至 22 项，v0.9 增至 24 项，v0.10 增至 26 项，v0.11 增至 28 项，v0.12 增至 31 项，v0.13 增至 32 项）。
+**引擎的诚实边界**。git 不可用时（WorkspacePort 新可选能力 `gitAvailable?()`），每条 git 查询各自失败返回空集——"什么都看不见"曾被吞成"什么都没变"，增量选择悄悄缩成空。现在变更集显式标记 `degraded`，引擎**强制全量跑**并在 `VerifyOutcome.degraded` 透出。中止的基线不再落盘——abort 的基线曾照常写盘，之后的回归判定对着半成品真值运行；现在已观测的证据仍全部入链、落 `baseline/aborted` 标记、检查点窗口照常闭合，返回值携带 `aborted` 标志，下一次 verify 诚实报告 `no-baseline`。signer 加载失败大声降级：链内 `trust/signer-unavailable` marker + verbose 日志——静默降级与诚实的 unsigned 部署从此可区分。`requireBaseline: 'warn'` 从"配置了但没接线"变成真通知：本轮动了工作区而没有基线时，回合结束经 `agent.inject` 注入纠正性提示。死配置 `driftNoticeMs` 删除（配置降至 22 项，v0.9 增至 24 项，v0.10 增至 26 项，v0.11 增至 28 项，v0.12 增至 31 项，v0.13 增至 32 项，v0.14 维持 32 项——MCP 服务器不读配置，走环境变量，见 §五·十八）。
 
 **正确性收口（soundness closure）**。monorepo workspace 子包检查不再丢失：CheckSpec 新增 `cwd`（相对 root），子包检查真正在子包目录执行、id 含 cwd（cwd 缺省时 checkId 与旧格式逐字节一致），`packages/*` 单层 glob 现在真正展开——同 argv 的兄弟包检查不再互相顶替。影响图补盲：动态 `import('...')` 与多行 ESM import 现在产生边；Python dotted import（`pkg.mod`）在扫描集内尝试解析——多出的边只造成过选，绝不漏选。`git status --porcelain -z` 的 rename 条目解析修正（旧路径曾被截掉 3 个字符成为幻影路径；解析提为纯函数 `parsePorcelainZ`）。Windows 盘符绝对路径（`C:\...`）统一进路径域：observe 的 touched 归类、LSP root 前缀比较（大小写不敏感）、证据库守卫均修正。EvidenceStore 写入改单飞队列——并发的 append/mark/checkpoint 曾可能都链到同一个 tail，后一条的 `prev` 指向一条已不存在的行：**正确代码与它自己的竞态**。证据输出捕获改用 StringDecoder，多字节字符跨 chunk 边界不再碎成 U+FFFD。工程卫生：CI 改 `npm ci` 并加 windows 矩阵；`check-bundle` 错误路径不再崩溃；`untouchedChecks` 输出修正。
 
@@ -454,6 +456,55 @@ coverage: change-executed (1 file(s) of the change observed running)
 **工程细节**。`establishBaseline` **不注入**覆盖率（v1）：基线是对工作区检查的一次测量，不是对某个变更集的主张——此时没有「changed」可门控，跳过注入还省每检查一次磁盘写入；覆盖维度归验证所有。每检查子目录名用 `sha256(checkId)` 前 16 hex（specId 内嵌命令、可能带空格/冒号/整串 argv，不是每个平台都安全的路径段；采集方从记录自己的 checkId 重导出同一名字，无需 spec 池）。mkdirp 失败被吞：子进程写不出 profile、采集无数据、observe 降级 basis `'none'`——诚实的答案，而不是崩溃的验证。新配置 1 项（现 32 项）：`coverage`（默认 `observe`）；工具数不变（9 个）。新测试文件 `test/20-coverage`（26 例）+ `05` 增 4 例（真进程端到端 change-executed / **头条盲区实证**：paths 匹配但从不执行 → unproven 点名 / require+无数据、off 对照 / 向后兼容逐位）。
 
 
+## 五·十七、开放标准与 MCP 服务器（v0.14.0）：证明走出本 harness
+
+验证核心从此有了规范文本：**Agent Proof Protocol（APP/1.0）**——一份开放标准（[PROTOCOL.md](./PROTOCOL.md)，八节：Concepts / Vocabulary / Content addressing / Tamper evidence / Exchange format / Verification API / Security / Conformance），任何实现都能说，不必是本插件。方言被完整命名：五张线上词表（verdict 8 值、grade 5 值、check status 6 值、chain 3 模式、ClaimKind 5 类）、`sha256(canonicalJson(v))` 内容寻址、哈希链 + 签名检查点 + 带外锚点的防篡改证据，以及一个 **Proof Bundle 交换格式**——manifest（`protocol` / `appFingerprint` / `workspaceKey` / `createdAt` / `files[{path,sha256,bytes}]`）在前、`evidence.jsonl`（连同存在时的 `baseline.json` / `anchor.json`）在后；验证方对生产者**零信任**：重算每一份摘要、走链、复核逐条自寻址、解析锚与基线，一切不能从字节重导出的结论都拒绝。`appFingerprint()`（`src/app/protocol.ts`）把词表与三条承重规则字符串一起摘成**实现指纹**——词表值或规则任何一变，指纹必变；消费方对指纹复现不出来的 bundle 只能拒收，不许猜方言。
+
+与标准同时落地的还有 **Proof MCP Server**：`dsh-proof-mcp` bin（检出目录里也可 `node --experimental-strip-types src/app/mcp-entry.ts` 直跑）是手写的 MCP JSON-RPC 2.0 over stdio 服务器，**零新增 npm 依赖**（运行时依赖仍然只有一个），恰好暴露五个一致性工具——`proof_status` / `proof_baseline` / `proof_verify` / `proof_claim` / `proof_bundle`，全部经环境变量配置（见 §五·十八）；`kind` 非法时报错而不是静默回退（与 DSH 工具面的刻意差异），jury / endorse / conjure 三族刻意不上 MCP 面——宿主审批 seam 与会话上下文不是一台开放服务器能假设的东西。
+
+**H1 信任加固（本版安全修复）**。检查点的 `count` 从此必须是安全整数、且等于走链实数的记录数（新增 `malformedCheckpoints` 审计通道）——伪造的小 count 曾能把检查点窗口抹成零、把截断洗白成「全覆盖」，如今对账只认链上实走数；rewind / 锚比较只采信锚 keyId 匹配的可验证检查点——伪造检查点（外来 keyId + 虚报 count）不再能洗白链重写（新对抗用例 THE ADVERSARY II，连同貌似合理的 `anchor.count + 1` 伪造、Infinity/负数/小数 count、外来 key 顶替锚点共 5 例进 `09`）。测试 388 → 424：`test/21-protocol` 把词表逐字钉死并与核心实际产出交叉核对、`test/22-bundle` 以篡改矩阵攻击交换格式、`test/23-mcp` 以真实子进程驱动真实服务器；`src/app/` 新增五个模块——protocol、bundle、mcp-server、mcp-entry，外加供 lib 使用方导入的 `index.ts` 桶文件。
+
+## 五·十八、MCP 快速上手
+
+三步——服务器说纯 MCP JSON-RPC 2.0 over stdio，无需安装 DSH。
+
+**第一步 · 安装**
+
+```sh
+npm i -g dsh-proof          # 或者不安装直接 npx dsh-proof-mcp
+```
+
+**第二步 · 在宿主里登记**。Claude Desktop（`claude_desktop_config.json`）：
+
+```json
+{
+  "mcpServers": {
+    "dsh-proof": {
+      "command": "dsh-proof-mcp",
+      "env": {
+        "DSH_PROOF_ROOT": "/path/to/your/project",
+        "DSH_PROOF_TRUST_DIR": "/path/to/trust/root",
+        "DSH_PROOF_EVIDENCE_STORE": "host"
+      }
+    }
+  }
+}
+```
+
+通用命令行形态（任何能拉起命令的 MCP 客户端）：
+
+```sh
+DSH_PROOF_ROOT=/path/to/project dsh-proof-mcp
+# 或直接从检出目录运行：
+node --experimental-strip-types src/app/mcp-entry.ts
+```
+
+服务器**不读 `cordis.yml`**——每个旋钮都是环境变量：`DSH_PROOF_ROOT`（它验证的工作区根，默认 cwd）、`DSH_PROOF_TRUST_DIR`（密钥与锚点，默认 `$DSH_HOME/proof`）、`DSH_PROOF_EVIDENCE_STORE`（`host` | `workspace`，默认 `host`）。协议版本协商接受 `2025-06-18` / `2025-03-26` / `2024-11-05`。配置表因此维持 32 项不变（§八）。
+
+**第三步 · 首跑**。打开任意项目目录，让 agent 调 `proof_baseline`——发现的检查全部真跑一遍，签名链与锚点就此建立；再调 `proof_verify` 拿到带回归归因的分级裁决。`proof_claim` 声明完成并证明它；`proof_bundle` 打包 manifest + 日志，交给另一台机器或第三方。
+
+注意：证词与合成工具**刻意不在 MCP 面上**——`proof_jury`、`proof_endorse`、`proof_conjure` 需要宿主持有的人工审批 seam 与会话上下文，开放服务器无法假设；它们留在 DSH 插件里，审批提示归宿主。
+
 ---
 
 ## 六、架构：领域核心 + 薄适配层
@@ -490,8 +541,15 @@ dsh-proof/
 │   │   ├── observe.ts        # 脏区追踪 + 漂移检测
 │   │   ├── prompt.ts         # proof:policy 段落
 │   │   └── lsp-impact.ts     # 宿主 LSP → DefinitionResolverPort 适配
+│   ├── app/                  ← APP/1.0 开放标准层（零 @deepseek-ai/* 依赖，任何宿主可实现）
+│   │   ├── protocol.ts       # APP/1.0 协议常量：五张词表 + 媒体类型 + 实现指纹 appFingerprint()
+│   │   ├── bundle.ts         # Proof Bundle 交换格式装配（manifest + 逐文件摘要重算）
+│   │   ├── mcp-server.ts     # 手写 MCP JSON-RPC 2.0 服务器（恰好 5 工具，零新增依赖）
+│   │   ├── mcp-entry.ts      # 独立进程入口：环境变量装配引擎，stdio 收发
+│   │   └── index.ts          # 桶导出（protocol + bundle + MCP 契约，供 lib 使用方）
 │   └── vendor/dsh-tools.ts   # 契约快照（pinned to dsh v0.2.1-alpha.1）
-├── test/                     # 20 个测试文件（388 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心、类型化断言合约、证据分级 B/C、PTC 证据合成、覆盖感知证明
+├── test/                     # 23 个测试文件（424 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心、类型化断言合约、证据分级 B/C、PTC 证据合成、覆盖感知证明、协议词表钉死、bundle 篡改矩阵、MCP 真子进程集成
+├── PROTOCOL.md               # Agent Proof Protocol (APP/1.0) 开放标准（英文规范，八节）
 ├── cordis.patch.yml          # bundle 层
 └── examples/cordis.yml       # --patch 本地调试
 ```
@@ -499,7 +557,7 @@ dsh-proof/
 **为什么领域核心不碰 `@deepseek-ai/*`：**
 
 1. DSH 是开发者预览版，破坏性变更频繁。核心逻辑与 harness 版本解耦 → 升级不重写。
-2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，388 个测试全绿。
+2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，424 个测试全绿。
 3. 同一个核心可以被别的宿主（CLI、CI、其他 harness）复用。
 
 **为什么 `vendor/dsh-tools.ts` 是契约快照而不是活依赖：**
@@ -598,7 +656,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit，离线可跑
-npm test              # 388 个测试（node:test）
+npm test              # 424 个测试（node:test）
 npm run build         # 产出 lib/
 npm run bundle:check  # 打包契约自检
 ```
@@ -610,7 +668,7 @@ npm run bundle:check  # 打包契约自检
 - `06` —— 漂移检测
 - `07` —— **真实 shell 集成**：真的 `npm run --silent test`，真的退出码，真的回归归因
 - `08` —— 插件接线：九个工具、pre-execute 钩子（基线门、证据库守卫、`proof_endorse` 恒 ask 的审批 seam）、提示词段落、纯投影、配置校验、陪审请求冻结/裁决校验/审批后落链、合成请求冻结（脚手架逐字返还 + `synthetic/requested` 落链）/合成经端口执行落链/筛检拒收以协议结果（而非报错）返回、覆盖三态投影（v8-executed 渲染与传递 / v8-unexecuted 点名前 3 文件 + conjure 处方 / none 如实声明 observe 与 require 之别；off 与旧日志无字段无线、敌意形状安全降级）
-- `09` —— **信任对抗**：链断裂、全量重写（用本包自己的哈希函数）、回滚、基线替换、真实 Ed25519 密钥
+- `09` —— **信任对抗**：链断裂、全量重写（用本包自己的哈希函数）、回滚、基线替换、真实 Ed25519 密钥；v0.14 追加 H1 加固 5 例——THE ADVERSARY II（外来 keyId + 虚报 count 的伪造检查点无法洗白链重写）、貌似合理的 count（`anchor.count + 1`）同样判 malformed、count 对账只认走链实数、Infinity/负数/小数 count 全拒、锚只认自己 keyId 的检查点（外来 key 的后到完好检查点不能顶替）
 - `10` —— **变更集溯源**：陈旧脏区豁免、还原即变更、未跟踪文件、外部回归不记账、引擎端到端
 - `11` —— **LSP 影响融合**：goToDefinition 验证近似边、别名导入盲区发现、缓存与预算、降级不缩窄
 - `12` —— **智能摘录**：显著失败行优先、整行尾窗、省略记账、（文本， 配置）纯函数确定性
@@ -622,6 +680,9 @@ npm run bundle:check  # 打包契约自检
 - `18` —— **证据分级（B/C 证词）**：量规存在性与结构化输出指令（英文 rubric 逐项核对：三值裁决、主观概率、弃权规则、Class B 落盘与重放警告）、`juryPrompt` 字节级确定性与段落结构（含量规版本覆盖）、`claimIdOf` 稳定 16-hex 身份（改写即新断言）、因子数学（p^w 语义、abstain 中性、w=0/w=1 边界、**[p,1] 网格扫描**、NaN/越界防毒、C 类 endorse 0.95^0.9 与 reject 0.05^0.9）、`activeAttestations` 链读纪律（垃圾载荷防御、gen 申诉解析、同 gen 后写者赢、B/C 独立信道、(claimId, kind) 确定性排序）、llm-jury 义务矩阵全分支、模块级确定性
 - `19` —— **PTC 证据合成（32 例）**：模板协议（末行 PASS/FAIL、文件内链上警告、脚手架自筛干净）、`sandboxEntryFor` 确定性与「seq 防碰撞不携带身份」、沙箱目录钉出发现的字面量同步、筛检双向精度（deny-list 恰为锁定集、静态/裸/动态/require 各拼写、node: 前缀、多行与 re-export、process.env 成员/计算形式、注释内导入照报、名字仅含禁用模块的本地 fixture 放行、findings 去重排序）、β 定价（同历史 0.15 vs 0.02 且别的不动、`syntheticFalsePass` 只覆盖它、闭式后验、端到端折价）、记录（合成元数据上链、**同结果不同 scriptDigest 即不同 evidenceId**、冻结时钟深度相等）、义务 tier ladder 全分支（latest 合成兜底点名折价、无覆盖维持 not met、organic 兜底不被误称 synthetic、混合覆盖逐桶点名、当次 organic 压过一切兜底、pre-ο 记录经 spec 池判 synthetic）、入口点纯函数确定性
 - `20` —— **覆盖感知证明（26 例）**：V8 解析（执行/加载未执行分桶、root 外与 node_modules 段丢弃、盘符大小写与双斜杠形态、百分号解码、垃圾 JSON 与异形防御、空 result 是合法报告、执行压倒加载）、聚合（executedSets 并集、零 executedSets 钉死 basis 'none'、重复坍缩、非源码文件入 notApplicable 不参与门控）、门控三档全分支（observe 无数据不拦 / 有数据 uncovered 拦、require 无数据拦 `no-coverage-data`、off 永不拦）、`applyCoverageGate`（unproven 降级与摘要挂载、grade 保序——regressed/stale 永不被改写、none basis 诚实附挂不拦截）、`makeEvidence`（coverage 附件参与内容寻址、自寻址、同输入同记录）、模块级确定性
+- `21` —— **协议词表（APP/1.0）**：`src/app/protocol.ts` 的五张词表逐字钉死，并与核心实际产出交叉核对——verdict 对 `verdictOf` 全真值表、grade 对五个行为夹具、chain mode 对 `walkChain`、status 对决定性/非决定性划分；常量声称一个核心产不出的值、或核心长出一个常量没钉住的值，都必须在这里失败
+- `22` —— **bundle 篡改矩阵**：用真实 `EvidenceStore`（内存 Fs，`09` 同款 fakes）铸造诚实 bundle，再按伪造者的方式逐个攻击——改日志一字节、调包基线、虚报锚点、改写 manifest 方言（appFingerprint 不匹配即拒）；全程 MemoryFs，不碰真实磁盘
+- `23` —— **MCP 真子进程集成**：spawn `node --experimental-strip-types src/app/mcp-entry.ts`，经 stdio 上的换行分隔 JSON-RPC 2.0 驱动握手与协议版本协商、五工具契约、baseline → verify → status → bundle 全链（真实 `npm test`、真实证据、真实 Ed25519 链）与错误路径（未知工具、非法 kind、畸形 JSON 行）——零 stub，证明任何外来 harness 都能端到端驱动证明协议
 
 本地调试：
 
@@ -657,6 +718,9 @@ pnpm dsh web --patch /absolute/path/to/dsh-proof/examples/cordis.yml
 - **执行覆盖是文件粒度（v0.13）。** v1 的「执行过」= 文件有任一函数的任一 range `count > 0`——它不区分执行了变更的那几行还是同文件的隔壁函数，一个只触达未改代码的测试与真正执行变更的测试在此粒度下等价。行级/符号级判定（需要基线内容 blob 或 LSP 符号映射把变更定位到行/符号）是演进方向，不是本版能力；读 `change-executed` 时请记住它说的是「这个文件」，不是「这一行」。
 - **非 node 生态没有覆盖数据（v0.13）。** `NODE_V8_COVERAGE` 是 Node 运行时开关：pytest、go test、cargo test 等进程继承变量但不产 V8 profile，覆盖维度对它们是 `basis: 'none'`——observe 不拦（该生态永远不门控），require 则每条断言都 unproven。这是部署决策不是缺陷：纯 node 工具链可放心 `require`，混合/非 node 生态请留在 `observe`，或干脆 `off`。
 - **「加载未执行」桶未参与更强判定（v0.13）。** V8 报告天然携带第三种事实——文件被 import 但从未跑过一行；v1 解析并保留该分桶，却只把**执行**用于门控。「加载未执行」本是「依赖图以为它会被用到、实际没有」的现成证据（更强的嫌疑文件排序、更精确的 `new-paths-covered`），v1 未消费——保留为演进，如实记在这里。
+- **MCP 面只有五个一致性工具（v0.14）。** `proof_jury` / `proof_jury_submit` / `proof_endorse` / `proof_conjure` / `proof_conjure_run` 刻意不经 MCP 暴露——它们依赖宿主持有的 seam（人工审批提示、会话上下文、隔离的审议模型），开放服务器无法假设。想要证词与合成的客户端请在 DSH 内跑插件，审批 seam 在那里。
+- **bundle 验证不替代本地审计（v0.14）。** 验证方从 bundle 自己的字节重导出一切——文件摘要、链链接、逐条自寻址、基线摘要——但检查点签名只在验证方持有（或被交给）点名密钥时可裁定，锚单调性只在锚文件可用时才检查；裁定的能力缺失如实记录，绝不四舍五入成伪造指控。没有锚的 bundle 保得住链与寻址保证，丢掉的是回滚覆盖。
+- **检查点 count 自 v0.14 起是规范性的（H1）。** `count` 不是安全整数、或不等于走链实数记录数的检查点，无论谁签，一律进 `malformedCheckpoints`；锚比较只采信锚 keyId 匹配的检查点——伪造检查点（外来 keyId、虚报 count）不再能洗白截断。反面同样对称：一个诚实但数错了 count 的有 bug 生产方会被同样拒绝，没有豁免通道。
 - **`proven` 允许存在预置红灯。** 一个本来就红的仓库不该让 Agent 无法工作。预置失败会在报告里显著列出，但不计入本次会话的责任。这是刻意设计，不是漏洞。
 - **它不替代测试本身。** `dsh-proof` 编排并归因你已有的客观检查。v0.12 的证据合成也不改变这条边界：断言由 agent 起草，插件只冻结脚手架、筛检、执行，并把结果折价记账为弱于任何独立检查的证据。
 - **DSH 是 v0.1/0.2 开发者预览版。** 插件契约会变。本插件已把依赖面最小化并钉死契约快照（`src/vendor/dsh-tools.ts`），但上游变更时仍需重新对齐。
