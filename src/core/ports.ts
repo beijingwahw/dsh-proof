@@ -67,6 +67,15 @@ export interface FsPort {
   /** Write a file atomically (write-temp + rename). */
   writeFile(path: string, contents: string): Promise<void>
   mkdirp(path: string): Promise<void>
+  /**
+   * τ: recursively delete a directory tree — used to clean up the
+   * `NODE_V8_COVERAGE` scratch directory after a run has harvested its
+   * `coverage-*.json` files. Optional capability: the Node implementation
+   * removes recursively; `MemoryFs` and other in-memory fakes may omit it,
+   * and callers must treat its absence as "cleanup not supported", never as
+   * an error.
+   */
+  removeDir?(path: string): Promise<void>
 }
 
 export interface FileStat {

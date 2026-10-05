@@ -147,6 +147,26 @@ export interface Config {
   syntheticFalsePass: number
   /** π: cooperative timeout for one conjured-test execution, in milliseconds. */
   syntheticTimeoutMs: number
+  /**
+   * υ: how V8 execution-coverage data gates the proof grade. Verification
+   * injects `NODE_V8_COVERAGE` into every check process (zero instrumentation
+   * — Node writes raw V8 profiles on exit), then asks whether the *changed
+   * files* were actually executed by the checks that claimed to cover them.
+   * Path coverage alone ("a check's paths match the change") is a selection
+   * heuristic; execution coverage is an observation.
+   *
+   * - `observe` (default): gate only when coverage data exists. No data (fake
+   *   command ports, non-Node test processes, stripped environments) does not
+   *   block, and the report honestly shows `basis: 'none'`. This keeps
+   *   production behaviour (real Node processes, real data, uncovered changes
+   *   named and gated) separate from data-less test environments — the same
+   *   run either speaks with evidence or visibly says it could not.
+   * - `require`: strict deployments. No coverage data at all is itself
+   *   grounds for `unproven` — a claim nobody observed executing is not
+   *   proven, however green the checks.
+   * - `off`: no injection, no gating, byte-identical to pre-υ behaviour.
+   */
+  coverage: 'observe' | 'require' | 'off'
   /** Emit plugin diagnostics to stdout. */
   verbose: boolean
 }
@@ -202,5 +222,10 @@ export const Config: Schema<Config> = Schema.object({
   syntheticDir: Schema.string().default('.proof-synthetic'),
   syntheticFalsePass: Schema.percent().default(0.15),
   syntheticTimeoutMs: Schema.number().default(60_000),
+  // υ: coverage-aware proof gating — observe by default so real Node check
+  // processes get execution-coverage honesty while data-less environments
+  // (fakes, non-Node toolchains) degrade visibly to basis 'none' instead of
+  // being blocked on data they structurally cannot produce.
+  coverage: Schema.union(['observe', 'require', 'off']).default('observe'),
   verbose: Schema.boolean().default(false),
 }) as unknown as Schema<Config>

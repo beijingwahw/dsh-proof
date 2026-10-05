@@ -1248,8 +1248,18 @@ test('π: behavior-adding falls back to conjured coverage — obligation met, ba
 
     const claim = 'added a new module, covered by a conjured test'
     const { request } = await engine.conjureRequest({ claim, paths: ['src/new.ts'] })
-    await fsp.writeFile(join(root, '.proof-synthetic', request.entry),
-      'if (2 + 2 !== 4) process.exit(1)\nconsole.log("SYNTHETIC: PASS")\n')
+    // υ: the conjured test EXECUTES the module it claims to cover. Before the
+    // coverage dimension this was a green assertion that never touched the
+    // change; now such a test is worth nothing to the grade (the blind-spot
+    // case at the bottom of this file), so the fixture exercises the honest
+    // version: import it, assert on it, then the arithmetic.
+    await fsp.writeFile(join(root, '.proof-synthetic', request.entry), [
+      'const mod = await import("../src/new.ts")',
+      'if (mod.added !== 1) process.exit(1)',
+      'if (2 + 2 !== 4) process.exit(1)',
+      'console.log("SYNTHETIC: PASS")',
+      '',
+    ].join('\n'))
     const conjured = await engine.conjureRun({ claim, entry: request.entry })
     assert.equal(conjured.status, 'pass')
 
@@ -1273,4 +1283,231 @@ test('π: behavior-adding falls back to conjured coverage — obligation met, ba
   } finally {
     await fsp.rm(root, { recursive: true, force: true })
   }
+})
+
+// -- υ: coverage-aware proof — injection, collection, gating, cleanup ----------
+//
+// Real-process tests mirror the π block above: scratch workspaces under
+// <workspace>/.openclaw/tmp, production Node ports, and real `node` children
+// writing real V8 profiles — because NODE_V8_COVERAGE injection is only ever
+// exercised honestly by an actual V8 instance on the other side.
+
+const COVER_ROOT = join(WORKSPACE_DIR, '.openclaw', 'tmp', `proof-coverage-${process.pid}`)
+
+before(async () => {
+  await fsp.rm(COVER_ROOT, { recursive: true, force: true })
+  await fsp.mkdir(COVER_ROOT, { recursive: true })
+})
+
+after(async () => {
+  await fsp.rm(COVER_ROOT, { recursive: true, force: true })
+})
+
+/** A real engine over a real scratch directory: checks are real node processes. */
+function coverageEngine(dir: string, checks: ConstructorParameters<typeof ProofEngine>[0]['checks'], overrides: Partial<ConstructorParameters<typeof ProofEngine>[0]> = {}) {
+  return new ProofEngine({
+    root: dir,
+    fs: new NodeFsPort(),
+    commands: new NodeCommandPort(),
+    workspace: new FakeWorkspace(dir),
+    clock: new SystemClock(),
+    autoDiscover: false,
+    checkTimeoutMs: 20_000,
+    verifyBudgetMs: 60_000,
+    checks,
+    ...overrides,
+  })
+}
+
+/** package.json + one source module + a check script that imports it. */
+async function makeCoverageWorkspace(dir: string, files: Record<string, string>): Promise<void> {
+  await fsp.rm(dir, { recursive: true, force: true })
+  await fsp.mkdir(join(dir, 'src'), { recursive: true })
+  await fsp.writeFile(join(dir, 'package.json'), JSON.stringify({ name: 'coverage-fixture', private: true }))
+  for (const [rel, content] of Object.entries(files)) {
+    await fsp.mkdir(join(dir, rel, '..'), { recursive: true })
+    await fsp.writeFile(join(dir, rel), content)
+  }
+}
+
+test('υ: end to end — a green check that executes the change proves with basis v8 and leaves no coverage residue', async () => {
+  const root = join(COVER_ROOT, 'covered')
+  await makeCoverageWorkspace(root, {
+    'src/feature.mjs': 'export const feature = (n) => n * 2\n',
+    'check.mjs': [
+      "import { feature } from './src/feature.mjs'",
+      'if (feature(2) !== 4) process.exit(1)',
+      "console.log('executed feature')",
+      '',
+    ].join('\n'),
+  })
+  try {
+    const engine = coverageEngine(root, [
+      { label: 'feature tests', command: ['node', 'check.mjs'], kind: 'test', paths: ['src/**'] },
+    ])
+    await engine.establishBaseline()
+    const outcome = await engine.verify({ changed: ['src/feature.mjs'] })
+
+    assert.equal(outcome.report.grade, 'proven', `grade: ${outcome.report.grade}`)
+    assert.equal(outcome.report.coverage?.basis, 'v8', 'the report mounts a v8-basis summary')
+    assert.deepEqual(outcome.report.coverage?.uncovered, [])
+    assert.ok(outcome.coverage !== undefined)
+    assert.equal(outcome.coverage.basis, 'v8')
+    assert.deepEqual(outcome.coverage.uncovered, [])
+    assert.equal(outcome.coverage.executedCount, 1, 'the one changed file was observed executing')
+    assert.match(proofNarrative(outcome.report), /PROVEN \(p≈[01]\.\d+, change-executed\)/)
+
+    // The evidence record itself carries its execution footprint — content
+    // addressed, so the chain can audit it.
+    const current = outcome.checks.find(c => c.label === 'feature tests')?.current
+    assert.ok(current, 'the check produced current evidence')
+    assert.deepEqual(current?.coverage?.changedExecuted, ['src/feature.mjs'])
+    assert.deepEqual(current?.coverage?.changedUncovered, [])
+    const latest = (await engine.latestEvidence()).get(current?.checkId ?? '')
+    assert.ok(latest, 'the enriched record is on the chain')
+    assert.deepEqual(latest?.coverage?.changedExecuted, ['src/feature.mjs'])
+    // Re-addressed records must still address themselves.
+    const audit = await engine.audit()
+    assert.equal(audit.ok, true, `corrupt: ${audit.corrupt.join(', ')}`)
+
+    // The scratch tree is gone: collected, then removed, nothing left behind.
+    const leftovers = await fsp.readdir(join(root, '.proof', 'coverage'), { recursive: true }).catch(() => [])
+    assert.ok(!leftovers.some(f => String(f).includes('coverage-')),
+      `V8 profiles must not survive the run (found: ${leftovers.join(', ')})`)
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('υ: THE BLIND SPOT — a green check whose paths cover the change but never execute it leaves the claim UNPROVEN', async () => {
+  // The headline case for the whole dimension: paths coverage says the check
+  // owns src/feature.mjs, the check is green — and it never loads the changed
+  // file. Selection coverage ≠ execution coverage, and only the latter earns
+  // `proven`.
+  const root = join(COVER_ROOT, 'blind-spot')
+  await makeCoverageWorkspace(root, {
+    'src/feature.mjs': 'export const feature = (n) => n * 2\n',
+    'src/other.mjs': 'export const other = 7\n',
+    'check.mjs': [
+      "import { other } from './src/other.mjs'",
+      'if (other !== 7) process.exit(1)',
+      "console.log('green, without ever touching the change')",
+      '',
+    ].join('\n'),
+  })
+  try {
+    const engine = coverageEngine(root, [
+      // paths: ['src/**'] MATCHES src/feature.mjs — the check is selected,
+      // re-run, and green. That is exactly the old, unobservable gap.
+      { label: 'feature tests', command: ['node', 'check.mjs'], kind: 'test', paths: ['src/**'] },
+    ])
+    await engine.establishBaseline()
+    const outcome = await engine.verify({ changed: ['src/feature.mjs'] })
+
+    // The check really was green — still-passing, zero failures. The grade
+    // died on the coverage dimension, not on a regression.
+    assert.equal(outcome.checks[0]?.verdict, 'still-passing')
+    assert.equal(outcome.report.summary.failing, 0)
+    assert.equal(outcome.report.grade, 'unproven',
+      'observe mode + real data + an unexecuted change = unproven, however green')
+    assert.equal(outcome.report.coverage?.basis, 'v8')
+    assert.ok(outcome.report.coverage?.uncovered.includes('src/feature.mjs'),
+      `uncovered names the file (got: ${outcome.report.coverage?.uncovered.join(', ')})`)
+    assert.ok(outcome.coverage !== undefined)
+    assert.deepEqual(outcome.coverage.uncovered, ['src/feature.mjs'])
+    assert.equal(outcome.coverage.executedCount, 0)
+    // The narrative names the blind spot and points at the remedy.
+    const narrative = proofNarrative(outcome.report)
+    assert.match(narrative, /unexecuted change \(src\/feature\.mjs\)/)
+    assert.match(narrative, /proof_conjure can synthesize a test that executes them/)
+    // The evidence honestly records that this check executed nothing of the change.
+    const current = outcome.checks[0]?.current
+    assert.deepEqual(current?.coverage?.changedExecuted, [])
+    assert.deepEqual(current?.coverage?.changedUncovered, ['src/feature.mjs'])
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('υ: require mode blocks on missing data, off mode never gates — the same fake fixture, opposite grades', async () => {
+  const make = () => MemoryFs.of({
+    [`${ROOT}/package.json`]: JSON.stringify({ name: 'demo' }),
+    [`${ROOT}/src/a.ts`]: 'export const a = 1\n',
+  })
+  const checks: ConstructorParameters<typeof ProofEngine>[0]['checks'] = [
+    { label: 'src tests', command: ['npm', 'test'], kind: 'test', paths: ['src/**'] },
+  ]
+  const verifyWith = async (coverage?: 'observe' | 'require' | 'off') => {
+    const engine = new ProofEngine({
+      root: ROOT,
+      fs: make(),
+      commands: new FakeCommands(),
+      workspace: new FakeWorkspace(ROOT),
+      clock: new FakeClock(),
+      autoDiscover: false,
+      checks,
+      impactGraphLimit: 1_000,
+      ...(coverage !== undefined ? { coverage } : {}),
+    })
+    await engine.establishBaseline()
+    return engine.verify({ changed: ['src/a.ts'] })
+  }
+
+  // FakeCommands never reads the injected env, so no coverage exists at all.
+  // `require` treats the absence itself as disqualifying: proven → unproven,
+  // reason `no-coverage-data` — the gate looked at the basis, not at the
+  // (vacuous) uncovered list the summary still slices honestly.
+  const required = await verifyWith('require')
+  assert.equal(required.report.grade, 'unproven', 'require: no data is not a pass')
+  assert.equal(required.report.coverage?.basis, 'none', 'the missing measurement is visible, not silent')
+  assert.deepEqual(required.report.coverage?.uncovered, ['src/a.ts'],
+    'the summary still names what the (empty) evidence never executed')
+  assert.equal(required.coverage?.basis, 'none')
+
+  // `off` injects nothing, gates nothing: the pre-υ grade, byte for byte.
+  const off = await verifyWith('off')
+  assert.equal(off.report.grade, 'proven', 'off: the gate is not in the room')
+  assert.equal(off.report.coverage, undefined, 'off: no summary is mounted at all')
+  assert.equal(off.coverage, undefined)
+})
+
+test('υ: backward compatibility — default observe over fake ports keeps the pre-gate grade and confidence bit for bit', async () => {
+  const runOnce = async (coverage?: 'observe' | 'off') => {
+    const engine = new ProofEngine({
+      root: ROOT,
+      fs: MemoryFs.of(waveProject()),
+      commands: new FakeCommands(),
+      workspace: new FakeWorkspace(ROOT),
+      clock: new FakeClock(),
+      autoDiscover: false,
+      checks: WAVE_CHECKS,
+      scheduler: 'set',
+      concurrency: 2,
+      impactGraphLimit: 1_000,
+      checkTimeoutMs: 5_000,
+      verifyBudgetMs: 20_000,
+      ...(coverage !== undefined ? { coverage } : {}),
+    })
+    await engine.establishBaseline()
+    return engine.verify({ changed: WAVE_CHANGED })
+  }
+
+  const off = await runOnce('off')
+  const observe = await runOnce() // default
+  // The gate's no-data branch must not move a single bit of the machine
+  // verdict: grade, confidence (strict ===, byte equality on the float) and
+  // basis are exactly what the pre-υ engine produced. (The report root is
+  // deliberately not compared: the observe run consumes one extra clock read
+  // for its staging nonce, which legitimately shifts recordedAt — staging
+  // noise, not verdict noise. Off-vs-off keeps root stability instead.)
+  assert.strictEqual(observe.report.grade, off.report.grade)
+  assert.strictEqual(observe.report.confidence, off.report.confidence)
+  assert.strictEqual(observe.report.confidenceBasis, off.report.confidenceBasis)
+  assert.deepEqual(observe.report.unverified, off.report.unverified)
+  // And observe does mount its honest 'nothing was measured' summary.
+  assert.equal(observe.report.coverage?.basis, 'none')
+  assert.equal(off.report.coverage, undefined)
+
+  const offAgain = await runOnce('off')
+  assert.equal(offAgain.report.root, off.report.root, 'determinism itself is untouched')
 })

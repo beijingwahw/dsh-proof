@@ -40,7 +40,7 @@ import type { CheckConfigEntry, DiscoverOptions } from './core/checks.ts'
 // this batch's to edit, and a direct import keeps the dependency explicit.
 import { evaluateContract, extractApiSurface } from './core/contract.ts'
 import type { ClaimContract, ClaimKind, ObligationResult, SurfaceEntry } from './core/contract.ts'
-import { assembleJuryReport } from './core/report.ts'
+import { assembleJuryReport, applyCoverageGate } from './core/report.ts'
 // κ: graded evidence (ι's core/attest.ts) consumed straight from its module —
 // same discipline as the contract import above: the core barrel is not this
 // batch's to edit, and a direct import keeps the dependency explicit.
@@ -58,6 +58,16 @@ import {
   sandboxEntryFor, screenScript, syntheticSpec,
 } from './core/synthetic.ts'
 import type { SyntheticEvidenceMeta, SyntheticRequest } from './core/synthetic.ts'
+// υ: the V8 execution-coverage domain (τ's core/coverage.ts) — parse, summarise
+// and gate, consumed straight from its module (same discipline as the
+// contract/attestation/synthetic imports above: the core barrel is not this
+// batch's to edit, and a direct import keeps the dependency explicit).
+// `applyCoverageGate` — the report-side half of the τ contract — lives in
+// core/report.ts and rides that module's existing import.
+import {
+  coverageGate, parseV8CoverageReport, summarizeCoverage,
+} from './core/coverage.ts'
+import type { CoverageSummary } from './core/coverage.ts'
 import { NodeCommandPort, NodeEd25519Signer, NodeFsPort, GitWorkspace, SystemClock } from './node-ports.ts'
 
 export interface EngineOptions {
@@ -145,6 +155,14 @@ export interface EngineOptions {
   readonly syntheticFalsePass?: number
   /** π: cooperative timeout for one conjured-test run (default 60s). */
   readonly syntheticTimeoutMs?: number
+  /**
+   * υ: V8 execution-coverage gating mode — `observe` (default: gate only when
+   * coverage data exists; no data degrades visibly to basis `'none'`),
+   * `require` (no data is itself disqualifying), or `off` (no injection, no
+   * gating, byte-identical to pre-υ behaviour). Mirrors the plugin config's
+   * `coverage` field; the long design note lives there (config.ts).
+   */
+  readonly coverage?: 'observe' | 'require' | 'off'
   readonly clock?: Clock
   readonly fs?: FsPort
   readonly commands?: CommandPort
@@ -188,6 +206,21 @@ export interface VerifyOutcome {
     readonly stoppedEarly: 'certified' | 'failed' | 'budget' | null
     /** Checks the plan deliberately never dispatched, each with the prior it rests on. */
     readonly skippedByPlan: ReadonlyArray<{ checkId: string; priorHealthy: number }>
+  }
+  /**
+   * υ: what the execution-coverage dimension said about the change set.
+   * Present whenever coverage collection ran (modes `observe`/`require`),
+   * absent in `off`. `basis: 'none'` is the honest "no data was produced"
+   * (fake command ports, non-Node toolchains) — under `observe` it gates
+   * nothing, under `require` it is itself the disqualification.
+   */
+  readonly coverage?: {
+    /** `'v8'` — real profiles were read; `'none'` — no data this run. */
+    readonly basis: 'v8' | 'none'
+    /** Changed files no decisively-passing check actually executed. */
+    readonly uncovered: readonly string[]
+    /** How many changed files were observed executing. */
+    readonly executedCount: number
   }
 }
 
@@ -332,6 +365,22 @@ function unionChecks(primary: readonly CheckSpec[], extra: readonly CheckSpec[])
   return out
 }
 
+/**
+ * υ: re-address one runner record over its execution-coverage attachment —
+ * exactly π's synthetic-metadata move in `conjureRun`: strip the plain
+ * address, add the field, re-derive `evidenceId` over the enriched body
+ * (canonical JSON sorts keys, so field order cannot leak into the digest),
+ * and the chain only ever sees the self-addressing enriched record. The
+ * attachment shape is `Evidence['coverage']` itself (τ's evidence.ts field):
+ * content-addressed, so a record cannot claim an execution its address does
+ * not encode.
+ */
+function attachEvidenceCoverage(record: Evidence, coverage: NonNullable<Evidence['coverage']>): Evidence {
+  const { evidenceId: plainAddress, ...body } = record
+  void plainAddress
+  return { ...body, coverage, evidenceId: addressOf({ ...body, coverage }) }
+}
+
 /** Bounded, printable reason a signer load failed — chains store text, not errors. */
 function failureText(reason: unknown): string {
   const text = reason instanceof Error ? reason.message : String(reason)
@@ -375,6 +424,8 @@ export class ProofEngine {
   private readonly logPath: string
   /** κ: trust weights for Class B/C evidence, synthesised from config passthrough. */
   private readonly trustWeights: TrustWeights
+  /** υ: the evidence store's physical directory — coverage staging lives beside it. */
+  private readonly storeDir: string
   private readonly options: {
     evidenceDir: string
     autoDiscover: boolean
@@ -394,6 +445,7 @@ export class ProofEngine {
     syntheticDir: string
     syntheticFalsePass: number
     syntheticTimeoutMs: number
+    coverage: 'observe' | 'require' | 'off'
   }
 
   constructor(options: EngineOptions) {
@@ -410,6 +462,8 @@ export class ProofEngine {
     // attestation pass below reads the raw marker lines through the same fs
     // port instead of growing the store's public surface mid-batch.
     this.logPath = `${storeDir}/evidence.jsonl`
+    // υ: coverage staging roots itself next to the evidence it annotates.
+    this.storeDir = storeDir
     // κ: trust weights for graded evidence. The exponents come from config;
     // the human probability rides the shared default so B and C factors stay
     // comparable no matter how a deployment tunes the exponents.
@@ -474,6 +528,10 @@ export class ProofEngine {
       syntheticDir: options.syntheticDir ?? SYNTHETIC_DIR_DEFAULT,
       syntheticFalsePass: options.syntheticFalsePass ?? 0.15,
       syntheticTimeoutMs: options.syntheticTimeoutMs ?? 60_000,
+      // υ: coverage gating mode — observe by default: real Node check processes
+      // get execution-coverage honesty, data-less environments degrade visibly
+      // to basis 'none' instead of being blocked on data they cannot produce.
+      coverage: options.coverage ?? 'observe',
     }
   }
 
@@ -604,6 +662,10 @@ export class ProofEngine {
       concurrency: this.options.concurrency,
       totalBudgetMs: this.options.verifyBudgetMs,
       workspace: snapshot,
+      // υ: baselines do NOT inject coverage (v1): a baseline is a measurement
+      // of the workspace's checks, not a claim about a change set — there is
+      // no "changed" to gate on yet, and skipping the injection saves a disk
+      // write per check. Verification owns the coverage dimension.
       ...(options.signal !== undefined ? { signal: options.signal } : {}),
       ...(options.onProgress !== undefined
         ? { onEvidence: (ev, i, total) => options.onProgress!(ev.label, i, total) }
@@ -694,11 +756,18 @@ export class ProofEngine {
     // started from, not with per-wave re-reads that could drift mid-run.
     const snapshot = await this.workspaceSnapshot()
 
+    // υ: this run's coverage scratch tree — created before the machine checks
+    // run, read and removed after they settle. The directory name (a clock
+    // nonce) is physical staging only: it never enters any hash material, so
+    // the same verification re-run against a different clock still addresses
+    // its evidence identically.
+    const coverageDir = await this.prepareCoverageDir()
+
     const records: Evidence[] = []
     let schedule: VerifyOutcome['schedule']
     let confidence: ConfidenceInput | undefined
     if (bayesian && selection.affected.length > 0) {
-      const plan = await this.runBayesianSchedule(selection.affected, changed, graph, snapshot, options)
+      const plan = await this.runBayesianSchedule(selection.affected, changed, graph, snapshot, options, coverageDir)
       records.push(...plan.records)
       schedule = plan.schedule
       confidence = plan.confidence
@@ -710,22 +779,30 @@ export class ProofEngine {
         concurrency: this.options.concurrency,
         totalBudgetMs: this.options.verifyBudgetMs,
         workspace: snapshot,
+        ...(coverageDir !== undefined ? { coverageDir } : {}),
         ...(options.signal !== undefined ? { signal: options.signal } : {}),
         ...(options.onProgress !== undefined
           ? { onEvidence: (ev, i, total) => options.onProgress!(ev.label, i, total) }
           : {}),
       })
-      for (const record of batch.records) await this.store.append(record)
       records.push(...batch.records)
       // Even the whole-batch path earns its confidence number — display only:
       // grading on this path stays binary (requireFullCoverage below).
       confidence = this.updateFactors(priors, batch.records, selection.affected.length > 0)
     }
 
-    const { report, checks } = assembleProof({
+    // υ: collect coverage and re-address the records BEFORE the first append —
+    // the coverage attachment is content-addressing material (π's synthetic
+    // precedent), so the chain must never first see a plain record and then
+    // its enriched twin. With no data (or mode 'off') the records pass through
+    // untouched and this is exactly the pre-υ append.
+    const collected = await this.collectRunCoverage(records, changed, coverageDir)
+    for (const record of collected.records) await this.store.append(record)
+
+    const { report: machineReport, checks } = assembleProof({
       specs,
       baseline,
-      records,
+      records: collected.records,
       changed,
       ...(graph !== undefined ? { graph } : {}),
       ...(provenance.size > 0 ? { provenance } : {}),
@@ -735,6 +812,17 @@ export class ProofEngine {
       ...(forceAll ? { forceAll: true } : {}),
       ...(confidence !== undefined ? { confidence } : {}),
     })
+
+    // υ: execution-coverage gating — after the machine grade, before anything
+    // else speaks. Plain verify() has no attestation fusion (v0.9 semantics
+    // locked), so here "gate the machine evidence" is the whole story: an
+    // observed-but-never-executed change (or, under `require`, the absence of
+    // any observation at all) turns `proven` into `unproven`, and the summary
+    // mounts on the report either way — `basis: 'none'` stays visible rather
+    // than silently absent, because "could not measure" is a fact a reader of
+    // a proof deserves to see.
+    const report = this.gateByCoverage(machineReport, collected.summary)
+
     await this.store.mark('proof/verified', {
       grade: report.grade, root: report.root, changed: changed.length,
       attribution: attribution.method,
@@ -751,6 +839,10 @@ export class ProofEngine {
             confidence: report.confidence ?? null,
           }
         : {}),
+      // υ: what the coverage dimension said at this boundary.
+      ...(collected.summary !== undefined
+        ? { coverage: this.coverageMarkerPayload(collected.summary) }
+        : {}),
     })
     // Every claim-grade boundary closes the checkpoint window.
     await this.store.checkpoint()
@@ -758,6 +850,15 @@ export class ProofEngine {
       report, checks, selection, changed, attribution,
       ...(degraded ? { degraded: true as const } : {}),
       ...(schedule !== undefined ? { schedule } : {}),
+      ...(collected.summary !== undefined
+        ? {
+            coverage: {
+              basis: collected.summary.basis,
+              uncovered: [...collected.summary.changedUncovered],
+              executedCount: collected.summary.changedExecuted.length,
+            },
+          }
+        : {}),
     }
   }
 
@@ -992,6 +1093,9 @@ export class ProofEngine {
       : selection.affected
 
     const snapshot = await this.workspaceSnapshot()
+    // υ: same coverage staging as verify() — the machine legs of a contract
+    // claim are ordinary checks and earn the same execution-coverage honesty.
+    const coverageDir = await this.prepareCoverageDir()
     // Whole-batch over the (possibly benchmark-extended) run set, with the
     // same priors/confidence display the 'set' path uses — see method note.
     const priors = await this.priorsFor(runSpecs, changed, graph)
@@ -999,18 +1103,21 @@ export class ProofEngine {
       concurrency: this.options.concurrency,
       totalBudgetMs: this.options.verifyBudgetMs,
       workspace: snapshot,
+      ...(coverageDir !== undefined ? { coverageDir } : {}),
       ...(rest.signal !== undefined ? { signal: rest.signal } : {}),
       ...(rest.onProgress !== undefined
         ? { onEvidence: (ev, i, total) => rest.onProgress!(ev.label, i, total) }
         : {}),
     })
-    for (const record of batch.records) await this.store.append(record)
+    // υ: collect + re-address before the first append — see verify().
+    const collected = await this.collectRunCoverage(batch.records, changed, coverageDir)
+    for (const record of collected.records) await this.store.append(record)
     const confidence = this.updateFactors(priors, batch.records, runSpecs.length > 0)
 
-    const { report, checks } = assembleProof({
+    const { report: machineReport, checks } = assembleProof({
       specs: pool,
       baseline,
-      records: batch.records,
+      records: collected.records,
       changed,
       ...(graph !== undefined ? { graph } : {}),
       ...(provenance.size > 0 ? { provenance } : {}),
@@ -1020,6 +1127,18 @@ export class ProofEngine {
       ...(forceAll ? { forceAll: true } : {}),
       ...(confidence !== undefined ? { confidence } : {}),
     })
+
+    // υ: execution-coverage gating — pinned order: after the machine grade,
+    // BEFORE the obligations cap and the κ attestation fusion. Coverage is a
+    // machine-evidence dimension, so it is judged with the machine verdict,
+    // not after the human/jury witnesses have spoken; and the placement is
+    // load-bearing for the fusion semantics below — a claim coverage knocked
+    // down to `unproven` can no longer be endorsement-unlocked, because the
+    // unlock condition demands grade `stale` (residual risk the human can
+    // accept). "The change never executed" is not residual risk; it is missing
+    // work, and exactly like an unmet obligation, endorsement cannot pay for
+    // work. The two locks agree by construction.
+    let graded = this.gateByCoverage(machineReport, collected.summary)
 
     // The contract is judged against the freshest facts: this run's records,
     // the surface as the workspace has it NOW, and the surface as the
@@ -1040,7 +1159,7 @@ export class ProofEngine {
         contract,
         changed,
         specs: pool,
-        records: batch.records,
+        records: collected.records,
         latestByCheckId: await this.store.latest(),
         baseline,
         apiSurfaceBefore: apiSurfaceBefore === undefined ? undefined : [...apiSurfaceBefore],
@@ -1055,9 +1174,9 @@ export class ProofEngine {
     // earned (the number says what was measured, the obligations say what is
     // missing); grades already worse than `proven` keep their more honest
     // verdict untouched.
-    let graded = report.grade === 'proven' && unmet.length > 0
-      ? { ...report, grade: 'stale' as const }
-      : report
+    if (graded.grade === 'proven' && unmet.length > 0) {
+      graded = { ...graded, grade: 'stale' as const }
+    }
 
     // κ: attestation fusion for machine kinds. The machine grade and
     // confidence are already on the table; active B/C witnesses for this
@@ -1121,6 +1240,10 @@ export class ProofEngine {
         // κ: which witnesses were fused in, when any were.
         ...(claimActive.length > 0 ? { attestations: this.attestationSummary(claimActive) } : {}),
       },
+      // υ: what the coverage dimension said at this boundary.
+      ...(collected.summary !== undefined
+        ? { coverage: this.coverageMarkerPayload(collected.summary) }
+        : {}),
     })
     await this.store.checkpoint()
     return {
@@ -1130,6 +1253,15 @@ export class ProofEngine {
       changed,
       attribution,
       ...(degraded ? { degraded: true as const } : {}),
+      ...(collected.summary !== undefined
+        ? {
+            coverage: {
+              basis: collected.summary.basis,
+              uncovered: [...collected.summary.changedUncovered],
+              executedCount: collected.summary.changedExecuted.length,
+            },
+          }
+        : {}),
       contract: {
         kind: verdict.kind,
         obligations: verdict.obligations,
@@ -1341,6 +1473,131 @@ export class ProofEngine {
       out.push(syntheticSpec(request, this.options.syntheticDir, this.options.syntheticTimeoutMs))
     }
     return out
+  }
+
+  // -- execution coverage (υ) ----------------------------------------------------
+
+  /**
+   * υ: create this run's coverage scratch directory — `${storeDir}/coverage/<clock
+   * nonce>` — or `undefined` when the mode injects nothing (`off`). The nonce
+   * only keeps concurrent/sequential runs from sharing subdirectories; it is
+   * physical staging and deliberately never enters any hash material, so run
+   * identity stays a function of the evidence alone. An mkdirp failure is
+   * swallowed: the children then fail to write their profiles, collection
+   * finds no data, and observe mode degrades to basis `'none'` — the honest
+   * answer, not a crashed verification.
+   */
+  private async prepareCoverageDir(): Promise<string | undefined> {
+    if (this.options.coverage === 'off') return undefined
+    const dir = `${this.storeDir}/coverage/${this.clock.now()}`
+    try {
+      await this.fs.mkdirp(dir)
+    } catch {
+      /* unwritable staging → no coverage data this run */
+    }
+    return dir
+  }
+
+  /**
+   * υ: read one verification run's V8 profiles back, re-address the records
+   * they speak for, and hand the caller both — collection order:
+   *
+   *   1. per decisively-passing record, read its spec's subdirectory (the
+   *      runner names it `sha256(checkId).slice(0,16)`, re-derived here from
+   *      the record's own checkId — no spec pool needed);
+   *   2. parse every `coverage-*.json` and union the workspace-relative
+   *      executed files into ONE set per record — `summarizeCoverage`'s
+   *      executedSets unit is "what this check executed", not "what this one
+   *      profile happened to contain";
+   *   3. attach the per-record coverage view (changed ∩ executed / changed −
+   *      executed) by RE-ADDRESSING the record — π's synthetic precedent: the
+   *      attachment is content-addressing material, so the enriched record is
+   *      a different piece of evidence from the plain one and audit must be
+   *      able to recompute exactly this address from the stored bytes;
+   *   4. remove the scratch tree (best effort — `removeDir` is an optional
+   *      FsPort capability; a MemoryFs without it is fine, `?.` and on we go);
+   *   5. summarise the whole change set against the collected executed sets.
+   *
+   * The empty-set subtlety in step 2 is the blind-spot detector: a check that
+   * produced real coverage data naming NO workspace file still contributes a
+   * (possibly empty) executed set — data existed and said "the change was
+   * never executed". Only a record with NO parseable profile at all (fake
+   * command ports, non-Node processes) contributes nothing, which is what
+   * keeps the gate's `basis: 'none'` branch honest.
+   */
+  private async collectRunCoverage(
+    records: readonly Evidence[],
+    changed: readonly RelPath[],
+    coverageDir: string | undefined,
+  ): Promise<{ records: Evidence[]; summary: CoverageSummary | undefined }> {
+    if (coverageDir === undefined) return { records: [...records], summary: undefined }
+    const executedSets: string[][] = []
+    const out: Evidence[] = []
+    for (const record of records) {
+      // Only a decisively passing check speaks for execution coverage: a fail
+      // already sank the grade on its own, and non-decisive outcomes may have
+      // died before V8 flushed any profile — half-execution proves nothing.
+      if (record.status !== 'pass') {
+        out.push(record)
+        continue
+      }
+      const dir = `${coverageDir}/${sha256(record.checkId).slice(0, 16)}`
+      const executed = new Set<string>()
+      let dataFound = false
+      for (const name of (await this.fs.readDir(dir)) ?? []) {
+        if (!/^coverage-.*\.json$/.test(name)) continue
+        const content = await this.fs.readFile(`${dir}/${name}`)
+        if (content === undefined) continue
+        try {
+          const parsed = parseV8CoverageReport(content, this.root)
+          if (parsed === undefined) continue
+          dataFound = true
+          for (const file of parsed.executed) executed.add(file)
+        } catch {
+          /* one unparseable profile is not the run's verdict */
+        }
+      }
+      if (!dataFound) {
+        out.push(record)
+        continue
+      }
+      executedSets.push([...executed].sort())
+      out.push(changed.length > 0
+        ? attachEvidenceCoverage(record, {
+            changedExecuted: changed.filter(f => executed.has(f)),
+            changedUncovered: changed.filter(f => !executed.has(f)),
+          })
+        : record)
+    }
+    // Staging is disposable by contract: collected, then removed. A failure
+    // here costs nothing — the next run re-creates the tree. `removeDir` is an
+    // optional FsPort capability; a MemoryFs without it is fine, `?.` and on.
+    await this.fs.removeDir?.(coverageDir).catch(() => { /* staging; nothing to salvage */ })
+    const summary = summarizeCoverage({ changed: [...changed], executedSets })
+    return { records: out, summary }
+  }
+
+  /**
+   * υ: gate one machine report by its coverage summary. `undefined` summary
+   * (mode `off`) returns the report untouched; otherwise `coverageGate` +
+   * `applyCoverageGate` decide the grade and mount the summary — always, even
+   * at basis `'none'` and even when the gate does not block: a proof that
+   * carries its coverage blind spot visibly is the entire point of observe
+   * mode.
+   */
+  private gateByCoverage(report: GradedProofReport, summary: CoverageSummary | undefined): GradedProofReport {
+    if (summary === undefined) return report
+    return applyCoverageGate(report, coverageGate(summary, this.options.coverage), summary)
+  }
+
+  /** υ: the coverage dimension's one-line footprint for boundary markers. */
+  private coverageMarkerPayload(summary: CoverageSummary): Record<string, unknown> {
+    return {
+      mode: this.options.coverage,
+      basis: summary.basis,
+      executed: summary.changedExecuted.length,
+      uncovered: summary.changedUncovered.length,
+    }
   }
 
   // -- graded evidence (κ) ----------------------------------------------------
@@ -1562,6 +1819,7 @@ export class ProofEngine {
     graph: DependencyGraph | undefined,
     snapshot: WorkspaceSnapshot,
     options: VerifyOptions,
+    coverageDir?: string,
   ): Promise<{ records: Evidence[]; schedule: NonNullable<VerifyOutcome['schedule']>; confidence: ConfidenceInput }> {
     const priors = await this.priorsFor(affected, changed, graph)
     const target = this.options.certifyTarget
@@ -1599,6 +1857,7 @@ export class ProofEngine {
         concurrency: this.options.concurrency,
         totalBudgetMs: remainingBudgetMs,
         workspace: snapshot,
+        ...(coverageDir !== undefined ? { coverageDir } : {}),
         ...(options.signal !== undefined ? { signal: options.signal } : {}),
         ...(options.onProgress !== undefined
           ? { onEvidence: (ev, index) => options.onProgress!(ev.label, settled + index, affected.length) }
@@ -1608,7 +1867,13 @@ export class ProofEngine {
 
       let decisiveFail = false
       for (const record of batch.records) {
-        await this.store.append(record)
+        // υ: no per-wave append anymore — the caller collects coverage and
+        // re-addresses every record BEFORE the first append (the attachment
+        // changes the evidence address, so the chain must never hold the
+        // plain record and its enriched twin). Nothing is lost by deferring:
+        // the wave loop reads no log state after this point, the priors were
+        // snapshotted before wave one, and a store failure mid-plan throws
+        // out of the deferred append exactly as it threw out of this one.
         records.push(record)
         runCheckIds.add(record.checkId)
         pending.delete(record.checkId)

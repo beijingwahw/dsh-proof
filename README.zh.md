@@ -121,6 +121,8 @@ Re-read these before relying on them, then re-run proof_verify.
 
 **分级信任（v0.9）**：默认的 `bayesian` 调度器下，`proven` / `stale` 的分界不再是「受影响检查是否全部拿到决定性结果」，而是**后验概率阈值**——claim 后验 ≥ `certifyTarget`（默认 0.97）即 `proven`，叙事展示为 `PROVEN (p≈0.97)`；未达标即 `stale`（如 `STALE (p≈0.61, target 0.97)`）。`no-baseline` / `regressed` / `unproven` 的优先序不变；`scheduler: 'set'` 时回到旧的二值覆盖规则（即上表语义）。详见 §五·十二。
 
+**覆盖维度（v0.13）**：「跑过、绿」之上，`proven` 还要求检查**真的执行过改动**（change-executed）——检查子进程经 `NODE_V8_COVERAGE` 留下的 V8 覆盖率若显示某个变更源文件从未被任何决定性通过的检查执行，`proven` 降为 `unproven`（点名未执行文件）；`regressed` / `stale` 不受此门影响。三档模式（`coverage`: `observe` / `require` / `off`）详见 §五·十六。
+
 ---
 
 ## 四、面向模型的九个工具
@@ -219,7 +221,7 @@ v0.6 在 `normalizeOutput` 落地双层归一：**root → `$WORKSPACE`（先具
 
 **信任三态**。audit 的签名裁定从二态改为三态。旧逻辑在**没有 signer 的机器**上（密钥丢失、换机器审计）会把带签名的检查点误读成可疑；现在只有本机实际持有的密钥、面对点名该密钥的检查点，才有资格**驳斥**（`badCheckpoints`，真正的伪造指控）；本机无法裁定的（`unverifiableCheckpoints`）是**能力缺失而非指控**，不再使 audit 失败。锚文件自身的签名现在也会被验证（`anchorForged`），且锚携带 `workspaceKey`——审计可以仅凭锚文件重导出被签名的字节。
 
-**引擎的诚实边界**。git 不可用时（WorkspacePort 新可选能力 `gitAvailable?()`），每条 git 查询各自失败返回空集——"什么都看不见"曾被吞成"什么都没变"，增量选择悄悄缩成空。现在变更集显式标记 `degraded`，引擎**强制全量跑**并在 `VerifyOutcome.degraded` 透出。中止的基线不再落盘——abort 的基线曾照常写盘，之后的回归判定对着半成品真值运行；现在已观测的证据仍全部入链、落 `baseline/aborted` 标记、检查点窗口照常闭合，返回值携带 `aborted` 标志，下一次 verify 诚实报告 `no-baseline`。signer 加载失败大声降级：链内 `trust/signer-unavailable` marker + verbose 日志——静默降级与诚实的 unsigned 部署从此可区分。`requireBaseline: 'warn'` 从"配置了但没接线"变成真通知：本轮动了工作区而没有基线时，回合结束经 `agent.inject` 注入纠正性提示。死配置 `driftNoticeMs` 删除（配置降至 22 项，v0.9 增至 24 项，v0.10 增至 26 项，v0.11 增至 28 项，v0.12 增至 31 项）。
+**引擎的诚实边界**。git 不可用时（WorkspacePort 新可选能力 `gitAvailable?()`），每条 git 查询各自失败返回空集——"什么都看不见"曾被吞成"什么都没变"，增量选择悄悄缩成空。现在变更集显式标记 `degraded`，引擎**强制全量跑**并在 `VerifyOutcome.degraded` 透出。中止的基线不再落盘——abort 的基线曾照常写盘，之后的回归判定对着半成品真值运行；现在已观测的证据仍全部入链、落 `baseline/aborted` 标记、检查点窗口照常闭合，返回值携带 `aborted` 标志，下一次 verify 诚实报告 `no-baseline`。signer 加载失败大声降级：链内 `trust/signer-unavailable` marker + verbose 日志——静默降级与诚实的 unsigned 部署从此可区分。`requireBaseline: 'warn'` 从"配置了但没接线"变成真通知：本轮动了工作区而没有基线时，回合结束经 `agent.inject` 注入纠正性提示。死配置 `driftNoticeMs` 删除（配置降至 22 项，v0.9 增至 24 项，v0.10 增至 26 项，v0.11 增至 28 项，v0.12 增至 31 项，v0.13 增至 32 项）。
 
 **正确性收口（soundness closure）**。monorepo workspace 子包检查不再丢失：CheckSpec 新增 `cwd`（相对 root），子包检查真正在子包目录执行、id 含 cwd（cwd 缺省时 checkId 与旧格式逐字节一致），`packages/*` 单层 glob 现在真正展开——同 argv 的兄弟包检查不再互相顶替。影响图补盲：动态 `import('...')` 与多行 ESM import 现在产生边；Python dotted import（`pkg.mod`）在扫描集内尝试解析——多出的边只造成过选，绝不漏选。`git status --porcelain -z` 的 rename 条目解析修正（旧路径曾被截掉 3 个字符成为幻影路径；解析提为纯函数 `parsePorcelainZ`）。Windows 盘符绝对路径（`C:\...`）统一进路径域：observe 的 touched 归类、LSP root 前缀比较（大小写不敏感）、证据库守卫均修正。EvidenceStore 写入改单飞队列——并发的 append/mark/checkpoint 曾可能都链到同一个 tail，后一条的 `prev` 指向一条已不存在的行：**正确代码与它自己的竞态**。证据输出捕获改用 StringDecoder，多字节字符跨 chunk 边界不再碎成 U+FFFD。工程卫生：CI 改 `npm ci` 并加 windows 矩阵；`check-bundle` 错误路径不再崩溃；`untouchedChecks` 输出修正。
 
@@ -389,6 +391,69 @@ PROVEN (p≈0.80, jury evidence — self-attestation is capped)
 
 **与 v0.9 / v0.10 / v0.11 的咬合（四个子系统互相成就）**。v0.9 的调度器为合成检查定价（β 进 `computePriors`，VOI 排序与提前停一切照常）；v0.10 的合约把合成覆盖接受为 `new-paths-covered` 的兜底（tier ladder 明示折价）；v0.11 的 basis 体系把 `synthetic` 排在证词之后、机器基之前（读者必须知道唯一说话的检查出自谁手）；本版的请求/执行协议则保证进入这条流水线的每条合成证据都真的运行过、真的被筛检过、真的以逐字源码寻址。新配置三项：`syntheticDir`（默认 `.proof-synthetic`，钉进 `DEFAULT_IGNORE_DIRS`，永不进入检查发现——沙箱是验证的**输出**，不是能使验证失效的源输入）、`syntheticFalsePass`（0.15）、`syntheticTimeoutMs`（60000）。
 
+## 五·十六、覆盖感知证明（v0.13.0）：跑过、绿、且真的执行过改动
+
+到 v0.12 为止，`proven` 的语义是「跑过的都绿」——受影响的检查全部重跑、零回归、后验过线。这个定义里藏着一个报告读者**看不见的洞**：检查的 `paths` 匹配了变更文件，只说明**选择**认为该检查管这个文件；它不说明检查的进程真的**执行**了变更处的代码。一条测试套件可以全绿，而没有任何测试 import 改动所在的模块；一个 lint 可以绿着跳过新扩展名；一个 typecheck 在编辑之前就已经是绿的。「全绿」是关于**检查**的陈述，不是关于**变更**的陈述。v0.13 把 `proven` 从「跑过、绿」升维为「**跑过、绿、且真的执行过改动**」——第三维的证据由检查子进程自己留下，零插桩取数。
+
+**零插桩取数：`NODE_V8_COVERAGE`**。验证开始前，引擎在证据库旁创建本轮的覆盖率暂存目录（`${storeDir}/coverage/<时钟 nonce>`——nonce 只是并发/顺序运行互不共享子目录的物理保险，刻意不进入任何哈希材料，运行身份仍是证据的纯函数），并为每个检查子进程注入环境变量 `NODE_V8_COVERAGE=<dir>/<sha256(checkId) 前 16 hex>`——Node 原生的 V8 inspector 覆盖率开关：**零插桩**（无 babel 钩子、无 import 改写、无 mock），继承了该环境变量的每个 node 进程——检查本身，以及它经 npm/.cmd 垫片与 scripts 派生的嵌套 node 测试进程——在退出时把原始 V8 覆盖率 JSON 写入该目录。跑完解析（新模块 `src/core/coverage.ts`，纯函数、零 I/O）：
+
+1. **执行判定**：文件有任一函数的任一 range `count > 0` 即**执行过**；出现在报告里但全部 range 计数为 0 是**加载未执行**（分桶保留，v1 未用于更强判定）；进程从未加载的文件根本不出现在报告里。
+2. **域过滤**：root 之外的一律丢弃（其他检出；`node:` 内部模块根本不以 `file:` 开头）；路径含 `node_modules` 段的一律丢弃——依赖代码被执行是**依赖**的覆盖率，不是本工作区变更被执行（按段匹配，pnpm 式嵌套 `pkg/node_modules/dep` 也抓得住）。
+3. **URL 归一**：`file:///C:/…` 三斜杠与 `file://C:/…` 两斜杠双形态、百分号解码、Windows 盘符大小写漂移（盘符形态大小写不敏感比较、POSIX root 保持敏感）全部归一为工作区相对 `/` 路径。
+4. **防御性解析**：垃圾 JSON / 形状不对（`result` 缺失或非数组）返回 `undefined`，按「没有报告」处理，绝不按「空覆盖」处理；同一脚本在报告里出现多次时执行压倒加载；空 `result` 不是 undefined——「进程没加载本工作区任何文件」本身就是信息。
+
+被检代码**无法从内部伪造覆盖率产物**：profile 由执行代码的同一个 V8 实例在**进程退出时**写出——测试代码既够不着写入时机，也伪造不了「执行过」这个物理事实。这就是把「检查执行了什么」从声明变成观察的全部含义。
+
+**证据级附件：覆盖率参与内容寻址**。每条**决定性通过**的证据记录挂上 `coverage` 附件——该记录自己的运行与变更集的交集/差集（`changedExecuted` / `changedUncovered`）。与 v0.12 合成证据的 `scriptDigest` 同一纪律：**附件参与 `evidenceId` 内容寻址**——一条记录不能声称执行过它从未运行过的变更；同样的绿色输出、不同的执行足迹，是两条不同的证据。采集时序是承重的：**重新寻址发生在第一条 append 之前**——链上永远不会先出现 plain 记录、再出现它的 enriched 双胞胎（审计必须能从存储字节重算出恰好这个地址）。非决定性记录不携带附件：fail 自己就击沉了 grade，非决定性（timeout 等）可能在 V8 刷盘前就死了——半执行什么也证明不了。暂存目录**用后即删**（FsPort 新可选能力 `removeDir`；内存实现没有它也照常），删除失败只损失暂存卫生不损失证据——下次运行重建目录。
+
+**门控语义：`unproven` 与 `stale` 的分界线**。`applyCoverageGate` 在 uncovered 非空时把 `proven` 降为 `unproven`，并把覆盖率摘要（basis + uncovered）**无条件**挂上报告——即便 basis 是 `'none'`、即便门没拦：「测不了」是证明读者应得的事实，不是可静默省略的字段。两个降级名词说的是两件不同的事：
+
+| | `stale` | `unproven`（覆盖降级） |
+|---|---|---|
+| 判定种类 | **过程**判定 | **证据**判定 |
+| 含义 | 验证没跑完（检查未跑 / 跳过 / 超时 / 中断） | 过程完成、全部绿——但绿的证据从未执行变更 |
+| 重跑能救吗 | 能：把没跑完的检查跑完 | **不能**：缺的不是更多运行，是真正触达变更的检查 |
+| 维度 | 检查侧（`unverified`：哪些检查没拿到裁决） | 变更侧（`uncovered`：哪些变更文件没被执行——`unverified` 的对偶） |
+
+边界规则：`regressed` 与 `stale` **永不被覆盖门改写**——回归有自己的理由，stale 自己就挡住了 proven；只有 otherwise-proven 的运行才可能被降级。门控次序**钉死**：机器 grade 之后、义务封顶与 κ 背书融合之前——覆盖率是机器证据维度，与机器裁决一起受审；这个位置对融合语义是承重的：**被覆盖率打成 `unproven` 的断言不可能再被背书解锁**——解锁条件要求 grade 是 `stale`（人类能接受的剩余风险），而「变更从未执行」不是剩余风险，是缺失的工作，与未 met 的义务一样，背书买不了工作。
+
+**三档模式（config `coverage`）与选择建议**：
+
+| 档位 | 无数据时 | 有数据时 | 适用 |
+|---|---|---|---|
+| `observe`（默认） | 不拦，但 basis `'none'` 如实可见 | uncovered 非空 → unproven | 大多数部署：真实 Node 检查进程得到执行覆盖的诚实；数据缺失环境（fake 端口、非 Node 工具链）可见降级，而不是新增一种失败 |
+| `require` | **也拦**（`no-coverage-data`）：无数据本身即不合格 | 同上 | 严格部署：已承诺覆盖率插桩存在，缺席即发现 |
+| `off` | 不注入、不门控 | 不注入、不门控 | 逐字节回到 v0.12 行为 |
+
+「生产行为与无数据环境分离」正是 observe 默认的来源——同一个运行要么拿着证据说话，要么显式说「我测不了」（这也正是 Fake 测试端口向后兼容的来源：Fake 命令端口不读注入的 env，observe 下无数据不拦，05 测试逐位核对了默认 observe 与 off 在 fake 端口上 grade / confidence / basis 逐位相等）。**非 node 生态按档选型**：pytest / go test 等进程不产 V8 数据——observe 不拦（永远不门控）、require 会拦（每条断言都 unproven），部署者按自己的生态选档。
+
+**与 conjure 的咬合：盲区的处方**。未执行被点名时，模型收到的不只是坏消息，还有现成的出路——叙事直接提示 `proof_conjure` 可合成真正执行变更的测试：v0.12 的合成证据协议恰好就是「构造一个验证」的机器，conjure 一个 import 变更模块并对它断言的测试，跑过即真的执行了变更，盲区闭合。最说明问题的是一个真事：门控落地当天，**特性抓到了自己历史用例的盲区**——π（v0.12）的既有 conjure 测试用例被查出「脚本从未触碰变更文件」（绿色断言从未 import 它声称覆盖的模块），用例被改写为真正 import 并断言变更模块后才重新成立。选择维度说「这个检查管这个文件」、执行维度说「它根本没碰」——两条证据第一次同时在场，历史用例的缝隙立刻现形。
+
+**叙事与展示**。执行过时评级行挣得尾注：
+
+```
+PROVEN (p≈0.97, change-executed) — 3 passing — 0 failing
+```
+
+未执行时 NOT PROVEN 点名前 3 个文件并给处方：
+
+```
+UNPROVEN (p≈0.97) — 1 passing — 0 failing — unexecuted change (src/feature.mjs) — proof_conjure can synthesize a test that executes them
+```
+
+（两个分支都要求 basis `'v8'`——basis `'none'` 时什么都没测过，点名「未执行」恰恰是这个维度要消除的不诚实。）`proof_verify` 的返回值新增 `coverage` 块（`VerifyValue.coverage`，仅在 observe/require 采集运行时出现，off 与旧 session log 无此字段——规范值字节稳定），渲染为紧跟置信行的一行**三态展示**：
+
+```
+coverage: change-executed (1 file(s) of the change observed running)
+⚠ coverage: unexecuted change — src/feature.mjs never ran under any green check (paths matched, execution did not); proof_conjure can synthesize a test that executes them
+ℹ coverage: no execution data this run (mode observe lets this pass ungated; mode require would not)
+```
+
+`VerifyOutcome.coverage` 同形透出（basis / uncovered / executedCount）；`proof/verified` 边界 marker 携带覆盖足迹（mode / basis / executed / uncovered）。
+
+**工程细节**。`establishBaseline` **不注入**覆盖率（v1）：基线是对工作区检查的一次测量，不是对某个变更集的主张——此时没有「changed」可门控，跳过注入还省每检查一次磁盘写入；覆盖维度归验证所有。每检查子目录名用 `sha256(checkId)` 前 16 hex（specId 内嵌命令、可能带空格/冒号/整串 argv，不是每个平台都安全的路径段；采集方从记录自己的 checkId 重导出同一名字，无需 spec 池）。mkdirp 失败被吞：子进程写不出 profile、采集无数据、observe 降级 basis `'none'`——诚实的答案，而不是崩溃的验证。新配置 1 项（现 32 项）：`coverage`（默认 `observe`）；工具数不变（9 个）。新测试文件 `test/20-coverage`（26 例）+ `05` 增 4 例（真进程端到端 change-executed / **头条盲区实证**：paths 匹配但从不执行 → unproven 点名 / require+无数据、off 对照 / 向后兼容逐位）。
+
+
 ---
 
 ## 六、架构：领域核心 + 薄适配层
@@ -398,7 +463,7 @@ PROVEN (p≈0.80, jury evidence — self-attestation is capped)
 ```
 dsh-proof/
 ├── src/
-│   ├── core/                 ← 纯领域层，零 @deepseek-ai/* 依赖（16 个模块）
+│   ├── core/                 ← 纯领域层，零 @deepseek-ai/* 依赖（17 个模块）
 │   │   ├── ports.ts          # 唯一的对外接口（Command/Fs/Clock/Workspace/Signer/Resolver）
 │   │   ├── hash.ts           # 规范化 JSON + 内容寻址 + Merkle root + 输出归一
 │   │   ├── checks.ts         # 客观检查发现（多语言 + monorepo 子包 cwd）
@@ -414,6 +479,7 @@ dsh-proof/
 │   │   ├── contract.ts       # 类型化断言合约（五类 kind 与义务、API 面提取/diff、docs 分类）
 │   │   ├── attest.ts         # 证据分级 B/C（量规、陪审包、信任算术、申诉解析，纯函数）
 │   │   ├── synthetic.ts      # PTC 证据合成（脚手架模板、能力筛检、合成 spec，纯函数）
+│   │   ├── coverage.ts       # 覆盖感知证明（V8 报告解析、变更集聚合、unproven 门控，纯函数）
 │   │   └── index.ts          # 领域导出
 │   ├── engine.ts             # ProofEngine —— 宿主调用的命令式门面
 │   ├── node-ports.ts         # Node 实现（spawn / fs / git / Ed25519）
@@ -425,7 +491,7 @@ dsh-proof/
 │   │   ├── prompt.ts         # proof:policy 段落
 │   │   └── lsp-impact.ts     # 宿主 LSP → DefinitionResolverPort 适配
 │   └── vendor/dsh-tools.ts   # 契约快照（pinned to dsh v0.2.1-alpha.1）
-├── test/                     # 19 个测试文件（356 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心、类型化断言合约、证据分级 B/C、PTC 证据合成
+├── test/                     # 20 个测试文件（388 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心、类型化断言合约、证据分级 B/C、PTC 证据合成、覆盖感知证明
 ├── cordis.patch.yml          # bundle 层
 └── examples/cordis.yml       # --patch 本地调试
 ```
@@ -433,7 +499,7 @@ dsh-proof/
 **为什么领域核心不碰 `@deepseek-ai/*`：**
 
 1. DSH 是开发者预览版，破坏性变更频繁。核心逻辑与 harness 版本解耦 → 升级不重写。
-2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，356 个测试全绿。
+2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，388 个测试全绿。
 3. 同一个核心可以被别的宿主（CLI、CI、其他 harness）复用。
 
 **为什么 `vendor/dsh-tools.ts` 是契约快照而不是活依赖：**
@@ -500,6 +566,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
         syntheticDir: .proof-synthetic # π：合成证据沙箱目录（脚手架与测试脚本落于此；钉出检查发现，永不成为客观检查）
         syntheticFalsePass: 0.15      # π：合成检查假阴率 β（agent 自写测试的定价；organic 为 0.02，见 §五·十五）
         syntheticTimeoutMs: 60000     # π：单个合成测试执行的协作超时
+        coverage: observe             # υ：覆盖感知证明门控：observe=有覆盖率数据才门控（默认，无数据降级为 basis 'none' 如实可见）| require=无数据也不给 proven | off=不注入不门控（逐字节旧行为），见 §五·十六
         verbose: false
 ```
 
@@ -531,7 +598,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit，离线可跑
-npm test              # 356 个测试（node:test）
+npm test              # 388 个测试（node:test）
 npm run build         # 产出 lib/
 npm run bundle:check  # 打包契约自检
 ```
@@ -539,10 +606,10 @@ npm run bundle:check  # 打包契约自检
 测试分层：
 
 - `01`–`04` —— 纯核心：哈希、检查发现、影响分析、证据与判定
-- `05` —— 引擎端到端（内存端口；v0.9 增补波式调度用例：提前认证、首败停、`set` 回归、确定性、预算降级；v0.10 增补四类合约端到端与旧基线无 API 面的诚实降级；v0.11 增补证据分级 5 例：链种 B 裁决零命令认证、双向申诉覆盖、背书风险接受与 reject 崩塌+对称锁、背书只解目标差不买工作、纯机器隔离——`verify()` 永不读链上证词；v0.12 增补合成闭环 4 例：真进程请求-执行闭环、筛检拒收零执行零落链、β 定价端到端（synthetic < organic 且 basis 点名 regime）、behavior-adding 合成兜底）
+- `05` —— 引擎端到端（内存端口；v0.9 增补波式调度用例：提前认证、首败停、`set` 回归、确定性、预算降级；v0.10 增补四类合约端到端与旧基线无 API 面的诚实降级；v0.11 增补证据分级 5 例：链种 B 裁决零命令认证、双向申诉覆盖、背书风险接受与 reject 崩塌+对称锁、背书只解目标差不买工作、纯机器隔离——`verify()` 永不读链上证词；v0.12 增补合成闭环 4 例：真进程请求-执行闭环、筛检拒收零执行零落链、β 定价端到端（synthetic < organic 且 basis 点名 regime）、behavior-adding 合成兜底；v0.13 增补覆盖门控 4 例：真进程端到端 change-executed（记录挂覆盖附件、重寻址后链仍自洽、暂存无残留）、**头条盲区实证**（paths 匹配但从不执行 → unproven 点名 + conjure 处方）、require+无数据与 off 对照（同一夹具两种相反 grade）、向后兼容（默认 observe 在 fake 端口上与 off 逐位相等）
 - `06` —— 漂移检测
 - `07` —— **真实 shell 集成**：真的 `npm run --silent test`，真的退出码，真的回归归因
-- `08` —— 插件接线：九个工具、pre-execute 钩子（基线门、证据库守卫、`proof_endorse` 恒 ask 的审批 seam）、提示词段落、纯投影、配置校验、陪审请求冻结/裁决校验/审批后落链、合成请求冻结（脚手架逐字返还 + `synthetic/requested` 落链）/合成经端口执行落链/筛检拒收以协议结果（而非报错）返回
+- `08` —— 插件接线：九个工具、pre-execute 钩子（基线门、证据库守卫、`proof_endorse` 恒 ask 的审批 seam）、提示词段落、纯投影、配置校验、陪审请求冻结/裁决校验/审批后落链、合成请求冻结（脚手架逐字返还 + `synthetic/requested` 落链）/合成经端口执行落链/筛检拒收以协议结果（而非报错）返回、覆盖三态投影（v8-executed 渲染与传递 / v8-unexecuted 点名前 3 文件 + conjure 处方 / none 如实声明 observe 与 require 之别；off 与旧日志无字段无线、敌意形状安全降级）
 - `09` —— **信任对抗**：链断裂、全量重写（用本包自己的哈希函数）、回滚、基线替换、真实 Ed25519 密钥
 - `10` —— **变更集溯源**：陈旧脏区豁免、还原即变更、未跟踪文件、外部回归不记账、引擎端到端
 - `11` —— **LSP 影响融合**：goToDefinition 验证近似边、别名导入盲区发现、缓存与预算、降级不缩窄
@@ -554,6 +621,7 @@ npm run bundle:check  # 打包契约自检
 - `17` —— **类型化断言合约**：五形态提取逐形态核对（含别名/字符串别名/多声明符/解构/`export =`/`export * as ns`）、入口推导与闭包截断、义务矩阵全分支（四类 × met/not met × detail 文案）、`requirements*.txt` 陷阱守卫、封顶值逐字兑现、纯函数确定性（同输入同字节、记录乱序不变）
 - `18` —— **证据分级（B/C 证词）**：量规存在性与结构化输出指令（英文 rubric 逐项核对：三值裁决、主观概率、弃权规则、Class B 落盘与重放警告）、`juryPrompt` 字节级确定性与段落结构（含量规版本覆盖）、`claimIdOf` 稳定 16-hex 身份（改写即新断言）、因子数学（p^w 语义、abstain 中性、w=0/w=1 边界、**[p,1] 网格扫描**、NaN/越界防毒、C 类 endorse 0.95^0.9 与 reject 0.05^0.9）、`activeAttestations` 链读纪律（垃圾载荷防御、gen 申诉解析、同 gen 后写者赢、B/C 独立信道、(claimId, kind) 确定性排序）、llm-jury 义务矩阵全分支、模块级确定性
 - `19` —— **PTC 证据合成（32 例）**：模板协议（末行 PASS/FAIL、文件内链上警告、脚手架自筛干净）、`sandboxEntryFor` 确定性与「seq 防碰撞不携带身份」、沙箱目录钉出发现的字面量同步、筛检双向精度（deny-list 恰为锁定集、静态/裸/动态/require 各拼写、node: 前缀、多行与 re-export、process.env 成员/计算形式、注释内导入照报、名字仅含禁用模块的本地 fixture 放行、findings 去重排序）、β 定价（同历史 0.15 vs 0.02 且别的不动、`syntheticFalsePass` 只覆盖它、闭式后验、端到端折价）、记录（合成元数据上链、**同结果不同 scriptDigest 即不同 evidenceId**、冻结时钟深度相等）、义务 tier ladder 全分支（latest 合成兜底点名折价、无覆盖维持 not met、organic 兜底不被误称 synthetic、混合覆盖逐桶点名、当次 organic 压过一切兜底、pre-ο 记录经 spec 池判 synthetic）、入口点纯函数确定性
+- `20` —— **覆盖感知证明（26 例）**：V8 解析（执行/加载未执行分桶、root 外与 node_modules 段丢弃、盘符大小写与双斜杠形态、百分号解码、垃圾 JSON 与异形防御、空 result 是合法报告、执行压倒加载）、聚合（executedSets 并集、零 executedSets 钉死 basis 'none'、重复坍缩、非源码文件入 notApplicable 不参与门控）、门控三档全分支（observe 无数据不拦 / 有数据 uncovered 拦、require 无数据拦 `no-coverage-data`、off 永不拦）、`applyCoverageGate`（unproven 降级与摘要挂载、grade 保序——regressed/stale 永不被改写、none basis 诚实附挂不拦截）、`makeEvidence`（coverage 附件参与内容寻址、自寻址、同输入同记录）、模块级确定性
 
 本地调试：
 
@@ -586,6 +654,9 @@ pnpm dsh web --patch /absolute/path/to/dsh-proof/examples/cordis.yml
 - **静态筛检不是沙箱（v0.12）。** 合成脚本的执行前置筛检是文本层 deny-list：计算式 specifier（`import(buildName())`）、别名通道（`createRequire` / `eval` / `new Function`）与大小写混淆的 specifier 它看不见——文本看不见运行时值。真正约束失控脚本的是沙箱 cwd 限制、执行超时（`syntheticTimeoutMs`）、输出摘录上限与宿主将来的 ptc-runtime 档位；筛检的职责只是让**容易的**外联尝试在执行之前大声失败。档位标签因此如实写 `'screened-subprocess'`，不冒充沙箱。
 - **合成 β = 0.15 是承认的猜测，且这个数按构造学不出来（v0.12）。** 假阴率需要「确实断了」的真值标注才能学习，而一条自利的测试（空断言、漏掉会破的输入）按构造**不产生任何可学的破坏信号**——日志里它永远是绿的。0.15 与 0.02 一样是定价立场而非测量；它刻意放在可覆盖的 `syntheticFalsePass` 而不是「不再重调」的 `BAYES_CONSTANTS` 里，正因为它是建模猜测，不是定律。
 - **合成覆盖永远弱于 organic 同侪（v0.12）。** 同样一次 pass，合成检查的后验抬升天然更少（端到端：synthetic ≈ 0.9706 < organic ≈ 0.9960）；义务 tier ladder 里合成让路于同档 organic；全部决定性记录皆合成时 basis 改名 `synthetic` 并在叙事里点名折扣。合成覆盖应读作「断言作者自己跑过并通过的验证」，不是独立确认——三层机制（β、tier ladder、basis）编码的都是这同一句话。
+- **执行覆盖是文件粒度（v0.13）。** v1 的「执行过」= 文件有任一函数的任一 range `count > 0`——它不区分执行了变更的那几行还是同文件的隔壁函数，一个只触达未改代码的测试与真正执行变更的测试在此粒度下等价。行级/符号级判定（需要基线内容 blob 或 LSP 符号映射把变更定位到行/符号）是演进方向，不是本版能力；读 `change-executed` 时请记住它说的是「这个文件」，不是「这一行」。
+- **非 node 生态没有覆盖数据（v0.13）。** `NODE_V8_COVERAGE` 是 Node 运行时开关：pytest、go test、cargo test 等进程继承变量但不产 V8 profile，覆盖维度对它们是 `basis: 'none'`——observe 不拦（该生态永远不门控），require 则每条断言都 unproven。这是部署决策不是缺陷：纯 node 工具链可放心 `require`，混合/非 node 生态请留在 `observe`，或干脆 `off`。
+- **「加载未执行」桶未参与更强判定（v0.13）。** V8 报告天然携带第三种事实——文件被 import 但从未跑过一行；v1 解析并保留该分桶，却只把**执行**用于门控。「加载未执行」本是「依赖图以为它会被用到、实际没有」的现成证据（更强的嫌疑文件排序、更精确的 `new-paths-covered`），v1 未消费——保留为演进，如实记在这里。
 - **`proven` 允许存在预置红灯。** 一个本来就红的仓库不该让 Agent 无法工作。预置失败会在报告里显著列出，但不计入本次会话的责任。这是刻意设计，不是漏洞。
 - **它不替代测试本身。** `dsh-proof` 编排并归因你已有的客观检查。v0.12 的证据合成也不改变这条边界：断言由 agent 起草，插件只冻结脚手架、筛检、执行，并把结果折价记账为弱于任何独立检查的证据。
 - **DSH 是 v0.1/0.2 开发者预览版。** 插件契约会变。本插件已把依赖面最小化并钉死契约快照（`src/vendor/dsh-tools.ts`），但上游变更时仍需重新对齐。

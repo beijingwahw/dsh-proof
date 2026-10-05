@@ -190,6 +190,29 @@ export function proofNarrative(report: ProofReport, certifyTarget: number = DEFA
   // record of certification) with the numeric comparison as fallback, so a
   // deployment with a non-default target still reads correctly.
   const graded = report as GradedProofReport
+  // υ: execution coverage — what the checks actually EXECUTED, not what their
+  // paths matched. The report's optional `coverage` summary is mounted by
+  // `applyCoverageGate` (core/report.ts). Both branches below demand basis
+  // 'v8': at basis 'none' nothing was measured, and naming files "unexecuted"
+  // without a measurement would be exactly the dishonesty this dimension
+  // exists to remove.
+  const coverage = graded.coverage
+  const coverageTail = coverage !== undefined
+    && coverage.basis === 'v8'
+    && coverage.uncovered.length === 0
+    ? ', change-executed'
+    : ''
+  if (
+    coverage !== undefined && coverage.basis === 'v8'
+    && coverage.uncovered.length > 0 && report.grade === 'unproven'
+  ) {
+    // Paths coverage said "a check owns this file"; execution coverage says
+    // "and then no green check ever ran a line of it". That gap is the claim
+    // this whole dimension exists to catch, so the narrative names the files
+    // and points at the remedy the toolset already has.
+    const named = coverage.uncovered.slice(0, 3).join(', ')
+    parts.push(`unexecuted change (${named}) — proof_conjure can synthesize a test that executes them`)
+  }
   // ζ jury path first: a docs-only verdict never reads like a measurement. The
   // proven line states the number AND its regime — jury evidence, capped — so
   // nobody mistakes self-attestation for check coverage; the failing line names
@@ -222,9 +245,12 @@ export function proofNarrative(report: ProofReport, certifyTarget: number = DEFA
   if (graded.confidence !== undefined) {
     const p = graded.confidence.toFixed(2)
     const met = graded.confidenceBasis === 'certified-subset' || graded.confidence >= certifyTarget
+    // υ: a change the checks verifiably executed earns its head a tail —
+    // `PROVEN (p≈0.97, change-executed)` — the one-word difference between
+    // "the suites are green" and "the suites are green AND ran this code".
     const head = met
-      ? `${report.grade.toUpperCase()} (p≈${p})`
-      : `${report.grade.toUpperCase()} (p≈${p}, target ${certifyTarget.toFixed(2)})`
+      ? `${report.grade.toUpperCase()} (p≈${p}${coverageTail})`
+      : `${report.grade.toUpperCase()} (p≈${p}, target ${certifyTarget.toFixed(2)}${coverageTail})`
     return [head, ...parts.slice(1)].join(' — ')
   }
   return parts.join(' · ')

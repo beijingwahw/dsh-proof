@@ -16,7 +16,7 @@ import type {
   ToolCallView, ToolResultView, ToolRunContext,
 } from '../vendor/dsh-tools.ts'
 import type { ProofEngine } from '../engine.ts'
-import type { AuditReport, CheckStatus, ProofGrade, ProofReport } from '../core/evidence.ts'
+import type { AuditReport, CheckStatus, ProofGrade } from '../core/evidence.ts'
 import type { ConfidenceBasis, GradedProofReport } from '../core/report.ts'
 import type { ClaimContract, ClaimKind, ObligationResult } from '../core/contract.ts'
 import { proofNarrative } from '../core/regression.ts'
@@ -110,6 +110,21 @@ export interface VerifyValue {
   stoppedEarly?: 'certified' | 'failed' | 'budget'
   /** Waves the bayesian plan actually dispatched; present only with a schedule. */
   waves?: number
+  /**
+   * υ: what the execution-coverage dimension said about the change set — not
+   * what the checks' paths matched, what they actually EXECUTED. Present
+   * exactly when coverage collection ran (modes observe/require, via the
+   * outcome); absent in mode `off` and on pre-υ session logs, so the
+   * no-coverage canonical value stays byte-identical.
+   */
+  coverage?: {
+    /** `'v8'` — real profiles were read; `'none'` — no execution data this run. */
+    basis: 'v8' | 'none'
+    /** Changed files a decisively-passing check actually executed. */
+    executedCount: number
+    /** Changed files no green check ever executed. */
+    uncovered: readonly string[]
+  }
   regressions: { label: string; suspects: string[]; detail: string }[]
   fixed: string[]
   preExisting: string[]
@@ -579,6 +594,17 @@ function createVerifyTool(engine: ProofEngine, touched?: () => readonly string[]
           certifiedSkips: { type: 'integer' },
           stoppedEarly: { type: 'string', enum: ['certified', 'failed', 'budget'] },
           waves: { type: 'integer' },
+          // Present only when coverage collection ran (see VerifyValue) —
+          // declared so the schema stays truthful about what a υ-gated run
+          // may emit.
+          coverage: {
+            type: 'object',
+            properties: {
+              basis: { type: 'string', enum: ['v8', 'none'] },
+              executedCount: { type: 'integer' },
+              uncovered: { type: 'array', items: { type: 'string' } },
+            },
+          },
           regressions: {
             type: 'array',
             items: {
@@ -619,7 +645,7 @@ function createVerifyTool(engine: ProofEngine, touched?: () => readonly string[]
       })
       return toVerifyValue(
         outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
-        outcome.schedule,
+        outcome.schedule, outcome.coverage,
       ) as unknown as JsonValue
     },
   }
@@ -726,7 +752,7 @@ function createClaimTool(engine: ProofEngine, touched?: () => readonly string[])
         })
         const verified = toVerifyValue(
           outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
-          outcome.schedule,
+          outcome.schedule, outcome.coverage,
         )
         return toClaimValue(parsed.claim, outcome.report, verified, outcome.contract) as unknown as JsonValue
       }
@@ -737,7 +763,7 @@ function createClaimTool(engine: ProofEngine, touched?: () => readonly string[])
       })
       const verified = toVerifyValue(
         outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
-        outcome.schedule,
+        outcome.schedule, outcome.coverage,
       )
       return toClaimValue(parsed.claim, outcome.report, verified) as unknown as JsonValue
     },
@@ -1449,6 +1475,16 @@ export function toVerifyValue(
     readonly stoppedEarly: 'certified' | 'failed' | 'budget' | null
     readonly skippedByPlan: ReadonlyArray<{ checkId: string; priorHealthy: number }>
   },
+  /**
+   * υ: the execution-coverage verdict on the change set, as the outcome
+   * reported it (report.coverage carries the same basis/uncovered — the
+   * outcome is the one that also holds executedCount). Absent in mode `off`.
+   */
+  coverage?: {
+    readonly basis: 'v8' | 'none'
+    readonly uncovered: readonly string[]
+    readonly executedCount: number
+  },
 ): VerifyValue {
   const externalChanged = attribution?.records.filter(r => r.provenance === 'external').map(r => r.path) ?? []
   // The check list covers every discovered spec (attribution included), so the
@@ -1470,6 +1506,15 @@ export function toVerifyValue(
   const skippedByPlan = Array.isArray(schedule?.skippedByPlan) ? schedule.skippedByPlan : []
   const stoppedEarly = schedule?.stoppedEarly
   const waves = typeof schedule?.waves === 'number' ? schedule.waves : undefined
+  // υ pass-through: the execution-coverage verdict rides only when the outcome
+  // carried a legible one — every field guarded so a partial or hostile shape
+  // degrades to absence (or to honest zeros) instead of throwing, and mode
+  // `off` (no coverage at all) keeps the canonical value byte-stable.
+  const coverageBasis = coverage?.basis === 'v8' || coverage?.basis === 'none' ? coverage.basis : undefined
+  const coverageUncovered = coverageBasis !== undefined && Array.isArray(coverage?.uncovered)
+    ? coverage.uncovered.filter((p): p is string => typeof p === 'string')
+    : []
+  const coverageExecuted = typeof coverage?.executedCount === 'number' ? coverage.executedCount : 0
   return {
     grade: report.grade,
     root: report.root,
@@ -1492,6 +1537,9 @@ export function toVerifyValue(
       ? { stoppedEarly }
       : {}),
     ...(waves !== undefined ? { waves } : {}),
+    ...(coverageBasis !== undefined
+      ? { coverage: { basis: coverageBasis, executedCount: coverageExecuted, uncovered: coverageUncovered } }
+      : {}),
     regressions: checks
       .filter(c => c.verdict === 'regression' || c.verdict === 'new-failure')
       .map(c => ({
@@ -1510,7 +1558,8 @@ export function toVerifyValue(
 
 export function toClaimValue(
   claim: string,
-  report: ProofReport,
+  /** Graded since γ; υ reads the coverage summary the gate attached to it. */
+  report: GradedProofReport,
   verified: VerifyValue,
   /** ζ: the engine's contract verdict; present only on the typed (kind) path. */
   contract?: { readonly kind: ClaimKind; readonly obligations: readonly ObligationResult[] },
@@ -1520,6 +1569,17 @@ export function toClaimValue(
   if (report.grade === 'stale') blockers.push(`Stale evidence: ${report.unverified.join(', ') || 'affected checks not re-run'}.`)
   for (const reg of verified.regressions) blockers.push(`Regression: ${reg.label} — ${reg.detail}`)
   if (report.grade === 'unproven') blockers.push('Verification was incomplete (skipped, aborted or timed out).')
+  // υ: an unexecuted change is blame on the claim itself — every check that
+  // ran came back green without ever executing a line of the change, so each
+  // uncovered file is a blocker in its own right (the model's action item:
+  // cover it, e.g. via proof_conjure). Only basis 'v8' may name files; at
+  // basis 'none' nothing was measured, and naming files "unexecuted" without
+  // a measurement is the dishonesty this dimension exists to remove.
+  if (report.coverage?.basis === 'v8' && Array.isArray(report.coverage.uncovered)) {
+    for (const file of report.coverage.uncovered) {
+      if (typeof file === 'string') blockers.push(`unexecuted change: ${file} was never run by any green check`)
+    }
+  }
 
   // γ graded trust: the posterior rides onto the claim exactly when the
   // verification had one — same two-decimal number, never a bare probability.
@@ -1663,6 +1723,38 @@ function confidenceLine(v: VerifyValue): string | null {
   return parts.length > 0 ? `confidence p≈${p} (${parts.join(' · ')})` : `confidence p≈${p}`
 }
 
+/**
+ * υ: the execution-coverage line — what the checks actually EXECUTED, not what
+ * their paths matched. Three states, one line each: at basis 'v8' with every
+ * changed file observed running, the line states the count; at basis 'v8' with
+ * an unexecuted change it names the first three files, states the gap in υ's
+ * own terms and points at the remedy the toolset already has; at basis 'none'
+ * nothing was measured, and naming files "unexecuted" without a measurement
+ * would be exactly the dishonesty this dimension exists to remove — so the
+ * line says "no data" and spells out the observe/require difference instead.
+ * Total on replay: every field is individually guarded, and a value without a
+ * coverage block produces no line at all.
+ */
+function coverageLine(v: VerifyValue): string | null {
+  const coverage = v.coverage
+  if (typeof coverage !== 'object' || coverage === null) return null
+  const basis = coverage.basis === 'v8' || coverage.basis === 'none' ? coverage.basis : null
+  if (basis === null) return null
+  if (basis === 'none') {
+    return 'ℹ coverage: no execution data this run (mode observe lets this pass ungated; mode require would not)'
+  }
+  const uncovered = Array.isArray(coverage.uncovered)
+    ? coverage.uncovered.filter((p): p is string => typeof p === 'string')
+    : []
+  if (uncovered.length === 0) {
+    const executed = typeof coverage.executedCount === 'number' ? coverage.executedCount : 0
+    return `coverage: change-executed (${executed} file(s) of the change observed running)`
+  }
+  const named = uncovered.slice(0, 3).join(', ')
+  return `⚠ coverage: unexecuted change — ${named} never ran under any green check (paths matched, execution did not); `
+    + 'proof_conjure can synthesize a test that executes them'
+}
+
 function renderVerify(value: VerifyValue): string {
   const v = value ?? ({} as VerifyValue)
   const root = typeof v.root === 'string' ? v.root.slice(0, 12) : '<none>'
@@ -1682,6 +1774,12 @@ function renderVerify(value: VerifyValue): string {
   // Absent on the legacy path so the normal render stays byte-identical.
   const confidence = confidenceLine(v)
   if (confidence !== null) lines.push(confidence)
+  // υ: the execution-coverage line rides right behind the posterior — the
+  // number says the affected checks are healthy, this one says the green
+  // checks actually ran the change. Absent without a coverage block so the
+  // pre-υ render stays byte-identical.
+  const coverage = coverageLine(v)
+  if (coverage !== null) lines.push(coverage)
   lines.push('')
   if (v.degraded === true) {
     // Without this line "impact forced" reads like the caller asked for `all`;

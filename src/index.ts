@@ -134,6 +134,7 @@ export function apply(ctx: Context, config: Config): void {
     syntheticDir: config.syntheticDir,
     syntheticFalsePass: config.syntheticFalsePass,
     syntheticTimeoutMs: config.syntheticTimeoutMs,
+    coverage: config.coverage,
   })
 
   const watch = new WorkspaceWatch(engineFs(engine), root)

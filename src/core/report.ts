@@ -24,6 +24,9 @@ import type { ChangeProvenance } from './changeset.ts'
 // the core barrel is not this batch's to edit, and a direct import keeps the
 // dependency on `core/contract.ts` (ε) explicit.
 import type { ClaimContract, ObligationResult } from './contract.ts'
+// τ: types only — core/coverage.ts is a leaf of the import graph (it depends
+// on nothing in core), so report can consume it without any cycle.
+import type { CoverageGateResult, CoverageSummary } from './coverage.ts'
 
 /**
  * How the confidence number on a report was earned (β).
@@ -79,6 +82,18 @@ export type GradedProofReport = ProofReport & {
   readonly confidence?: number
   /** How `confidence` was earned; present exactly when `confidence` is. */
   readonly confidenceBasis?: ConfidenceBasis
+  /**
+   * τ: the coverage summary this report was judged against (attached by
+   * `applyCoverageGate`). `basis: 'none'` says no check produced coverage
+   * data; `uncovered` lists the changed source files no evidence run ever
+   * executed — the τ analog of `unverified`, which lists the checks that
+   * never produced a verdict. One is about the checks, the other about the
+   * change itself.
+   */
+  readonly coverage?: {
+    readonly basis: 'v8' | 'none'
+    readonly uncovered: readonly string[]
+  }
 }
 
 /** Graded-trust inputs handed to `assembleProof` by a bayesian-aware engine. */
@@ -268,6 +283,52 @@ export function assembleJuryReport(input: JuryReportInput): GradedProofReport {
     confidence: input.confidence,
     confidenceBasis: 'jury-only',
   }
+}
+
+// ---------------------------------------------------------------------------
+// τ: coverage-aware proof
+// ---------------------------------------------------------------------------
+
+/**
+ * Apply the τ gate to a graded report: demote `proven` to `unproven` when the
+ * gate blocked, and attach the coverage summary either way.
+ *
+ * The semantic line this function draws — **unproven vs stale**:
+ *
+ * - `stale` is a *process* verdict: the verification did not finish. Checks
+ *   were selected but produced no decisive outcome (skipped, timed out,
+ *   never dispatched), so the reader's move is "re-run and complete the
+ *   verification". Nothing is known yet.
+ * - `unproven` (the τ demotion) is an *evidence* verdict: the process
+ *   completed, everything that ran was green — and the green evidence never
+ *   executed the changed code. There is nothing to wait for and nothing to
+ *   re-run to fix it with the current check set; the claim simply has no
+ *   supporting evidence for the thing that changed. The reader's move is
+ *   "add/extend a check that exercises the change", not "wait".
+ *
+ * `regressed` and `stale` are never overwritten by this gate: `regressed` is
+ * a strictly worse verdict (a decisive failure must not be laundered into a
+ * coverage complaint), and `stale` already blocks `proven` on its own. Only a
+ * report that was about to claim `proven` gets demoted — τ's whole point is
+ * that "ran + green" must additionally mean "and executed the change".
+ *
+ * The coverage summary (`basis` + `uncovered`) is attached unconditionally so
+ * a reader of a passing report can also *see* the change was covered — the
+ * same transparency `confidence`/`confidenceBasis` buy for the β layer.
+ */
+export function applyCoverageGate(
+  report: GradedProofReport,
+  gate: CoverageGateResult,
+  coverage: CoverageSummary,
+): GradedProofReport {
+  const attached: GradedProofReport['coverage'] = {
+    basis: coverage.basis,
+    uncovered: [...coverage.changedUncovered],
+  }
+  if (gate.blocked && report.grade === 'proven') {
+    return { ...report, grade: 'unproven', coverage: attached }
+  }
+  return { ...report, coverage: attached }
 }
 
 interface GradeInput {

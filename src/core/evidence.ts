@@ -59,6 +59,19 @@ export interface Evidence {
    * evidence, and neither can borrow the other's pass.
    */
   readonly synthetic?: SyntheticEvidenceMeta
+  /**
+   * τ: what of the change set *this record's own run* actually executed —
+   * the executed/uncovered split of the V8 coverage the check's process left
+   * behind (see `core/coverage.ts`). Like `synthetic`, it participates in the
+   * content address: a record cannot claim to have exercised a change it
+   * never ran, and two records with the same green output but different
+   * execution footprints are two different pieces of evidence. Absent on
+   * pre-τ records and on runs without instrumentation.
+   */
+  readonly coverage?: {
+    readonly changedExecuted: readonly string[]
+    readonly changedUncovered: readonly string[]
+  }
   readonly recordedAt: string
   /** Workspace state when the evidence was produced. */
   readonly workspace: WorkspaceSnapshot
@@ -175,6 +188,11 @@ export interface RunOutcome {
  * authorship). It rides into the content address like every other field —
  * the point is exactly that a record cannot claim a script it did not run.
  * Optional and last, so every pre-ο call site is untouched.
+ *
+ * τ: the trailing `coverage` parameter (after `synthetic`, same pattern)
+ * carries the executed/uncovered split of the change set for this run, when
+ * the check ran under V8 coverage instrumentation. It too rides into the
+ * address; every pre-τ call site is untouched.
  */
 export function makeEvidence(
   spec: CheckSpec,
@@ -184,6 +202,7 @@ export function makeEvidence(
   excerpt: ExcerptOptions = DEFAULT_EXCERPT,
   canonical: NormalizeOptions = {},
   synthetic?: SyntheticEvidenceMeta,
+  coverage?: Evidence['coverage'],
 ): Evidence {
   // Canonical roots make the record location-independent: the same outcome
   // under any checkout directory (or user home) hashes to the same address.
@@ -204,6 +223,7 @@ export function makeEvidence(
     outputHead: exc.text,
     ...(exc.truncated ? { outputTruncated: true, outputOmittedChars: exc.omittedChars } : {}),
     ...(synthetic !== undefined ? { synthetic } : {}),
+    ...(coverage !== undefined ? { coverage } : {}),
     recordedAt: new Date(clock.now()).toISOString(),
     workspace,
   }

@@ -415,6 +415,23 @@ export class NodeFsPort implements FsPort {
   async mkdirp(dirPath: string): Promise<void> {
     await fsp.mkdir(dirPath, { recursive: true })
   }
+
+  /**
+   * υ: recursive best-effort directory removal for transient artifacts (the
+   * V8-coverage scratch tree a verification collects and then throws away).
+   * Failure is swallowed on purpose: what lives under these paths is
+   * regenerable staging, and a cleanup error must never fail a verification
+   * that already produced its proof. `force` rides along so a read-only
+   * leftover file or a Windows file-lock wart degrades to "still there until
+   * the next run overwrites it" instead of an exception.
+   */
+  async removeDir(dirPath: string): Promise<void> {
+    try {
+      await fsp.rm(dirPath, { recursive: true, force: true })
+    } catch {
+      /* staging area; the next run recreates it regardless */
+    }
+  }
 }
 
 /**

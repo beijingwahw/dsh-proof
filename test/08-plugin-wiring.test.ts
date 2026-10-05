@@ -1334,3 +1334,145 @@ test('ρ: proof_conjure_run refuses a screened script as a protocol result, not 
   const card = run.presentResult!({}, { meta: value } as never) as { title: string }
   assert.match(card.title, /refused — not recorded/)
 })
+
+// ---------------------------------------------------------------------------
+// Execution coverage (υ): the coverage dimension's verdict must reach the
+// canonical verify value and the render in all three states — v8 with the
+// change fully executed, v8 with an unexecuted change, and the honest no-data
+// basis 'none' — and a claim over an unexecuted change must carry the blocker
+// that says so. The no-coverage path (mode `off`, pre-υ session logs) emits no
+// coverage key, no coverage line and no coverage blocker, staying
+// byte-identical.
+// ---------------------------------------------------------------------------
+
+/** fakeReport grown by the coverage summary the υ gate attaches (core/report). */
+function coveredReport(
+  basis: 'v8' | 'none',
+  uncovered: readonly string[],
+  overrides: { grade?: ProofGrade; unverified?: string[] } = {},
+): GradedProofReport {
+  return { ...fakeReport(overrides), coverage: { basis, uncovered } }
+}
+
+test('υ: coverage transfers in all three states, renders its line, and absent coverage changes nothing', () => {
+  const verify = appliedTools().find(t => t.name === 'proof_verify')!
+
+  // v8, every changed file observed executing: the field carries the counts
+  // and the render states the change-executed tail with them.
+  const executed = toVerifyValue(
+    coveredReport('v8', [], { grade: 'proven' }),
+    ['src/a.ts', 'src/b.ts'], [], { untouched: [], precision: 'approximate' },
+    undefined, undefined, undefined,
+    { basis: 'v8', uncovered: [], executedCount: 2 },
+  )
+  assert.deepEqual(executed.coverage, { basis: 'v8', executedCount: 2, uncovered: [] })
+  assert.match(
+    renderedText(verify, executed),
+    /coverage: change-executed \(2 file\(s\) of the change observed running\)/,
+  )
+
+  // v8, an unexecuted change: the canonical value carries the FULL uncovered
+  // list (the three-file cap is render-only), and the render names the first
+  // three files, states the gap in υ's own terms and points at the remedy.
+  const files = ['src/x.ts', 'src/y.ts', 'src/z.ts', 'src/w.ts']
+  const unexecuted = toVerifyValue(
+    coveredReport('v8', files, { grade: 'unproven' }),
+    files, [], { untouched: [], precision: 'approximate' },
+    undefined, undefined, undefined,
+    { basis: 'v8', uncovered: files, executedCount: 0 },
+  )
+  assert.deepEqual(unexecuted.coverage, { basis: 'v8', executedCount: 0, uncovered: files })
+  const rendered = renderedText(verify, unexecuted)
+  assert.match(rendered, /⚠ coverage: unexecuted change — src\/x\.ts, src\/y\.ts, src\/z\.ts never ran under any green check/)
+  assert.match(rendered, /\(paths matched, execution did not\)/)
+  assert.match(rendered, /proof_conjure can synthesize a test that executes them/)
+  assert.ok(!rendered.includes('src/w.ts'), 'the unexecuted line caps at the first three files')
+
+  // basis 'none': no data was produced — the render says so with the
+  // observe/require difference spelled out, and never names a file unexecuted
+  // (even though the gate's summary may carry an uncovered list at 'none').
+  const blindRendered = renderedText(
+    verify,
+    toVerifyValue(
+      coveredReport('none', files), files, [], { untouched: [], precision: 'approximate' },
+      undefined, undefined, undefined,
+      { basis: 'none', uncovered: files, executedCount: 0 },
+    ),
+  )
+  assert.match(blindRendered, /ℹ coverage: no execution data this run \(mode observe lets this pass ungated; mode require would not\)/)
+  assert.ok(!blindRendered.includes('never ran under any green check'), 'basis none measured nothing — no file may be called unexecuted')
+
+  // Mode off / pre-υ session logs: no coverage key on the canonical value, no
+  // coverage line on the render — the no-coverage path stays byte-identical.
+  const legacy = toVerifyValue(fakeReport(), [], [], { untouched: [], precision: 'approximate' })
+  assert.ok(!('coverage' in legacy), 'off mode emits no coverage key at all')
+  let legacyRender = ''
+  assert.doesNotThrow(() => {
+    legacyRender = renderedText(verify, {
+      summary: 's', changed: [], externalChanged: [], regressions: [], fixed: [], preExisting: [], unverified: [],
+    })
+  })
+  assert.ok(!legacyRender.includes('coverage'), 'no coverage line without the field')
+
+  // Defensive projection and replay: a partial or hostile coverage shape
+  // degrades to honest zeros instead of throwing, and old meta never throws.
+  const hostile = toVerifyValue(
+    fakeReport(), [], [], { untouched: [], precision: 'approximate' },
+    undefined, undefined, undefined,
+    { basis: 'v8', uncovered: 'nope' as never, executedCount: 'many' as never },
+  )
+  assert.deepEqual(hostile.coverage, { basis: 'v8', executedCount: 0, uncovered: [] })
+  assert.doesNotThrow(() => { renderedText(verify, {}) })
+  assert.doesNotThrow(() => { renderedText(verify, { summary: 's', coverage: { basis: 'v8' } }) })
+  assert.doesNotThrow(() => { renderedText(verify, { summary: 's', coverage: null }) })
+  assert.doesNotThrow(() => {
+    renderedText(verify, { summary: 's', coverage: { basis: 'strange', uncovered: 'nope', executedCount: null } })
+  })
+})
+
+test('υ: a claim over an unexecuted change carries an unexecuted-change blocker; no coverage, no such blocker', () => {
+  const claimTool = appliedTools().find(t => t.name === 'proof_claim')!
+
+  // Each uncovered file is its own blocker; the generic unproven blocker and
+  // the coverage blocker coexist, and both reach the summary and the render.
+  const report = coveredReport('v8', ['src/x.ts', 'src/y.ts'], { grade: 'unproven' })
+  const claim = toClaimValue(
+    'rewired the parser',
+    report,
+    toVerifyValue(
+      report, ['src/x.ts', 'src/y.ts'], [], { untouched: [], precision: 'approximate' },
+      undefined, undefined, undefined,
+      { basis: 'v8', uncovered: ['src/x.ts', 'src/y.ts'], executedCount: 0 },
+    ),
+  )
+  assert.ok(claim.blockers.includes('unexecuted change: src/x.ts was never run by any green check'))
+  assert.ok(claim.blockers.includes('unexecuted change: src/y.ts was never run by any green check'))
+  assert.ok(claim.blockers.includes('Verification was incomplete (skipped, aborted or timed out).'))
+  assert.match(claim.summary, /unexecuted change: src\/x\.ts was never run by any green check/)
+  assert.match(renderedText(claimTool, claim), /unexecuted change: src\/x\.ts was never run by any green check/)
+
+  // Basis 'none' measured nothing — no file may be named unexecuted.
+  const blind = coveredReport('none', ['src/x.ts'])
+  const blindClaim = toClaimValue(
+    'same claim', blind,
+    toVerifyValue(
+      blind, [], [], { untouched: [], precision: 'approximate' },
+      undefined, undefined, undefined,
+      { basis: 'none', uncovered: ['src/x.ts'], executedCount: 0 },
+    ),
+  )
+  assert.ok(blindClaim.blockers.every(b => !b.startsWith('unexecuted change:')))
+
+  // No coverage at all (mode off / pre-υ session log): the blocker must not
+  // appear, and the canonical blockers stay byte-identical.
+  const legacyReport = fakeReport({ grade: 'unproven' })
+  const legacy = toClaimValue(
+    'same claim', legacyReport,
+    toVerifyValue(legacyReport, [], [], { untouched: [], precision: 'approximate' }),
+  )
+  assert.deepEqual(
+    legacy.blockers,
+    ['Verification was incomplete (skipped, aborted or timed out).'],
+    'the no-coverage claim carries exactly its pre-υ blockers',
+  )
+})

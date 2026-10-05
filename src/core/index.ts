@@ -76,8 +76,16 @@ export {
   type Excerpt, type ExcerptOptions, type ExcerptStrategy,
 } from './excerpt.ts'
 
+// τ: the coverage-aware-proof pure domain — V8 report parsing, change-set
+// summarisation and the gate that keeps "green but never executed" honest.
 export {
-  assembleBaseline, assembleProof, type AssembleInput, type AssembleResult,
+  coverageGate, parseV8CoverageReport, summarizeCoverage,
+  type CoverageGateResult, type CoverageSummary, type ParsedCoverage,
+} from './coverage.ts'
+
+export {
+  applyCoverageGate, assembleBaseline, assembleProof,
+  type AssembleInput, type AssembleResult,
   type ConfidenceBasis, type ConfidenceInput, type GradedProofReport,
 } from './report.ts'
 

@@ -12,6 +12,7 @@
 import type { CheckSpec, Clock, CommandPort, WorkspacePort } from './ports.ts'
 import type { CheckStatus, Evidence, RunOutcome, WorkspaceSnapshot } from './evidence.ts'
 import { makeEvidence, snapshotWorkspace } from './evidence.ts'
+import { sha256 } from './hash.ts'
 import type { ExcerptOptions } from './excerpt.ts'
 import type { NormalizeOptions } from './hash.ts'
 
@@ -30,6 +31,13 @@ export interface RunnerOptions {
   readonly workspace?: WorkspaceSnapshot
   /** Called as each check settles, for streaming UIs. */
   readonly onEvidence?: (evidence: Evidence, index: number, total: number) => void
+  /**
+   * υ: base directory for V8 execution-coverage collection. When set, every
+   * spec executes with `NODE_V8_COVERAGE=<coverageDir>/<sanitised specId>` in
+   * its environment — see `coverageSubdir` for why the id is hashed. Absent
+   * (the default) injects nothing and the batch is byte-for-byte pre-υ.
+   */
+  readonly coverageDir?: string
 }
 
 export interface BatchResult {
@@ -88,7 +96,7 @@ export class VerificationRunner {
           continue
         }
 
-        const outcome = await this.runOne(spec, options.signal, snapshot)
+        const outcome = await this.runOne(spec, options.signal, snapshot, options.coverageDir)
         const evidence = makeEvidence(spec, outcome, snapshot, this.clock, this.excerpt, this.canonical)
         records.push(evidence)
         ranIds.push(spec.id)
@@ -120,7 +128,26 @@ export class VerificationRunner {
     }
   }
 
-  private async runOne(spec: CheckSpec, signal: AbortSignal | undefined, _snapshot: WorkspaceSnapshot): Promise<RunOutcome> {
+  /**
+   * υ: filesystem-safe subdirectory for one spec's V8 coverage output.
+   *
+   * specIds embed their command (and may carry colons, hashes, spaces, even
+   * whole argv strings), none of which are safe as a path segment on every
+   * platform this runner executes on. `sha256(id).slice(0,16)` is: 16 hex
+   * characters, collision-safe for any realistic check pool, and deterministic
+   * — the engine collecting the output re-derives the exact same name from the
+   * exact same spec.
+   */
+  private coverageSubdir(coverageDir: string, specId: string): string {
+    return `${coverageDir.replace(/[\/]+$/, '')}/${sha256(specId).slice(0, 16)}`
+  }
+
+  private async runOne(
+    spec: CheckSpec,
+    signal: AbortSignal | undefined,
+    _snapshot: WorkspaceSnapshot,
+    coverageDir?: string,
+  ): Promise<RunOutcome> {
     const started = this.clock.now()
     const controller = new AbortController()
     const onAbort = () => controller.abort()
@@ -135,6 +162,22 @@ export class VerificationRunner {
         timeoutMs: spec.timeoutMs,
         signal: controller.signal,
         maxOutputChars: 64_000,
+        // υ: zero-instrumentation execution coverage. `NODE_V8_COVERAGE` is a
+        // Node runtime flag delivered through the environment: any node process
+        // that inherits it — the check itself, and any nested node the check
+        // spawns through npm/.cmd shims or scripts, because the overlay merges
+        // into the child's full inherited environment at the port — writes its
+        // raw V8 coverage profile to <dir>/coverage-<pid>-<seq>.json on exit.
+        // No mocks, no babel hooks, no import rewriting: the evidence of what
+        // the check executed is produced by the same V8 instance that executed
+        // it, which is precisely what makes it hard to fake from inside the
+        // checked code. Command ports that ignore `env` (the test fakes)
+        // simply produce no coverage directory — the engine's observe mode
+        // treats that as "no data" and declines to gate on it, so this
+        // injection is invisible to every pre-υ consumer.
+        ...(coverageDir !== undefined
+          ? { env: { NODE_V8_COVERAGE: this.coverageSubdir(coverageDir, spec.id) } as Readonly<Record<string, string>> }
+          : {}),
       })
       // Death-cause honesty: `exitCode === null` alone cannot tell "our
       // timeout killed it" from "something outside killed it". A port that
