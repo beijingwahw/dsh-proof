@@ -123,6 +123,8 @@ export function apply(ctx: Context, config: Config): void {
     impactGraph: config.impactGraph,
     impactGraphLimit: config.impactGraphLimit,
     headChars: config.headChars,
+    scheduler: config.scheduler,
+    certifyTarget: config.certifyTarget,
   })
 
   const watch = new WorkspaceWatch(engineFs(engine), root)

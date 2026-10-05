@@ -47,6 +47,22 @@ export interface Config {
   verifyBudgetMs: number
   /** Concurrent check processes. */
   concurrency: number
+  /**
+   * Scheduling strategy for `proof_verify` (β). `bayesian` (the default and
+   * this version's product stance) ranks the affected checks by expected
+   * information gain per unit cost, runs them in waves, updates each check's
+   * health posterior from the wave's real outcomes, and stops as soon as the
+   * claim probability crosses `certifyTarget` — "proven (p≈0.97)" instead of
+   * all-or-nothing. `set` is the behavioural escape hatch: the legacy
+   * whole-batch run with legacy grading, for deployments that must reproduce
+   * pre-β outcomes exactly.
+   */
+  scheduler: 'bayesian' | 'set'
+  /**
+   * Posterior probability the whole affected set must reach before the claim
+   * is certified without running every check. The "p≈" in `proven (p≈0.97)`.
+   */
+  certifyTarget: number
   /** Build the reverse-dependency graph for precise impact analysis. */
   impactGraph: boolean
   /** Hard cap on graph size, so a monorepo cannot stall the plugin. */
@@ -107,6 +123,11 @@ export const Config: Schema<Config> = Schema.object({
   checkTimeoutMs: Schema.number().default(120_000),
   verifyBudgetMs: Schema.number().default(300_000),
   concurrency: Schema.number().default(2),
+  scheduler: Schema.union(['bayesian', 'set']).default('bayesian'),
+  // 0–1 posterior displayed as a percentage by schema-aware hosts; the
+  // meaningful band is 0.5–0.999 (below 0.5 certifies nothing, 1.0 is
+  // unreachable by construction — every factor keeps a flake residual).
+  certifyTarget: Schema.percent().default(0.97),
   impactGraph: Schema.boolean().default(true),
   impactGraphLimit: Schema.number().default(20_000),
   lspImpact: Schema.boolean().default(true),

@@ -65,8 +65,16 @@ export {
 
 export {
   assembleBaseline, assembleProof, type AssembleInput, type AssembleResult,
+  type ConfidenceBasis, type ConfidenceInput, type GradedProofReport,
 } from './report.ts'
 
 export {
   VerificationRunner, type BatchResult, type RunnerOptions,
 } from './runner.ts'
+
+export {
+  BAYES_CONSTANTS, claimProbability, computePriors, posteriorHealthy,
+  rankByInformationGain, summarizeHistory,
+  type CheckPrior, type CheckStats, type ClaimModel, type PriorInput,
+  type ScheduleStep,
+} from './bayes.ts'

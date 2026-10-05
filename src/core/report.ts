@@ -21,6 +21,53 @@ import { forcedSelection, selectAffectedChecks } from './impact.ts'
 import { attributeChecks, type AttributedCheck } from './regression.ts'
 import type { ChangeProvenance } from './changeset.ts'
 
+/**
+ * How the confidence number on a report was earned (β).
+ *
+ * - `full-coverage`: every affected check was executed to a decisive outcome.
+ *   The posterior is still below 1 — the flake residual in every factor is
+ *   honest, not a bug.
+ * - `certified-subset`: the bayesian scheduler stopped early because the claim
+ *   posterior crossed the target; the checks not run are listed as planned
+ *   skips carrying their priors.
+ * - `degraded`: the run ended below target without certifying — budget
+ *   exhausted, aborted, or a decisive failure stopped the plan.
+ */
+export type ConfidenceBasis = 'full-coverage' | 'certified-subset' | 'degraded'
+
+/**
+ * `ProofReport` grown by the graded-trust fields (β). Declared here as an
+ * extension because `ProofReport` itself lives in `evidence.ts`, which is not
+ * this batch's file to edit; every plain `ProofReport` stays assignable, so
+ * legacy consumers see nothing change.
+ */
+export type GradedProofReport = ProofReport & {
+  /**
+   * Posterior probability that every affected check is healthy — the "p" in
+   * `proven (p≈0.97)`. The full value is stored; rendering rounds to two
+   * decimals for display only.
+   */
+  readonly confidence?: number
+  /** How `confidence` was earned; present exactly when `confidence` is. */
+  readonly confidenceBasis?: ConfidenceBasis
+}
+
+/** Graded-trust inputs handed to `assembleProof` by a bayesian-aware engine. */
+export interface ConfidenceInput {
+  /** The certification threshold — `certifyTarget` in the engine/config. */
+  readonly target: number
+  /**
+   * Per-check health probabilities over the affected set: a posterior for
+   * every check observed to a decisive outcome this run, the prior for
+   * everything still undecided (never run, timed out, skipped...).
+   */
+  readonly factors: ReadonlyMap<string, number>
+  /** Checks this verification actually dispatched (records exist for them). */
+  readonly runCheckIds: ReadonlySet<string>
+  /** Checks the wave plan deliberately never dispatched, with their priors. */
+  readonly skippedByPlan: ReadonlyArray<{ checkId: string; priorHealthy: number }>
+}
+
 export interface AssembleInput {
   readonly specs: readonly CheckSpec[]
   readonly baseline?: Baseline | undefined
@@ -35,10 +82,17 @@ export interface AssembleInput {
   readonly requireFullCoverage?: boolean
   /** When true, impact analysis is bypassed and every check counts as affected. */
   readonly forceAll?: boolean
+  /**
+   * Graded trust (β): when present (and `requireFullCoverage` is false), the
+   * binary coverage gate is replaced by the certify target — confidence ≥
+   * target is `proven`, below it `stale`.
+   */
+  readonly confidence?: ConfidenceInput
 }
 
 export interface AssembleResult {
-  readonly report: ProofReport
+  /** Carries the graded-trust fields whenever `AssembleInput.confidence` was wired. */
+  readonly report: GradedProofReport
   readonly checks: readonly AttributedCheck[]
 }
 
@@ -77,6 +131,9 @@ export function assembleProof(input: AssembleInput): AssembleResult {
     records: input.records,
     attributed,
     requireFullCoverage: input.requireFullCoverage ?? true,
+    ...(input.confidence !== undefined
+      ? { confidence: { value: productOf(input.confidence.factors), target: input.confidence.target } }
+      : {}),
   })
 
   const summary = {
@@ -89,7 +146,15 @@ export function assembleProof(input: AssembleInput): AssembleResult {
     indeterminate: attributed.filter(c => c.verdict === 'indeterminate').length,
   }
 
-  const report: ProofReport = {
+  // β graded trust: the claim posterior and how it was earned. Both fields
+  // ride together or not at all, so a reader can never see a probability it
+  // cannot place in a regime.
+  const confidence = input.confidence !== undefined ? productOf(input.confidence.factors) : undefined
+  const confidenceBasis = input.confidence !== undefined && confidence !== undefined
+    ? basisFor(confidence, input.confidence.target, unverified, new Set(input.confidence.skippedByPlan.map(s => s.checkId)))
+    : undefined
+
+  const report: GradedProofReport = {
     grade,
     root: merkleRoot(input.records.map(r => r.evidenceId)),
     baselineRoot: input.baseline?.root ?? null,
@@ -103,6 +168,8 @@ export function assembleProof(input: AssembleInput): AssembleResult {
     regressions: attributed
       .filter(c => c.verdict === 'regression' || c.verdict === 'new-failure')
       .map(c => `${c.label}: ${c.rationale}`),
+    ...(confidence !== undefined ? { confidence } : {}),
+    ...(confidenceBasis !== undefined ? { confidenceBasis } : {}),
   }
 
   return { report, checks: attributed }
@@ -131,6 +198,12 @@ interface GradeInput {
   records: readonly Evidence[]
   attributed: readonly AttributedCheck[]
   requireFullCoverage: boolean
+  /**
+   * Graded trust (β): the claim posterior and its target. Present exactly when
+   * the caller wired a `ConfidenceInput`; it only takes over the grade gate
+   * when `requireFullCoverage` is false (the bayesian regime).
+   */
+  confidence?: { value: number; target: number }
 }
 
 /** Statuses that actually answer the question — single source: `evidence.ts`. */
@@ -141,11 +214,62 @@ function decideGrade(input: GradeInput): ProofGrade {
 
   if (!input.hasBaseline) return 'no-baseline'
   if (regressions > 0 || newFailures > 0) return 'regressed'
+  // β graded trust: under the bayesian scheduler coverage stops being binary.
+  // The stale gate ("something ran without a verdict") is replaced by the
+  // certify target — a claim is proven when its posterior crosses the target,
+  // stale when it does not. Priority over the legacy gate is inherited: it
+  // sits exactly where the coverage rule used to, after regressions (a dead
+  // assertion is never "certified") and before the nothing-to-verify honesty
+  // below. The legacy 'set'/forced path never passes `confidence` with
+  // `requireFullCoverage: false`, so its grades are bit-for-bit unchanged.
+  if (input.confidence !== undefined && !input.requireFullCoverage) {
+    // Nothing objective speaks for the claim: the workspace declares no
+    // checks, or the change set touches none of them. Honest answer stays
+    // "unproven" — an empty product is vacuous certainty, not proof.
+    if (input.discoveredCount === 0 || input.affectedCount === 0) return 'unproven'
+    return input.confidence.value >= input.confidence.target ? 'proven' : 'stale'
+  }
   if (input.unverifiedCount > 0 && input.requireFullCoverage) return 'stale'
   // Nothing objective speaks for the claim: the workspace declares no checks,
   // or the change set touches none of them. Honest answer is "unproven".
   if (input.discoveredCount === 0 || input.affectedCount === 0) return 'unproven'
   return 'proven'
+}
+
+/**
+ * The claim posterior: the product of the per-check health factors, iterated
+ * in sorted-key order so the float product is bit-identical to
+ * `claimProbability` (core/bayes.ts) over the same factors — the number the
+ * engine gates on and the number the report displays must never disagree in
+ * the last ulp. The empty product is 1 by convention — guarded upstream by
+ * the `affectedCount` honesty branch, which never lets a vacuous 1 stand as
+ * proof.
+ */
+function productOf(factors: ReadonlyMap<string, number>): number {
+  let product = 1
+  for (const key of [...factors.keys()].sort()) {
+    product *= factors.get(key) as number
+  }
+  return product
+}
+
+/**
+ * Which regime earned the number: a planned skip-set whose claim crossed the
+ * target is a certified subset; a fully decisive run is full coverage (still
+ * below 1 — flake residual); anything else — unplanned gaps, or stops below
+ * target — is degraded.
+ */
+function basisFor(
+  confidence: number,
+  target: number,
+  unverified: readonly string[],
+  plannedSkips: ReadonlySet<string>,
+): ConfidenceBasis {
+  if (plannedSkips.size > 0 && confidence >= target && unverified.every(id => plannedSkips.has(id))) {
+    return 'certified-subset'
+  }
+  if (unverified.length === 0) return 'full-coverage'
+  return 'degraded'
 }
 
 /**

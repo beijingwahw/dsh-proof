@@ -17,6 +17,7 @@ import type { RelPath } from './impact.ts'
 import { attributeChange, isGlobalInvalidator, matchesAny } from './impact.ts'
 import type { DependencyGraph } from './impact.ts'
 import type { ChangeProvenance } from './changeset.ts'
+import type { GradedProofReport } from './report.ts'
 import { firstInformativeLine } from './excerpt.ts'
 
 /** The minimum a report needs to decide who owns a red check. */
@@ -161,8 +162,16 @@ export function regressionNarrative(checks: readonly AttributedCheck[]): string[
   return out
 }
 
+/**
+ * The display default for the certify target in the narrative — mirrors
+ * `certifyTarget`'s config default ("proven (p≈0.97)"). Callers that know the
+ * run's actual target can pass it; the plain `ProofReport` carries only the
+ * posterior, not the threshold it was certified against.
+ */
+const DEFAULT_CERTIFY_TARGET = 0.97
+
 /** Plain-language summary of what is and is not proven. */
-export function proofNarrative(report: ProofReport): string {
+export function proofNarrative(report: ProofReport, certifyTarget: number = DEFAULT_CERTIFY_TARGET): string {
   const s = report.summary
   const parts = [
     `${report.grade.toUpperCase()}`,
@@ -174,5 +183,20 @@ export function proofNarrative(report: ProofReport): string {
   if (s.preExisting > 0) parts.push(`${s.preExisting} pre-existing failure(s)`)
   if (s.indeterminate > 0) parts.push(`${s.indeterminate} indeterminate`)
   if (report.unverified.length > 0) parts.push(`${report.unverified.length} stale/unrun`)
+  // β graded trust: with a posterior on the report the grade line becomes a
+  // trust statement — `PROVEN (p≈0.97)` / `STALE (p≈0.61, target 0.97)`. The
+  // counts keep their exact legacy form; only the head grows a tail. Whether
+  // the target was met is read off `confidenceBasis` first (the report's own
+  // record of certification) with the numeric comparison as fallback, so a
+  // deployment with a non-default target still reads correctly.
+  const graded = report as GradedProofReport
+  if (graded.confidence !== undefined) {
+    const p = graded.confidence.toFixed(2)
+    const met = graded.confidenceBasis === 'certified-subset' || graded.confidence >= certifyTarget
+    const head = met
+      ? `${report.grade.toUpperCase()} (p≈${p})`
+      : `${report.grade.toUpperCase()} (p≈${p}, target ${certifyTarget.toFixed(2)})`
+    return [head, ...parts.slice(1)].join(' — ')
+  }
   return parts.join(' · ')
 }

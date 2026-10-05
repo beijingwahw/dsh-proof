@@ -9,7 +9,7 @@
 $ proof_claim "fixed the login redirect bug and added a regression test"
 ✓ PROVEN — fixed the login redirect bug and added a regression test
 evidence root: 9f2c1ab47d0e
-PROVEN — 3 check(s) passing, 0 regression(s), 1 pre-existing failure(s) left untouched.
+PROVEN (p≈0.97) — "fixed the login redirect bug and added a regression test" is backed by evidence root 9f2c1ab47d0e: 3 check(s) passing, 0 regression(s), 1 pre-existing failure(s) left untouched.
 ```
 
 **Install**
@@ -43,7 +43,7 @@ Existing plugins each cover part of it: `dsh-completion-guard` uses checklists t
 
 **2 · Change-impact incremental verification.** Only re-run the checks this change set made stale, selected through a reverse-dependency closure (import graph) plus path coupling. Lockfiles, `tsconfig`, CI workflows and other global invalidators force a full run. Uncertainty *widens* the selection — over-running costs a minute, under-running hides a break.
 
-**3 · Claim → evidence.** `proof_claim` is the only compliant way to state completion. It re-runs the affected checks and returns `proven: true` only when nothing regressed and coverage is complete.
+**3 · Claim → evidence.** `proof_claim` is the only compliant way to state completion. It re-runs the affected checks and returns `proven: true` only when nothing regressed and the claim is certified — posterior ≥ `certifyTarget` under the default bayesian scheduler, full coverage in `set` mode.
 
 ### The headline distinction
 
@@ -64,7 +64,7 @@ Working in an already-red repository is the normal condition. `dsh-proof` does n
 
 `proven` · `regressed` · `stale` · `unproven` · `no-baseline`
 
-Missing evidence is never papered over: a check that could not produce a decisive result makes the claim `stale`, not `proven`.
+Missing evidence is never papered over. Under the default `bayesian` scheduler (v0.9) the boundary is a confidence target: the claim is `proven` once its posterior crosses `certifyTarget` (narrative: `PROVEN (p≈0.97)`), `stale` below it — skipped checks carry their remaining uncertainty into the posterior instead of being hidden; with `scheduler: 'set'` a check that could not produce a decisive result makes the claim `stale`, not `proven`.
 
 ---
 
@@ -134,6 +134,10 @@ A deep-read pass closed every path that could round uncertainty into good news. 
 
 The v0.7 pass closed paths where *unknown* rounded up to "ok"; v0.8 closes paths where the **facts themselves** were wrong — miscounted, mangled by crashes and restarts, or mistranslated by the adapter layer. **Excerpt truth-in-budgeting**: the budget now bounds the assembled `text` itself — the omission marker and joining newlines count against it — uniformly for both strategies, and a new `keptOriginalChars` field closes the books exactly (`omittedChars + keptOriginalChars === normalized.length`; reconcile against it, never against `text.length`, which the marker inflates). Picked salient failure lines are never cut in half; overrun sacrifices the earliest tail line, then the head window's tail, and only a pathological budget degrades to head semantics. **Storage endurance**: appends are idempotent *across processes* — the first log scan re-indexes every address already on disk, so replaying a check against a fresh store after a restart is a true no-op instead of a duplicate record. A crash mid-write leaves a torn final line that used to fail audit forever; it is now atomically rewritten away with the repair recorded on-chain as `log/recovered-partial-tail`, while corruption of a whole line mid-log is deliberately **not** repaired — that is the signature of tampering, and audit keeps reporting it. Explicit `checks` and auto-discovery dedupe by command (explicit wins; the same command runs once), `canonicalJson` rejects circular structures with a clear `TypeError`, and Windows drive-letter case drift (`c:\ws\...` vs `C:/ws/...`) folds into `$WORKSPACE` (backslash roots keep legacy digests). **Windows shim resolution**: `npm`/`pnpm`/`yarn` ship as `.cmd` shims that Node's spawn refuses to execute — pnpm simply could not be a check command on Windows. The shims are *parsed* (npm's generation template is stable) and reduced to a direct `spawn(node, [script])` — no shell, no injection surface; non-standard shims produce a clean error instead of mojibake. **Death-cause honesty**: `CommandResult.killedBySignal` carries the fact that an external signal killed the child (always absent on win32 — Windows does not propagate signals across processes), and a signal death is recorded as `error` with the signal named — no longer silently mis-filed as `timeout`. **Adapter races and honesty**: concurrent writes use unique temp names plus rename retries (Windows EPERM contention), startup probes the on-disk baseline so the first prompt never claims "no baseline" when one exists, turn-stopping observers flush before drift detection reads state, mutation classification has a single source of truth (unknown tools default to mutation — conservatively charged to the agent), and the `source` content key no longer leaks code-snippet text into the touched set where it misattributed edits. The scheduling core (runner) gained its first direct unit tests: concurrency clamping, budget skips, abort propagation, out-of-order completion, signal deaths, spawn errors, excerpt pass-through.
 
+## Bayesian verification scheduling (v0.9): certify at 0.97, don't run everything
+
+"Which checks to run" stops being set algebra and becomes an information-gain decision — predictive test selection (Google 2015–2021, Facebook 2019) applied to agent assertions for the first time. The evidence log is, among other things, a labelled historical dataset (checkId × status × duration); the new pure module `src/core/bayes.ts` learns each check's flakiness and cost from it and models every check as a noisy sensor for one binary proposition ("the workspace is healthy"): the prior π = clamp(1 − ρ·s, 0.05, 0.999) combines a Laplace-smoothed failure tendency ρ = (failures+1)/(runs+5) (a never-run check starts skeptical at ρ = 0.2, a 200-run all-green veteran decays to ≈ 0.005; flips pair decisive observations only) with a change-impact strength ladder (direct hit or LSP-confirmed edge 1.0, closure distance 1/(1+d), bare prefix 0.7, wildcard/no-evidence 0.5); α = P(false fail | healthy) is learned from flips and clamped to [0.01, 0.3]; β = P(false pass | broken) is fixed at 0.02 — unlearnable without breakage ground truth, an admitted guess. `rankByInformationGain` then prices every candidate run by expected reduction of the claim's binary entropy per millisecond (VOI ≥ 0 provably — the Bayesian update is a martingale), with deterministic greedy ordering and lexicographic tie-breaks. The engine dispatches **waves** of `concurrency` checks, folds each wave's real outcomes into the running posterior, and stops early on one of three conditions — the claim posterior crosses `certifyTarget` (default 0.97), a first decisive failure lands (the assertion is dead; attribution is already sufficient), or the budget drains — leaving the rest as auditable planned skips carrying their priors (`skippedByPlan` rides the `proof/verified` marker). Graded trust replaces the binary grade: `proven` now means "posterior ≥ target", displayed as `PROVEN (p≈0.97)` or `STALE (p≈0.61, target 0.97)`, with `confidenceBasis` naming how the number was earned (`full-coverage` — still below 1, the flake residual is honest; `certified-subset`; `degraded`), and `proof_verify` surfaces `confidence` / `confidenceBasis` / `certifiedSkips` / `stoppedEarly` / `waves`. Soundness is preserved: the candidate pool is still the impact closure (global invalidators and uncertain graphs still widen it to every check), `all: true` and degraded git facts still bypass the waves for a forced whole-batch run, and `scheduler: 'set'` is the kill-switch restoring v0.8 behaviour bit-for-bit. Honest limits: the claim posterior is a product of per-check factors — independence is the model's largest known distortion (checks sharing changed files fail correlated), so the number is a ranking signal, not a calibrated probability.
+
 ## Architecture
 
 ```
@@ -150,7 +154,7 @@ The domain core is framework-free on purpose: it is fully unit-testable offline,
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit
-npm test              # 195 tests, node:test
+npm test              # 229 tests, node:test
 npm run build
 npm run bundle:check  # packaging contract self-check
 ```
@@ -167,6 +171,8 @@ Every tunable is a `cordis.yml` field — no hardcoded knobs. See [README.zh.md 
       name: dsh-proof
       config:
         requireBaseline: warn      # off | warn | ask
+        scheduler: bayesian        # bayesian = VOI-ranked waves + graded trust (default) | set = legacy whole-batch
+        certifyTarget: 0.97        # claim posterior that certifies `proven` without running everything
         impactGraph: true
         driftDetection: true
         enforceOnTurnEnd: true
@@ -176,6 +182,7 @@ Every tunable is a `cordis.yml` field — no hardcoded knobs. See [README.zh.md 
 
 - Check discovery is heuristic. For monorepos or custom build systems, declare `checks` explicitly with `paths` so incremental verification stays precise.
 - The dependency graph is approximate and errs toward over-inclusion. Dynamic `import()` calls, multi-line ESM imports and Python dotted imports produce edges since v0.7; reflection and string-built paths still cannot be resolved.
+- The claim posterior (v0.9) is a product of per-check health factors: independence is the model's largest known distortion — checks sharing changed files fail correlated — so `confidence` is a ranking signal, not a calibrated probability. β (false-pass) is fixed at 0.02, an admitted guess; the checks a certified-subset run skips stay on the books as planned skips carrying their priors, and priors are only as good as the evidence log.
 - Checkpoint cadence leaves a window (v0.2): records after the last signed checkpoint are chain-covered but not checkpoint-covered. The window is bounded by `checkpointEvery`, closed at every baseline/verify/claim boundary, and *visible* — `proof_status` reports `tailRecords`, the count of records since the last checkpoint. The anchor protects against the audited agent, not against a fully compromised host.
 - On machines without the signing key, signed checkpoints cannot be adjudicated locally: the audit reports them as `unverifiableCheckpoints` (a missing capability, not a forgery charge — the audit does not fail on it; anchor count/head comparison still bounds rewind).
 - `proven` permits pre-existing red checks — they are reported prominently but not charged to the session. Deliberate, not a hole.

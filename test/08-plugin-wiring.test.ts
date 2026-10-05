@@ -17,6 +17,7 @@ import * as plugin from '../src/index.ts'
 import { WorkspaceWatch } from '../src/dsh/observe.ts'
 import { toBaselineValue, toClaimValue, toStatusValue, toVerifyValue } from '../src/dsh/tools.ts'
 import type { AuditReport, ProofGrade, ProofReport } from '../src/core/evidence.ts'
+import type { ConfidenceBasis, GradedProofReport } from '../src/core/report.ts'
 import { Config } from '../src/config.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition, ToolRunContext } from '../src/vendor/dsh-tools.ts'
@@ -680,4 +681,119 @@ test('a pre-existing baseline on disk reaches the prompt section after the prewa
   } finally {
     await fsp.rm(proofDir, { recursive: true, force: true })
   }
+})
+
+// ---------------------------------------------------------------------------
+// Graded trust (γ): the bayesian scheduler's product — confidence, basis and
+// wave-plan footprint — must reach the canonical verify/claim values and the
+// render, and only when it exists: the legacy binary path stays byte-identical.
+// ---------------------------------------------------------------------------
+
+/** fakeReport grown by the graded-trust pair the bayesian regime produces. */
+function gradedReport(
+  confidence: number,
+  confidenceBasis: ConfidenceBasis,
+  overrides: { grade?: ProofGrade; unverified?: string[] } = {},
+): GradedProofReport {
+  return { ...fakeReport(overrides), confidence, confidenceBasis }
+}
+
+const bayesianSchedule = {
+  mode: 'bayesian' as const,
+  waves: 3,
+  stoppedEarly: 'certified' as const,
+  skippedByPlan: [
+    { checkId: 'lint', priorHealthy: 0.99 },
+    { checkId: 'e2e', priorHealthy: 0.98 },
+  ],
+}
+
+test('graded-trust fields ride the verify value only when the scheduler produced them', () => {
+  const value = toVerifyValue(
+    gradedReport(0.9654321, 'certified-subset', { grade: 'proven' }),
+    ['src/a.ts'], [],
+    { untouched: [], precision: 'approximate' },
+    undefined, undefined,
+    bayesianSchedule,
+  )
+  assert.equal(value.confidence, 0.97, 'the posterior is pre-rounded to two decimals for display')
+  assert.equal(value.confidenceBasis, 'certified-subset')
+  assert.equal(value.certifiedSkips, 2, 'planned skips carry their count')
+  assert.equal(value.stoppedEarly, 'certified')
+  assert.equal(value.waves, 3)
+
+  // A plan that ran to completion: nothing stopped early, nothing was skipped,
+  // so neither key may appear even though the confidence does.
+  const completed = toVerifyValue(
+    gradedReport(0.99, 'full-coverage'),
+    [], [], { untouched: [], precision: 'approximate' },
+    undefined, undefined,
+    { mode: 'bayesian' as const, waves: 1, stoppedEarly: null, skippedByPlan: [] },
+  )
+  assert.equal(completed.confidence, 0.99)
+  assert.equal(completed.confidenceBasis, 'full-coverage')
+  assert.ok(!('stoppedEarly' in completed) && !('certifiedSkips' in completed),
+    'null stop and empty skip-set emit neither field')
+
+  // The legacy binary path: no confidence on the report, no schedule — none of
+  // the graded-trust keys may appear, byte-stable with pre-γ session logs.
+  const legacy = toVerifyValue(fakeReport(), [], [], { untouched: [], precision: 'approximate' })
+  for (const key of ['confidence', 'confidenceBasis', 'certifiedSkips', 'stoppedEarly', 'waves']) {
+    assert.ok(!(key in legacy), `${key} must not appear on the ungraded path`)
+  }
+})
+
+test('renderVerify states the posterior, its basis and the prior-carried skips, and replays old meta without throwing', () => {
+  const verify = appliedTools().find(t => t.name === 'proof_verify')!
+
+  const certified = renderedText(verify, {
+    summary: 's', changed: [], externalChanged: [], regressions: [], fixed: [], preExisting: [], unverified: [],
+    confidence: 0.97, confidenceBasis: 'certified-subset', certifiedSkips: 2, stoppedEarly: 'certified', waves: 3,
+  })
+  assert.match(certified, /confidence p≈0\.97 \(certified-subset · 3 wave\(s\) · 2 check\(s\) certified by prior\)/)
+
+  const degraded = renderedText(verify, {
+    summary: 's', changed: [], externalChanged: [], regressions: [], fixed: [], preExisting: [], unverified: [],
+    confidence: 0.61, confidenceBasis: 'degraded', stoppedEarly: 'budget', waves: 2,
+  })
+  assert.match(degraded, /confidence p≈0\.61 \(degraded · 2 wave\(s\) · stopped early: budget\)/)
+
+  const wholeBatch = renderedText(verify, {
+    summary: 's', changed: [], externalChanged: [], regressions: [], fixed: [], preExisting: [], unverified: [],
+    confidence: 0.99, confidenceBasis: 'full-coverage',
+  })
+  assert.match(wholeBatch, /confidence p≈0\.99 \(full-coverage · all checks run\)/)
+
+  // Pre-γ session meta lacks every new field; replay must degrade to prose,
+  // never throw, and never invent a confidence line.
+  let legacy = ''
+  assert.doesNotThrow(() => {
+    legacy = renderedText(verify, {
+      summary: 's', changed: [], externalChanged: [], regressions: [], fixed: [], preExisting: [], unverified: [],
+    })
+  })
+  assert.ok(!legacy.includes('confidence'), 'no confidence line without a posterior')
+  // A partial/hostile value (posterior but no basis) still renders the number.
+  assert.doesNotThrow(() => { renderedText(verify, {}) })
+  assert.doesNotThrow(() => { renderedText(verify, { summary: 's', confidence: 0.5 }) })
+})
+
+test('claim values carry the posterior and say p≈ in the summary when one exists', () => {
+  const report = gradedReport(0.9654321, 'certified-subset', { grade: 'proven' })
+  const verified = toVerifyValue(report, ['src/a.ts'], [], { untouched: [], precision: 'approximate' })
+  const claim = toClaimValue('fixed the flaky retry', report, verified)
+  assert.equal(claim.confidence, 0.97, 'the posterior transfers with the claim')
+  assert.match(claim.summary, /PROVEN \(p≈0\.97\) — /)
+
+  const stale = gradedReport(0.61, 'degraded', { grade: 'stale', unverified: ['e2e'] })
+  const staleClaim = toClaimValue('same claim', stale, toVerifyValue(stale, [], [], { untouched: [], precision: 'approximate' }))
+  assert.match(staleClaim.summary, /NOT PROVEN \(stale, p≈0\.61\)/)
+
+  // The legacy binary path: no posterior anywhere, canonical claim unchanged.
+  const legacyReport = fakeReport({ grade: 'unproven' })
+  const legacyClaim = toClaimValue(
+    'same claim', legacyReport, toVerifyValue(legacyReport, [], [], { untouched: [], precision: 'approximate' }),
+  )
+  assert.ok(!('confidence' in legacyClaim), 'no posterior on the ungraded path — canonical value stays byte-identical')
+  assert.ok(!legacyClaim.summary.includes('p≈'))
 })

@@ -17,6 +17,7 @@ import type {
 } from '../vendor/dsh-tools.ts'
 import type { ProofEngine } from '../engine.ts'
 import type { AuditReport, ProofGrade, ProofReport } from '../core/evidence.ts'
+import type { ConfidenceBasis, GradedProofReport } from '../core/report.ts'
 import { proofNarrative } from '../core/regression.ts'
 import { firstInformativeLine } from '../core/excerpt.ts'
 
@@ -87,6 +88,21 @@ export interface VerifyValue {
    * what moved" stays loud instead of reading like a deliberate `all: true`.
    */
   degraded?: true
+  /**
+   * Posterior probability that every affected check is healthy (γ): the "p" in
+   * `proven (p≈0.97)`, pre-rounded to two decimals for display. Present exactly
+   * when the report carried graded trust; the legacy binary path omits every
+   * field below so its canonical value stays byte-stable.
+   */
+  confidence?: number
+  /** How `confidence` was earned; rides with it, never alone. */
+  confidenceBasis?: ConfidenceBasis
+  /** Checks the wave plan never dispatched, resting on their priors (>0 only). */
+  certifiedSkips?: number
+  /** Why the wave plan ended before every affected check ran; only when it did. */
+  stoppedEarly?: 'certified' | 'failed' | 'budget'
+  /** Waves the bayesian plan actually dispatched; present only with a schedule. */
+  waves?: number
   regressions: { label: string; suspects: string[]; detail: string }[]
   fixed: string[]
   preExisting: string[]
@@ -101,6 +117,11 @@ export interface ClaimValue {
   grade: ProofGrade
   proven: boolean
   root: string
+  /**
+   * The verification posterior (γ), transferred when the run carried one so a
+   * claim card can speak in probabilities. Absent on the legacy binary path.
+   */
+  confidence?: number
   /** Checks that regressed against the baseline — blame, not credit. */
   regressions: VerifyValue['regressions']
   blockers: string[]
@@ -293,6 +314,13 @@ function createVerifyTool(engine: ProofEngine, touched?: () => readonly string[]
           affectedChecks: { type: 'integer' }, untouchedChecks: { type: 'integer' },
           // Present only when git facts were unavailable (see VerifyValue).
           degraded: { type: 'boolean' },
+          // Present only when the run carries graded trust (γ) — declared so
+          // the schema stays truthful about what a bayesian run may emit.
+          confidence: { type: 'number' },
+          confidenceBasis: { type: 'string', enum: ['full-coverage', 'certified-subset', 'degraded'] },
+          certifiedSkips: { type: 'integer' },
+          stoppedEarly: { type: 'string', enum: ['certified', 'failed', 'budget'] },
+          waves: { type: 'integer' },
           regressions: {
             type: 'array',
             items: {
@@ -333,6 +361,7 @@ function createVerifyTool(engine: ProofEngine, touched?: () => readonly string[]
       })
       return toVerifyValue(
         outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
+        outcome.schedule,
       ) as unknown as JsonValue
     },
   }
@@ -354,6 +383,8 @@ function createClaimTool(engine: ProofEngine, touched?: () => readonly string[])
           claim: { type: 'string' },
           grade: { type: 'string', enum: ['proven', 'unproven', 'regressed', 'no-baseline', 'stale'] },
           proven: { type: 'boolean' }, root: { type: 'string' },
+          // Present only when the verification carried a posterior (γ).
+          confidence: { type: 'number' },
           regressions: {
             type: 'array',
             items: {
@@ -398,6 +429,7 @@ function createClaimTool(engine: ProofEngine, touched?: () => readonly string[])
       })
       const verified = toVerifyValue(
         outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
+        outcome.schedule,
       )
       return toClaimValue(parsed.claim, outcome.report, verified) as unknown as JsonValue
     },
@@ -502,18 +534,39 @@ export function toBaselineValue(
 }
 
 export function toVerifyValue(
-  report: ProofReport,
+  report: GradedProofReport,
   changed: readonly string[],
   checks: readonly { label: string; verdict: string; suspects: readonly string[]; current?: { outputHead?: string } }[],
   selection?: { readonly untouched?: readonly unknown[]; readonly precision?: string },
   attribution?: { method: string; records: readonly { path: string; provenance: string }[] },
   degraded?: true,
+  schedule?: {
+    readonly mode: 'bayesian'
+    readonly waves: number
+    readonly stoppedEarly: 'certified' | 'failed' | 'budget' | null
+    readonly skippedByPlan: ReadonlyArray<{ checkId: string; priorHealthy: number }>
+  },
 ): VerifyValue {
   const externalChanged = attribution?.records.filter(r => r.provenance === 'external').map(r => r.path) ?? []
   // The check list covers every discovered spec (attribution included), so the
   // old `discovered - checks.length` formula was structurally always 0 — the
   // honest count of proven-untouched checks lives on the selection itself.
   const untouched = selection?.untouched
+  // γ graded trust: the scheduler's by-products ride only when they exist.
+  // Every read is guarded so a partial or hostile outcome shape degrades to
+  // absence instead of throwing; the display value is pre-rounded to two
+  // decimals while the report keeps the full-precision number.
+  const confidence = typeof report.confidence === 'number'
+    ? Math.round(report.confidence * 100) / 100
+    : undefined
+  const confidenceBasis = report.confidenceBasis === 'full-coverage'
+    || report.confidenceBasis === 'certified-subset'
+    || report.confidenceBasis === 'degraded'
+    ? report.confidenceBasis
+    : undefined
+  const skippedByPlan = Array.isArray(schedule?.skippedByPlan) ? schedule.skippedByPlan : []
+  const stoppedEarly = schedule?.stoppedEarly
+  const waves = typeof schedule?.waves === 'number' ? schedule.waves : undefined
   return {
     grade: report.grade,
     root: report.root,
@@ -526,6 +579,16 @@ export function toVerifyValue(
     // E3 pass-through: forced-because-blind must read differently from
     // forced-because-asked-for. Present only on the degraded path.
     ...(degraded === true ? { degraded: true as const } : {}),
+    // γ pass-through: posterior, basis and wave-plan footprint — each key
+    // appears only when it carries information, so the ungraded canonical
+    // value stays byte-identical to what session logs already hold.
+    ...(confidence !== undefined ? { confidence } : {}),
+    ...(confidence !== undefined && confidenceBasis !== undefined ? { confidenceBasis } : {}),
+    ...(skippedByPlan.length > 0 ? { certifiedSkips: skippedByPlan.length } : {}),
+    ...(stoppedEarly === 'certified' || stoppedEarly === 'failed' || stoppedEarly === 'budget'
+      ? { stoppedEarly }
+      : {}),
+    ...(waves !== undefined ? { waves } : {}),
     regressions: checks
       .filter(c => c.verdict === 'regression' || c.verdict === 'new-failure')
       .map(c => ({
@@ -549,18 +612,23 @@ export function toClaimValue(claim: string, report: ProofReport, verified: Verif
   for (const reg of verified.regressions) blockers.push(`Regression: ${reg.label} — ${reg.detail}`)
   if (report.grade === 'unproven') blockers.push('Verification was incomplete (skipped, aborted or timed out).')
 
+  // γ graded trust: the posterior rides onto the claim exactly when the
+  // verification had one — same two-decimal number, never a bare probability.
+  // The no-posterior branches keep their exact legacy text.
+  const p = typeof verified.confidence === 'number' ? verified.confidence : undefined
   return {
     claim,
     grade: report.grade,
     proven: report.grade === 'proven',
     root: report.root,
+    ...(p !== undefined ? { confidence: p } : {}),
     regressions: verified.regressions,
     blockers,
     summary: report.grade === 'proven'
-      ? `PROVEN — "${claim}" is backed by evidence root ${report.root.slice(0, 12)}: `
+      ? `PROVEN${p !== undefined ? ` (p≈${p.toFixed(2)})` : ''} — "${claim}" is backed by evidence root ${report.root.slice(0, 12)}: `
         + `${report.summary.passing} check(s) passing, ${report.summary.regressions} regression(s), `
         + `${report.summary.preExisting} pre-existing failure(s) left untouched.`
-      : `NOT PROVEN (${report.grade}) — "${claim}". ${blockers.join(' ')}`,
+      : `NOT PROVEN (${report.grade}${p !== undefined ? `, p≈${p.toFixed(2)}` : ''}) — "${claim}". ${blockers.join(' ')}`,
   }
 }
 
@@ -621,6 +689,44 @@ function renderBaseline(value: BaselineValue): string {
   return lines.join('\n')
 }
 
+/**
+ * The γ confidence line: `confidence p≈0.97 (certified-subset · 3 wave(s) ·
+ * 2 check(s) certified by prior)`. The basis names the regime; the tail says
+ * what earned it — full-coverage: every affected check ran; certified-subset:
+ * the posterior crossed the target and the unrun checks rest on their priors;
+ * degraded: the run ended below target (with the stop reason when there was
+ * one). Total on replay: every field is individually guarded, and a value
+ * without a posterior produces no line at all.
+ */
+function confidenceLine(v: VerifyValue): string | null {
+  if (typeof v.confidence !== 'number') return null
+  const p = v.confidence.toFixed(2)
+  const basis = v.confidenceBasis === 'full-coverage' || v.confidenceBasis === 'certified-subset'
+    || v.confidenceBasis === 'degraded'
+    ? v.confidenceBasis
+    : null
+  const waves = typeof v.waves === 'number' ? v.waves : null
+  const skips = typeof v.certifiedSkips === 'number' ? v.certifiedSkips : 0
+  const stopped = v.stoppedEarly === 'certified' || v.stoppedEarly === 'failed' || v.stoppedEarly === 'budget'
+    ? v.stoppedEarly
+    : null
+  const parts: string[] = []
+  if (basis !== null) parts.push(basis)
+  if (waves !== null) parts.push(`${waves} wave(s)`)
+  if (basis === 'certified-subset') {
+    parts.push(skips > 0 ? `${skips} check(s) certified by prior` : 'certified by prior')
+  } else if (basis === 'full-coverage') {
+    parts.push('all checks run')
+  } else if (basis === 'degraded') {
+    parts.push(stopped !== null ? `stopped early: ${stopped}` : 'below target')
+  } else if (skips > 0) {
+    // Unknown or missing basis (partial replay): keep whatever schedule facts
+    // survive instead of throwing.
+    parts.push(`${skips} check(s) certified by prior`)
+  }
+  return parts.length > 0 ? `confidence p≈${p} (${parts.join(' · ')})` : `confidence p≈${p}`
+}
+
 function renderVerify(value: VerifyValue): string {
   const v = value ?? ({} as VerifyValue)
   const root = typeof v.root === 'string' ? v.root.slice(0, 12) : '<none>'
@@ -635,8 +741,12 @@ function renderVerify(value: VerifyValue): string {
     `changed: ${changed.length} file(s) · attribution ${String(v.attributionMethod ?? 'explicit')}` +
       (externalChanged.length > 0 ? ` · ${externalChanged.length} external edit(s)` : '') +
       ` · impact ${String(v.impactPrecision ?? 'approximate')}`,
-    '',
   ]
+  // γ graded trust: one line stating the posterior and how it was earned.
+  // Absent on the legacy path so the normal render stays byte-identical.
+  const confidence = confidenceLine(v)
+  if (confidence !== null) lines.push(confidence)
+  lines.push('')
   if (v.degraded === true) {
     // Without this line "impact forced" reads like the caller asked for `all`;
     // the honest cause is that git facts were missing, so everything ran.

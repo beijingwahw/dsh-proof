@@ -3,8 +3,8 @@ import assert from 'node:assert/strict'
 
 import { ProofEngine } from '../src/engine.ts'
 import { assembleProof } from '../src/core/report.ts'
-import { attributeChecks } from '../src/core/regression.ts'
-import { snapshotWorkspace } from '../src/core/evidence.ts'
+import { attributeChecks, proofNarrative } from '../src/core/regression.ts'
+import { makeEvidence, snapshotWorkspace } from '../src/core/evidence.ts'
 import { VerificationRunner } from '../src/core/runner.ts'
 import { FakeClock, FakeCommands, FakeWorkspace, MemoryFs, spec } from './helpers.ts'
 
@@ -382,4 +382,161 @@ test('E3: git unavailable forces the full check set even for a narrow change', a
   assert.equal(outcome.selection.untouched.length, 0)
   assert.equal(outcome.degraded, true, 'degradation is surfaced on the outcome')
   assert.equal(outcome.report.grade, 'proven', 'the forced run itself still grades normally')
+})
+
+// -- β: bayesian wave scheduling + graded trust ----------------------------------
+
+function waveProject() {
+  return {
+    [`${ROOT}/package.json`]: JSON.stringify({ name: 'demo' }),
+    [`${ROOT}/src/a.ts`]: 'export const a = 1\n',
+    [`${ROOT}/src/b.ts`]: 'export const b = 1\n',
+    [`${ROOT}/src/c.ts`]: 'export const c = 1\n',
+    [`${ROOT}/src/d.ts`]: 'export const d = 1\n',
+  }
+}
+
+const WAVE_CHECKS = [
+  { label: 'a tests', command: ['npm', 'run', '--silent', 'a'], kind: 'test' as const, paths: ['src/a.ts'] },
+  { label: 'b tests', command: ['npm', 'run', '--silent', 'b'], kind: 'test' as const, paths: ['src/b.ts'] },
+  { label: 'c tests', command: ['npm', 'run', '--silent', 'c'], kind: 'test' as const, paths: ['src/c.ts'] },
+  { label: 'd tests', command: ['npm', 'run', '--silent', 'd'], kind: 'test' as const, paths: ['src/d.ts'] },
+]
+
+const WAVE_CHANGED = ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts']
+
+function waveEngine(
+  fs: MemoryFs,
+  commands: FakeCommands,
+  overrides: Partial<ConstructorParameters<typeof ProofEngine>[0]> = {},
+) {
+  return new ProofEngine({
+    root: ROOT,
+    fs,
+    commands,
+    workspace: new FakeWorkspace(ROOT),
+    clock: new FakeClock(),
+    autoDiscover: false,
+    checks: WAVE_CHECKS,
+    concurrency: 2,
+    impactGraphLimit: 1_000,
+    checkTimeoutMs: 5_000,
+    verifyBudgetMs: 20_000,
+    ...overrides,
+  })
+}
+
+/** Seed straight green history straight into the evidence log, behind the engine's back. */
+async function seedGreenHistory(engine: ProofEngine, passes: number): Promise<void> {
+  const specs = await engine.loadChecks()
+  const clock = new FakeClock()
+  const ws = snapshotWorkspace('abc123', [])
+  for (let i = 0; i < passes; i++) {
+    for (const s of specs) {
+      await engine.storeView.append(makeEvidence(s, { status: 'pass', exitCode: 0, durationMs: 5, output: 'ok' }, ws, clock))
+    }
+  }
+}
+
+test('β: bayesian scheduling certifies early — planned skips carry their priors', async () => {
+  const fs = MemoryFs.of(waveProject())
+  const commands = new FakeCommands()
+  const engine = waveEngine(fs, commands, { certifyTarget: 0.5 })
+  await engine.establishBaseline()
+  await seedGreenHistory(engine, 6)
+
+  const callsBefore = commands.calls.length
+  const outcome = await engine.verify({ changed: WAVE_CHANGED })
+
+  const schedule = outcome.schedule
+  assert.ok(schedule, 'bayesian mode carries schedule metadata')
+  assert.equal(schedule.mode, 'bayesian')
+  assert.equal(schedule.waves, 1, 'one wave dispatched')
+  assert.equal(schedule.stoppedEarly, 'certified')
+  assert.equal(commands.calls.length - callsBefore, 2, 'only the first wave actually executed')
+  assert.equal(schedule.skippedByPlan.length, 2, 'the rest of the plan is a planned skip')
+  for (const skip of schedule.skippedByPlan) {
+    assert.ok(skip.priorHealthy > 0.5 && skip.priorHealthy < 1, `prior for ${skip.checkId} is a healthy probability`)
+  }
+  assert.deepEqual(schedule.skippedByPlan.map(s => s.checkId), outcome.report.unverified, 'unverified is exactly the planned skips')
+  assert.ok(outcome.report.confidence !== undefined && outcome.report.confidence >= 0.5, 'claim posterior crosses the target')
+  assert.equal(outcome.report.grade, 'proven')
+  assert.equal(outcome.report.confidenceBasis, 'certified-subset')
+  assert.match(proofNarrative(outcome.report), /PROVEN \(p≈0\.\d+\)/)
+})
+
+test('β: a decisive failure in the first wave stops the plan — attribution over coverage', async () => {
+  const fs = MemoryFs.of(waveProject())
+  const commands = new FakeCommands()
+  const engine = waveEngine(fs, commands)
+  await engine.establishBaseline()
+  commands.on(() => true, { exitCode: 1, output: 'boom' })
+
+  const callsBefore = commands.calls.length
+  const outcome = await engine.verify({ changed: WAVE_CHANGED })
+
+  const schedule = outcome.schedule
+  assert.ok(schedule)
+  assert.equal(schedule.stoppedEarly, 'failed')
+  assert.equal(schedule.waves, 1)
+  assert.equal(commands.calls.length - callsBefore, 2, 'no second wave is dispatched after a decisive failure')
+  assert.equal(schedule.skippedByPlan.length, 2)
+  assert.equal(outcome.report.grade, 'regressed')
+  assert.equal(outcome.report.summary.regressions, 2)
+  assert.equal(outcome.report.confidenceBasis, 'degraded')
+  assert.ok((outcome.report.confidence ?? 1) < 0.97, 'a dead assertion drags the claim posterior down')
+})
+
+test('β: scheduler set keeps the legacy whole-batch behaviour', async () => {
+  const fs = MemoryFs.of(waveProject())
+  const commands = new FakeCommands()
+  const engine = waveEngine(fs, commands, { scheduler: 'set' })
+  await engine.establishBaseline()
+
+  const callsBefore = commands.calls.length
+  const outcome = await engine.verify({ changed: WAVE_CHANGED })
+
+  assert.equal(outcome.schedule, undefined, 'no wave metadata on the legacy path')
+  assert.equal(commands.calls.length - callsBefore, 4, 'every affected check ran')
+  assert.equal(outcome.report.grade, 'proven')
+  assert.equal(outcome.report.unverified.length, 0)
+  assert.ok(outcome.report.confidence !== undefined, 'the whole-batch path still displays a confidence number')
+  assert.equal(outcome.report.confidenceBasis, 'full-coverage')
+})
+
+test('β: identical inputs produce byte-identical confidence (determinism)', async () => {
+  const runOnce = async () => {
+    const fs = MemoryFs.of(waveProject())
+    const commands = new FakeCommands()
+    const engine = waveEngine(fs, commands, { certifyTarget: 0.9 })
+    await engine.establishBaseline()
+    await seedGreenHistory(engine, 6)
+    return engine.verify({ changed: WAVE_CHANGED })
+  }
+  const first = await runOnce()
+  const second = await runOnce()
+  assert.strictEqual(first.report.confidence, second.report.confidence, 'confidence is bit-for-bit stable')
+  assert.equal(JSON.stringify(first.schedule), JSON.stringify(second.schedule))
+  assert.equal(first.report.root, second.report.root)
+})
+
+test('β: budget exhaustion degrades below target and grades stale', async () => {
+  const fs = MemoryFs.of(waveProject())
+  const commands = new FakeCommands()
+  const warm = waveEngine(fs, commands)
+  await warm.establishBaseline()
+
+  // A second engine over the same evidence log, holding a budget the
+  // FakeClock (1ms per read) exhausts before the first wave can be afforded.
+  const starved = waveEngine(fs, commands, { verifyBudgetMs: 1 })
+  const outcome = await starved.verify({ changed: WAVE_CHANGED })
+
+  const schedule = outcome.schedule
+  assert.ok(schedule)
+  assert.equal(schedule.stoppedEarly, 'budget')
+  assert.equal(schedule.waves, 0, 'no wave was ever dispatched')
+  assert.equal(schedule.skippedByPlan.length, 4, 'the whole plan is skipped')
+  assert.equal(outcome.report.grade, 'stale')
+  assert.equal(outcome.report.confidenceBasis, 'degraded')
+  assert.ok((outcome.report.confidence ?? 1) < 0.97, 'the claim never reached the target')
 })

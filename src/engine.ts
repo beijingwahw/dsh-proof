@@ -16,13 +16,18 @@
 
 import type {
   Baseline, ChangeProvenance, ChangeSetResolution, CheckSpec, Clock, CommandPort,
-  DefinitionResolverPort, DependencyGraph, Evidence, FsPort, ProofReport,
-  RelPath, SelectionResult, SignerPort, WorkspacePort, WorkspaceSnapshot,
+  DefinitionResolverPort, DependencyGraph, Evidence, FsPort, RelPath,
+  SelectionResult, SignerPort, WorkspacePort, WorkspaceSnapshot,
 } from './core/index.ts'
 import {
   DEFAULT_IGNORE_DIRS, EvidenceStore, VerificationRunner, assembleBaseline,
   assembleProof, buildDependencyGraph, discoverChecks, resolveChangeSet,
   selectAffectedChecks, sha256, snapshotWorkspace,
+  claimProbability, computePriors, posteriorHealthy, rankByInformationGain,
+  summarizeHistory,
+} from './core/index.ts'
+import type {
+  CheckPrior, ClaimModel, ConfidenceInput, GradedProofReport,
 } from './core/index.ts'
 // core/index.ts re-exports the stable surface; `forcedSelection` is consumed
 // here straight from its module (the core barrel is not this batch's to edit).
@@ -53,6 +58,15 @@ export interface EngineOptions {
   readonly checkTimeoutMs?: number
   readonly verifyBudgetMs?: number
   readonly concurrency?: number
+  /**
+   * Verification scheduling strategy (β). `bayesian` (default): rank the
+   * affected checks by information gain per cost, run them in waves, and stop
+   * once the claim posterior crosses `certifyTarget`. `set`: the legacy
+   * whole-batch run with legacy grading — the behavioural escape hatch.
+   */
+  readonly scheduler?: 'bayesian' | 'set'
+  /** Claim-probability target for bayesian certification — the p in `proven (p≈0.97)`. */
+  readonly certifyTarget?: number
   readonly impactGraph?: boolean
   readonly impactGraphLimit?: number
   /** LSP-backed resolver for precise, alias-aware impact edges (v0.4). */
@@ -90,7 +104,7 @@ export interface VerifyOptions {
 }
 
 export interface VerifyOutcome {
-  readonly report: ProofReport
+  readonly report: GradedProofReport
   readonly checks: readonly AttributedCheck[]
   readonly selection: SelectionResult
   readonly changed: readonly RelPath[]
@@ -102,6 +116,20 @@ export interface VerifyOutcome {
    * so "we ran everything because we couldn't tell what moved" stays loud.
    */
   readonly degraded?: true
+  /**
+   * Bayesian wave-plan metadata (β). Present only when the bayesian scheduler
+   * actually planned waves — never on the forced/'set' whole-batch path, and
+   * never when nothing was affected.
+   */
+  readonly schedule?: {
+    readonly mode: 'bayesian'
+    /** Waves actually dispatched. */
+    readonly waves: number
+    /** Why the plan ended before every affected check ran; null when it ran to completion. */
+    readonly stoppedEarly: 'certified' | 'failed' | 'budget' | null
+    /** Checks the plan deliberately never dispatched, each with the prior it rests on. */
+    readonly skippedByPlan: ReadonlyArray<{ checkId: string; priorHealthy: number }>
+  }
 }
 
 /**
@@ -159,6 +187,8 @@ export class ProofEngine {
     checkTimeoutMs: number
     verifyBudgetMs: number
     concurrency: number
+    scheduler: 'bayesian' | 'set'
+    certifyTarget: number
     impactGraph: boolean
     impactGraphLimit: number
     lspQueryBudget: number
@@ -212,6 +242,10 @@ export class ProofEngine {
       checkTimeoutMs: options.checkTimeoutMs ?? 120_000,
       verifyBudgetMs: options.verifyBudgetMs ?? 300_000,
       concurrency: options.concurrency ?? 2,
+      // β: bayesian waves are the default product stance; 'set' is the escape
+      // hatch for deployments that must reproduce pre-β behaviour exactly.
+      scheduler: options.scheduler ?? 'bayesian',
+      certifyTarget: options.certifyTarget ?? 0.97,
       impactGraph: options.impactGraph ?? true,
       impactGraphLimit: options.impactGraphLimit ?? 20_000,
       lspQueryBudget: options.lspQueryBudget ?? 400,
@@ -405,37 +439,233 @@ export class ProofEngine {
       ? forcedSelection(specs, changed)
       : selectAffectedChecks(specs, changed, graph)
 
-    const batch = await this.runner.run(selection.affected, {
-      concurrency: this.options.concurrency,
-      totalBudgetMs: this.options.verifyBudgetMs,
-      ...(options.signal !== undefined ? { signal: options.signal } : {}),
-      ...(options.onProgress !== undefined
-        ? { onEvidence: (ev, i, total) => options.onProgress!(ev.label, i, total) }
-        : {}),
-    })
-    for (const record of batch.records) await this.store.append(record)
+    // β: the sanity constitution keeps the whole-batch path mandatory wherever
+    // certainty is owed — `all`, degraded git facts, and the 'set' escape
+    // hatch all run every affected check to completion. Only a healthy,
+    // non-forced, bayesian-scheduled run may stop early on evidence.
+    const bayesian = this.options.scheduler !== 'set' && !forceAll
+
+    // One verification, one workspace snapshot: waves and the whole-batch path
+    // alike stamp every record (and the report) with the state verification
+    // started from, not with per-wave re-reads that could drift mid-run.
+    const snapshot = await this.workspaceSnapshot()
+
+    const records: Evidence[] = []
+    let schedule: VerifyOutcome['schedule']
+    let confidence: ConfidenceInput | undefined
+    if (bayesian && selection.affected.length > 0) {
+      const plan = await this.runBayesianSchedule(selection.affected, changed, graph, snapshot, options)
+      records.push(...plan.records)
+      schedule = plan.schedule
+      confidence = plan.confidence
+    } else {
+      // Priors must snapshot the log BEFORE this run appends to it — history
+      // is what the check brought to the table, not what it did just now.
+      const priors = await this.priorsFor(selection.affected, changed, graph)
+      const batch = await this.runner.run(selection.affected, {
+        concurrency: this.options.concurrency,
+        totalBudgetMs: this.options.verifyBudgetMs,
+        workspace: snapshot,
+        ...(options.signal !== undefined ? { signal: options.signal } : {}),
+        ...(options.onProgress !== undefined
+          ? { onEvidence: (ev, i, total) => options.onProgress!(ev.label, i, total) }
+          : {}),
+      })
+      for (const record of batch.records) await this.store.append(record)
+      records.push(...batch.records)
+      // Even the whole-batch path earns its confidence number — display only:
+      // grading on this path stays binary (requireFullCoverage below).
+      confidence = this.updateFactors(priors, batch.records, selection.affected.length > 0)
+    }
 
     const { report, checks } = assembleProof({
       specs,
       baseline,
-      records: batch.records,
+      records,
       changed,
       ...(graph !== undefined ? { graph } : {}),
       ...(provenance.size > 0 ? { provenance } : {}),
-      workspace: batch.workspace,
+      workspace: snapshot,
       clock: this.clock,
-      requireFullCoverage: true,
+      requireFullCoverage: !bayesian,
       ...(forceAll ? { forceAll: true } : {}),
+      ...(confidence !== undefined ? { confidence } : {}),
     })
     await this.store.mark('proof/verified', {
       grade: report.grade, root: report.root, changed: changed.length,
       attribution: attribution.method,
       preExistingExcluded: attribution.preExistingExcluded.length,
       regressions: report.summary.regressions,
+      // β: the wave plan's footprint rides the marker — what stopped it and
+      // how much of the plan never ran are chain facts, like everything else.
+      ...(schedule !== undefined
+        ? {
+            scheduler: schedule.mode,
+            waves: schedule.waves,
+            stoppedEarly: schedule.stoppedEarly ?? 'completed',
+            plannedSkips: schedule.skippedByPlan.length,
+            confidence: report.confidence ?? null,
+          }
+        : {}),
     })
     // Every claim-grade boundary closes the checkpoint window.
     await this.store.checkpoint()
-    return { report, checks, selection, changed, attribution, ...(degraded ? { degraded: true as const } : {}) }
+    return {
+      report, checks, selection, changed, attribution,
+      ...(degraded ? { degraded: true as const } : {}),
+      ...(schedule !== undefined ? { schedule } : {}),
+    }
+  }
+
+  /**
+   * β: the bayesian wave plan. Ranks the not-yet-run checks by expected
+   * information gain per unit cost, dispatches a wave of `concurrency` of
+   * them, folds each decisive outcome into the running claim model, and stops
+   * the moment one of three things happens, checked in this order:
+   *
+   *   (a) the claim posterior crosses `certifyTarget` — certified, the rest
+   *       of the plan becomes a planned skip resting on its prior;
+   *   (b) a decisive failure lands — the assertion is dead, attribution
+   *       evidence is already sufficient, remaining checks cannot rescue it;
+   *   (c) the budget drains or the caller aborts.
+   *
+   * Non-decisive outcomes (timeout/aborted/error/skipped) never update a
+   * factor: the check keeps its prior and stays counted as undecided.
+   */
+  private async runBayesianSchedule(
+    affected: readonly CheckSpec[],
+    changed: readonly RelPath[],
+    graph: DependencyGraph | undefined,
+    snapshot: WorkspaceSnapshot,
+    options: VerifyOptions,
+  ): Promise<{ records: Evidence[]; schedule: NonNullable<VerifyOutcome['schedule']>; confidence: ConfidenceInput }> {
+    const priors = await this.priorsFor(affected, changed, graph)
+    const target = this.options.certifyTarget
+    const specById = new Map(affected.map(c => [c.id, c] as const))
+    const factors = new Map<string, number>()
+    for (const prior of priors.values()) factors.set(prior.checkId, prior.priorHealthy)
+    const model: ClaimModel = { factors }
+    const pending = new Map<string, CheckPrior>(priors)
+
+    const records: Evidence[] = []
+    const runCheckIds = new Set<string>()
+    const started = this.clock.now()
+    // Behind a call on purpose: `signal.aborted` is live state that flips while
+    // a wave is awaited, and TS would otherwise keep the loop-top narrowing
+    // ("not aborted") across the await and flag the post-wave re-read as
+    // unreachable.
+    const signalAborted = (): boolean => options.signal?.aborted === true
+    let waves = 0
+    let settled = 0
+    let stoppedEarly: 'certified' | 'failed' | 'budget' | null = null
+
+    while (pending.size > 0) {
+      // (c) pre-wave: a plan that cannot afford its next wave must not start it.
+      if (signalAborted() || this.clock.now() - started >= this.options.verifyBudgetMs) {
+        stoppedEarly = 'budget'
+        break
+      }
+      const ordered = rankByInformationGain(pending, model)
+      const wave = ordered.slice(0, Math.max(1, Math.min(this.options.concurrency, pending.size)))
+      const waveSpecs = wave
+        .map(step => specById.get(step.checkId))
+        .filter((c): c is CheckSpec => c !== undefined)
+      const remainingBudgetMs = Math.max(0, this.options.verifyBudgetMs - (this.clock.now() - started))
+      const batch = await this.runner.run(waveSpecs, {
+        concurrency: this.options.concurrency,
+        totalBudgetMs: remainingBudgetMs,
+        workspace: snapshot,
+        ...(options.signal !== undefined ? { signal: options.signal } : {}),
+        ...(options.onProgress !== undefined
+          ? { onEvidence: (ev, index) => options.onProgress!(ev.label, settled + index, affected.length) }
+          : {}),
+      })
+      waves += 1
+
+      let decisiveFail = false
+      for (const record of batch.records) {
+        await this.store.append(record)
+        records.push(record)
+        runCheckIds.add(record.checkId)
+        pending.delete(record.checkId)
+        const prior = priors.get(record.checkId)
+        if (prior === undefined) continue
+        if (record.status === 'pass' || record.status === 'fail') {
+          factors.set(record.checkId, posteriorHealthy(prior, record.status))
+          if (record.status === 'fail') decisiveFail = true
+        }
+        // every other status: the factor keeps its prior — undecided, not
+        // acquitted and not condemned.
+      }
+      settled += batch.records.length
+
+      // Early stops, in the design's priority order: certify, then blame,
+      // then resources.
+      if (claimProbability(model) >= target) {
+        stoppedEarly = 'certified'
+        break
+      }
+      if (decisiveFail) {
+        stoppedEarly = 'failed'
+        break
+      }
+      if (batch.aborted || signalAborted() || this.clock.now() - started >= this.options.verifyBudgetMs) {
+        stoppedEarly = 'budget'
+        break
+      }
+    }
+
+    const skippedByPlan = [...pending.keys()].sort().map(checkId => ({
+      checkId,
+      priorHealthy: priors.get(checkId)?.priorHealthy ?? 0,
+    }))
+    return {
+      records,
+      schedule: { mode: 'bayesian' as const, waves, stoppedEarly, skippedByPlan },
+      confidence: { target, factors, runCheckIds, skippedByPlan },
+    }
+  }
+
+  /**
+   * Priors over one affected set: history summarised from the whole evidence
+   * log, priced with a quarter of the per-check timeout as the fallback cost
+   * of a check that has never been observed.
+   */
+  private async priorsFor(
+    affected: readonly CheckSpec[],
+    changed: readonly RelPath[],
+    graph: DependencyGraph | undefined,
+  ): Promise<Map<string, CheckPrior>> {
+    const history = summarizeHistory(await this.store.all())
+    return computePriors({
+      specs: affected,
+      changed,
+      // Required-but-nullable in PriorInput: `undefined` degrades impact
+      // strength to path matching alone, exactly the no-graph semantics.
+      graph,
+      history,
+      fallbackCostMs: this.options.checkTimeoutMs / 4,
+    })
+  }
+
+  /**
+   * Fold one whole batch's outcomes into the factor map (display path): each
+   * decisive outcome earns its posterior, everything else keeps its prior.
+   */
+  private updateFactors(priors: Map<string, CheckPrior>, records: readonly Evidence[], hasFactors: boolean): ConfidenceInput | undefined {
+    if (!hasFactors) return undefined
+    const factors = new Map<string, number>()
+    const runCheckIds = new Set<string>()
+    for (const prior of priors.values()) factors.set(prior.checkId, prior.priorHealthy)
+    for (const record of records) {
+      runCheckIds.add(record.checkId)
+      const prior = priors.get(record.checkId)
+      if (prior === undefined) continue
+      if (record.status === 'pass' || record.status === 'fail') {
+        factors.set(record.checkId, posteriorHealthy(prior, record.status))
+      }
+    }
+    return { target: this.options.certifyTarget, factors, runCheckIds, skippedByPlan: [] }
   }
 
   /**
