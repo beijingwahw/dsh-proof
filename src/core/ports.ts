@@ -91,6 +91,23 @@ export interface SignerPort {
   verify(data: string, signature: string): Promise<boolean>
 }
 
+/**
+ * Resolves the workspace file an import site binds to, typically by asking
+ * a language server (goToDefinition on the module specifier). Implementations
+ * MUST be defensive: any failure resolves to `null`, which the graph builder
+ * treats as "unverified" and falls back to the approximate edge — precision
+ * degrades visibly, soundness never narrows.
+ */
+export interface DefinitionResolverPort {
+  /**
+   * @param file workspace-relative path of the importing file
+   * @param line 0-based line of the specifier, UTF-16 code units
+   * @param character 0-based column of the specifier start
+   * @returns workspace-relative path of the resolved file, or `null`
+   */
+  resolveDefinition(file: string, line: number, character: number): Promise<string | null>
+}
+
 /** Workspace facts the core needs but does not own. */
 export interface WorkspacePort {
   /** Absolute root of the project under verification. */

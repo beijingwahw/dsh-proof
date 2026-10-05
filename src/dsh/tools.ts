@@ -61,6 +61,7 @@ export interface VerifyValue {
   changed: string[]
   attributionMethod: string
   externalChanged: string[]
+  impactPrecision: string
   affectedChecks: number
   untouchedChecks: number
   regressions: { label: string; suspects: string[]; detail: string }[]
@@ -319,6 +320,7 @@ function createVerifyTool(engine: ProofEngine, touched?: () => readonly string[]
           root: { type: 'string' }, changed: { type: 'array', items: { type: 'string' } },
           attributionMethod: { type: 'string' },
           externalChanged: { type: 'array', items: { type: 'string' } },
+          impactPrecision: { type: 'string', enum: ['lsp-verified', 'approximate', 'forced'] },
           affectedChecks: { type: 'integer' }, untouchedChecks: { type: 'integer' },
           regressions: {
             type: 'array',
@@ -358,7 +360,7 @@ function createVerifyTool(engine: ProofEngine, touched?: () => readonly string[]
         ...(touched !== undefined ? { touched: touched() } : {}),
         signal: exec.signal,
       })
-      return toVerifyValue(outcome.report, outcome.changed, outcome.checks, outcome.attribution) as unknown as JsonValue
+      return toVerifyValue(outcome.report, outcome.changed, outcome.checks, outcome.attribution, outcome.selection.precision) as unknown as JsonValue
     },
   }
 }
@@ -421,7 +423,7 @@ function createClaimTool(engine: ProofEngine, touched?: () => readonly string[])
         ...(touched !== undefined ? { touched: touched() } : {}),
         signal: exec.signal,
       })
-      const value = toVerifyValue(outcome.report, outcome.changed, outcome.checks, outcome.attribution)
+      const value = toVerifyValue(outcome.report, outcome.changed, outcome.checks, outcome.attribution, outcome.selection.precision)
       const blockers: string[] = []
       if (outcome.report.grade === 'no-baseline') blockers.push('No baseline exists. Run proof_baseline first.')
       if (outcome.report.grade === 'stale') blockers.push(`Stale evidence: ${outcome.report.unverified.join(', ') || 'affected checks not re-run'}.`)
@@ -455,6 +457,7 @@ function toVerifyValue(
   changed: readonly string[],
   checks: readonly { label: string; verdict: string; suspects: readonly string[]; current?: { outputHead?: string } }[],
   attribution?: { method: string; records: readonly { path: string; provenance: string }[] },
+  precision: string = 'approximate',
 ): VerifyValue {
   const externalChanged = attribution?.records.filter(r => r.provenance === 'external').map(r => r.path) ?? []
   return {
@@ -463,6 +466,7 @@ function toVerifyValue(
     changed: [...changed],
     attributionMethod: attribution?.method ?? 'explicit',
     externalChanged,
+    impactPrecision: precision,
     affectedChecks: checks.filter(c => c.verdict !== 'not-run').length,
     untouchedChecks: Math.max(0, report.discovered - checks.length),
     regressions: checks
@@ -527,7 +531,8 @@ function renderVerify(value: VerifyValue): string {
   const lines = [
     `GRADE: ${String(v.grade ?? 'unknown').toUpperCase()}   evidence root ${root}`,
     `changed: ${changed.length} file(s) · attribution ${String(v.attributionMethod ?? 'explicit')}` +
-      (externalChanged.length > 0 ? ` · ${externalChanged.length} external edit(s)` : ''),
+      (externalChanged.length > 0 ? ` · ${externalChanged.length} external edit(s)` : '') +
+      ` · impact ${String(v.impactPrecision ?? 'approximate')}`,
     '',
   ]
   if (externalChanged.length > 0) {

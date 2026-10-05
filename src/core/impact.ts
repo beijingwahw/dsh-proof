@@ -10,10 +10,13 @@
  * @module dsh-proof/core/impact
  */
 
-import type { CheckSpec, FsPort } from './ports.ts'
+import type { CheckSpec, DefinitionResolverPort, FsPort } from './ports.ts'
 
 /** A file path relative to the workspace root, using `/` separators. */
 export type RelPath = string
+
+/** How exact the impact analysis behind a selection is. */
+export type SelectionPrecision = 'lsp-verified' | 'approximate' | 'forced'
 
 /** Adjacency: file -> files it directly depends on. */
 export interface DependencyGraph {
@@ -23,11 +26,18 @@ export interface DependencyGraph {
   /** How many files were scanned; surfaced in reports so limits are visible. */
   readonly scanned: number
   readonly truncated: boolean
+  /** Edges confirmed by the resolver, keyed `${dependent}\u0000${dependency}`. */
+  readonly lspConfirmed: ReadonlySet<string>
+  readonly precision: SelectionPrecision
 }
 
 export interface BuildGraphOptions {
   readonly limit?: number
   readonly ignoreDirs?: readonly string[]
+  /** Optional LSP-backed resolver for precise, alias-aware edges. */
+  readonly resolver?: DefinitionResolverPort
+  /** Maximum resolver round-trips for one graph build (degrades beyond). */
+  readonly lspQueryBudget?: number
 }
 
 const SOURCE_EXT = /\.(m|c)?(j|t)sx?$|\.py$|\.go$|\.rs$|\.java$|\.kt$|\.rb$|\.php$|\.cs$/
@@ -66,10 +76,19 @@ export function isGlobalInvalidator(path: RelPath): boolean {
 /**
  * Build a reverse-dependency graph from the workspace's source files.
  *
- * Import resolution is deliberately *approximate*: relative specifiers are
- * resolved against the filesystem, bare specifiers are ignored (they are
- * external dependencies, already covered by the lockfile rules). Approximation
- * errs toward over-inclusion, which costs a re-run and never hides a break.
+ * Two edge sources, fused conservatively:
+ *
+ * 1. *Approximate* — regex-extracted relative specifiers resolved against the
+ *    filesystem. Always available; errs toward over-inclusion.
+ * 2. *LSP-verified* — when a `resolver` is provided, every import site
+ *    (relative AND bare/alias) is resolved through the language server's
+ *    goToDefinition. This both confirms approximate edges and discovers
+ *    workspace-internal edges regex cannot see (tsconfig `paths` aliases,
+ *    package-internal imports) — real breakage blind spots in monorepos.
+ *
+ * Selection semantics never narrow: confirmed and approximate edges are
+ * unioned; a failed or budget-exhausted resolver simply leaves the edge
+ * approximate. `precision` reports which regime produced the graph.
  */
 export async function buildDependencyGraph(
   fs: FsPort,
@@ -91,17 +110,45 @@ export async function buildDependencyGraph(
   }
   for (const f of scannedFiles) ensure(f)
 
+  const resolver = options.resolver
+  const lspBudget = options.lspQueryBudget ?? 400
+  let lspQueries = 0
+  let lspConfirmedCount = 0
+  const lspConfirmed = new Set<string>()
+
   for (const file of scannedFiles) {
     const content = await fs.readFile(`${root}/${file}`)
     if (content === undefined) continue
-    for (const spec of extractImports(content)) {
-      const resolved = resolveSpecifier(file, spec, known)
-      if (resolved === undefined) continue
-      ensure(resolved).add(file)
+    for (const site of extractImportSites(content)) {
+      // Approximate edge: relative specifiers against the filesystem.
+      if (site.kind === 'relative') {
+        const resolved = resolveSpecifier(file, site.specifier, known)
+        if (resolved !== undefined) ensure(resolved).add(file)
+      }
+      // Verified edge: ask the language server where this import actually
+      // binds. `node:` builtins are external by contract; everything else
+      // (bare aliases included) may resolve inside the workspace.
+      if (resolver !== undefined && lspQueries < lspBudget && !site.specifier.startsWith('node:')) {
+        lspQueries += 1
+        const target = await resolver.resolveDefinition(file, site.line, site.character).catch(() => null)
+        if (typeof target === 'string' && target.length > 0 && target !== file) {
+          const normalized = target.replace(/\\/g, '/')
+          ensure(normalized).add(file)
+          const key = `${file}\u0000${normalized}`
+          if (!lspConfirmed.has(key)) { lspConfirmed.add(key); lspConfirmedCount += 1 }
+        }
+      }
     }
   }
 
-  return { nodes: new Set(scannedFiles), dependents, scanned: scannedFiles.length, truncated }
+  return {
+    nodes: new Set(scannedFiles),
+    dependents,
+    scanned: scannedFiles.length,
+    truncated,
+    lspConfirmed,
+    precision: resolver !== undefined && lspConfirmedCount > 0 ? 'lsp-verified' : 'approximate',
+  }
 }
 
 /**
@@ -134,6 +181,8 @@ export interface SelectionResult {
   readonly closure: readonly RelPath[]
   /** True when the dependency graph could not cover every changed file. */
   readonly uncertain: boolean
+  /** Which edge regime produced the graph behind this selection. */
+  readonly precision: SelectionPrecision
 }
 
 /**
@@ -150,9 +199,10 @@ export function selectAffectedChecks(
   const closure = graph ? [...impactClosure(graph, changed)].sort() : [...new Set(changed)].sort()
   const uncertain = graph === undefined || graph.truncated
     || changed.some(f => graph !== undefined && !graph.nodes.has(f) && SOURCE_EXT.test(f))
+  const precision: SelectionPrecision = graph === undefined ? 'approximate' : graph.precision
 
   if (forcedAll) {
-    return { affected: [...checks], untouched: [], forcedAll, closure, uncertain }
+    return { affected: [...checks], untouched: [], forcedAll, closure, uncertain, precision }
   }
 
   const affected: CheckSpec[] = []
@@ -162,7 +212,7 @@ export function selectAffectedChecks(
     const hit = closure.some(file => matchesAny(file, check.paths))
     ;(hit ? affected : untouched).push(check)
   }
-  return { affected, untouched, forcedAll, closure, uncertain }
+  return { affected, untouched, forcedAll, closure, uncertain, precision }
 }
 
 /**
@@ -227,6 +277,53 @@ function isIgnored(file: RelPath, ignore: ReadonlySet<string>): boolean {
 }
 
 /**
+ * One import site: a module specifier plus the 0-based UTF-16 position of its
+ * first character — exactly where a language server's goToDefinition resolves
+ * the module the statement binds to.
+ */
+export interface ImportSite {
+  readonly specifier: string
+  readonly line: number
+  readonly character: number
+  readonly kind: 'relative' | 'bare'
+}
+
+const SITE_ESM_FROM = /(?:^|[;{}])\s*(?:import|export)\b[^\n]*?\bfrom\s+(['"])([^'"]+)\1/d
+const SITE_SIDE_EFFECT = /(?:^|[;{}])\s*import\s+(['"])([^'"]+)\1/d
+const SITE_PYTHON = /^from\s+([.\w][\w.]*)\s+import\b/d
+const SITE_REQUIRE = /require\(\s*(['"])([^'"]+)\1\s*\)/d
+
+/** Pull every import site (specifier + cursor position) out of source text. */
+export function extractImportSites(content: string): ImportSite[] {
+  const out: ImportSite[] = []
+  const lines = content.split('\n')
+  lines.forEach((rawLine, index) => {
+    const trimmed = rawLine.trim()
+    if (trimmed.length === 0 || trimmed.startsWith('//') || trimmed.startsWith('#') || trimmed.startsWith('*')) return
+    for (const pattern of [SITE_ESM_FROM, SITE_SIDE_EFFECT, SITE_REQUIRE]) {
+      const match = pattern.exec(rawLine)
+      const groups = match?.indices
+      const start = groups?.[2]?.[0]
+      const specifier = match?.[2]
+      if (start !== undefined && specifier !== undefined) {
+        out.push({ specifier, line: index, character: start, kind: kindOf(specifier) })
+      }
+    }
+    const py = SITE_PYTHON.exec(trimmed)
+    const pyStart = py?.indices?.[1]?.[0]
+    if (pyStart !== undefined && py?.[1] !== undefined) {
+      const indent = rawLine.length - rawLine.trimStart().length
+      out.push({ specifier: py[1], line: index, character: pyStart + indent, kind: kindOf(py[1]) })
+    }
+  })
+  return out
+}
+
+function kindOf(specifier: string): 'relative' | 'bare' {
+  return specifier.startsWith('.') || specifier.startsWith('/') ? 'relative' : 'bare'
+}
+
+/**
  * Pull workspace-reachable module specifiers out of source text.
  *
  * Line-based rather than one heroic regex: ESM/CJS `import`/`export ... from`,
@@ -236,25 +333,8 @@ function isIgnored(file: RelPath, ignore: ReadonlySet<string>): boolean {
  */
 export function extractImports(content: string): string[] {
   const out = new Set<string>()
-  for (const rawLine of content.split('\n')) {
-    const line = rawLine.trim()
-    if (line.length === 0 || line.startsWith('//') || line.startsWith('#') || line.startsWith('*')) continue
-
-    // ESM: import ... from 'x' / export ... from 'x'
-    const from = /(?:^|[;{}])\s*(?:import|export)\b[\s\S]*?\bfrom\s+['"]([^'"]+)['"]/.exec(line)
-    if (from?.[1]) { add(out, from[1]); continue }
-
-    // Side-effect: import 'x'
-    const bare = /^import\s+['"]([^'"]+)['"]/.exec(line)
-    if (bare?.[1]) { add(out, bare[1]); continue }
-
-    // Python: from x.y import thing
-    const py = /^from\s+([.\w][\w.]*)\s+import\b/.exec(line)
-    if (py?.[1]) { add(out, py[1]); continue }
-
-    // CJS: require('x') — searched anywhere in the line.
-    const req = /require\(\s*['"]([^'"]+)['"]\s*\)/.exec(line)
-    if (req?.[1]) add(out, req[1])
+  for (const site of extractImportSites(content)) {
+    add(out, site.specifier)
   }
   return [...out]
 }

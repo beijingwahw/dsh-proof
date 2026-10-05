@@ -42,6 +42,12 @@
         # Build the reverse-dependency graph for precise change-impact analysis.
         impactGraph: true
         impactGraphLimit: 20000
+        # Use the host's LSP (when a language server is configured) to verify
+        # and extend impact edges — catches tsconfig `paths` aliases and other
+        # workspace-internal imports regex cannot resolve.
+        lspImpact: true
+        # Maximum language-server round-trips per graph build.
+        lspQueryBudget: 400
         # off  = never gate
         # warn = attach a corrective notice
         # ask  = route the mutation through user approval until a baseline exists

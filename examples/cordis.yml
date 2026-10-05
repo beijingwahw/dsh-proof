@@ -17,6 +17,8 @@
         concurrency: 2
         impactGraph: true
         impactGraphLimit: 20000
+        lspImpact: true
+        lspQueryBudget: 400
         requireBaseline: warn
         driftDetection: true
         enforceOnTurnEnd: true

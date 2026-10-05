@@ -56,7 +56,7 @@ export function assembleProof(input: AssembleInput): AssembleResult {
   })
 
   const selection = input.forceAll === true
-    ? { affected: input.specs, untouched: [], forcedAll: true, closure: input.changed, uncertain: false }
+    ? { affected: input.specs, untouched: [], forcedAll: true, closure: input.changed, uncertain: false, precision: 'forced' as const }
     : selectAffectedChecks(input.specs, input.changed, input.graph)
   const affectedIds = new Set(selection.affected.map(c => c.id))
 

@@ -167,6 +167,16 @@ DSH 生态已超过 5000 个插件、14 个分类。但把分类摊开看，缺�
 
 解析方法在结果里显式标注（`attributionMethod`：`baseline-content` / `git-head` / `dirty-fallback` / `explicit`），降级可见：无 git 时退化为脏区并集，旧格式基线（无摘要）退化为保守包含。`proof_verify` 的输出新增 `externalChanged` 清单，渲染为 "EXTERNAL edits (outside your tool stream, not charged to you)"。
 
+## 五·七、LSP 影响融合（v0.4）：双源置信的影响图
+
+影响分析从「正则近似」升级为**双源置信融合**。核心技巧：把 `goToDefinition` 放在**导入语句的模块说明符上**（TS/Python 语言服务器都支持"点导入字符串跳到目标文件"），于是：
+
+1. **验证**：正则图的每条近似边都可被语言服务器确认，变成 `lsp-verified` 边；
+2. **发现盲区**：`tsconfig paths` 别名、包内路径等**工作区内部导入**是正则永远看不见的——monorepo 里「改了别名指向的文件、检查却没被选中」的漏判由此堵上；
+3. **并集语义（soundness 永不变窄）**：验证过的边与近似边取并集；语言服务器缺席、查询失败或预算耗尽时，该边退回近似——**精度降级，覆盖不降级**。
+
+工程控制：`DefinitionResolverPort` 端口（核心层零框架依赖不变）+ 宿主 `ctx.lsp` 适配（`dsh/lsp-impact.ts`）；结果按（文件, 内容版本, 位置）缓存，单次建图有 `lspQueryBudget`（默认 400）硬预算。精度在 `proof_verify` 输出中显式可见（`impactPrecision`：`lsp-verified` / `approximate` / `forced`）。
+
 ---
 
 ## 六、架构：领域核心 + 薄适配层
@@ -194,7 +204,7 @@ dsh-proof/
 │   ├── vendor/dsh-tools.ts   # 契约快照（pinned to dsh v0.2.1-alpha.1）
 │   ├── config.ts             # Schemastery 配置
 │   └── index.ts              # Cordis 插件入口
-├── test/                     # 81 个测试，含真实 shell 集成、信任对抗与变更集溯源
+├── test/                     # 88 个测试，含真实 shell 集成、信任对抗、变更集溯源与 LSP 影响融合
 ├── cordis.patch.yml          # bundle 层
 └── examples/cordis.yml       # --patch 本地调试
 ```
@@ -202,7 +212,7 @@ dsh-proof/
 **为什么领域核心不碰 `@deepseek-ai/*`：**
 
 1. DSH 是开发者预览版，破坏性变更频繁。核心逻辑与 harness 版本解耦 → 升级不重写。
-2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，81 个测试全绿。
+2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，88 个测试全绿。
 3. 同一个核心可以被别的宿主（CLI、CI、其他 harness）复用。
 
 **为什么 `vendor/dsh-tools.ts` 是契约快照而不是活依赖：**
@@ -218,6 +228,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 | **内容寻址证据链** | `evidenceId = sha256(canonical(record))`，`proofRoot = merkleRoot(证据地址)` | 可复算、可跨会话比对、单条记录篡改即被 `audit()` 抓出 |
 | **哈希链 + 签名检查点 + 带外锚点**（v0.2） | 每行 `prev = sha256(上一行)`；检查点由宿主 Ed25519 密钥签名并镜像到工作区外的锚点 | 对抗「被审计者自己重写日志」：全量重写/回滚/换基线全部可检测 |
 | **内容锚定变更集 + 来源归因**（v0.3） | 基线快照携带脏文件内容摘要；变更 = 与快照的字节差异；工具触达集区分 agent/external | 陈旧脏区不再冤枉会话；用户 IDE 手改不再记在智能体头上；「还原也是变更」也能抓到 |
+| **LSP 双源影响融合**（v0.4） | `goToDefinition` 放在导入说明符上：验证近似边 + 发现别名导入盲区；并集语义；缓存 + 预算 | 精度提升不牺牲覆盖；monorepo 别名断链不再漏判；降级显式可见 |
 | **反向依赖闭包** | import 图 + 传染式 BFS | 增量验证，省时间也省 token |
 | **基线差分回归归因** | `baseline ∘ delta = proof` | 区分「本来就坏」与「被你改坏」 |
 | **接口 / 实现 / 消费者分层** | 领域核心零框架依赖 | 可测、可复用、抗上游抖动 |
@@ -246,6 +257,8 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
         verifyBudgetMs: 300000     # 单批验证总预算
         concurrency: 2             # 并发检查进程数
         impactGraph: true          # 构建反向依赖图
+        lspImpact: true            # 用宿主 LSP 验证/扩展影响边（含别名导入盲区）
+        lspQueryBudget: 400        # 单次建图的语言服务器查询预算
         impactGraphLimit: 20000    # 图规模上限（防 monorepo 卡死）
         requireBaseline: warn      # off | warn | ask
         driftDetection: true       # 工具流之外的改动检测
@@ -284,7 +297,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit，离线可跑
-npm test              # 81 个测试（node:test）
+npm test              # 88 个测试（node:test）
 npm run build         # 产出 lib/
 npm run bundle:check  # 打包契约自检
 ```

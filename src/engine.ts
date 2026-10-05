@@ -16,8 +16,8 @@
 
 import type {
   Baseline, ChangeProvenance, ChangeSetResolution, CheckSpec, Clock, CommandPort,
-  DependencyGraph, Evidence, FsPort, ProofReport, RelPath, SelectionResult,
-  SignerPort, WorkspacePort, WorkspaceSnapshot,
+  DefinitionResolverPort, DependencyGraph, Evidence, FsPort, ProofReport,
+  RelPath, SelectionResult, SignerPort, WorkspacePort, WorkspaceSnapshot,
 } from './core/index.ts'
 import {
   EvidenceStore, VerificationRunner, assembleBaseline, assembleProof,
@@ -52,6 +52,10 @@ export interface EngineOptions {
   readonly concurrency?: number
   readonly impactGraph?: boolean
   readonly impactGraphLimit?: number
+  /** LSP-backed resolver for precise, alias-aware impact edges (v0.4). */
+  readonly resolver?: DefinitionResolverPort
+  /** Maximum language-server round-trips per graph build. */
+  readonly lspQueryBudget?: number
   readonly headChars?: number
   readonly clock?: Clock
   readonly fs?: FsPort
@@ -99,6 +103,7 @@ export class ProofEngine {
   private graph: DependencyGraph | undefined
   private baselineSeen = false
   private signerPromise: Promise<SignerPort | undefined> | undefined
+  private readonly resolver: DefinitionResolverPort | undefined
   private readonly options: {
     evidenceDir: string
     autoDiscover: boolean
@@ -108,6 +113,7 @@ export class ProofEngine {
     concurrency: number
     impactGraph: boolean
     impactGraphLimit: number
+    lspQueryBudget: number
     headChars: number
   }
 
@@ -137,6 +143,7 @@ export class ProofEngine {
       },
     )
     this.runner = new VerificationRunner(this.commands, this.workspace, this.clock)
+    this.resolver = options.resolver
     this.options = {
       evidenceDir,
       autoDiscover: options.autoDiscover ?? true,
@@ -146,6 +153,7 @@ export class ProofEngine {
       concurrency: options.concurrency ?? 2,
       impactGraph: options.impactGraph ?? true,
       impactGraphLimit: options.impactGraphLimit ?? 20_000,
+      lspQueryBudget: options.lspQueryBudget ?? 400,
       headChars: options.headChars ?? 2_000,
     }
   }
@@ -179,7 +187,10 @@ export class ProofEngine {
       limit: this.options.impactGraphLimit,
       ignoreDirs: ['node_modules', '.git', 'dist', 'build', 'out', 'target', 'coverage', '.next', '.venv', 'venv', '__pycache__', 'vendor', '.proof', 'lib', '.turbo', '.cache'],
     })
-    this.graph = await buildDependencyGraph(this.fs, this.root, files, { limit: this.options.impactGraphLimit })
+    this.graph = await buildDependencyGraph(this.fs, this.root, files, {
+      limit: this.options.impactGraphLimit,
+      ...(this.resolver !== undefined ? { resolver: this.resolver, lspQueryBudget: this.options.lspQueryBudget } : {}),
+    })
     return this.graph
   }
 
@@ -254,7 +265,7 @@ export class ProofEngine {
       attribution.records.map(r => [r.path, r.provenance] as [RelPath, ChangeProvenance]),
     )
     const selection = options.all
-      ? { affected: specs, untouched: [], forcedAll: true, closure: changed, uncertain: false }
+      ? { affected: specs, untouched: [], forcedAll: true, closure: changed, uncertain: false, precision: 'forced' as const }
       : selectAffectedChecks(specs, changed, graph)
 
     const batch = await this.runner.run(selection.affected, {

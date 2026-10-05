@@ -216,3 +216,30 @@ export interface DshEvents {
   'tools/post-execute': (exec: ToolExecution, result: Readonly<ToolExecutionResult>, next: () => Promise<PostToolDecision>) => Promise<PostToolDecision>
   'tools/result': (exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>) => void
 }
+
+// ---------------------------------------------------------------------------
+// LSP seam (ctx.lsp) — closed four-operation surface, positions 0-based UTF-16
+// ---------------------------------------------------------------------------
+
+export interface LspQueryArgs {
+  readonly file: string
+  readonly line: number
+  readonly character: number
+}
+
+export interface LspLocation {
+  readonly uri: string
+  readonly range: unknown
+}
+
+export type LspQueryResult =
+  | { readonly kind: 'locations'; readonly locations: readonly LspLocation[]; readonly resolvedWorkspaceUri?: unknown }
+  | { readonly kind: 'hover'; readonly hover: unknown }
+
+export interface LspLike {
+  query(
+    operation: 'goToDefinition' | 'findReferences' | 'goToImplementation' | 'hover',
+    args: LspQueryArgs,
+    signal?: AbortSignal,
+  ): Promise<LspQueryResult>
+}

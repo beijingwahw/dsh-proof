@@ -107,6 +107,12 @@ By default (`evidenceStore: host`) the log itself lives under `$DSH_HOME/proof/w
 
 The method is surfaced as `attributionMethod` (`baseline-content` / `git-head` / `dirty-fallback` / `explicit`) so degradation is visible, and `proof_verify` renders an "EXTERNAL edits" section with the files not charged to the agent.
 
+## LSP-fused impact (v0.4): dual-source confidence
+
+Impact analysis upgrades from regex approximation to a fusion of two edge sources. The trick: `goToDefinition` placed *on the module specifier of an import statement* resolves to the file that specifier binds to — which both verifies the regex graph's approximate edges and discovers **workspace-internal imports regex cannot see** (tsconfig `paths` aliases, package-internal paths): real missed-breakage blind spots in monorepos.
+
+Union semantics keep soundness absolute: verified and approximate edges are unioned; a missing language server, a failed query, or an exhausted budget simply leaves the edge approximate — *precision degrades, coverage never does*. Results are cached per (file, content version, position) with a hard per-build budget (`lspQueryBudget`, default 400), and the regime is surfaced as `impactPrecision`: `lsp-verified` / `approximate` / `forced`.
+
 ## Architecture
 
 ```
@@ -123,7 +129,7 @@ The domain core is framework-free on purpose: it is fully unit-testable offline,
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit
-npm test              # 81 tests, node:test
+npm test              # 88 tests, node:test
 npm run build
 npm run bundle:check  # packaging contract self-check
 ```

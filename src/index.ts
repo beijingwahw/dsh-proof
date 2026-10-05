@@ -24,10 +24,12 @@ import { ProofEngine } from './engine.ts'
 import { createProofTools } from './dsh/tools.ts'
 import { WorkspaceWatch, driftNarrative } from './dsh/observe.ts'
 import { buildPolicySection } from './dsh/prompt.ts'
+import { createLspResolver } from './dsh/lsp-impact.ts'
 import { sha256 } from './core/hash.ts'
+import { NodeFsPort } from './node-ports.ts'
 import type { FsPort } from './core/ports.ts'
 import type {
-  ContentBlock, PreToolDecision, ToolExecution, ToolExecutionResult, ToolRuntimeLike, UserMessage,
+  ContentBlock, LspLike, PreToolDecision, ToolExecution, ToolExecutionResult, ToolRuntimeLike, UserMessage,
 } from './vendor/dsh-tools.ts'
 
 export const name = 'dsh-proof'
@@ -70,6 +72,8 @@ interface Emitter {
 interface HostContext extends Emitter {
   tools: ToolRuntimeLike
   systemPrompt?: { section(section: PromptSection): () => void }
+  /** The host's language-server seam; used for precise impact edges when present. */
+  lsp?: LspLike
   effect(disposer: () => void | (() => void)): unknown
 }
 
@@ -95,12 +99,21 @@ export function apply(ctx: Context, config: Config): void {
     ? config.evidenceDir
     : nodePath.join(trustRoot, 'workspaces', workspaceKey)
 
+  // Shared filesystem port: the engine, the LSP resolver and the watcher all
+  // see the same files (and the resolver's cache keys off the same stats).
+  const sharedFs = new NodeFsPort()
+  const lspResolver = config.lspImpact === false
+    ? undefined
+    : createLspResolver(host.lsp, root, sharedFs, { budget: config.lspQueryBudget })
+
   const engine = new ProofEngine({
     root,
     evidenceDir,
     trustDir: trustRoot,
     workspaceKey,
     checkpointEvery: config.checkpointEvery,
+    fs: sharedFs,
+    ...(lspResolver !== undefined ? { resolver: lspResolver } : {}),
     autoDiscover: config.autoDiscover,
     checks: config.checks.map(c => ({
       ...(c.label !== undefined ? { label: c.label } : {}),

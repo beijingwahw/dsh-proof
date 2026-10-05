@@ -10,7 +10,8 @@
 
 export type {
   CheckKind, CheckSource, CheckSpec, Clock, CommandPort, CommandResult,
-  CommandRunOptions, FileStat, FsPort, SignerPort, WalkOptions, WorkspacePort,
+  CommandRunOptions, DefinitionResolverPort, FileStat, FsPort, SignerPort,
+  WalkOptions, WorkspacePort,
 } from './ports.ts'
 
 export {
@@ -38,8 +39,10 @@ export {
 
 export {
   GLOBAL_INVALIDATORS, attributeChange, buildDependencyGraph, extractImports,
-  impactClosure, isGlobalInvalidator, matches, matchesAny, selectAffectedChecks,
-  type DependencyGraph, type RelPath, type SelectionResult,
+  extractImportSites, impactClosure, isGlobalInvalidator, matches, matchesAny,
+  selectAffectedChecks,
+  type DependencyGraph, type ImportSite, type RelPath,
+  type SelectionPrecision, type SelectionResult,
 } from './impact.ts'
 
 export {

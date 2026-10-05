@@ -52,6 +52,14 @@ export interface Config {
   /** Hard cap on graph size, so a monorepo cannot stall the plugin. */
   impactGraphLimit: number
   /**
+   * Use the host's LSP (when a language server is available) to verify and
+   * extend impact edges — including tsconfig `paths` aliases and other
+   * workspace-internal imports regex cannot resolve.
+   */
+  lspImpact: boolean
+  /** Maximum language-server round-trips per graph build. */
+  lspQueryBudget: number
+  /**
    * Block mutation tools until a baseline exists. `off` never blocks, `warn`
    * attaches a corrective notice, `ask` routes the call through user approval.
    */
@@ -91,6 +99,8 @@ export const Config: Schema<Config> = Schema.object({
   concurrency: Schema.number().default(2),
   impactGraph: Schema.boolean().default(true),
   impactGraphLimit: Schema.number().default(20_000),
+  lspImpact: Schema.boolean().default(true),
+  lspQueryBudget: Schema.number().default(400),
   requireBaseline: Schema.union(['off', 'warn', 'ask']).default('warn'),
   driftDetection: Schema.boolean().default(true),
   driftNoticeMs: Schema.number().default(1_500),
