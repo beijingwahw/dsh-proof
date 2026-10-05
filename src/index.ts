@@ -16,12 +16,15 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { homedir } from 'node:os'
+import * as nodePath from 'node:path'
 
 import type { Config } from './config.ts'
 import { ProofEngine } from './engine.ts'
 import { createProofTools } from './dsh/tools.ts'
 import { WorkspaceWatch, driftNarrative } from './dsh/observe.ts'
 import { buildPolicySection } from './dsh/prompt.ts'
+import { sha256 } from './core/hash.ts'
 import type { FsPort } from './core/ports.ts'
 import type {
   ContentBlock, PreToolDecision, ToolExecution, ToolExecutionResult, ToolRuntimeLike, UserMessage,
@@ -83,9 +86,21 @@ export function apply(ctx: Context, config: Config): void {
   const root = process.env.DSH_PROOF_ROOT
     ?? hostWorkspaceRoot(ctx)
 
+  // -- trust root: keys and anchors live with the host, never in the workspace.
+  const trustRoot = (config.trustDir && config.trustDir.length > 0 ? config.trustDir : undefined)
+    ?? process.env.DSH_PROOF_TRUST_DIR
+    ?? nodePath.join(dshHome(), 'proof')
+  const workspaceKey = sha256(root).slice(0, 16)
+  const evidenceDir = config.evidenceStore === 'workspace'
+    ? config.evidenceDir
+    : nodePath.join(trustRoot, 'workspaces', workspaceKey)
+
   const engine = new ProofEngine({
     root,
-    evidenceDir: config.evidenceDir,
+    evidenceDir,
+    trustDir: trustRoot,
+    workspaceKey,
+    checkpointEvery: config.checkpointEvery,
     autoDiscover: config.autoDiscover,
     checks: config.checks.map(c => ({
       ...(c.label !== undefined ? { label: c.label } : {}),
@@ -114,6 +129,30 @@ export function apply(ctx: Context, config: Config): void {
   for (const tool of createProofTools(engine)) {
     host.tools.register(tool)
     log(`registered tool ${tool.name}`)
+  }
+  // -- evidence-store guard: the log must not be agent-writable ------------
+  // In `workspace` mode the log still lives inside the project, so mutation
+  // tools touching it are routed through user approval. In `host` mode the
+  // log is outside the sandboxed workspace and needs no gate.
+  if (config.evidenceStore === 'workspace') {
+    const evidenceSegment = config.evidenceDir.replace(/^\.\/+/, '').replace(/\/+$/, '')
+    const touchesEvidence = (candidate: string): boolean => {
+      const normalized = candidate.replace(/\\/g, '/')
+      return normalized === evidenceSegment || normalized.includes(`/${evidenceSegment}/`) || normalized.startsWith(`${evidenceSegment}/`)
+    }
+    host.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
+      if (!isMutationTool(exec.name)) return next()
+      const paths = WorkspaceWatch.pathsIn(exec.arguments)
+      if (!paths.some(touchesEvidence)) return next()
+      return {
+        kind: 'ask',
+        reason: 'dsh-proof: this call writes into the verification evidence store, which must not be modified by the agent it is meant to audit.',
+        displayReason: {
+          en: 'dsh-proof: block writes to the evidence log?',
+          'zh-CN': 'dsh-proof：拒绝写入证据日志？',
+        },
+      }
+    })
   }
   // -- policy gate: no baseline, no unreviewed mutation --------------------
   if (config.requireBaseline !== 'off') {
@@ -225,12 +264,19 @@ export function apply(ctx: Context, config: Config): void {
     log('unloaded')
   })
 
-  log(`loaded (root=${root}, requireBaseline=${config.requireBaseline})`)
+  log(`loaded (root=${root}, requireBaseline=${config.requireBaseline}, evidence=${config.evidenceStore}, trust=${trustRoot})`)
 }
 
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/** The harness home directory: keys and anchors live under `<home>/proof`. */
+function dshHome(): string {
+  const fromEnv = process.env.DSH_HOME
+  if (typeof fromEnv === 'string' && fromEnv.length > 0) return fromEnv
+  return nodePath.join(homedir(), '.dsh')
+}
 
 /**
  * Resolve the workspace root. `ctx` does not expose a portable workspace path

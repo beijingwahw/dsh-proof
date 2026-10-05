@@ -8,8 +8,19 @@
     - id: dsh-proof
       name: dsh-proof
       config:
-        # Where evidence lives, relative to the workspace root.
+        # Where the evidence log lives:
+        #   host      = under the host trust root ($DSH_HOME/proof), outside
+        #               the agent's writable workspace (default, recommended)
+        #   workspace = at `evidenceDir` inside the project (legacy; still
+        #               chain- and checkpoint-protected, but agent-readable)
+        evidenceStore: host
+        # Relative evidence directory (workspace mode only).
         evidenceDir: .proof
+        # Host-side trust root: checkpoint signing keys + rewind anchors.
+        # Defaults to $DSH_PROOF_TRUST_DIR or $DSH_HOME/proof.
+        # trustDir: /var/lib/dsh-proof
+        # Append a signed checkpoint after every N records (boundaries always do).
+        checkpointEvery: 25
         # Discover objective checks from package.json / pyproject.toml /
         # go.mod / Cargo.toml / Makefile / composer.json.
         autoDiscover: true

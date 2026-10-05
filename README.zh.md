@@ -135,9 +135,23 @@ DSH 生态已超过 5000 个插件、14 个分类。但把分类摊开看，缺�
 | 扩展点 | 机制 |
 |---|---|
 | `tools/pre-execute`（waterfall） | `requireBaseline: ask` 时，**没有基线就不许改工作区**，走用户审批 |
+| `tools/pre-execute`（waterfall） | `evidenceStore: workspace` 时，**写入证据库的变更类工具一律转用户审批**——被审计者不能改审计记录 |
 | `tools/result`（emit） | 观察每次工具结果，维护脏区与文件指纹 |
 | `agent/turn-stopping` | 本轮改了东西但没做 `proof_claim` → 注入纠正性上下文；检测到漂移 → 注入 stale 警告 |
 | `ctx.systemPrompt.section()` | 发布 `proof:policy` 段落，让模型知道规则存在，不必靠失败去摸索 |
+
+## 五·五、信任模型（v0.2）：对抗被审计者
+
+证据日志的对手不是黑客，是**它要审计的智能体本身**——模型有文件写工具，可以把 `.proof/` 整个重写，并用本包导出的哈希函数重算所有自洽地址。v0.1 的 `audit()` 只能抓这种「天真篡改」。v0.2 用四层机制把「证明者」和「验证者」分开：
+
+1. **哈希链**：每行携带 `prev = sha256(上一行)`，改动或删除任意一行都会断链。
+2. **签名检查点**：检查点承诺 `{记录数, 链头}`，由**宿主持有、模型不可见**的 Ed25519 密钥签名（密钥在 `$DSH_HOME/proof/keys/`，永远不在工作区内）。智能体可以伪造整条链，但**造不出签名**。
+3. **带外锚点**：历史最高检查点同时镜像到密钥旁边的锚点文件（工作区之外）。把日志截断或回滚到旧检查点之前 → `rewind` 检测。
+4. **基线摘要入链**：`baseline.json` 是普通 JSON 文件，整体替换原本不可察觉——现在保存时其 sha256 作为 marker 落链并紧跟检查点，任何事后替换都会被 `audit()` 标记 `baselineTampered`。
+
+配套的存储隔离：默认 `evidenceStore: host` 把日志放到 `$DSH_HOME/proof/workspaces/<工作区指纹>/`，**完全移出智能体沙箱可写范围**；选择 `workspace` 模式（放回项目内）时，写入 `.proof/` 的变更类工具会被转用户审批。
+
+`proof_status` 暴露全部信任遥测：`chainMode`（signed/unsigned/legacy）、`checkpoints`、`chainIntact`、`rewindDetected`、`baselineTampered`。`proven` 评级的可信度从此有了对抗性保证：**日志要么没被动过，要么动了就会被点名。**
 
 ---
 
@@ -166,7 +180,7 @@ dsh-proof/
 │   ├── vendor/dsh-tools.ts   # 契约快照（pinned to dsh v0.2.1-alpha.1）
 │   ├── config.ts             # Schemastery 配置
 │   └── index.ts              # Cordis 插件入口
-├── test/                     # 61 个测试，含真实 shell 集成测试
+├── test/                     # 71 个测试，含真实 shell 集成与信任对抗测试
 ├── cordis.patch.yml          # bundle 层
 └── examples/cordis.yml       # --patch 本地调试
 ```
@@ -174,7 +188,7 @@ dsh-proof/
 **为什么领域核心不碰 `@deepseek-ai/*`：**
 
 1. DSH 是开发者预览版，破坏性变更频繁。核心逻辑与 harness 版本解耦 → 升级不重写。
-2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，61 个测试全绿。
+2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，71 个测试全绿。
 3. 同一个核心可以被别的宿主（CLI、CI、其他 harness）复用。
 
 **为什么 `vendor/dsh-tools.ts` 是契约快照而不是活依赖：**
@@ -187,7 +201,8 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 
 | 技术 | 做法 | 收益 |
 |---|---|---|
-| **内容寻址证据链** | `evidenceId = sha256(canonical(record))`，`proofRoot = merkleRoot(证据地址)` | 可复算、可跨会话比对、篡改即被 `audit()` 抓出 |
+| **内容寻址证据链** | `evidenceId = sha256(canonical(record))`，`proofRoot = merkleRoot(证据地址)` | 可复算、可跨会话比对、单条记录篡改即被 `audit()` 抓出 |
+| **哈希链 + 签名检查点 + 带外锚点**（v0.2） | 每行 `prev = sha256(上一行)`；检查点由宿主 Ed25519 密钥签名并镜像到工作区外的锚点 | 对抗「被审计者自己重写日志」：全量重写/回滚/换基线全部可检测 |
 | **反向依赖闭包** | import 图 + 传染式 BFS | 增量验证，省时间也省 token |
 | **基线差分回归归因** | `baseline ∘ delta = proof` | 区分「本来就坏」与「被你改坏」 |
 | **接口 / 实现 / 消费者分层** | 领域核心零框架依赖 | 可测、可复用、抗上游抖动 |
@@ -206,7 +221,10 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
     - id: dsh-proof
       name: dsh-proof
       config:
-        evidenceDir: .proof        # 证据目录（相对工作区根）
+        evidenceStore: host        # host=日志放宿主信任根（默认，移出智能体可写区）| workspace=放回项目内
+        evidenceDir: .proof        # 证据目录（workspace 模式下生效）
+        trustDir: ''               # 信任根（密钥+锚点）；默认 $DSH_PROOF_TRUST_DIR 或 $DSH_HOME/proof
+        checkpointEvery: 25        # 每 N 条记录自动追加签名检查点（边界必加）
         autoDiscover: true         # 从构建元数据自动发现客观检查
         checks: []                 # 显式检查，可设 exclusive: true 关闭自动发现
         checkTimeoutMs: 120000     # 单个检查超时
@@ -251,7 +269,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit，离线可跑
-npm test              # 61 个测试（node:test）
+npm test              # 71 个测试（node:test）
 npm run build         # 产出 lib/
 npm run bundle:check  # 打包契约自检
 ```
@@ -263,6 +281,7 @@ npm run bundle:check  # 打包契约自检
 - `06` —— 漂移检测
 - `07` —— **真实 shell 集成**：真的 `npm run --silent test`，真的退出码，真的回归归因
 - `08` —— 插件接线：四个工具、三个钩子、提示词段落、纯投影、配置校验
+- `09` —— **信任对抗**：链断裂、全量重写（用本包自己的哈希函数）、回滚、基线替换、真实 Ed25519 密钥
 
 本地调试：
 
@@ -277,6 +296,8 @@ pnpm dsh web --patch /absolute/path/to/dsh-proof/examples/cordis.yml
 
 - **检查发现是启发式的。** 复杂 monorepo、自定义构建系统、Bazel/Nx/Turborepo 编排请用 `checks` 显式配置，并给出 `paths`，增量验证才会精确。
 - **依赖图是近似的。** 动态 `import()`、反射、运行时字符串拼接的路径无法解析。近似**偏向过覆盖**（多跑一次，绝不漏判）。
+- **检查点存在窗口期（v0.2）。** 最后一个签名检查点之后的记录受哈希链保护但不受检查点保护；窗口由 `checkpointEvery` 界定，且每次基线/验证/断言边界都会闭合它。删除锚点文件可以造成「回滚不可检测」——锚点因此放在智能体沙箱之外；若整台主机被攻陷，本插件的威胁模型不适用。
+- **签名密钥的边界。** 密钥防的是「被审计的智能体」，不是「能读宿主文件的人」；主机被完全攻陷时一切本地信任机制都失效。
 - **`proven` 允许存在预置红灯。** 一个本来就红的仓库不该让 Agent 无法工作。预置失败会在报告里显著列出，但不计入本次会话的责任。这是刻意设计，不是漏洞。
 - **它不替代测试本身。** `dsh-proof` 编排并归因你已有的客观检查；它不生成测试用例。
 - **DSH 是 v0.1/0.2 开发者预览版。** 插件契约会变。本插件已把依赖面最小化并钉死契约快照（`src/vendor/dsh-tools.ts`），但上游变更时仍需重新对齐。

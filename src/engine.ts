@@ -4,24 +4,45 @@
  * Wires the pure core together behind one imperative API the DSH adapter (or
  * any other host) can call. Holds no Cordis types; the host injects ports.
  *
+ * Trust wiring (v0.2): when `trustDir` (or a `signer` provider) is supplied,
+ * the store hash-chains every line, signs checkpoints with a host-held
+ * Ed25519 key, and mirrors the highest checkpoint to an out-of-band anchor
+ * — see `core/trust.ts` for the adversary model. An absolute `evidenceDir`
+ * is used as-is, which is how hosts keep the log outside the agent's
+ * writable workspace.
+ *
  * @module dsh-proof/engine
  */
 
 import type {
   Baseline, CheckSpec, Clock, CommandPort, DependencyGraph, Evidence,
-  FsPort, ProofReport, RelPath, SelectionResult, WorkspacePort, WorkspaceSnapshot,
+  FsPort, ProofReport, RelPath, SelectionResult, SignerPort, WorkspacePort, WorkspaceSnapshot,
 } from './core/index.ts'
 import {
   EvidenceStore, VerificationRunner, assembleBaseline, assembleProof,
   buildDependencyGraph, discoverChecks, selectAffectedChecks, snapshotWorkspace,
 } from './core/index.ts'
+import type { AuditReport } from './core/evidence.ts'
 import type { AttributedCheck } from './core/regression.ts'
 import type { CheckConfigEntry, DiscoverOptions } from './core/checks.ts'
-import { NodeCommandPort, NodeFsPort, GitWorkspace, SystemClock } from './node-ports.ts'
+import { NodeCommandPort, NodeEd25519Signer, NodeFsPort, GitWorkspace, SystemClock } from './node-ports.ts'
 
 export interface EngineOptions {
   readonly root: string
+  /**
+   * Where evidence lives. Relative paths resolve against the workspace root
+   * (legacy, agent-writable); absolute paths are used as-is so hosts can keep
+   * the log under DSH_HOME instead.
+   */
   readonly evidenceDir?: string
+  /** Host-side trust root (signing keys + anchors), outside the workspace. */
+  readonly trustDir?: string
+  /** Stable workspace identity committed into checkpoints and anchors. */
+  readonly workspaceKey?: string
+  /** Append a signed checkpoint after every N records (boundaries always do). */
+  readonly checkpointEvery?: number
+  /** Explicit signer provider; overrides trustDir-derived Ed25519. */
+  readonly signer?: () => Promise<SignerPort | undefined>
   readonly autoDiscover?: boolean
   readonly checks?: readonly CheckConfigEntry[]
   readonly checkTimeoutMs?: number
@@ -52,6 +73,10 @@ export interface VerifyOutcome {
   readonly changed: readonly RelPath[]
 }
 
+function isAbsolutePath(p: string): boolean {
+  return /^([A-Za-z]:[\\/]|\/)/.test(p)
+}
+
 export class ProofEngine {
   readonly root: string
   private readonly fs: FsPort
@@ -64,6 +89,7 @@ export class ProofEngine {
   private specs: CheckSpec[] = []
   private graph: DependencyGraph | undefined
   private baselineSeen = false
+  private signerPromise: Promise<SignerPort | undefined> | undefined
   private readonly options: {
     evidenceDir: string
     autoDiscover: boolean
@@ -83,11 +109,23 @@ export class ProofEngine {
     this.commands = options.commands ?? new NodeCommandPort()
     this.workspace = options.workspace ?? new GitWorkspace(options.root, this.commands, this.clock)
     const evidenceDir = options.evidenceDir ?? '.proof'
+    const storeDir = isAbsolutePath(evidenceDir)
+      ? evidenceDir.replace(/[\/]+$/, '')
+      : `${options.root.replace(/[\/]+$/, '')}/${evidenceDir}`
+    const workspaceKey = options.workspaceKey ?? 'default'
+    const signerProvider = options.signer
+      ?? (options.trustDir !== undefined ? () => this.loadSigner(`${options.trustDir}/keys`) : undefined)
     this.store = new EvidenceStore(
       this.fs,
-      `${options.root}/${evidenceDir}/evidence.jsonl`,
-      `${options.root}/${evidenceDir}/baseline.json`,
+      `${storeDir}/evidence.jsonl`,
+      `${storeDir}/baseline.json`,
       this.clock,
+      {
+        ...(signerProvider !== undefined ? { signer: signerProvider } : {}),
+        ...(options.trustDir !== undefined ? { anchorPath: `${options.trustDir}/anchors/${workspaceKey}/anchor.json` } : {}),
+        workspaceKey,
+        checkpointEvery: options.checkpointEvery ?? 25,
+      },
     )
     this.runner = new VerificationRunner(this.commands, this.workspace, this.clock)
     this.options = {
@@ -101,6 +139,12 @@ export class ProofEngine {
       impactGraphLimit: options.impactGraphLimit ?? 20_000,
       headChars: options.headChars ?? 2_000,
     }
+  }
+
+  /** Host-held Ed25519 signer under the trust root; degrades to unsigned on failure. */
+  private loadSigner(dir: string): Promise<SignerPort | undefined> {
+    this.signerPromise ??= NodeEd25519Signer.load(dir).catch(() => undefined)
+    return this.signerPromise
   }
 
   // -- discovery ----------------------------------------------------------
@@ -158,8 +202,8 @@ export class ProofEngine {
     return this.store.latest()
   }
 
-  /** Integrity check of the evidence log: every record still addresses itself. */
-  async audit(): Promise<{ ok: boolean; total: number; corrupt: string[] }> {
+  /** Integrity check of the evidence log: chain, signatures, anchor, baseline. */
+  async audit(): Promise<AuditReport> {
     return this.store.audit()
   }
 
@@ -177,9 +221,11 @@ export class ProofEngine {
         : {}),
     })
     for (const record of batch.records) await this.store.append(record)
+    // saveBaseline records the file digest into the chain and checkpoints.
     const baseline = assembleBaseline(specs, batch.records, batch.workspace, this.clock)
     await this.store.saveBaseline(baseline)
     await this.store.mark('baseline/established', { baselineId: baseline.baselineId, root: baseline.root, checks: batch.records.length })
+    await this.store.checkpoint()
     return { baseline, records: batch.records }
   }
 
@@ -218,6 +264,8 @@ export class ProofEngine {
       grade: report.grade, root: report.root, changed: changed.length,
       regressions: report.summary.regressions,
     })
+    // Every claim-grade boundary closes the checkpoint window.
+    await this.store.checkpoint()
     return { report, checks, selection, changed }
   }
 

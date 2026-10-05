@@ -8,7 +8,9 @@
     - id: dsh-proof
       name: '/ABSOLUTE/PATH/TO/dsh-proof/src/index.ts'
       config:
+        evidenceStore: host
         evidenceDir: .proof
+        checkpointEvery: 25
         autoDiscover: true
         checkTimeoutMs: 120000
         verifyBudgetMs: 300000

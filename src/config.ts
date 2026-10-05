@@ -19,8 +19,24 @@ export interface CheckEntryConfig {
 }
 
 export interface Config {
-  /** Where evidence lives, relative to the workspace root. */
+  /**
+   * Where the evidence log lives. `host` keeps it under the host trust root
+   * (`$DSH_HOME/proof/workspaces/<key>`), outside the agent's writable
+   * workspace — the default and the recommended setting. `workspace` puts it
+   * back at `evidenceDir` inside the project (legacy behaviour; still
+   * chain- and checkpoint-protected, but the agent could read or delete it).
+   */
+  evidenceStore: 'host' | 'workspace'
+  /** Where evidence lives, relative to the workspace root (workspace mode only). */
   evidenceDir: string
+  /**
+   * Host-side trust root: checkpoint signing keys and rewind anchors. Must
+   * stay outside every agent-writable workspace. Defaults to
+   * `$DSH_PROOF_TRUST_DIR` or `$DSH_HOME/proof`.
+   */
+  trustDir: string | undefined
+  /** Append a signed checkpoint after this many records (boundaries always do). */
+  checkpointEvery: number
   /** Discover objective checks from the project's own build metadata. */
   autoDiscover: boolean
   /** Explicit checks, merged over (or instead of) auto-discovery. */
@@ -57,7 +73,10 @@ export interface Config {
 }
 
 export const Config: Schema<Config> = Schema.object({
+  evidenceStore: Schema.union(['host', 'workspace']).default('host'),
   evidenceDir: Schema.string().default('.proof'),
+  trustDir: Schema.string(),
+  checkpointEvery: Schema.number().default(25),
   autoDiscover: Schema.boolean().default(true),
   checks: Schema.array(Schema.object({
     label: Schema.string(),

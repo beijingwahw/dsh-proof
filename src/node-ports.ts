@@ -9,21 +9,38 @@
  */
 
 import { spawn } from 'node:child_process'
-import { promises as fsp } from 'node:fs'
+import { existsSync, promises as fsp } from 'node:fs'
 import * as path from 'node:path'
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign as edSign, verify as edVerify } from 'node:crypto'
 import type {
   Clock, CommandPort, CommandResult, CommandRunOptions, FileStat, FsPort,
-  WalkOptions, WorkspacePort,
+  SignerPort, WalkOptions, WorkspacePort,
 } from './core/ports.ts'
 
 export class SystemClock implements Clock {
   now(): number { return Date.now() }
 }
 
+/**
+ * Windows: `npm` ships as an `.cmd` shim, which `spawn(shell: false)` cannot
+ * execute. Rather than enabling a shell (an injection surface this port
+ * refuses to open), rewrite well-known shims to `node <cli.js>` — still a
+ * pure argv vector, still no string interpolation.
+ */
+function resolveWindowsArgv(argv: readonly string[]): string[] {
+  const command = argv[0]
+  if (command === undefined) return [...argv]
+  const cli = command.toLowerCase() === 'npm' || command.toLowerCase() === 'npm.cmd'
+    ? path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js')
+    : undefined
+  if (cli !== undefined && existsSync(cli)) return [process.execPath, cli, ...argv.slice(1)]
+  return [...argv]
+}
+
 /** Spawns argv vectors without a shell — no quoting games, no injection surface. */
 export class NodeCommandPort implements CommandPort {
   run(argv: readonly string[], options: CommandRunOptions): Promise<CommandResult> {
-    const [command, ...args] = argv
+    const [command, ...args] = process.platform === 'win32' ? resolveWindowsArgv(argv) : [...argv]
     const started = Date.now()
     return new Promise((resolve) => {
       if (command === undefined) {
@@ -169,6 +186,72 @@ export class NodeFsPort implements FsPort {
 
   async mkdirp(dirPath: string): Promise<void> {
     await fsp.mkdir(dirPath, { recursive: true })
+  }
+}
+
+/**
+ * Ed25519 checkpoint signer whose key lives in a host-side directory the
+ * agent's sandboxed tools cannot write to (default DSH_HOME, never the
+ * workspace). The private key is created with owner-only permissions on
+ * first use and never leaves the directory.
+ *
+ * The trust asymmetry this buys: the model can recompute every hash in the
+ * evidence log, but only this key can produce the checkpoint signatures the
+ * audit chain accepts.
+ */
+export class NodeEd25519Signer implements SignerPort {
+  readonly keyId: string
+  private readonly privateKeyPem: string
+  private readonly publicKeyPem: string
+
+  private constructor(privateKeyPem: string, publicKeyPem: string) {
+    this.privateKeyPem = privateKeyPem
+    this.publicKeyPem = publicKeyPem
+    this.keyId = createHash('sha256').update(publicKeyPem, 'utf8').digest('hex').slice(0, 16)
+  }
+
+  /** Load the key from `dir`, creating it on first use. */
+  static async load(dir: string): Promise<NodeEd25519Signer> {
+    await fsp.mkdir(dir, { recursive: true })
+    const privateKeyPath = path.join(dir, 'proof-signing-key.pem')
+    const publicKeyPath = path.join(dir, 'proof-signing-key.pub.pem')
+    let privatePem: string
+    try {
+      privatePem = await fsp.readFile(privateKeyPath, 'utf8')
+    } catch {
+      const { privateKey, publicKey } = generateKeyPairSync('ed25519')
+      privatePem = privateKey.export({ type: 'pkcs8', format: 'pem' }) as string
+      const publicPem = publicKey.export({ type: 'spki', format: 'pem' }) as string
+      // Write the private half first (atomic temp+rename, owner-only) so a
+      // crash never leaves a public half without its private counterpart.
+      const privateTmp = `${privateKeyPath}.${process.pid}.tmp`
+      await fsp.writeFile(privateTmp, privatePem, { mode: 0o600 })
+      await fsp.rename(privateTmp, privateKeyPath)
+      await fsp.writeFile(publicKeyPath, publicPem, { mode: 0o644 })
+    }
+    let publicPem: string
+    try {
+      publicPem = await fsp.readFile(publicKeyPath, 'utf8')
+    } catch {
+      // Key exists but the public half is missing: derive it from the private key.
+      publicPem = createPublicKey(createPrivateKey(privatePem)).export({ type: 'spki', format: 'pem' }) as string
+      await fsp.writeFile(publicKeyPath, publicPem, { mode: 0o644 })
+    }
+    return new NodeEd25519Signer(privatePem, publicPem)
+  }
+
+  async sign(data: string): Promise<string> {
+    const key = createPrivateKey(this.privateKeyPem)
+    return edSign(null, Buffer.from(data, 'utf8'), key).toString('base64')
+  }
+
+  async verify(data: string, signature: string): Promise<boolean> {
+    try {
+      const key = createPublicKey(this.publicKeyPem)
+      return edVerify(null, Buffer.from(data, 'utf8'), key, Buffer.from(signature, 'base64'))
+    } catch {
+      return false
+    }
   }
 }
 

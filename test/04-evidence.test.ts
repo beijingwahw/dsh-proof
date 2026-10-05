@@ -40,7 +40,11 @@ test('store appends, dedupes and audits integrity', async () => {
   assert.equal(all.length, 1, 're-appending the same address is a no-op')
 
   const audit = await store.audit()
-  assert.deepEqual(audit, { ok: true, total: 1, corrupt: [] })
+  assert.equal(audit.ok, true)
+  assert.equal(audit.total, 1)
+  assert.deepEqual(audit.corrupt, [])
+  assert.equal(audit.chain.mode, 'unsigned', 'a store without a signer produces an unsigned v2 chain')
+  assert.equal(audit.chain.breaks.length, 0)
 
   // Tamper with the log and confirm the audit catches it.
   fs.mutate('/ws/.proof/evidence.jsonl', JSON.stringify({ v: 1, kind: 'evidence', at: 't', payload: { ...ev, status: 'fail' } }) + '\n')

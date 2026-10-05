@@ -76,6 +76,21 @@ export interface Clock {
   now(): number
 }
 
+/**
+ * Signs checkpoint payloads with a key held by the *host*, outside the
+ * workspace the agent can write to. The model can recompute every hash in
+ * the log, but it cannot produce a signature only this key can make — that
+ * asymmetry is what separates the prover from the verifier.
+ */
+export interface SignerPort {
+  /** Stable identity of the signing key (digest of the public key). */
+  readonly keyId: string
+  /** Detached signature over the exact UTF-8 string, base64-encoded. */
+  sign(data: string): Promise<string>
+  /** True when `signature` was produced by this key over `data`. */
+  verify(data: string, signature: string): Promise<boolean>
+}
+
 /** Workspace facts the core needs but does not own. */
 export interface WorkspacePort {
   /** Absolute root of the project under verification. */

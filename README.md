@@ -81,9 +81,21 @@ All four follow DSH's hard contract: `execute` returns one canonical JSON value,
 | extension point | mechanism |
 |---|---|
 | `tools/pre-execute` | with `requireBaseline: ask`, mutations require user approval until a baseline exists |
+| `tools/pre-execute` | with `evidenceStore: workspace`, mutation tools touching the evidence store are routed through user approval |
 | `tools/result` | observes every tool result; maintains the dirty set and file fingerprints |
 | `agent/turn-stopping` | injects corrective context when a turn mutated the workspace without a proven claim, and flags files changed outside the tool stream |
 | `ctx.systemPrompt.section()` | publishes the `proof:policy` section so the model knows the rules exist |
+
+## Trust model (v0.2): the adversary is the auditee
+
+The agent under audit has file-write tools. It could rewrite `.proof/` wholesale and recompute every self-consistent address with the hashing functions this very package exports — self-addressing alone only catches naive tampering. v0.2 separates the prover from the verifier with four layers:
+
+1. **Hash chain** — every line carries `prev = sha256(previous line)`; editing or removing any line breaks the link into the next.
+2. **Signed checkpoints** — a checkpoint commits to `{count, head}` and is signed with a host-held Ed25519 key (`$DSH_HOME/proof/keys/`, never inside the workspace). The agent can forge a whole chain; it cannot forge a signature.
+3. **Out-of-band anchor** — the highest checkpoint ever written is mirrored next to the key, outside the workspace. Truncating or rewinding the log is detected as `rewind`.
+4. **Baseline digest in the chain** — `baseline.json` is plain JSON, so its sha256 is recorded as a chained marker at save time; later substitution trips `baselineTampered`.
+
+By default (`evidenceStore: host`) the log itself lives under `$DSH_HOME/proof/workspaces/<key>/`, outside the agent's sandboxed writable area. `proof_status` surfaces the telemetry: `chainMode`, `checkpoints`, `chainIntact`, `rewindDetected`, `baselineTampered`.
 
 ## Architecture
 
@@ -101,7 +113,7 @@ The domain core is framework-free on purpose: it is fully unit-testable offline,
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit
-npm test              # 61 tests, node:test
+npm test              # 71 tests, node:test
 npm run build
 npm run bundle:check  # packaging contract self-check
 ```
@@ -127,6 +139,7 @@ Every tunable is a `cordis.yml` field — no hardcoded knobs. See [README.zh.md 
 
 - Check discovery is heuristic. For monorepos or custom build systems, declare `checks` explicitly with `paths` so incremental verification stays precise.
 - The dependency graph is approximate and errs toward over-inclusion. Dynamic imports and string-built paths cannot be resolved.
+- Checkpoint cadence leaves a window (v0.2): records after the last signed checkpoint are chain-covered but not checkpoint-covered. The window is bounded by `checkpointEvery` and closed at every baseline/verify/claim boundary. The anchor protects against the audited agent, not against a fully compromised host.
 - `proven` permits pre-existing red checks — they are reported prominently but not charged to the session. Deliberate, not a hole.
 - It orchestrates and attributes your existing objective checks; it does not write tests.
 - DSH is a developer preview and its plugin contract changes. This plugin pins a minimal contract snapshot and declares peers rather than bundling, but upstream shifts still need re-alignment.

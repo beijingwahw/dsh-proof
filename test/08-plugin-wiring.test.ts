@@ -85,6 +85,8 @@ function valueOf(result: unknown): Record<string, unknown> {
 before(async () => {
   await fsp.rm(ROOT, { recursive: true, force: true })
   await fsp.mkdir(ROOT, { recursive: true })
+  // Keep the host-side trust root (signing keys, anchors) inside the fixture.
+  process.env.DSH_PROOF_TRUST_DIR = join(ROOT, 'trust')
   await fsp.writeFile(join(ROOT, 'package.json'), JSON.stringify({
     name: 'wiring-fixture',
     scripts: { test: 'node -e "process.exit(0)"' },
@@ -93,6 +95,7 @@ before(async () => {
 })
 
 after(async () => {
+  delete process.env.DSH_PROOF_TRUST_DIR
   await fsp.rm(ROOT, { recursive: true, force: true })
 })
 
@@ -111,10 +114,40 @@ test('the plugin declares the DSH contract surface', () => {
 test('Schemastery fills configuration defaults and rejects bad values', () => {
   const defaults = valueOf(Config({} as never))
   assert.equal(defaults.evidenceDir, '.proof')
+  assert.equal(defaults.evidenceStore, 'host', 'evidence defaults to the host trust root, outside the workspace')
+  assert.equal(defaults.checkpointEvery, 25)
   assert.equal(defaults.requireBaseline, 'warn')
   assert.equal(defaults.concurrency, 2)
   assert.throws(() => Config({ requireBaseline: 'nonsense' } as never), /invalid|expected|union/i)
   assert.throws(() => Config({ concurrency: 'lots' } as never), /invalid|expected|number/i)
+})
+
+test('workspace mode gates writes into the evidence store', async () => {
+  const harness = makeHarness()
+  process.env.DSH_PROOF_ROOT = ROOT
+  try {
+    plugin.apply(harness.ctx, config({ evidenceStore: 'workspace', requireBaseline: 'off' }))
+  } finally {
+    delete process.env.DSH_PROOF_ROOT
+  }
+
+  const gate = harness.listeners.get('tools/pre-execute')![0] as (
+    exec: unknown, next: () => Promise<unknown>,
+  ) => Promise<{ kind: string; reason?: string }>
+
+  const denied = await gate(
+    { name: 'write', arguments: { path: '.proof/evidence.jsonl', content: 'forged' }, signal: new AbortController().signal },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(denied.kind, 'ask')
+  assert.match(denied.reason ?? '', /evidence/i)
+
+  // Ordinary writes are never gated by the evidence-store guard.
+  const allowed = await gate(
+    { name: 'write', arguments: { path: 'ok.txt', content: 'fine' }, signal: new AbortController().signal },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(allowed.kind, 'allow')
 })
 
 test('apply registers exactly the four proof tools', () => {

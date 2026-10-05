@@ -31,6 +31,13 @@ export interface StatusValue {
   checks: { id: string; label: string; kind: string; lastStatus: string | null; recordedAt: string | null }[]
   evidenceRecords: number
   evidenceLogIntact: boolean
+  /** Trust telemetry from the hash chain + signed checkpoints (v0.2). */
+  chainMode: 'signed' | 'unsigned' | 'legacy'
+  checkpoints: number
+  chainIntact: boolean
+  tailRecords: number
+  rewindDetected: boolean
+  baselineTampered: boolean
   dirtyFiles: number
   summary: string
 }
@@ -151,6 +158,12 @@ function createStatusTool(engine: ProofEngine): ToolDefinition {
           },
           evidenceRecords: { type: 'integer' },
           evidenceLogIntact: { type: 'boolean' },
+          chainMode: { type: 'string', enum: ['signed', 'unsigned', 'legacy'] },
+          checkpoints: { type: 'integer' },
+          chainIntact: { type: 'boolean' },
+          tailRecords: { type: 'integer' },
+          rewindDetected: { type: 'boolean' },
+          baselineTampered: { type: 'boolean' },
           dirtyFiles: { type: 'integer' },
           summary: { type: 'string' },
         },
@@ -187,6 +200,12 @@ function createStatusTool(engine: ProofEngine): ToolDefinition {
         }
       })
 
+      const trustLine = `chain ${audit.chain.mode}, ${audit.chain.checkpoints} checkpoint(s)`
+        + (audit.chain.tailRecords > 0 ? `, ${audit.chain.tailRecords} record(s) since last checkpoint` : '')
+        + (audit.chain.rewind ? ', REWIND DETECTED' : '')
+        + (audit.chain.anchorMismatch ? ', ANCHOR MISMATCH' : '')
+        + (audit.chain.baselineTampered ? ', BASELINE TAMPERED' : '')
+
       const value: StatusValue = {
         hasBaseline: baseline !== undefined,
         baselineCreatedAt: baseline?.createdAt ?? null,
@@ -195,12 +214,22 @@ function createStatusTool(engine: ProofEngine): ToolDefinition {
         checks,
         evidenceRecords: audit.total,
         evidenceLogIntact: audit.ok,
+        chainMode: audit.chain.mode,
+        checkpoints: audit.chain.checkpoints,
+        chainIntact: audit.chain.breaks.length === 0
+          && audit.chain.badCheckpoints.length === 0
+          && audit.chain.unsignedCheckpoints.length === 0
+          && audit.chain.headMismatches.length === 0,
+        tailRecords: audit.chain.tailRecords,
+        rewindDetected: audit.chain.rewind,
+        baselineTampered: audit.chain.baselineTampered,
         dirtyFiles: snapshot.dirty.length,
         summary: baseline === undefined
-          ? `No baseline. ${specs.length} objective check(s) discovered. Establish one with proof_baseline before editing.`
+          ? `No baseline. ${specs.length} objective check(s) discovered. Establish one with proof_baseline before editing. ${trustLine}.`
           : `Baseline from ${baseline.createdAt} (${baseline.checks.length} checks, root ${baseline.root.slice(0, 12)}). `
             + `${specs.length} check(s) discovered, ${audit.total} evidence record(s), `
-            + `${audit.ok ? 'log intact' : `LOG CORRUPT (${audit.corrupt.length})`}, ${snapshot.dirty.length} dirty file(s).`,
+            + `${audit.ok ? `log intact (${trustLine})` : `LOG CORRUPT (${audit.corrupt.length}; ${trustLine})`}, `
+            + `${snapshot.dirty.length} dirty file(s).`,
       }
       return value as unknown as JsonValue
     },
@@ -447,6 +476,10 @@ function renderStatus(value: StatusValue): string {
   const checks = Array.isArray(v.checks) ? v.checks : []
   const summary = typeof v.summary === 'string' ? v.summary : 'no status available'
   const lines = [summary, '']
+  if (v.rewindDetected === true || v.baselineTampered === true || v.chainIntact === false) {
+    lines.push('⚠️ Evidence log trust: TAMPER-EVIDENCE TRIPPED — do not trust grades until restored from a known-good copy.')
+    lines.push('')
+  }
   if (checks.length === 0) lines.push('No objective checks discovered. Add `checks` to the plugin config, or give the project a test/build script.')
   else {
     lines.push('Objective checks:')

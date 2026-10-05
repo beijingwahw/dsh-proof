@@ -10,12 +10,18 @@
 
 export type {
   CheckKind, CheckSource, CheckSpec, Clock, CommandPort, CommandResult,
-  CommandRunOptions, FileStat, FsPort, WalkOptions, WorkspacePort,
+  CommandRunOptions, FileStat, FsPort, SignerPort, WalkOptions, WorkspacePort,
 } from './ports.ts'
 
 export {
   addressOf, canonicalJson, merkleRoot, normalizeOutput, sha256,
 } from './hash.ts'
+
+export {
+  GENESIS_PREV, checkpointSignedData, lineDigest, parseAnchor, walkChain,
+  type AnchorFile, type ChainMode, type ChainWalk, type CheckpointPayload,
+  type WalkedCheckpoint,
+} from './trust.ts'
 
 export {
   DEFAULT_IGNORE_DIRS, DEFAULT_SCRIPT_KINDS, checkId, discoverChecks,
@@ -25,9 +31,9 @@ export {
 export {
   DEFAULT_BASELINE_RELPATH, DEFAULT_LOG_RELPATH, EvidenceStore,
   buildBaseline, makeEvidence, snapshotWorkspace, verdictOf,
-  type Baseline, type CheckReport, type CheckStatus, type CheckVerdict,
-  type Evidence, type ProofGrade, type ProofReport, type RunOutcome,
-  type WorkspaceSnapshot,
+  type AuditReport, type Baseline, type CheckReport, type CheckStatus,
+  type CheckVerdict, type Evidence, type ProofGrade, type ProofReport,
+  type RunOutcome, type StoreTrust, type WorkspaceSnapshot,
 } from './evidence.ts'
 
 export {

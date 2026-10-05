@@ -6,11 +6,18 @@
  * the model makes must be recomputable from the evidence log*. The log is
  * append-only; a `baseline` or `proof` is just a named view over it.
  *
+ * Since v0.2 the log is also tamper-evident against its own writer: every
+ * line carries `prev = sha256(previous line)` (a hash chain), checkpoints
+ * are signed by a host-held key (see `core/trust.ts`), the highest
+ * checkpoint is mirrored to an anchor file outside the workspace, and the
+ * baseline file's digest is recorded in the chain when it is saved.
+ *
  * @module dsh-proof/core/evidence
  */
 
-import type { CheckKind, CheckSpec, Clock, FsPort, WorkspacePort } from './ports.ts'
-import { addressOf, merkleRoot, normalizeOutput, sha256 } from './hash.ts'
+import type { CheckKind, CheckSpec, Clock, FsPort, SignerPort, WorkspacePort } from './ports.ts'
+import { addressOf, canonicalJson, merkleRoot, normalizeOutput, sha256 } from './hash.ts'
+import { GENESIS_PREV, checkpointSignedData, lineDigest, parseAnchor, walkChain } from './trust.ts'
 
 export type CheckStatus = 'pass' | 'fail' | 'error' | 'timeout' | 'aborted' | 'skipped'
 
@@ -177,50 +184,208 @@ export function buildBaseline(records: readonly Evidence[], workspace: Workspace
 }
 
 // ---------------------------------------------------------------------------
-// The append-only evidence log
+// The append-only, hash-chained evidence log
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_LOG_RELPATH = '.proof/evidence.jsonl'
 export const DEFAULT_BASELINE_RELPATH = '.proof/baseline.json'
 
-interface LogEnvelope {
-  readonly v: 1
-  readonly kind: 'evidence' | 'marker'
-  readonly at: string
-  readonly payload: unknown
+/** Trust wiring for an EvidenceStore: signing, anchoring, checkpoint cadence. */
+export interface StoreTrust {
+  /** Lazily resolved host signer; `undefined` results in an unsigned chain. */
+  readonly signer?: () => Promise<SignerPort | undefined>
+  /** Where the out-of-band anchor lives (outside the agent-writable area). */
+  readonly anchorPath?: string
+  /** Stable identity of the workspace, committed into checkpoints. */
+  readonly workspaceKey?: string
+  /** Append a checkpoint automatically after this many records. */
+  readonly checkpointEvery?: number
 }
 
-/** Content-addressed, append-only evidence store backed by a JSONL file. */
+/** Everything `audit()` can tell you about the log's integrity. */
+export interface AuditReport {
+  readonly ok: boolean
+  /** Evidence records in the log. */
+  readonly total: number
+  /** checkIds whose payload no longer addresses itself. */
+  readonly corrupt: readonly string[]
+  readonly chain: {
+    readonly mode: 'signed' | 'unsigned' | 'legacy'
+    readonly breaks: readonly number[]
+    readonly checkpoints: number
+    readonly badCheckpoints: readonly number[]
+    readonly unsignedCheckpoints: readonly number[]
+    readonly headMismatches: readonly number[]
+    /** Records after the last checkpoint — chain-covered, not checkpoint-covered. */
+    readonly tailRecords: number
+    /** The log ends before the best checkpoint the anchor remembers. */
+    readonly rewind: boolean
+    readonly anchorMismatch: boolean
+    /** The baseline file no longer matches the digest recorded in the chain. */
+    readonly baselineTampered: boolean
+  }
+}
+
+interface LogEnvelope {
+  readonly v: 1 | 2
+  readonly kind: 'evidence' | 'marker' | 'checkpoint'
+  readonly at: string
+  readonly payload: unknown
+  /** v2: digest of the physically previous line. */
+  readonly prev?: string
+  readonly sig?: string
+  readonly keyId?: string
+  readonly sigError?: string
+}
+
+/** Content-addressed, append-only, hash-chained evidence store backed by a JSONL file. */
 export class EvidenceStore {
   private readonly fs: FsPort
   private readonly logPath: string
   private readonly baselinePath: string
   private readonly clock: Clock
+  private readonly trust: StoreTrust
   private readonly cache = new Map<string, Evidence>()
 
-  constructor(fs: FsPort, logPath: string, baselinePath: string, clock: Clock) {
+  private tailReady = false
+  private tail = GENESIS_PREV
+  private recordsSoFar = 0
+  private sinceCheckpoint = 0
+  private signerPromise: Promise<SignerPort | undefined> | undefined
+
+  constructor(fs: FsPort, logPath: string, baselinePath: string, clock: Clock, trust: StoreTrust = {}) {
     this.fs = fs
     this.logPath = logPath
     this.baselinePath = baselinePath
     this.clock = clock
+    this.trust = trust
   }
 
   static atWorkspace(fs: FsPort, root: string, clock: Clock): EvidenceStore {
     return new EvidenceStore(fs, `${root}/${DEFAULT_LOG_RELPATH}`, `${root}/${DEFAULT_BASELINE_RELPATH}`, clock)
   }
 
+  /** Load the chain tail (and record counts) from disk exactly once. */
+  private async ensureTail(): Promise<void> {
+    if (this.tailReady) return
+    const lines = await this.fs.readLines(this.logPath)
+    let lastCheckpointIndex = -1
+    let records = 0
+    lines.forEach((line, index) => {
+      const envelope = parseEnvelope(line)
+      if (envelope === undefined) return
+      if (envelope.kind === 'checkpoint') lastCheckpointIndex = index
+      if (envelope.kind === 'evidence' || envelope.kind === 'marker') records += 1
+    })
+    const last = lines[lines.length - 1]
+    this.tail = last === undefined ? GENESIS_PREV : lineDigest(last)
+    this.recordsSoFar = records
+    this.sinceCheckpoint = lines
+      .slice(lastCheckpointIndex + 1)
+      .filter(line => {
+        const envelope = parseEnvelope(line)
+        return envelope?.kind === 'evidence' || envelope?.kind === 'marker'
+      }).length
+    this.tailReady = true
+  }
+
+  private async resolveSigner(): Promise<SignerPort | undefined> {
+    if (this.trust.signer === undefined) return undefined
+    this.signerPromise ??= this.trust.signer().catch(() => undefined)
+    return this.signerPromise
+  }
+
   /** Append one evidence record. Re-appending an existing address is a no-op. */
   async append(evidence: Evidence): Promise<void> {
     if (this.cache.has(evidence.evidenceId)) return
-    const envelope: LogEnvelope = { v: 1, kind: 'evidence', at: new Date(this.clock.now()).toISOString(), payload: evidence }
-    await this.fs.appendLine(this.logPath, JSON.stringify(envelope))
+    await this.ensureTail()
+    const envelope: LogEnvelope = {
+      v: 2,
+      kind: 'evidence',
+      at: new Date(this.clock.now()).toISOString(),
+      prev: this.tail,
+      payload: evidence,
+    }
+    await this.writeEnvelope(envelope)
     this.cache.set(evidence.evidenceId, evidence)
+    this.recordsSoFar += 1
+    this.sinceCheckpoint += 1
+    await this.maybeCheckpoint()
   }
 
   /** Append a free-form marker (session boundaries, decisions). */
   async mark(label: string, data: Record<string, unknown> = {}): Promise<void> {
-    const envelope: LogEnvelope = { v: 1, kind: 'marker', at: new Date(this.clock.now()).toISOString(), payload: { label, ...data } }
-    await this.fs.appendLine(this.logPath, JSON.stringify(envelope))
+    await this.ensureTail()
+    const envelope: LogEnvelope = {
+      v: 2,
+      kind: 'marker',
+      at: new Date(this.clock.now()).toISOString(),
+      prev: this.tail,
+      payload: { label, ...data },
+    }
+    await this.writeEnvelope(envelope)
+    this.recordsSoFar += 1
+    this.sinceCheckpoint += 1
+    await this.maybeCheckpoint()
+  }
+
+  /**
+   * Append a signed checkpoint and refresh the out-of-band anchor.
+   *
+   * A checkpoint commits to "the chain head, after N records". Without the
+   * host's key the writer of the log cannot produce a new one, and without
+   * the anchor the log cannot be quietly rewound past the last checkpoint.
+   */
+  async checkpoint(): Promise<void> {
+    await this.ensureTail()
+    const payload = {
+      count: this.recordsSoFar,
+      head: this.tail,
+      workspaceKey: this.trust.workspaceKey ?? null,
+      at: new Date(this.clock.now()).toISOString(),
+    }
+    const signer = await this.resolveSigner()
+    let sig: string | undefined
+    let keyId: string | undefined
+    let sigError: string | undefined
+    if (signer !== undefined) {
+      try {
+        sig = await signer.sign(checkpointSignedData(payload))
+        keyId = signer.keyId
+      } catch (error) {
+        // Loud degradation: an unsigned checkpoint that should have been
+        // signed is recorded as such and fails audit while a signer is active.
+        sigError = errorMessage(error)
+      }
+    }
+    const envelope: LogEnvelope = {
+      v: 2,
+      kind: 'checkpoint',
+      at: payload.at,
+      prev: this.tail,
+      payload,
+      ...(sig !== undefined ? { sig, keyId } : {}),
+      ...(sigError !== undefined ? { sigError } : {}),
+    }
+    await this.writeEnvelope(envelope)
+    this.sinceCheckpoint = 0
+    if (signer !== undefined && sig !== undefined && this.trust.anchorPath !== undefined) {
+      const anchor = { v: 1, keyId: signer.keyId, count: payload.count, head: payload.head, sig, at: payload.at }
+      await this.fs.writeFile(this.trust.anchorPath, JSON.stringify(anchor, null, 2))
+    }
+  }
+
+  private async maybeCheckpoint(): Promise<void> {
+    const every = this.trust.checkpointEvery
+    if (every !== undefined && every > 0 && this.sinceCheckpoint >= every) {
+      await this.checkpoint()
+    }
+  }
+
+  private async writeEnvelope(envelope: LogEnvelope): Promise<void> {
+    const line = JSON.stringify(envelope)
+    await this.fs.appendLine(this.logPath, line)
+    this.tail = lineDigest(line)
   }
 
   /** Every evidence record ever appended, in log order. */
@@ -247,19 +412,82 @@ export class EvidenceStore {
     return map
   }
 
-  /** Verify the log's internal consistency: every record still addresses itself. */
-  async audit(): Promise<{ ok: boolean; total: number; corrupt: string[] }> {
+  /**
+   * Verify the log's integrity end to end: per-record self-addressing, hash
+   * chain linkage, checkpoint signatures, anchor monotonicity, and the
+   * baseline file digest recorded at save time.
+   */
+  async audit(): Promise<AuditReport> {
+    const lines = await this.fs.readLines(this.logPath)
+    const walk = walkChain(lines)
     const all = await this.all()
+
     const corrupt: string[] = []
     for (const ev of all) {
       const { evidenceId, ...rest } = ev
       if (addressOf(rest) !== evidenceId) corrupt.push(ev.checkId)
     }
-    return { ok: corrupt.length === 0, total: all.length, corrupt }
+
+    const signer = await this.resolveSigner()
+    const badCheckpoints: number[] = []
+    const unsignedCheckpoints: number[] = []
+    const headMismatches: number[] = []
+    for (const cp of walk.checkpoints) {
+      if (cp.payload.head !== cp.expectedHead) headMismatches.push(cp.index)
+      if (cp.sig === null) {
+        if (signer !== undefined) unsignedCheckpoints.push(cp.index)
+      } else {
+        const okSig = signer !== undefined && await signer.verify(checkpointSignedData(cp.payload), cp.sig)
+        if (!okSig) badCheckpoints.push(cp.index)
+      }
+    }
+
+    let rewind = false
+    let anchorMismatch = false
+    const anchor = parseAnchor(this.trust.anchorPath === undefined ? undefined : await this.fs.readFile(this.trust.anchorPath))
+    if (anchor !== undefined) {
+      const best = walk.checkpoints[walk.checkpoints.length - 1]
+      if (best === undefined || best.payload.count < anchor.count) rewind = true
+      else if (best.payload.count === anchor.count && best.payload.head !== anchor.head) anchorMismatch = true
+    }
+
+    let baselineTampered = false
+    const baselineRaw = await this.fs.readFile(this.baselinePath)
+    const saved = lastMarkerDigest(lines, 'baseline/saved')
+    if (baselineRaw !== undefined && saved !== undefined && sha256(baselineRaw) !== saved) baselineTampered = true
+
+    const chain = {
+      mode: walk.mode,
+      breaks: walk.chainBreaks,
+      checkpoints: walk.checkpoints.length,
+      badCheckpoints,
+      unsignedCheckpoints,
+      headMismatches,
+      tailRecords: walk.tailRecords,
+      rewind,
+      anchorMismatch,
+      baselineTampered,
+    }
+    const ok = corrupt.length === 0
+      && walk.corruptLines.length === 0
+      && walk.chainBreaks.length === 0
+      && badCheckpoints.length === 0
+      && headMismatches.length === 0
+      && unsignedCheckpoints.length === 0
+      && !rewind
+      && !anchorMismatch
+      && !baselineTampered
+    return { ok, total: all.length, corrupt, chain }
   }
 
   async saveBaseline(baseline: Baseline): Promise<void> {
-    await this.fs.writeFile(this.baselinePath, JSON.stringify(baseline, null, 2))
+    const contents = JSON.stringify(baseline, null, 2)
+    await this.fs.writeFile(this.baselinePath, contents)
+    // The baseline file is a plain JSON document — an adversary with write
+    // access could replace it wholesale. Recording its digest in the chain
+    // (and checkpointing right after) makes any later substitution detectable.
+    await this.mark('baseline/saved', { digest: sha256(contents), bytes: contents.length })
+    await this.checkpoint()
   }
 
   async loadBaseline(): Promise<Baseline | undefined> {
@@ -274,10 +502,22 @@ export class EvidenceStore {
   }
 }
 
+function lastMarkerDigest(lines: readonly string[], label: string): string | undefined {
+  let digest: string | undefined
+  for (const line of lines) {
+    const envelope = parseEnvelope(line)
+    if (envelope?.kind !== 'marker') continue
+    const payload = envelope.payload as { label?: unknown; digest?: unknown }
+    if (payload?.label === label && typeof payload?.digest === 'string') digest = payload.digest
+  }
+  return digest
+}
+
 function parseEnvelope(line: string): LogEnvelope | undefined {
   try {
     const value = JSON.parse(line) as LogEnvelope
-    return value && value.v === 1 ? value : undefined
+    if (!value || (value.v !== 1 && value.v !== 2)) return undefined
+    return value
   } catch {
     return undefined
   }
@@ -304,6 +544,11 @@ export function verdictOf(baseline: Evidence | undefined, current: Evidence | un
   if (!ok(b) && !ok(c)) return 'still-failing'
   if (ok(b) && !ok(c)) return 'regression'
   return 'fixed'
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message
+  try { return String(error) } catch { return '<unprintable>' }
 }
 
 export type { CheckStatus as EvidenceCheckStatus }
