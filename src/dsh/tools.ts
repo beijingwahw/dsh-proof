@@ -18,6 +18,7 @@ import type {
 import type { ProofEngine } from '../engine.ts'
 import type { AuditReport, ProofGrade, ProofReport } from '../core/evidence.ts'
 import type { ConfidenceBasis, GradedProofReport } from '../core/report.ts'
+import type { ClaimContract, ClaimKind, ObligationResult } from '../core/contract.ts'
 import { proofNarrative } from '../core/regression.ts'
 import { firstInformativeLine } from '../core/excerpt.ts'
 
@@ -122,6 +123,19 @@ export interface ClaimValue {
    * claim card can speak in probabilities. Absent on the legacy binary path.
    */
   confidence?: number
+  /**
+   * ζ: the contract kind this claim was typed against. Present exactly when the
+   * call carried a `kind` (the typed path); the legacy path omits every field
+   * below so its canonical value stays byte-identical to pre-ζ session logs.
+   */
+  kind?: ClaimKind
+  /** ζ: per-obligation verdicts under the claim's contract, in engine order. */
+  obligations?: ReadonlyArray<{ id: string; met: boolean; detail: string }>
+  /**
+   * ζ: docs-only whose every obligation held — the verdict is jury evidence
+   * (the author's self-attestation, structurally capped), never a measurement.
+   */
+  jury?: true
   /** Checks that regressed against the baseline — blame, not credit. */
   regressions: VerifyValue['regressions']
   blockers: string[]
@@ -154,11 +168,40 @@ const claimParams: ParameterSchemaSpec = {
     required: true,
     description: 'The exact completion claim, e.g. "fixed the login redirect bug and added a regression test".',
   },
+  kind: {
+    type: 'string',
+    enum: ['behavior-preserving', 'behavior-adding', 'perf-budget', 'docs-only'],
+    description: 'Optional typed contract for the claim: refactor/optimization → behavior-preserving '
+      + '(the public API surface must not move); new feature → behavior-adding (every new source path covered '
+      + 'by a passing check); performance → perf-budget (with budgetMs); documentation → docs-only (with review). '
+      + 'Omit to verify without a contract.',
+  },
+  budgetMs: {
+    type: 'number',
+    description: 'perf-budget only: benchmark checks must stay within this many milliseconds.',
+  },
+  review: {
+    type: 'string',
+    description: 'docs-only only: the self-review that jury evidence carries — what a human reviewer should double-check.',
+  },
+  entryPoints: {
+    type: 'array',
+    items: { type: 'string' },
+    description: 'API-face entry points (workspace-relative files) the surface check covers; omit to let the engine '
+      + 'derive them from package.json. Advanced usage.',
+  },
   changed: {
     type: 'array',
     items: { type: 'string' },
     description: 'Files this session changed, relative to the workspace root.',
   },
+}
+
+const CLAIM_KINDS: readonly string[] = ['behavior-preserving', 'behavior-adding', 'perf-budget', 'docs-only']
+
+/** ζ: narrow an untrusted `kind` argument to the four-value union, or nothing. */
+function isClaimKind(value: unknown): value is ClaimKind {
+  return typeof value === 'string' && CLAIM_KINDS.includes(value)
 }
 
 export function createProofTools(engine: ProofEngine, touched?: () => readonly string[]): ToolDefinition[] {
@@ -385,6 +428,17 @@ function createClaimTool(engine: ProofEngine, touched?: () => readonly string[])
           proven: { type: 'boolean' }, root: { type: 'string' },
           // Present only when the verification carried a posterior (γ).
           confidence: { type: 'number' },
+          // Present only when the claim carried a `kind` (ζ) — declared so the
+          // schema stays truthful about what a typed contract may emit.
+          kind: { type: 'string', enum: ['behavior-preserving', 'behavior-adding', 'perf-budget', 'docs-only'] },
+          obligations: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: { id: { type: 'string' }, met: { type: 'boolean' }, detail: { type: 'string' } },
+            },
+          },
+          jury: { type: 'boolean' },
           regressions: {
             type: 'array',
             items: {
@@ -413,15 +467,54 @@ function createClaimTool(engine: ProofEngine, touched?: () => readonly string[])
       }
     },    presentResult: (_args, result) => {
       const meta = result.meta as ClaimValue | undefined
+      // ζ: a typed claim names its contract in the title; the untyped card keeps
+      // its exact legacy wording.
+      const kind = typeof meta?.kind === 'string' ? meta.kind : undefined
       return {
         card: 'generic',
-        title: meta?.proven === true ? '✓ Proven' : `✗ Not proven · ${meta?.grade ?? 'unknown'}`,
+        title: meta?.proven === true
+          ? (kind !== undefined ? `✓ Claim (${kind})` : '✓ Proven')
+          : (kind !== undefined
+            ? `✗ Claim (${kind}) · ${meta?.grade ?? 'unknown'}`
+            : `✗ Not proven · ${meta?.grade ?? 'unknown'}`),
         content: [text(meta?.summary ? oneLine(meta.summary) : 'no claim result')],
       }
     },
     async execute(args, exec: ToolRunContext) {
       assertActive(exec)
-      const parsed = (args ?? {}) as { claim: string; changed?: string[] }
+      const parsed = (args ?? {}) as {
+        claim: string
+        changed?: string[]
+        kind?: string
+        budgetMs?: number
+        review?: string
+        entryPoints?: string[]
+      }
+      // ζ typed-contract path: a `kind` binds the claim to its obligations via
+      // engine.verifyContract. Everything else (no kind) keeps the legacy
+      // verify() path byte-for-byte.
+      if (isClaimKind(parsed.kind)) {
+        const contract: ClaimContract = {
+          kind: parsed.kind,
+          claim: parsed.claim,
+          ...(typeof parsed.budgetMs === 'number' ? { budgetMs: parsed.budgetMs } : {}),
+          ...(typeof parsed.review === 'string' ? { review: parsed.review } : {}),
+          ...(Array.isArray(parsed.entryPoints)
+            ? { entryPoints: parsed.entryPoints.filter((e): e is string => typeof e === 'string') }
+            : {}),
+        }
+        const outcome = await engine.verifyContract({
+          contract,
+          ...(Array.isArray(parsed.changed) ? { changed: parsed.changed } : {}),
+          ...(touched !== undefined ? { touched: touched() } : {}),
+          signal: exec.signal,
+        })
+        const verified = toVerifyValue(
+          outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
+          outcome.schedule,
+        )
+        return toClaimValue(parsed.claim, outcome.report, verified, outcome.contract) as unknown as JsonValue
+      }
       const outcome = await engine.verify({
         ...(Array.isArray(parsed.changed) ? { changed: parsed.changed } : {}),
         ...(touched !== undefined ? { touched: touched() } : {}),
@@ -605,7 +698,13 @@ export function toVerifyValue(
   }
 }
 
-export function toClaimValue(claim: string, report: ProofReport, verified: VerifyValue): ClaimValue {
+export function toClaimValue(
+  claim: string,
+  report: ProofReport,
+  verified: VerifyValue,
+  /** ζ: the engine's contract verdict; present only on the typed (kind) path. */
+  contract?: { readonly kind: ClaimKind; readonly obligations: readonly ObligationResult[] },
+): ClaimValue {
   const blockers: string[] = []
   if (report.grade === 'no-baseline') blockers.push('No baseline exists. Run proof_baseline first.')
   if (report.grade === 'stale') blockers.push(`Stale evidence: ${report.unverified.join(', ') || 'affected checks not re-run'}.`)
@@ -616,12 +715,39 @@ export function toClaimValue(claim: string, report: ProofReport, verified: Verif
   // verification had one — same two-decimal number, never a bare probability.
   // The no-posterior branches keep their exact legacy text.
   const p = typeof verified.confidence === 'number' ? verified.confidence : undefined
+
+  // ζ typed-contract half: rides only when the engine judged a contract. The
+  // obligation list is defensively copied into plain records (the canonical
+  // value owns its shape, whatever the engine object grows into), and each
+  // unmet obligation is a blocker in its own right — its detail is the model's
+  // action item, phrased by core/contract.ts. Both-or-nothing: a contract
+  // without a legible kind or obligations degrades to the legacy value rather
+  // than half-announcing a contract.
+  const kind = contract !== undefined && typeof contract.kind === 'string' ? contract.kind : undefined
+  const obligations = contract !== undefined && Array.isArray(contract.obligations)
+    ? contract.obligations.map(o => ({ id: o.id, met: o.met === true, detail: o.detail }))
+    : undefined
+  if (kind !== undefined && obligations !== undefined) {
+    for (const obligation of obligations) {
+      if (obligation.met !== true) blockers.push(`contract unmet: ${obligation.id} — ${obligation.detail}`)
+    }
+  }
+  // The jury flag marks a docs-only claim whose every obligation held: that
+  // verdict is self-attestation carrying the structural cap, and the render
+  // must be able to say so. An empty obligation list is not a standing jury.
+  const jury = kind === 'docs-only'
+    && obligations !== undefined
+    && obligations.length > 0
+    && obligations.every(o => o.met === true)
+
   return {
     claim,
     grade: report.grade,
     proven: report.grade === 'proven',
     root: report.root,
     ...(p !== undefined ? { confidence: p } : {}),
+    ...(kind !== undefined && obligations !== undefined ? { kind, obligations } : {}),
+    ...(jury ? { jury: true as const } : {}),
     regressions: verified.regressions,
     blockers,
     summary: report.grade === 'proven'
@@ -776,6 +902,27 @@ function renderClaim(value: ClaimValue): string {
   const head = proven ? `✓ PROVEN — ${v.claim ?? ''}` : `✗ NOT PROVEN (${String(v.grade ?? 'unknown').toUpperCase()}) — ${v.claim ?? ''}`
   const root = typeof v.root === 'string' ? v.root.slice(0, 12) : '<none>'
   const lines = [head, `evidence root: ${root}`, '']
+  // ζ typed-contract section: present only when the value carries a kind, so a
+  // legacy (pre-ζ) replay renders byte-identically — no kind, no section, and
+  // every field below is individually guarded against hostile meta.
+  const kind = typeof v.kind === 'string' ? v.kind : undefined
+  if (kind !== undefined) {
+    lines.push(`contract: ${kind}`)
+    const obligations = Array.isArray(v.obligations) ? v.obligations : []
+    for (const entry of obligations) {
+      const o = (entry ?? {}) as { id?: unknown; met?: unknown; detail?: unknown }
+      const id = typeof o.id === 'string' ? o.id : 'unknown'
+      const detail = typeof o.detail === 'string' ? o.detail : ''
+      lines.push(o.met === true ? `  ✓ ${id}` : `  ✖ ${id}${detail.length > 0 ? ` — ${detail}` : ''}`)
+    }
+    if (v.jury === true) {
+      // The cap rides as the claim's confidence on the jury path; stating it
+      // here keeps self-attestation from reading like check coverage.
+      const cap = typeof v.confidence === 'number' ? ` at p≈${v.confidence.toFixed(2)}` : ''
+      lines.push(`  jury evidence — no objective check ran; self-attestation is capped${cap}`)
+    }
+    lines.push('')
+  }
   const blockers = Array.isArray(v.blockers) ? v.blockers : []
   if (blockers.length > 0) {
     lines.push('Blockers:')

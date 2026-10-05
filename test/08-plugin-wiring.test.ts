@@ -797,3 +797,147 @@ test('claim values carry the posterior and say p≈ in the summary when one exis
   assert.ok(!('confidence' in legacyClaim), 'no posterior on the ungraded path — canonical value stays byte-identical')
   assert.ok(!legacyClaim.summary.includes('p≈'))
 })
+
+// ---------------------------------------------------------------------------
+// Typed claim contracts (ζ): a proof_claim carrying a `kind` is judged by
+// engine.verifyContract against the obligations that kind imposes. The tool
+// surface must declare the new parameters, the projection must carry the
+// obligations into the canonical value (unmet ones as blockers), and the
+// untyped path must stay byte-identical to pre-ζ session logs.
+// ---------------------------------------------------------------------------
+
+test('proof_claim declares the typed-contract parameters without weakening the legacy surface (ζ)', () => {
+  const claimTool = appliedTools().find(t => t.name === 'proof_claim')!
+  const params = claimTool.parameters as Record<string, Record<string, unknown>>
+
+  assert.equal(params.claim?.required, true, 'claim stays required')
+  assert.equal(params.claim?.type, 'string')
+  assert.equal(params.changed?.type, 'array', 'the legacy changed parameter survives untouched')
+
+  const kind = params.kind!
+  assert.equal(kind.type, 'string')
+  assert.deepEqual(kind.enum, ['behavior-preserving', 'behavior-adding', 'perf-budget', 'docs-only'])
+  assert.match(
+    String(kind.description),
+    /behavior-preserving.*behavior-adding.*perf-budget.*docs-only/s,
+    'one sentence of guidance: which claim goes with which contract',
+  )
+  assert.match(String(kind.description), /budgetMs/)
+  assert.match(String(kind.description), /review/)
+
+  assert.equal(params.budgetMs?.type, 'number')
+  assert.match(String(params.budgetMs?.description), /benchmark checks must stay within this/)
+  assert.equal(params.review?.type, 'string')
+  assert.match(String(params.review?.description), /the self-review that jury evidence carries/)
+  assert.equal(params.entryPoints?.type, 'array')
+  assert.deepEqual(params.entryPoints?.items, { type: 'string' })
+})
+
+test('typed claims carry obligations and unmet ones block; untyped claims stay byte-identical (ζ)', () => {
+  const claimTool = appliedTools().find(t => t.name === 'proof_claim')!
+
+  // The engine downgrades a proven-with-unmet run to `stale` — render that corner.
+  const report = fakeReport({ grade: 'stale' })
+  const verified = toVerifyValue(report, ['src/api.ts'], [], { untouched: [], precision: 'approximate' })
+  const contract = {
+    kind: 'behavior-preserving' as const,
+    obligations: [
+      { id: 'zero-regressions', met: true, detail: '2 check(s) compared against the baseline, 0 regressions' },
+      { id: 'api-surface-unchanged', met: false, detail: 'public API changed — added: src/api.ts#frobnicate' },
+    ],
+  }
+  const claim = toClaimValue('refactored the retry internals', report, verified, contract)
+  assert.equal(claim.kind, 'behavior-preserving')
+  assert.deepEqual(
+    claim.obligations,
+    [
+      { id: 'zero-regressions', met: true, detail: '2 check(s) compared against the baseline, 0 regressions' },
+      { id: 'api-surface-unchanged', met: false, detail: 'public API changed — added: src/api.ts#frobnicate' },
+    ],
+    'the obligation verdicts transfer verbatim into the canonical value',
+  )
+  assert.ok(!('jury' in claim), 'jury marks docs-only verdicts only')
+  assert.ok(
+    claim.blockers.includes('contract unmet: api-surface-unchanged — public API changed — added: src/api.ts#frobnicate'),
+    'an unmet obligation is a blocker carrying its action-item detail',
+  )
+  assert.ok(
+    claim.blockers.some(b => b.startsWith('Stale evidence:')),
+    'legacy blockers and contract blockers coexist, both listed',
+  )
+
+  const rendered = renderedText(claimTool, claim)
+  assert.match(rendered, /^contract: behavior-preserving$/m)
+  assert.match(rendered, /✓ zero-regressions/)
+  assert.match(rendered, /✖ api-surface-unchanged — public API changed — added: src\/api\.ts#frobnicate/)
+
+  const card = claimTool.presentResult!({}, { meta: claim } as never) as { title: string }
+  assert.match(card.title, /Claim \(behavior-preserving\)/)
+
+  // The untyped path: none of the new keys, and the render is byte-identical
+  // to what pre-ζ session logs already hold.
+  const legacyReport = fakeReport({ grade: 'stale', unverified: ['e2e'] })
+  const legacy = toClaimValue(
+    'same claim', legacyReport, toVerifyValue(legacyReport, [], [], { untouched: [], precision: 'approximate' }),
+  )
+  for (const key of ['kind', 'obligations', 'jury']) {
+    assert.ok(!(key in legacy), `${key} must not appear on the untyped path`)
+  }
+  assert.equal(
+    renderedText(claimTool, legacy),
+    [
+      '✗ NOT PROVEN (STALE) — same claim',
+      'evidence root: abababababab',
+      '',
+      'Blockers:',
+      '  · Stale evidence: e2e.',
+      '',
+      'NOT PROVEN (stale) — "same claim". Stale evidence: e2e.',
+    ].join('\n'),
+    'the untyped render stays byte-identical to the pre-ζ renderer',
+  )
+
+  // Defensive replay: partial or hostile meta never throws — it degrades to prose.
+  assert.doesNotThrow(() => { renderedText(claimTool, { summary: 's' }) })
+  assert.doesNotThrow(() => { renderedText(claimTool, { summary: 's', kind: 'docs-only', obligations: null }) })
+  assert.doesNotThrow(() => { renderedText(claimTool, { summary: 's', kind: 42 }) })
+})
+
+test('docs-only jury claims mark their verdict as capped jury evidence (ζ)', () => {
+  const claimTool = appliedTools().find(t => t.name === 'proof_claim')!
+
+  const report = gradedReport(0.8, 'jury-only', { grade: 'proven' })
+  const verified = toVerifyValue(report, ['README.md'], [], { untouched: [], precision: 'approximate' })
+  const contract = {
+    kind: 'docs-only' as const,
+    obligations: [
+      { id: 'zero-regressions', met: true, detail: 'docs-only claims run no checks — the regression obligation is carried by docs-only-changes instead' },
+      { id: 'docs-only-changes', met: true, detail: 'all 1 changed path(s) are docs-only assets' },
+      { id: 'jury-review', met: true, detail: 'jury self-review on record: "checked every link"' },
+    ],
+  }
+  const claim = toClaimValue('documented the retry options', report, verified, contract)
+  assert.equal(claim.proven, true)
+  assert.equal(claim.kind, 'docs-only')
+  assert.equal(claim.jury, true, 'a fully-met docs-only contract is standing jury evidence')
+  assert.equal(claim.confidence, 0.8, 'the cap rides as the claim confidence')
+
+  const rendered = renderedText(claimTool, claim)
+  assert.match(rendered, /^contract: docs-only$/m)
+  assert.match(rendered, /✓ jury-review/)
+  assert.match(rendered, /jury evidence/)
+  assert.match(rendered, /self-attestation is capped at p≈0\.80/)
+
+  const card = claimTool.presentResult!({}, { meta: claim } as never) as { title: string }
+  assert.match(card.title, /✓ Claim \(docs-only\)/)
+
+  // A docs-only contract with an unmet obligation is not standing jury evidence.
+  const broken = toClaimValue('docs only', gradedReport(0.8, 'jury-only', { grade: 'stale' }), verified, {
+    kind: 'docs-only',
+    obligations: [
+      { id: 'jury-review', met: false, detail: 'docs-only claims require contract.review — write down what a human reviewer should double-check' },
+    ],
+  })
+  assert.ok(!('jury' in broken), 'an unmet jury obligation means the jury does not stand')
+  assert.ok(broken.blockers.some(b => b.startsWith('contract unmet: jury-review — ')))
+})

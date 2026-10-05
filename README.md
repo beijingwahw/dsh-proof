@@ -75,7 +75,7 @@ Missing evidence is never papered over. Under the default `bayesian` scheduler (
 | `proof_status` | baseline, discovered checks, latest evidence, evidence-log integrity |
 | `proof_baseline` | establish/refresh the baseline (runs every discovered check) |
 | `proof_verify` | incremental verification + grade + regression attribution |
-| `proof_claim` | state a claim **and** prove it; `blockers` is the to-do list |
+| `proof_claim` | state a claim **and** prove it; `blockers` is the to-do list; v0.10 adds contract params (`kind` + `budgetMs` / `review` / `entryPoints`) binding the claim to typed evidence obligations |
 
 All four follow DSH's hard contract: `execute` returns one canonical JSON value, prose lives in `output.render`, and UI cards come from **pure** `presentCall` / `presentResult` / `presentationMeta` projections so a session-log replay reproduces the identical card.
 
@@ -138,6 +138,19 @@ The v0.7 pass closed paths where *unknown* rounded up to "ok"; v0.8 closes paths
 
 "Which checks to run" stops being set algebra and becomes an information-gain decision — predictive test selection (Google 2015–2021, Facebook 2019) applied to agent assertions for the first time. The evidence log is, among other things, a labelled historical dataset (checkId × status × duration); the new pure module `src/core/bayes.ts` learns each check's flakiness and cost from it and models every check as a noisy sensor for one binary proposition ("the workspace is healthy"): the prior π = clamp(1 − ρ·s, 0.05, 0.999) combines a Laplace-smoothed failure tendency ρ = (failures+1)/(runs+5) (a never-run check starts skeptical at ρ = 0.2, a 200-run all-green veteran decays to ≈ 0.005; flips pair decisive observations only) with a change-impact strength ladder (direct hit or LSP-confirmed edge 1.0, closure distance 1/(1+d), bare prefix 0.7, wildcard/no-evidence 0.5); α = P(false fail | healthy) is learned from flips and clamped to [0.01, 0.3]; β = P(false pass | broken) is fixed at 0.02 — unlearnable without breakage ground truth, an admitted guess. `rankByInformationGain` then prices every candidate run by expected reduction of the claim's binary entropy per millisecond (VOI ≥ 0 provably — the Bayesian update is a martingale), with deterministic greedy ordering and lexicographic tie-breaks. The engine dispatches **waves** of `concurrency` checks, folds each wave's real outcomes into the running posterior, and stops early on one of three conditions — the claim posterior crosses `certifyTarget` (default 0.97), a first decisive failure lands (the assertion is dead; attribution is already sufficient), or the budget drains — leaving the rest as auditable planned skips carrying their priors (`skippedByPlan` rides the `proof/verified` marker). Graded trust replaces the binary grade: `proven` now means "posterior ≥ target", displayed as `PROVEN (p≈0.97)` or `STALE (p≈0.61, target 0.97)`, with `confidenceBasis` naming how the number was earned (`full-coverage` — still below 1, the flake residual is honest; `certified-subset`; `degraded`), and `proof_verify` surfaces `confidence` / `confidenceBasis` / `certifiedSkips` / `stoppedEarly` / `waves`. Soundness is preserved: the candidate pool is still the impact closure (global invalidators and uncertain graphs still widen it to every check), `all: true` and degraded git facts still bypass the waves for a forced whole-batch run, and `scheduler: 'set'` is the kill-switch restoring v0.8 behaviour bit-for-bit. Honest limits: the claim posterior is a product of per-check factors — independence is the model's largest known distortion (checks sharing changed files fail correlated), so the number is a ranking signal, not a calibrated probability.
 
+## Typed assertion contracts (v0.10): the claim binds its own evidence obligations
+
+The claim text used to be free prose: the engine could prove "no affected check regressed", never what the sentence *ought* to prove. "I refactored X", "I added feature Y" and "nothing got slower" carry completely different proof obligations, and one generic no-regressions gate cannot tell them apart. v0.10 upgrades `proof_claim` with an optional **contract kind** that binds the assertion to a fixed set of decidable evidence obligations — stable obligation ids, and an unmet one says exactly what is missing and how to fix it:
+
+| kind | use for | obligations (fixed order) |
+|---|---|---|
+| `behavior-preserving` | refactors / optimisation | `zero-regressions` + `api-surface-unchanged` |
+| `behavior-adding` | new features / modules | `zero-regressions` + `new-paths-covered` |
+| `perf-budget` | performance claims | `zero-regressions` + `benchmark-evidence` + `within-budget` |
+| `docs-only` | documentation-only changes | `docs-only-changes` + `jury-review` |
+
+`api-surface-unchanged` diffs the public API surface in **both directions** (added and removed must both be empty): entry points come from `package.json` (`main`, `exports["."]`, `types`) or the `apiEntryPoints` config, are expanded through a bounded relative-import closure (depth ≤ 10, ≤ 500 files, truncation marked on-chain), and each file's exports are extracted per line in five forms — named declarations (including multi-declarator and destructuring lists), brace lists with aliases kept verbatim, `export default` → `#default`, `export *` → `#*` (plus the `ns` of `export * as ns`), and TS `export =` → `#=` — as sorted `file#symbol` strings riding the baseline as a non-addressing `apiSurface` attachment. Extraction deliberately **over-reports**: a missed export is a missed breaking change (a wrong pass), while a phantom export only makes an honest claim work harder (a wrong fail). `new-paths-covered` demands every changed source file be covered by a check that passed decisively this run — new behaviour must ride tested paths. A `perf-budget` claim force-runs **every** benchmark check (kind `benchmark`, from `bench` / `benchmark` / `perf:bench` scripts or explicit config) regardless of impact analysis, and its `durationMs` must stay within the claim's `budgetMs`. A `docs-only` claim runs **no checks at all** — `docs-only-changes` (docs extensions only; `requirements*.txt`-style traps guarded by the global-invalidator set) plus a `jury-review` self-attestation — and when everything holds the grade is `proven` with confidence structurally capped at `juryConfidenceCap` (default 0.8, basis `jury-only`, narrative `PROVEN (p≈0.80, jury evidence — self-attestation is capped)`): jury evidence never impersonates an experiment, and the verdict lands on the chain as a `claim/jury` marker. Contract runs go whole-batch — no bayesian planned skips, since an obligation must not rest on a check the plan skipped — and **a proven run carrying any unmet obligation is downgraded to `stale`** (confidence keeps what the run measured; the obligations say what is missing). Backwards compatibility: a claim without a `kind` behaves exactly as in v0.9, and a pre-v0.10 baseline without a surface fails `api-surface-unchanged` honestly, telling you to re-run `proof_baseline`.
+
 ## Architecture
 
 ```
@@ -154,7 +167,7 @@ The domain core is framework-free on purpose: it is fully unit-testable offline,
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit
-npm test              # 229 tests, node:test
+npm test              # 277 tests, node:test
 npm run build
 npm run bundle:check  # packaging contract self-check
 ```
@@ -173,6 +186,8 @@ Every tunable is a `cordis.yml` field — no hardcoded knobs. See [README.zh.md 
         requireBaseline: warn      # off | warn | ask
         scheduler: bayesian        # bayesian = VOI-ranked waves + graded trust (default) | set = legacy whole-batch
         certifyTarget: 0.97        # claim posterior that certifies `proven` without running everything
+        apiEntryPoints: []         # API-surface entry points; [] = derive from package.json main/exports/types
+        juryConfidenceCap: 0.8     # confidence ceiling for docs-only jury self-attestation
         impactGraph: true
         driftDetection: true
         enforceOnTurnEnd: true
@@ -183,6 +198,9 @@ Every tunable is a `cordis.yml` field — no hardcoded knobs. See [README.zh.md 
 - Check discovery is heuristic. For monorepos or custom build systems, declare `checks` explicitly with `paths` so incremental verification stays precise.
 - The dependency graph is approximate and errs toward over-inclusion. Dynamic `import()` calls, multi-line ESM imports and Python dotted imports produce edges since v0.7; reflection and string-built paths still cannot be resolved.
 - The claim posterior (v0.9) is a product of per-check health factors: independence is the model's largest known distortion — checks sharing changed files fail correlated — so `confidence` is a ranking signal, not a calibrated probability. β (false-pass) is fixed at 0.02, an admitted guess; the checks a certified-subset run skips stay on the books as planned skips carrying their priors, and priors are only as good as the evidence log.
+- The API surface (v0.10) is a line-regex extraction that deliberately over-reports: runtime-computed exports (dynamically built export names, string-assembled re-exports) are invisible to it, and a missed export would be a missed breaking change — so when in doubt it reports, and a phantom export only makes an honest claim work harder. Set `apiEntryPoints` when `package.json` does not point at the real entries.
+- The docs-only jury (v0.10) is self-attestation, not experiment: `review` is the author's own note, confidence is capped at `juryConfidenceCap` (default 0.80) with basis `jury-only` — the number is a ceiling, never a measurement.
+- `perf-budget`'s `durationMs` (v0.10) is a wall-clock measurement subject to machine noise (load, frequency scaling, contention) and not comparable across machines; leave headroom in `budgetMs` and expect boundary jitter.
 - Checkpoint cadence leaves a window (v0.2): records after the last signed checkpoint are chain-covered but not checkpoint-covered. The window is bounded by `checkpointEvery`, closed at every baseline/verify/claim boundary, and *visible* — `proof_status` reports `tailRecords`, the count of records since the last checkpoint. The anchor protects against the audited agent, not against a fully compromised host.
 - On machines without the signing key, signed checkpoints cannot be adjudicated locally: the audit reports them as `unverifiableCheckpoints` (a missing capability, not a forgery charge — the audit does not fail on it; anchor count/head comparison still bounds rewind).
 - `proven` permits pre-existing red checks — they are reported prominently but not charged to the session. Deliberate, not a hole.

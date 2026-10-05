@@ -31,10 +31,16 @@ import type {
 } from './core/index.ts'
 // core/index.ts re-exports the stable surface; `forcedSelection` is consumed
 // here straight from its module (the core barrel is not this batch's to edit).
-import { forcedSelection } from './core/impact.ts'
+import { forcedSelection, extractImportSites } from './core/impact.ts'
 import type { AuditReport } from './core/evidence.ts'
 import type { AttributedCheck } from './core/regression.ts'
 import type { CheckConfigEntry, DiscoverOptions } from './core/checks.ts'
+// ζ: the typed claim contract (ε's core/contract.ts) and the jury report
+// assembler are consumed straight from their modules — the core barrel is not
+// this batch's to edit, and a direct import keeps the dependency explicit.
+import { evaluateContract, extractApiSurface } from './core/contract.ts'
+import type { ClaimContract, ClaimKind, ObligationResult, SurfaceEntry } from './core/contract.ts'
+import { assembleJuryReport } from './core/report.ts'
 import { NodeCommandPort, NodeEd25519Signer, NodeFsPort, GitWorkspace, SystemClock } from './node-ports.ts'
 
 export interface EngineOptions {
@@ -86,6 +92,17 @@ export interface EngineOptions {
   readonly logger?: (message: string) => void
   /** Emit degradation warnings through `logger`. */
   readonly verbose?: boolean
+  /**
+   * Entry points (workspace-relative) for the baseline API-surface snapshot
+   * (ζ). Empty/absent = derive from the project's `package.json` `main`,
+   * `exports["."]` and `types` fields. Explicit entries are used as-is.
+   */
+  readonly apiEntryPoints?: readonly string[]
+  /**
+   * Confidence ceiling for docs-only jury self-attestation (ζ). Mirrors the
+   * plugin config's `juryConfidenceCap` (default 0.8).
+   */
+  readonly juryConfidenceCap?: number
   readonly clock?: Clock
   readonly fs?: FsPort
   readonly commands?: CommandPort
@@ -138,11 +155,89 @@ export interface VerifyOutcome {
  * `buildBaseline` product and never enters any hash material — it says "this
  * object was never persisted", which the persisted form cannot say about
  * itself.
+ *
+ * ζ: the baseline may additionally carry `apiSurface` — the workspace's
+ * exported-API fingerprint at baseline time. Like `aborted`, it is a
+ * non-addressing attachment: `buildBaseline`'s `baselineId` hashes only
+ * {createdAt, workspace, checkIds, root}, so the extra field changes nothing
+ * about identity, round-trips through saveBaseline/loadBaseline, and reads
+ * back as `undefined` from pre-ζ baseline files.
  */
-export type EngineBaseline = Baseline & { readonly aborted?: true }
+export type EngineBaseline = Baseline & {
+  readonly apiSurface?: readonly string[]
+  readonly aborted?: true
+}
+
+/** ζ: what `verifyContract` judged a typed claim against, beyond the run. */
+export interface ContractSummary {
+  readonly kind: ClaimKind
+  readonly obligations: readonly ObligationResult[]
+  /** Present when the verdict was jury-capped (docs-only self-attestation). */
+  readonly juryConfidenceCap?: number
+}
+
+/** ζ: `verify`'s options grown by the claim contract under judgment. */
+export type ContractVerifyOptions = VerifyOptions & { readonly contract: ClaimContract }
+
+/** ζ: `verify`'s outcome grown by the contract verdict. */
+export type ContractVerifyOutcome = VerifyOutcome & { readonly contract: ContractSummary }
 
 function isAbsolutePath(p: string): boolean {
   return /^([A-Za-z]:[\\/]|\/)/.test(p)
+}
+
+/**
+ * ζ: workspace-relative path canonicalisation (slash folding + `.`/`..`
+ * collapse) — the same discipline `core/impact.ts` applies internally, kept
+ * local because that module's helpers are not exported and are not this
+ * batch's to touch.
+ */
+function normalizeRel(path: string): string {
+  const segments: string[] = []
+  for (const segment of path.replace(/\\/g, '/').split('/')) {
+    if (segment === '' || segment === '.') continue
+    if (segment === '..') segments.pop()
+    else segments.push(segment)
+  }
+  return segments.join('/')
+}
+
+/** ζ: directory part of a workspace-relative path ('' at the root). */
+function dirnameRel(path: string): string {
+  const idx = path.lastIndexOf('/')
+  return idx < 0 ? '' : path.slice(0, idx)
+}
+
+/**
+ * ζ: existence-probe order for one declared package entry. The declared path
+ * is tried as-is (extension stripped and restored, so `dist/index.js` also
+ * probes its `.ts`/`.d.ts` siblings), then the `src/` equivalent of a
+ * compiled layout (`dist/x.js` → `src/x.ts`). First candidate with a readable
+ * file wins — the surface is built on probes, never on speculation.
+ */
+function entryCandidates(declared: string): string[] {
+  const clean = declared.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '')
+  if (clean.length === 0) return []
+  const noExt = clean.replace(/\.(d\.|m\.|c\.)?(t|j)sx?$/i, '')
+  const inSrc = noExt.startsWith('src/') ? noExt : `src/${noExt.replace(/^(dist|lib|build|out)\//, '')}`
+  const out: string[] = []
+  for (const ext of ['', '.ts', '.tsx', '.d.ts', '.js', '.jsx', '.mjs', '.cjs']) {
+    out.push(`${noExt}${ext}`)
+    out.push(`${inSrc}${ext}`)
+  }
+  return [...new Set(out)]
+}
+
+/** ζ: union two check lists by id, preserving first-seen (selection) order. */
+function unionChecks(primary: readonly CheckSpec[], extra: readonly CheckSpec[]): CheckSpec[] {
+  const seen = new Set<string>()
+  const out: CheckSpec[] = []
+  for (const item of [...primary, ...extra]) {
+    if (seen.has(item.id)) continue
+    seen.add(item.id)
+    out.push(item)
+  }
+  return out
 }
 
 /** Bounded, printable reason a signer load failed — chains store text, not errors. */
@@ -163,6 +258,10 @@ function resolutionDegraded(attribution: ChangeSetResolution): boolean {
 
 /** Beyond this many dirty files the per-file digest pass is skipped (conservative mode). */
 const WORKSPACE_DIGEST_CAP = 2000
+
+/** ζ: import-closure bounds for the API-surface snapshot. */
+const API_SURFACE_MAX_DEPTH = 10
+const API_SURFACE_MAX_FILES = 500
 
 export class ProofEngine {
   readonly root: string
@@ -194,6 +293,8 @@ export class ProofEngine {
     lspQueryBudget: number
     excerptStrategy: 'head' | 'balanced'
     headChars: number
+    apiEntryPoints: readonly string[]
+    juryConfidenceCap: number
   }
 
   constructor(options: EngineOptions) {
@@ -251,6 +352,10 @@ export class ProofEngine {
       lspQueryBudget: options.lspQueryBudget ?? 400,
       excerptStrategy: options.excerptStrategy ?? 'balanced',
       headChars: options.headChars ?? 2_000,
+      // ζ: API-surface wiring — [] means "derive from package.json", and the
+      // jury cap mirrors the plugin config default when the host says nothing.
+      apiEntryPoints: options.apiEntryPoints ?? [],
+      juryConfidenceCap: options.juryConfidenceCap ?? 0.8,
     }
   }
 
@@ -389,6 +494,14 @@ export class ProofEngine {
     // Facts first: whatever was observed is appended, abort or not.
     for (const record of batch.records) await this.store.append(record)
     const baseline = assembleBaseline(specs, batch.records, snapshot, this.clock)
+    // ζ: the API-surface snapshot rides on the baseline as a non-addressing
+    // attachment (see EngineBaseline) — computed after `buildBaseline` has
+    // minted the id, so baseline identity is untouched by the extra field.
+    // `undefined` ("no surface could be derived honestly") attaches nothing:
+    // a wrong surface would be worse than none, and old readers simply see a
+    // baseline without the field.
+    const apiSurface = await this.computeApiSurface()
+    const anchored: EngineBaseline = apiSurface === undefined ? baseline : { ...baseline, apiSurface }
     // Two honest abort signals: the batch-level flag (a cancelled run — some
     // checks were never even attempted) and any record that came back
     // `aborted` (a check whose process was killed mid-flight). Either means
@@ -402,13 +515,20 @@ export class ProofEngine {
         discovered: specs.length,
       })
       await this.store.checkpoint()
-      return { baseline: { ...baseline, aborted: true }, records: batch.records }
+      return { baseline: { ...anchored, aborted: true }, records: batch.records }
     }
     // saveBaseline records the file digest into the chain and checkpoints.
-    await this.store.saveBaseline(baseline)
-    await this.store.mark('baseline/established', { baselineId: baseline.baselineId, root: baseline.root, checks: batch.records.length })
+    await this.store.saveBaseline(anchored)
+    await this.store.mark('baseline/established', {
+      baselineId: baseline.baselineId,
+      root: baseline.root,
+      checks: batch.records.length,
+      // ζ: whether this baseline carries an API surface is a chain fact —
+      // a later `api-surface-unchanged` judgment rests on it.
+      apiSurface: apiSurface !== undefined ? apiSurface.length : null,
+    })
     await this.store.checkpoint()
-    return { baseline, records: batch.records }
+    return { baseline: anchored, records: batch.records }
   }
 
   /** Re-run the checks this change set made stale, and grade the claim. */
@@ -515,6 +635,341 @@ export class ProofEngine {
       ...(degraded ? { degraded: true as const } : {}),
       ...(schedule !== undefined ? { schedule } : {}),
     }
+  }
+
+  /**
+   * ζ: verify a typed claim contract — the objective run plus the obligations
+   * the claim's kind imposes on top of it.
+   *
+   * - docs-only never runs a single check. The claim is judged by jury review
+   *   (self-attestation, structurally capped at `juryConfidenceCap`), the
+   *   verdict lands on the chain as a `claim/jury` marker, and the report is
+   *   the jury report: grade exactly "did every obligation hold", confidence
+   *   the capped number, basis `jury-only`.
+   * - Every other kind runs its whole affected set to decisive outcomes (the
+   *   whole-batch regime — a contract's obligations need the evidence, and a
+   *   bayesian planned skip could leave precisely the check the claim rests
+   *   on unobserved). perf-budget additionally unions *every* benchmark
+   *   check into the run set: a performance claim must produce fresh
+   *   benchmark evidence whether or not impact analysis considers the
+   *   harness affected. Obligations are then evaluated against the fresh
+   *   records with the API surface diffed against the baseline, and a
+   *   `proven` run carrying any unmet obligation is downgraded to `stale` —
+   *   the engine never co-signs more than the obligations allow.
+   */
+  async verifyContract(options: ContractVerifyOptions): Promise<ContractVerifyOutcome> {
+    const { contract, ...rest } = options
+    const specs = await this.loadChecks()
+    const baseline = await this.store.loadBaseline()
+
+    // -- docs-only: the jury path -------------------------------------------
+    if (contract.kind === 'docs-only') {
+      // `changed` is still resolved honestly (the jury's `docs-only-changes`
+      // obligation judges the real change set), and `specs`/`baseline` are
+      // handed to the evaluator as context — but no command ever runs.
+      const attribution = await this.resolveChanges(rest, baseline)
+      const changed = attribution.changed
+      const verdict = evaluateContract(
+        {
+          contract,
+          changed,
+          specs,
+          records: [],
+          // ContractInput's context fields are required-but-nullable: an
+          // explicit `undefined` is the honest "not available here". The jury
+          // path judges neither regressions-from-records nor the API surface.
+          baseline,
+          apiSurfaceBefore: undefined,
+          apiSurfaceAfter: undefined,
+          graph: undefined,
+        },
+        this.options.juryConfidenceCap,
+      )
+      const confidence = verdict.juryCappedConfidence ?? this.options.juryConfidenceCap
+      const report = assembleJuryReport({
+        contract,
+        obligations: verdict.obligations,
+        confidence,
+        workspace: await this.workspaceSnapshot(),
+        clock: this.clock,
+      })
+      // docs-only never goes through check selection. The `selection` below is
+      // a legal minimal placeholder that says exactly that: nothing affected,
+      // everything untouched, no graph consulted — `precision: 'forced'`
+      // names the regime, `forcedAll: false` records that no run was forced
+      // (none happened at all).
+      const selection: SelectionResult = {
+        affected: [],
+        untouched: [...specs],
+        forcedAll: false,
+        closure: [...changed],
+        uncertain: false,
+        precision: 'forced',
+      }
+      await this.store.mark('claim/jury', {
+        claim: contract.claim,
+        // 200-character review summary: enough to audit what the jury was
+        // told, short enough to keep markers cheap.
+        review: (contract.review ?? '').slice(0, 200),
+        grade: report.grade,
+        unmet: verdict.obligations.filter(o => !o.met).map(o => o.id),
+      })
+      await this.store.checkpoint()
+      return {
+        report,
+        checks: [],
+        selection,
+        changed,
+        attribution,
+        contract: {
+          kind: verdict.kind,
+          obligations: verdict.obligations,
+          juryConfidenceCap: confidence,
+        },
+      }
+    }
+
+    // -- every other kind: the run, then the contract on top of it ---------
+    const graph = await this.loadGraph()
+    const attribution = await this.resolveChanges(rest, baseline)
+    const changed = attribution.changed
+    const provenance = new Map<RelPath, ChangeProvenance>(
+      attribution.records.map(r => [r.path, r.provenance] as [RelPath, ChangeProvenance]),
+    )
+    const degraded = resolutionDegraded(attribution) || await this.gitFactsUnavailable()
+    const forceAll = rest.all === true || degraded
+    const selection = forceAll
+      ? forcedSelection(specs, changed)
+      : selectAffectedChecks(specs, changed, graph)
+
+    const runSpecs = contract.kind === 'perf-budget'
+      ? unionChecks(selection.affected, specs.filter(s => s.kind === 'benchmark'))
+      : selection.affected
+
+    const snapshot = await this.workspaceSnapshot()
+    // Whole-batch over the (possibly benchmark-extended) run set, with the
+    // same priors/confidence display the 'set' path uses — see method note.
+    const priors = await this.priorsFor(runSpecs, changed, graph)
+    const batch = await this.runner.run(runSpecs, {
+      concurrency: this.options.concurrency,
+      totalBudgetMs: this.options.verifyBudgetMs,
+      workspace: snapshot,
+      ...(rest.signal !== undefined ? { signal: rest.signal } : {}),
+      ...(rest.onProgress !== undefined
+        ? { onEvidence: (ev, i, total) => rest.onProgress!(ev.label, i, total) }
+        : {}),
+    })
+    for (const record of batch.records) await this.store.append(record)
+    const confidence = this.updateFactors(priors, batch.records, runSpecs.length > 0)
+
+    const { report, checks } = assembleProof({
+      specs,
+      baseline,
+      records: batch.records,
+      changed,
+      ...(graph !== undefined ? { graph } : {}),
+      ...(provenance.size > 0 ? { provenance } : {}),
+      workspace: snapshot,
+      clock: this.clock,
+      requireFullCoverage: true,
+      ...(forceAll ? { forceAll: true } : {}),
+      ...(confidence !== undefined ? { confidence } : {}),
+    })
+
+    // The contract is judged against the freshest facts: this run's records,
+    // the surface as the workspace has it NOW, and the surface as the
+    // baseline remembers it (absent on pre-ζ baselines — the evaluator
+    // decides what that missing honesty costs the obligation). ContractInput's
+    // context fields are required-but-nullable, so both sides are handed over
+    // explicitly, `undefined` included.
+    const apiSurfaceAfter = await this.computeApiSurface()
+    const apiSurfaceBefore = (baseline as EngineBaseline | undefined)?.apiSurface
+    const verdict = evaluateContract(
+      {
+        contract,
+        changed,
+        specs,
+        records: batch.records,
+        baseline,
+        apiSurfaceBefore: apiSurfaceBefore === undefined ? undefined : [...apiSurfaceBefore],
+        apiSurfaceAfter: apiSurfaceAfter === undefined ? undefined : [...apiSurfaceAfter],
+        graph,
+      },
+      this.options.juryConfidenceCap,
+    )
+    const unmet = verdict.obligations.filter(o => !o.met)
+    // A proven run is still only as proven as its obligations allow: any unmet
+    // one caps the grade at `stale`. Confidence and basis keep what the run
+    // earned (the number says what was measured, the obligations say what is
+    // missing); grades already worse than `proven` keep their more honest
+    // verdict untouched.
+    const graded = report.grade === 'proven' && unmet.length > 0
+      ? { ...report, grade: 'stale' as const }
+      : report
+
+    await this.store.mark('proof/verified', {
+      grade: graded.grade,
+      root: graded.root,
+      changed: changed.length,
+      attribution: attribution.method,
+      preExistingExcluded: attribution.preExistingExcluded.length,
+      regressions: graded.summary.regressions,
+      // ζ: the contract summary rides the boundary marker — kind, the
+      // unmet obligation ids, and whether the verdict was jury-capped.
+      contract: {
+        kind: verdict.kind,
+        unmet: unmet.map(o => o.id),
+        jury: verdict.skipChecks,
+      },
+    })
+    await this.store.checkpoint()
+    return {
+      report: graded,
+      checks,
+      selection,
+      changed,
+      attribution,
+      ...(degraded ? { degraded: true as const } : {}),
+      contract: {
+        kind: verdict.kind,
+        obligations: verdict.obligations,
+        ...(verdict.juryCappedConfidence !== undefined
+          ? { juryConfidenceCap: verdict.juryCappedConfidence }
+          : {}),
+      },
+    }
+  }
+
+  // -- API surface (ζ) ------------------------------------------------------
+
+  /**
+   * The workspace's exported-API fingerprint: `file#export` lines over every
+   * module reachable from the package entry points along import edges — the
+   * first honest approximation of "what this package exports" (the entry
+   * itself plus the internal modules its public surface stands on).
+   *
+   * `undefined` is the honest answer when no entry point resolves: the rule
+   * is *rather no surface than a wrong one* — a mis-derived surface would
+   * make every later `api-surface-unchanged` judgment wrong in both
+   * directions. Reachability is a bounded BFS over import sites extracted
+   * from file contents (depth ≤ 10, files ≤ 500); when the bounds truncate
+   * the closure, the truncation is recorded on the chain, because a snapshot
+   * that silently stops halfway is a wrong surface with extra steps.
+   */
+  private async computeApiSurface(): Promise<readonly string[] | undefined> {
+    try {
+      const entries = await this.resolveEntryPoints()
+      if (entries.length === 0) return undefined
+      const reachable = new Set<string>()
+      let frontier = [...entries].sort()
+      let depth = 0
+      let truncated = false
+      while (frontier.length > 0 && !truncated) {
+        if (depth >= API_SURFACE_MAX_DEPTH) { truncated = true; break }
+        const next: string[] = []
+        for (const rel of frontier) {
+          if (reachable.size >= API_SURFACE_MAX_FILES) { truncated = true; break }
+          if (reachable.has(rel)) continue
+          const content = await this.fs.readFile(`${this.root}/${rel}`)
+          if (content === undefined) continue
+          reachable.add(rel)
+          for (const site of extractImportSites(content)) {
+            if (site.kind !== 'relative') continue
+            const resolved = await this.resolveModuleSpecifier(rel, site.specifier)
+            if (resolved !== undefined && !reachable.has(resolved)) next.push(resolved)
+          }
+        }
+        frontier = [...new Set(next)].sort()
+        depth += 1
+      }
+      if (reachable.size === 0) return undefined
+      const surfaceEntries: SurfaceEntry[] = []
+      for (const rel of [...reachable].sort()) {
+        const content = await this.fs.readFile(`${this.root}/${rel}`)
+        if (content !== undefined) surfaceEntries.push({ rel, content })
+      }
+      if (truncated) {
+        await this.store.mark('api-surface/truncated', {
+          files: reachable.size,
+          limit: API_SURFACE_MAX_FILES,
+          depth: API_SURFACE_MAX_DEPTH,
+        })
+      }
+      return extractApiSurface(surfaceEntries)
+    } catch {
+      // Surface derivation is an attachment, never a load-bearing leg: any
+      // failure means "no surface this time", not a broken baseline/verify.
+      return undefined
+    }
+  }
+
+  /**
+   * Entry points for the surface. Explicit `apiEntryPoints` config wins (used
+   * as-is, filtered to files that actually exist); otherwise the entries
+   * declared in `package.json` — `main`, then `exports["."]` (a string, or
+   * the object's `types`/`default`/`import`/`require` conditions), then
+   * `types`/`typings` — are each resolved by existence probing (see
+   * `entryCandidates`). All declarations failing to resolve means no entries,
+   * which means no surface — see `computeApiSurface` for why that is the
+   * right failure.
+   */
+  private async resolveEntryPoints(): Promise<string[]> {
+    const exists = async (rel: string): Promise<boolean> =>
+      await this.fs.readFile(`${this.root}/${rel}`) !== undefined
+    if (this.options.apiEntryPoints.length > 0) {
+      const out: string[] = []
+      for (const entry of this.options.apiEntryPoints) {
+        const rel = normalizeRel(entry)
+        if (rel.length > 0 && !out.includes(rel) && await exists(rel)) out.push(rel)
+      }
+      return out
+    }
+    const raw = await this.fs.readFile(`${this.root}/package.json`)
+    if (raw === undefined) return []
+    let pkg: Record<string, unknown>
+    try {
+      pkg = JSON.parse(raw) as Record<string, unknown>
+    } catch {
+      return []
+    }
+    const declared: string[] = []
+    const add = (value: unknown): void => {
+      if (typeof value === 'string' && value.length > 0) declared.push(value)
+    }
+    add(pkg.main)
+    const dot = (pkg.exports as Record<string, unknown> | undefined)?.['.']
+    if (typeof dot === 'string') add(dot)
+    else if (dot !== null && typeof dot === 'object') {
+      const conditions = dot as Record<string, unknown>
+      add(conditions.types)
+      add(conditions.default)
+      add(conditions.import)
+      add(conditions.require)
+    }
+    add(pkg.types)
+    add(pkg.typings)
+    const out: string[] = []
+    for (const value of declared) {
+      for (const candidate of entryCandidates(value)) {
+        if (await exists(candidate)) { out.push(candidate); break }
+      }
+    }
+    return [...new Set(out)]
+  }
+
+  /** Resolve one relative import against its importer, existence-backed. */
+  private async resolveModuleSpecifier(from: string, specifier: string): Promise<string | undefined> {
+    const joined = normalizeRel(`${dirnameRel(from)}/${specifier}`)
+    if (joined.length === 0) return undefined
+    const candidates = [
+      joined,
+      `${joined}.ts`, `${joined}.tsx`, `${joined}.js`, `${joined}.jsx`, `${joined}.mjs`, `${joined}.cjs`,
+      `${joined}/index.ts`, `${joined}/index.tsx`, `${joined}/index.js`,
+    ]
+    for (const candidate of candidates) {
+      if (await this.fs.readFile(`${this.root}/${candidate}`) !== undefined) return candidate
+    }
+    return undefined
   }
 
   /**

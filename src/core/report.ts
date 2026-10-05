@@ -20,6 +20,10 @@ import type { RelPath, DependencyGraph } from './impact.ts'
 import { forcedSelection, selectAffectedChecks } from './impact.ts'
 import { attributeChecks, type AttributedCheck } from './regression.ts'
 import type { ChangeProvenance } from './changeset.ts'
+// ζ: the jury path consumes the typed claim contract straight from its module —
+// the core barrel is not this batch's to edit, and a direct import keeps the
+// dependency on `core/contract.ts` (ε) explicit.
+import type { ClaimContract, ObligationResult } from './contract.ts'
 
 /**
  * How the confidence number on a report was earned (β).
@@ -32,8 +36,11 @@ import type { ChangeProvenance } from './changeset.ts'
  *   skips carrying their priors.
  * - `degraded`: the run ended below target without certifying — budget
  *   exhausted, aborted, or a decisive failure stopped the plan.
+ * - `jury-only`: no objective check speaks for the claim — a docs-only change
+ *   graded by jury review (the author's self-attestation, capped by
+ *   `juryConfidenceCap`). The number is a ceiling, not a measurement (ζ).
  */
-export type ConfidenceBasis = 'full-coverage' | 'certified-subset' | 'degraded'
+export type ConfidenceBasis = 'full-coverage' | 'certified-subset' | 'degraded' | 'jury-only'
 
 /**
  * `ProofReport` grown by the graded-trust fields (β). Declared here as an
@@ -187,6 +194,45 @@ export function assembleBaseline(
   // (records + workspace), never the discovery-time spec list.
   void specs
   return buildBaseline(records, workspace, clock)
+}
+
+/** Inputs for the docs-only jury report (ζ). */
+export interface JuryReportInput {
+  /** The claim being judged — the report carries its identity implicitly. */
+  readonly contract: ClaimContract
+  /** What the jury path demands; the report's grade is exactly "all met". */
+  readonly obligations: readonly ObligationResult[]
+  /** The capped self-attestation number (`juryCappedConfidence`). */
+  readonly confidence: number
+  readonly workspace: WorkspaceSnapshot
+  readonly clock: Clock
+}
+
+/**
+ * The report a docs-only claim earns (ζ): no objective check was run, so there
+ * is nothing to attribute, nothing discovered, nothing unverified — the grade
+ * is exactly "did every jury obligation hold", and the confidence is the
+ * capped self-attestation, never a measurement. `root` commits to the empty
+ * evidence set (`merkleRoot([])`), which is itself the honest statement: this
+ * verdict rests on the chain's `claim/jury` marker, not on check records.
+ */
+export function assembleJuryReport(input: JuryReportInput): GradedProofReport {
+  const allMet = input.obligations.every(o => o.met)
+  return {
+    grade: allMet ? 'proven' : 'stale',
+    root: merkleRoot([]),
+    baselineRoot: null,
+    baselineCreatedAt: null,
+    generatedAt: new Date(input.clock.now()).toISOString(),
+    workspace: input.workspace,
+    checks: [],
+    discovered: 0,
+    unverified: [],
+    summary: { passing: 0, failing: 0, regressions: 0, fixed: 0, preExisting: 0, newChecks: 0, indeterminate: 0 },
+    regressions: [],
+    confidence: input.confidence,
+    confidenceBasis: 'jury-only',
+  }
 }
 
 interface GradeInput {

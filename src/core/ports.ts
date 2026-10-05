@@ -151,7 +151,11 @@ export interface CheckSpec {
   readonly label: string
   /** argv vector. The first element is the executable. */
   readonly command: readonly string[]
-  /** What kind of claim this check answers. */
+  /**
+   * What kind of claim this check answers. A `benchmark` kind measures
+   * performance: its evidence's `durationMs` is what a perf-budget contract's
+   * `within-budget` obligation binds to.
+   */
   readonly kind: CheckKind
   /** Where the check was discovered. */
   readonly source: CheckSource
@@ -172,7 +176,9 @@ export interface CheckSpec {
   readonly timeoutMs: number
 }
 
-export type CheckKind = 'test' | 'build' | 'lint' | 'typecheck' | 'other'
+// 'benchmark' (ε) is additive: perf-measuring checks get their own kind so a
+// perf-budget claim can find their evidence by kind.
+export type CheckKind = 'test' | 'build' | 'lint' | 'typecheck' | 'benchmark' | 'other'
 export type CheckSource =
   | 'package.json'
   | 'pyproject.toml'

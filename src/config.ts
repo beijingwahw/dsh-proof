@@ -12,7 +12,7 @@ import Schema from '@deepseek-ai/schemastery'
 export interface CheckEntryConfig {
   label?: string
   command: string | string[]
-  kind?: 'test' | 'build' | 'lint' | 'typecheck' | 'other'
+  kind?: 'test' | 'build' | 'lint' | 'typecheck' | 'benchmark' | 'other'
   paths?: string[]
   timeoutMs?: number
   exclusive?: boolean
@@ -102,6 +102,20 @@ export interface Config {
    * identical across machines (cross-machine comparability).
    */
   normalizeHome: boolean
+  /**
+   * Entry points (workspace-relative paths) for the API-surface snapshot the
+   * baseline carries. Default `[]` means the engine derives them from the
+   * project's own `package.json` (`main`, `exports["."]`, `types`) — set this
+   * only when the declared fields do not point at the real source entries.
+   */
+  apiEntryPoints?: string[]
+  /**
+   * Confidence ceiling for docs-only claims (ζ). A docs-only change is judged
+   * by jury review (the author's self-attestation) rather than objective
+   * checks, so its `proven` grade can never carry more confidence than this
+   * cap — honest self-reporting, structurally bounded.
+   */
+  juryConfidenceCap: number
   /** Emit plugin diagnostics to stdout. */
   verbose: boolean
 }
@@ -115,7 +129,7 @@ export const Config: Schema<Config> = Schema.object({
   checks: Schema.array(Schema.object({
     label: Schema.string(),
     command: Schema.union([Schema.string(), Schema.array(Schema.string())]).required(),
-    kind: Schema.union(['test', 'build', 'lint', 'typecheck', 'other']),
+    kind: Schema.union(['test', 'build', 'lint', 'typecheck', 'benchmark', 'other']),
     paths: Schema.array(Schema.string()),
     timeoutMs: Schema.number(),
     exclusive: Schema.boolean(),
@@ -140,5 +154,10 @@ export const Config: Schema<Config> = Schema.object({
   excerptStrategy: Schema.union(['head', 'balanced']).default('balanced'),
   headChars: Schema.number().default(2_000),
   normalizeHome: Schema.boolean().default(true),
+  // ζ: `[]` = derive entry points from package.json; an explicit list wins.
+  apiEntryPoints: Schema.array(Schema.string()).default([]),
+  // ζ: docs-only self-attestation tops out below objective proof — the same
+  // percent band as certifyTarget (0–1), defaulted to a deliberately humble 0.8.
+  juryConfidenceCap: Schema.percent().default(0.8),
   verbose: Schema.boolean().default(false),
 }) as unknown as Schema<Config>

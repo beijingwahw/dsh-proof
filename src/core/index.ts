@@ -32,6 +32,12 @@ export {
 } from './checks.ts'
 
 export {
+  diffApiSurface, evaluateContract, extractApiSurface, isDocsPath,
+  type ClaimContract, type ClaimKind, type ContractInput,
+  type ContractVerdict, type ObligationResult, type SurfaceEntry,
+} from './contract.ts'
+
+export {
   DEFAULT_BASELINE_RELPATH, DEFAULT_LOG_RELPATH, EvidenceStore,
   buildBaseline, isDecisiveStatus, makeEvidence, snapshotWorkspace, verdictOf,
   type AuditReport, type Baseline, type CheckReport, type CheckStatus,

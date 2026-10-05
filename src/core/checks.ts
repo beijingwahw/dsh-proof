@@ -56,6 +56,11 @@ const DEFAULT_SCRIPT_KINDS: Record<string, CheckKind> = {
   'lint:ci': 'lint',
   stylelint: 'lint',
   eslint: 'lint',
+  // ε: perf scripts map to the benchmark kind so perf-budget claims have
+  // durationMs-carrying evidence to bind to.
+  bench: 'benchmark',
+  benchmark: 'benchmark',
+  'perf:bench': 'benchmark',
 }
 
 const DEFAULT_IGNORE_DIRS = [

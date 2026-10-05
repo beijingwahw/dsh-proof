@@ -125,6 +125,10 @@ export function apply(ctx: Context, config: Config): void {
     headChars: config.headChars,
     scheduler: config.scheduler,
     certifyTarget: config.certifyTarget,
+    ...(config.apiEntryPoints !== undefined && config.apiEntryPoints.length > 0
+      ? { apiEntryPoints: config.apiEntryPoints }
+      : {}),
+    juryConfidenceCap: config.juryConfidenceCap,
   })
 
   const watch = new WorkspaceWatch(engineFs(engine), root)

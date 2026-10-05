@@ -190,6 +190,18 @@ export function proofNarrative(report: ProofReport, certifyTarget: number = DEFA
   // record of certification) with the numeric comparison as fallback, so a
   // deployment with a non-default target still reads correctly.
   const graded = report as GradedProofReport
+  // ζ jury path first: a docs-only verdict never reads like a measurement. The
+  // proven line states the number AND its regime — jury evidence, capped — so
+  // nobody mistakes self-attestation for check coverage; the failing line names
+  // the actual reason (obligations unmet), not a probability that no longer
+  // means anything.
+  if (graded.confidenceBasis === 'jury-only') {
+    const p = (graded.confidence ?? 0).toFixed(2)
+    const head = report.grade === 'proven'
+      ? `${report.grade.toUpperCase()} (p≈${p}, jury evidence — self-attestation is capped)`
+      : `${report.grade.toUpperCase()} (jury obligations unmet)`
+    return [head, ...parts.slice(1)].join(' — ')
+  }
   if (graded.confidence !== undefined) {
     const p = graded.confidence.toFixed(2)
     const met = graded.confidenceBasis === 'certified-subset' || graded.confidence >= certifyTarget

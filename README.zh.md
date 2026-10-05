@@ -130,7 +130,7 @@ Re-read these before relying on them, then re-run proof_verify.
 | `proof_status` | 当前证明状态：基线、发现的检查、最新证据、证据链是否完好 |
 | `proof_baseline` | 建立/刷新基线：跑全部客观检查并记录证据 |
 | `proof_verify` | 增量验证：只跑变更集所影响的检查，对照基线给出评级与归因 |
-| `proof_claim` | **声明 + 证明**：`proven: true` 才算数，否则 `blockers` 就是待办清单 |
+| `proof_claim` | **声明 + 证明**：`proven: true` 才算数，否则 `blockers` 就是待办清单；v0.10 起可携带合约参数（`kind` 与 `budgetMs` / `review` / `entryPoints`）把断言绑定到对应的证据义务（§五·十三） |
 
 所有工具都遵守 DSH 的硬契约：`execute` 只返回**规范 JSON 值**，人类可读文案在 `output.render`，UI 卡片通过 `presentCall` / `presentResult` / `presentationMeta` **纯投影**生成 —— session-log 回放时逐字节复现同一张卡片。
 
@@ -213,7 +213,7 @@ v0.6 在 `normalizeOutput` 落地双层归一：**root → `$WORKSPACE`（先具
 
 **信任三态**。audit 的签名裁定从二态改为三态。旧逻辑在**没有 signer 的机器**上（密钥丢失、换机器审计）会把带签名的检查点误读成可疑；现在只有本机实际持有的密钥、面对点名该密钥的检查点，才有资格**驳斥**（`badCheckpoints`，真正的伪造指控）；本机无法裁定的（`unverifiableCheckpoints`）是**能力缺失而非指控**，不再使 audit 失败。锚文件自身的签名现在也会被验证（`anchorForged`），且锚携带 `workspaceKey`——审计可以仅凭锚文件重导出被签名的字节。
 
-**引擎的诚实边界**。git 不可用时（WorkspacePort 新可选能力 `gitAvailable?()`），每条 git 查询各自失败返回空集——"什么都看不见"曾被吞成"什么都没变"，增量选择悄悄缩成空。现在变更集显式标记 `degraded`，引擎**强制全量跑**并在 `VerifyOutcome.degraded` 透出。中止的基线不再落盘——abort 的基线曾照常写盘，之后的回归判定对着半成品真值运行；现在已观测的证据仍全部入链、落 `baseline/aborted` 标记、检查点窗口照常闭合，返回值携带 `aborted` 标志，下一次 verify 诚实报告 `no-baseline`。signer 加载失败大声降级：链内 `trust/signer-unavailable` marker + verbose 日志——静默降级与诚实的 unsigned 部署从此可区分。`requireBaseline: 'warn'` 从"配置了但没接线"变成真通知：本轮动了工作区而没有基线时，回合结束经 `agent.inject` 注入纠正性提示。死配置 `driftNoticeMs` 删除（配置降至 22 项，v0.9 增至 24 项）。
+**引擎的诚实边界**。git 不可用时（WorkspacePort 新可选能力 `gitAvailable?()`），每条 git 查询各自失败返回空集——"什么都看不见"曾被吞成"什么都没变"，增量选择悄悄缩成空。现在变更集显式标记 `degraded`，引擎**强制全量跑**并在 `VerifyOutcome.degraded` 透出。中止的基线不再落盘——abort 的基线曾照常写盘，之后的回归判定对着半成品真值运行；现在已观测的证据仍全部入链、落 `baseline/aborted` 标记、检查点窗口照常闭合，返回值携带 `aborted` 标志，下一次 verify 诚实报告 `no-baseline`。signer 加载失败大声降级：链内 `trust/signer-unavailable` marker + verbose 日志——静默降级与诚实的 unsigned 部署从此可区分。`requireBaseline: 'warn'` 从"配置了但没接线"变成真通知：本轮动了工作区而没有基线时，回合结束经 `agent.inject` 注入纠正性提示。死配置 `driftNoticeMs` 删除（配置降至 22 项，v0.9 增至 24 项，v0.10 增至 26 项）。
 
 **正确性收口（soundness closure）**。monorepo workspace 子包检查不再丢失：CheckSpec 新增 `cwd`（相对 root），子包检查真正在子包目录执行、id 含 cwd（cwd 缺省时 checkId 与旧格式逐字节一致），`packages/*` 单层 glob 现在真正展开——同 argv 的兄弟包检查不再互相顶替。影响图补盲：动态 `import('...')` 与多行 ESM import 现在产生边；Python dotted import（`pkg.mod`）在扫描集内尝试解析——多出的边只造成过选，绝不漏选。`git status --porcelain -z` 的 rename 条目解析修正（旧路径曾被截掉 3 个字符成为幻影路径；解析提为纯函数 `parsePorcelainZ`）。Windows 盘符绝对路径（`C:\...`）统一进路径域：observe 的 touched 归类、LSP root 前缀比较（大小写不敏感）、证据库守卫均修正。EvidenceStore 写入改单飞队列——并发的 append/mark/checkpoint 曾可能都链到同一个 tail，后一条的 `prev` 指向一条已不存在的行：**正确代码与它自己的竞态**。证据输出捕获改用 StringDecoder，多字节字符跨 chunk 边界不再碎成 U+FFFD。工程卫生：CI 改 `npm ci` 并加 windows 矩阵；`check-bundle` 错误路径不再崩溃；`untouchedChecks` 输出修正。
 
@@ -276,6 +276,52 @@ VOI = H(p₀) − [P(pass)·H(p₁|pass) + P(fail)·H(p₁|fail)]
 
 **诚实边界**。**(1) 独立乘积近似是最大的已知失真**：`confidence` 是各检查健康概率的连乘，隐含检查相互独立——共享同一批变更文件（或同一夹具、同一套测试跑两遍）的检查，失败是相关的，乘积会**高估**证据强度；替代方案（对全部检查建模联合分布）恰恰需要我们没有的真值数据，所以这个数应读作**排序信号而非标定概率**。**(2) β = 0.02 是承认的猜测**：假阴率需要「确实断了」的标注数据才能学习，而日志只记录观测；固定常数是诚实的猜测，在这里学一个数出来才是假精度。**(3) 先验只和日志一样好**：证据日志短的检查先验保守（ρ = 0.2 起步），这不是缺陷而是设计——没有历史就没有便宜话可讲。
 
+## 五·十三、类型化断言合约（v0.10.0）：断言与证据之间的契约
+
+到 v0.9 为止，`proof_claim` 的 `claim` 是一段自由文本——引擎能证明的只有「受影响检查零回归（且后验过线）」，至于这句话**应该**证明什么，机器无从判定。「我重构了 X，行为不变」「我加了新功能 Y」「性能没变慢」是三种证明义务完全不同的断言，但一道泛化的 no-regressions 门区分不了它们：重构还欠一条「公共 API 没动」，新功能还欠一条「新增路径被测过」，性能主张欠的是一次真实的测量。v0.10 把 claim 从自由文本升维为**合约类型**（`kind`）：声明你做的是哪一类事，就自动绑定那一类断言应负的证据义务——**断言与证据之间从此有契约**。每条义务都可判定（met / not met），义务 id 固定供引擎与工具接线，未 met 时 detail 直接说缺什么、怎么补。
+
+**四类合约与义务矩阵**（义务 id 固定；`zero-regressions` 永远排第一）：
+
+| kind | 适用场景 | 义务（按固定顺序） | 未 met 的后果 |
+|---|---|---|---|
+| `behavior-preserving` | 重构 / 优化 / 内部清理 | `zero-regressions` + `api-surface-unchanged` | proven 降级 `stale`，detail 点名新增/移除的公共符号 |
+| `behavior-adding` | 新功能 / 新模块 | `zero-regressions` + `new-paths-covered` | proven 降级 `stale`，detail 点名未被检查覆盖的源码文件 |
+| `perf-budget` | 性能主张 | `zero-regressions` + `benchmark-evidence` + `within-budget` | proven 降级 `stale`，detail 点名超预算的 benchmark 及耗时 |
+| `docs-only` | 纯文档变更 | `docs-only-changes` + `jury-review`（`zero-regressions` 为空真——docs-only 不跑检查，该义务诚实移交 `docs-only-changes` 承担） | 义务未 met 即 `stale`；全 met 也只有封顶置信（见下） |
+
+**API 面机制（`api-surface-unchanged` 的证据）**。behavior-preserving 的第二义务是「公共 API 面**双向 diff 为空**」——既不许少（破坏性变更），也不许多（悄悄扩面）。面从以下几个环节装配：
+
+1. **入口推导**：默认从项目 `package.json` 推导——`main`、`exports["."]`（字符串，或对象里的 `types`/`default`/`import`/`require` 条件）、`types`/`typings`。每个声明路径做**存在性探测**：原样 + 扩展名变体（`.ts`/`.tsx`/`.d.ts`/`.js`/`.jsx`/`.mjs`/`.cjs`），以及编译产物的 `src/` 等价物（`dist/x.js` → `src/x.ts`）。显式配置 `apiEntryPoints` 优先（只用真实存在的文件）。所有声明都解析不到文件 → **不产出面**——宁可没有面，也不要一个错的面。
+2. **import 闭包**：从入口沿**相对导入边**做有界 BFS（深度 ≤ 10、文件 ≤ 500）——面不只看入口文件，而是入口的公共面所立足的全部内部模块。截断会落 `api-surface/truncated` 链上标记：静默截断的面就是错的面加了步数。
+3. **五形态提取**（逐行正则，跳过注释与空行）：① `export` 具名声明（`const`/`let`/`var`/`function`/`class`/`abstract class`/`interface`/`type`/`enum`，含 `async`/`declare`/`function*`/`const enum` 变体、多声明符 `const a = 1, b = 2` 与解构导出全量上报）；② `export { a, b as c }`（单/多行折叠、含 `export type { … }`；别名才是导入方绑定的名字，字符串别名原样保留）；③ `export default …` → 记为 `#default`；④ `export * from …` → 记为 `#*`（再导出的面变了也是面变了；`export * as ns` 额外记 `ns`）；⑤ `export = …`（TS CommonJS）→ 记为 `#=`。每个条目形如 `文件#符号名`，排序去重。
+4. **内容寻址快照与双向 diff**：建基线时把 API 面作为**非寻址附件**挂在基线上（`apiSurface` 字段；`baselineId` 只哈希 {createdAt, workspace, checkIds, root}，附件不改变基线身份，v0.10 之前的旧基线读回该字段为 `undefined`）。断言时计算当前面，与基线面做**双向 diff**——`added` 与 `removed` 都必须为空，义务才 met；未 met 时 detail 逐个点名（`public API changed — added: …; removed: …`）。
+5. **提取刻意偏向过报**：漏掉一个导出 = 漏掉一次破坏性变更（错误通过）；多报一个幽灵导出只是让诚实的断言多干一点活（错误失败）。拿不准就报。
+
+**`new-paths-covered`（behavior-adding 的义务）**：变更集中每个源码文件（按扩展名判定：js/ts/jsx/tsx/mjs/cjs、py、go、rs、java、kt、rb、php、cs）必须被 ≥1 个检查的 `paths` 覆盖，且该检查本次拿到**决定性通过**——新行为必须骑在被测过的路径上。未 met 时 detail 点名未覆盖文件并提示补检查。
+
+**`benchmark-evidence` 与 `within-budget`（perf-budget 的义务）**：前者要求本次运行真的存在 kind='benchmark' 的检查且拿到决定性结果（pass/fail 都算——失败的 benchmark 也是一次测量，只是进不了预算）；后者要求其 `durationMs` ≤ 断言携带的 `budgetMs`（缺失 `budgetMs` 本身即未 met，detail 要求写出毫秒数）。benchmark 检查**不受影响分析裁剪**：perf-budget 断言会把全部 benchmark 检查并进运行集强制执行——性能主张必须产出新鲜的测量，无论影响分析认为 benchmark harness 是否被波及。benchmark 检查两个来源：显式配置 `kind: benchmark`，或脚本名 `bench` / `benchmark` / `perf:bench` 自动发现。
+
+**docs-only 的陪审语义（与 v0.9 分级信任的咬合）**。纯文档变更**不跑任何检查**——对文档正确与否的机器测量本来就不存在，硬跑检查只会制造伪证据。两条义务：`docs-only-changes`（变更集全部是文档类路径——`.md`/`.markdown`/`.txt`/`.rst`/`.adoc` 与图片等，且不命中全局失效器；`requirements*.txt` 挂着文档扩展名却是依赖声明，正是要防的洗白通道，守卫直接复用 `GLOBAL_INVALIDATORS`，两模块永不漂移）+ `jury-review`（claim 必须携带 `review` 自评——写下评审者应复核什么）。义务全 met 时 grade 为 `proven`，但 confidence 被**结构性封顶**在 `juryConfidenceCap`（默认 0.8），`confidenceBasis` 为 `jury-only`，叙事直说其 regime：
+
+```
+PROVEN (p≈0.80, jury evidence — self-attestation is capped)
+```
+
+这正是 v0.9 分级信任的自然延伸：`full-coverage` / `certified-subset` / `degraded` 说的是「这个数是测量、测量到了什么程度」，`jury-only` 说的是「这个数是自证的**上限**，不是测量」——陪审证据永不冒充实验。裁决落链为 `claim/jury` 标记（携带 claim、review 摘要 200 字符、grade、未 met 义务 id）；报告的 `root` 是 `merkleRoot([])`——对空证据集的承诺，本身就在说：这个裁决靠的是链上 marker，不是检查记录。义务未 met 时 grade 为 `stale`，叙事为 `STALE (jury obligations unmet)`——点名的义务才是理由，一个不再有含义的概率不是。
+
+**`proof_claim` 的新参数**：
+
+| 参数 | 类型 | 语义 |
+|---|---|---|
+| `claim` | string（必填） | 人类可读的断言文本——保留为陈述，不是规范部分 |
+| `kind` | 四选一 | 合约类型：`behavior-preserving` / `behavior-adding` / `perf-budget` / `docs-only`；**省略则与 v0.9 行为完全一致** |
+| `budgetMs` | number | perf-budget 必填：benchmark 的 `durationMs` 必须不超过此值 |
+| `review` | string | docs-only 必填：留给评审的自查说明（空白文本 = 义务未 met） |
+| `entryPoints` | string[] | API 面入口的逐断言覆盖；省略则由 `package.json` 推导或 `apiEntryPoints` 配置 |
+| `changed` | string[] | 本次变更文件（原有参数） |
+
+**运行制度与健全性**。带 kind 的断言走全批（whole-batch）制度而非波式调度——义务需要证据，贝叶斯计划性跳过恰好可能跳过断言所依赖的那个检查，所以合约运行不做提前认证（perf-budget 另加强制 benchmark）。义务判定在运行之后做，依据是本次的新鲜记录与「现在」的工作区面。**义务未 met 绝不 proven**：一次 otherwise-proven 的运行只要携带任何未 met 义务，grade 一律封顶 `stale`（更差的评级保持原样；confidence 与 basis 保留运行挣到的数字——数字说测到了什么，义务说还缺什么）。合约摘要随 `proof/verified` 边界标记入链（kind、未 met 义务 id、是否 jury）。向后兼容：不声明 `kind` 的 claim 与 v0.9 行为**完全一致**，自由文本断言保留为人类陈述。旧基线诚实降级：v0.10 之前建立的基线没有 `apiSurface` 附件，`behavior-preserving` 的 `api-surface-unchanged` 直接判 not met，detail 明确提示重建基线（re-run proof_baseline）——不可比较的面永远不是一次通过。义务判定是纯函数（无时钟、无随机、无文件系统），一切多值 detail 先排序——同一输入永远产出字节级同一裁决。
+
 ---
 
 ## 六、架构：领域核心 + 薄适配层
@@ -285,7 +331,7 @@ VOI = H(p₀) − [P(pass)·H(p₁|pass) + P(fail)·H(p₁|fail)]
 ```
 dsh-proof/
 ├── src/
-│   ├── core/                 ← 纯领域层，零 @deepseek-ai/* 依赖（13 个模块）
+│   ├── core/                 ← 纯领域层，零 @deepseek-ai/* 依赖（14 个模块）
 │   │   ├── ports.ts          # 唯一的对外接口（Command/Fs/Clock/Workspace/Signer/Resolver）
 │   │   ├── hash.ts           # 规范化 JSON + 内容寻址 + Merkle root + 输出归一
 │   │   ├── checks.ts         # 客观检查发现（多语言 + monorepo 子包 cwd）
@@ -295,9 +341,10 @@ dsh-proof/
 │   │   ├── changeset.ts      # 内容锚定变更集 + 来源归因
 │   │   ├── regression.ts     # 回归判定与嫌疑文件归因
 │   │   ├── runner.ts         # 增量验证调度（并发/超时/预算/可取消）
-│   │   ├── report.ts         # 证明装配与五档评级
+│   │   ├── report.ts         # 证明装配与五档评级（含 docs-only 陪审报告）
 │   │   ├── excerpt.ts        # 智能摘录（balanced / head）
 │   │   ├── trust.ts          # 哈希链 + 检查点签名 + 带外锚点
+│   │   ├── contract.ts       # 类型化断言合约（四类 kind 与义务、API 面提取/diff、docs 分类）
 │   │   └── index.ts          # 领域导出
 │   ├── engine.ts             # ProofEngine —— 宿主调用的命令式门面
 │   ├── node-ports.ts         # Node 实现（spawn / fs / git / Ed25519）
@@ -309,7 +356,7 @@ dsh-proof/
 │   │   ├── prompt.ts         # proof:policy 段落
 │   │   └── lsp-impact.ts     # 宿主 LSP → DefinitionResolverPort 适配
 │   └── vendor/dsh-tools.ts   # 契约快照（pinned to dsh v0.2.1-alpha.1）
-├── test/                     # 16 个测试文件（229 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心
+├── test/                     # 17 个测试文件（277 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心、类型化断言合约
 ├── cordis.patch.yml          # bundle 层
 └── examples/cordis.yml       # --patch 本地调试
 ```
@@ -317,7 +364,7 @@ dsh-proof/
 **为什么领域核心不碰 `@deepseek-ai/*`：**
 
 1. DSH 是开发者预览版，破坏性变更频繁。核心逻辑与 harness 版本解耦 → 升级不重写。
-2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，229 个测试全绿。
+2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，277 个测试全绿。
 3. 同一个核心可以被别的宿主（CLI、CI、其他 harness）复用。
 
 **为什么 `vendor/dsh-tools.ts` 是契约快照而不是活依赖：**
@@ -377,6 +424,8 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
         headChars: 2000            # 每条证据保留的输出摘要长度
         excerptStrategy: balanced # 摘录策略：balanced=头+显著失败行+尾 | head=传统前N字符
         normalizeHome: true          # 把用户主目录归一为 $HOME（隐私+跨机器可比）
+        apiEntryPoints: []           # API 面入口（工作区相对路径）；缺省 [] = 从 package.json main/exports["."]/types 推导
+        juryConfidenceCap: 0.8       # docs-only 陪审自证的置信上限（grade 可 proven，confidence 永不超过此值）
         verbose: false
 ```
 
@@ -408,7 +457,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit，离线可跑
-npm test              # 229 个测试（node:test）
+npm test              # 277 个测试（node:test）
 npm run build         # 产出 lib/
 npm run bundle:check  # 打包契约自检
 ```
@@ -416,7 +465,7 @@ npm run bundle:check  # 打包契约自检
 测试分层：
 
 - `01`–`04` —— 纯核心：哈希、检查发现、影响分析、证据与判定
-- `05` —— 引擎端到端（内存端口；v0.9 增补波式调度用例：提前认证、首败停、`set` 回归、确定性、预算降级）
+- `05` —— 引擎端到端（内存端口；v0.9 增补波式调度用例：提前认证、首败停、`set` 回归、确定性、预算降级；v0.10 增补四类合约端到端与旧基线无 API 面的诚实降级）
 - `06` —— 漂移检测
 - `07` —— **真实 shell 集成**：真的 `npm run --silent test`，真的退出码，真的回归归因
 - `08` —— 插件接线：四个工具、三个钩子、提示词段落、纯投影、配置校验
@@ -428,6 +477,7 @@ npm run bundle:check  # 打包契约自检
 - `14` —— **Node 适配层**：`porcelain -z` 解析（rename/copy 双端、幻影路径）、git 能力探测、多字节 UTF-8 跨 chunk 捕获、Windows `.cmd` 垫片解析（真实 npm 模板、非标准垫片清晰报错）、`killedBySignal`、并发写唯一临时名 + rename 重试
 - `15` —— **runner 直测**：并发 clamp、验证预算 skip、abort 传播、乱序完成重排、`killedBySignal` 判定（信号 ≠ 超时）、spawnError、excerpt 贯通
 - `16` —— **贝叶斯调度核心**：公式阶梯逐档核对（ρ 平滑、s 的 1.0 / 1/(1+d) / 0.7 / 0.5、π 双侧 clamp、α clamp）、后验单调性与全概率恒等式（鞅）、VOI 非负且与独立转写的公式吻合、确定性 / 乱序不变、(π, α) 网格扫描
+- `17` —— **类型化断言合约**：五形态提取逐形态核对（含别名/字符串别名/多声明符/解构/`export =`/`export * as ns`）、入口推导与闭包截断、义务矩阵全分支（四类 × met/not met × detail 文案）、`requirements*.txt` 陷阱守卫、封顶值逐字兑现、纯函数确定性（同输入同字节、记录乱序不变）
 
 本地调试：
 
@@ -450,6 +500,9 @@ pnpm dsh web --patch /absolute/path/to/dsh-proof/examples/cordis.yml
 - **半行恢复只修尾行撕裂（v0.8）。** 启动时只把「有前缀、没有闭括号」的**最后一条**残行原子重写掉（并落 `log/recovered-partial-tail` marker）；完整行的损坏不恢复、不改写——那可能是篡改，审计继续报。崩溃恢复与篡改检测的界线就在这里：撕裂是崩溃的物理签名，整行重写不是。
 - **签名密钥的边界。** 密钥防的是「被审计的智能体」，不是「能读宿主文件的人」；主机被完全攻陷时一切本地信任机制都失效。在**没有 signer 的机器**上（密钥丢失、换机器审计），带签名的检查点无法本地裁定——审计报告为 `unverifiableCheckpoints`：这是**能力缺失，不是伪造指控**，audit 不会因此失败；rewind 覆盖也不依赖密钥（锚的 count/head 比较仍然约束日志）。
 - **`killedBySignal` 的平台边界（v0.8）。** 该字段只在子进程能如实报告信号死因的平台上出现；win32 下恒缺省——Windows 不跨进程传播信号。信号死亡在本插件记 `error` 并注明信号（不再误判为超时），但 Windows 上外部击杀只能表现为退出码/错误，插件不会编造一个信号名。
+- **API 面是正则提取的保守过报近似（v0.10）。** 逐行正则看不见运行时动态生成的导出（动态计算的导出名、字符串拼出的再导出）；提取刻意偏向过报——漏报一个导出等于漏掉一次破坏性变更（错误通过），多报只是让诚实的断言多干活（错误失败）。入口推导依赖 `package.json` 声明与存在性探测，声明与真实入口不符时请显式配置 `apiEntryPoints`。
+- **docs-only 的陪审是自证，不是实验（v0.10）。** `review` 是作者自评：confidence 封顶 `juryConfidenceCap`（默认 0.80）、basis 为 `jury-only`、叙事直说 `self-attestation is capped`。这个数是**上限不是测量**，不得当作实验证据引用。
+- **perf-budget 的 `durationMs` 受机器噪声影响（v0.10）。** 预算判定基于 wall-clock 时长测量，受机器负载、频率漂移与并行进程影响，跨机器不可比。`budgetMs` 应留余量，边界值附近的判定波动是预期行为而非回归。
 - **`proven` 允许存在预置红灯。** 一个本来就红的仓库不该让 Agent 无法工作。预置失败会在报告里显著列出，但不计入本次会话的责任。这是刻意设计，不是漏洞。
 - **它不替代测试本身。** `dsh-proof` 编排并归因你已有的客观检查；它不生成测试用例。
 - **DSH 是 v0.1/0.2 开发者预览版。** 插件契约会变。本插件已把依赖面最小化并钉死契约快照（`src/vendor/dsh-tools.ts`），但上游变更时仍需重新对齐。

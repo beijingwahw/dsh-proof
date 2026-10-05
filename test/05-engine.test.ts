@@ -540,3 +540,242 @@ test('β: budget exhaustion degrades below target and grades stale', async () =>
   assert.equal(outcome.report.confidenceBasis, 'degraded')
   assert.ok((outcome.report.confidence ?? 1) < 0.97, 'the claim never reached the target')
 })
+
+// -- ζ: typed claim contracts wired into the engine -------------------------------
+
+/**
+ * A workspace whose package.json declares a source entry point, so the engine
+ * derives an API surface: index re-exports a and b, b imports a internally.
+ */
+function surfaceProject() {
+  return {
+    [`${ROOT}/package.json`]: JSON.stringify({
+      name: 'demo',
+      main: './src/index.ts',
+      scripts: { test: 'vitest run', build: 'tsc -b' },
+    }),
+    [`${ROOT}/src/index.ts`]: "export { a } from './a'\nexport { b } from './b'\n",
+    [`${ROOT}/src/a.ts`]: 'export const a = 1\n',
+    [`${ROOT}/src/b.ts`]: "import { a } from './a'\nexport const b = a + 1\n",
+    [`${ROOT}/test/a.test.ts`]: "import { a } from '../src/a'\nvoid a\n",
+  }
+}
+
+function contractEngine(
+  fs: MemoryFs,
+  commands: FakeCommands,
+  checks?: ConstructorParameters<typeof ProofEngine>[0]['checks'],
+) {
+  const base: ConstructorParameters<typeof ProofEngine>[0] = {
+    root: ROOT,
+    fs,
+    commands,
+    workspace: new FakeWorkspace(ROOT),
+    clock: new FakeClock(),
+    impactGraphLimit: 1_000,
+    checkTimeoutMs: 5_000,
+    verifyBudgetMs: 20_000,
+    concurrency: 2,
+  }
+  return new ProofEngine(checks === undefined ? base : { ...base, autoDiscover: false, checks })
+}
+
+test('ζ: behavior-preserving end to end — surface snapshot, then the downgrade', async () => {
+  const fs = MemoryFs.of(surfaceProject())
+  const engine = contractEngine(fs, new FakeCommands())
+
+  const { baseline } = await engine.establishBaseline()
+  assert.ok(Array.isArray(baseline.apiSurface) && baseline.apiSurface.length >= 3,
+    `baseline carries the apiSurface snapshot: ${JSON.stringify(baseline.apiSurface)}`)
+
+  // Internal-only edit: same exports, different body. The claim holds.
+  fs.mutate(`${ROOT}/src/b.ts`, "import { a } from './a'\nexport const b = a + 2\n")
+  const kept = await engine.verifyContract({
+    changed: ['src/b.ts'],
+    contract: { kind: 'behavior-preserving', claim: 'refactored b internals, no API change' },
+  })
+  assert.equal(kept.report.grade, 'proven')
+  const keptSurface = kept.contract.obligations.find(o => o.id === 'api-surface-unchanged')
+  assert.ok(keptSurface, 'api-surface-unchanged obligation present')
+  assert.equal(keptSurface.met, true)
+  assert.equal(kept.contract.kind, 'behavior-preserving')
+
+  // Public face moves: a new export appears. The run is still green, but the
+  // obligation fails and drags the grade down — the engine never co-signs
+  // more than the contract allows.
+  fs.mutate(`${ROOT}/src/a.ts`, 'export const a = 1\nexport const a2 = 2\n')
+  const broken = await engine.verifyContract({
+    changed: ['src/a.ts'],
+    contract: { kind: 'behavior-preserving', claim: 'still preserving, honest' },
+  })
+  assert.equal(broken.report.grade, 'stale', 'a proven run with unmet obligations is capped at stale')
+  assert.ok(broken.report.confidence !== undefined, 'the confidence number survives the downgrade')
+  assert.equal(broken.report.confidenceBasis, 'full-coverage')
+  const brokenSurface = broken.contract.obligations.find(o => o.id === 'api-surface-unchanged')
+  assert.ok(brokenSurface)
+  assert.equal(brokenSurface.met, false)
+  assert.match(brokenSurface.detail, /a2/, 'the detail names the new symbol')
+  // The contract summary rides the proof/verified boundary marker.
+  assert.ok(fs.log.some(l => l.includes('proof/verified') && l.includes('"kind":"behavior-preserving"')),
+    'chain marker carries the contract summary')
+})
+
+test('ζ: behavior-adding — new paths must be covered by a passing check', async () => {
+  const make = () => MemoryFs.of({
+    [`${ROOT}/package.json`]: JSON.stringify({ name: 'demo', main: './src/index.ts' }),
+    [`${ROOT}/src/index.ts`]: "export { a } from './a'\n",
+    [`${ROOT}/src/a.ts`]: 'export const a = 1\n',
+  })
+
+  // Covered: a check whose paths match the new file exists and passes.
+  const coveredFs = make()
+  const covered = contractEngine(coveredFs, new FakeCommands(), [
+    { label: 'src tests', command: ['npm', 'test'], kind: 'test', paths: ['src/**'] },
+  ])
+  await covered.establishBaseline()
+  coveredFs.mutate(`${ROOT}/src/new.ts`, 'export const n = 1\n')
+  const good = await covered.verifyContract({
+    changed: ['src/new.ts'],
+    contract: { kind: 'behavior-adding', claim: 'added a new module' },
+  })
+  assert.equal(good.report.grade, 'proven')
+  const goodPaths = good.contract.obligations.find(o => o.id === 'new-paths-covered')
+  assert.ok(goodPaths)
+  assert.equal(goodPaths.met, true)
+
+  // Uncovered: the new file matches no check's paths — the obligation names it.
+  const bareFs = make()
+  const bare = contractEngine(bareFs, new FakeCommands(), [
+    { label: 'a tests', command: ['npm', 'test'], kind: 'test', paths: ['src/a.ts'] },
+  ])
+  await bare.establishBaseline()
+  bareFs.mutate(`${ROOT}/src/new.ts`, 'export const n = 1\n')
+  const bad = await bare.verifyContract({
+    changed: ['src/a.ts', 'src/new.ts'],
+    contract: { kind: 'behavior-adding', claim: 'added a new module' },
+  })
+  assert.equal(bad.report.grade, 'stale')
+  const badPaths = bad.contract.obligations.find(o => o.id === 'new-paths-covered')
+  assert.ok(badPaths)
+  assert.equal(badPaths.met, false)
+  assert.match(badPaths.detail, /src\/new\.ts/, 'the detail names the uncovered file')
+})
+
+test('ζ: perf-budget — benchmark evidence is force-run and judged against budgetMs', async () => {
+  const make = () => MemoryFs.of({
+    [`${ROOT}/package.json`]: JSON.stringify({ name: 'demo' }),
+    [`${ROOT}/src/a.ts`]: 'export const a = 1\n',
+    [`${ROOT}/bench/run.ts`]: 'export const run = (): number => 1\n',
+  })
+  const checks: ConstructorParameters<typeof ProofEngine>[0]['checks'] = [
+    { label: 'src tests', command: ['npm', 'test'], kind: 'test', paths: ['src/**'] },
+    { label: 'bench', command: ['node', 'bench/run.ts'], kind: 'benchmark', paths: ['bench/**'] },
+  ]
+
+  // Over budget: the benchmark must run anyway (its paths never matched the
+  // change set) and its duration fails the stated budget.
+  const slowFs = make()
+  const slowCommands = new FakeCommands()
+    .on(argv => argv.includes('bench/run.ts'), { exitCode: 0, output: 'bench: 500ms', durationMs: 500 })
+  const slow = contractEngine(slowFs, slowCommands, checks)
+  await slow.establishBaseline()
+  const callsAfterBaseline = slowCommands.calls.length
+  const over = await slow.verifyContract({
+    changed: ['src/a.ts'],
+    contract: { kind: 'perf-budget', claim: 'no path got slower', budgetMs: 100 },
+  })
+  assert.equal(slowCommands.calls.length - callsAfterBaseline, 2,
+    'the benchmark ran despite impact analysis not selecting it')
+  assert.equal(over.report.grade, 'stale', 'green checks cannot carry an over-budget claim')
+  const within = over.contract.obligations.find(o => o.id === 'within-budget')
+  assert.ok(within)
+  assert.equal(within.met, false)
+  assert.match(within.detail, /500ms/)
+  const evidence = over.contract.obligations.find(o => o.id === 'benchmark-evidence')
+  assert.ok(evidence?.met, 'the forced benchmark run produced decisive evidence')
+
+  // Within budget: fresh workspace, fresh engine, fast benchmark.
+  const fastFs = make()
+  const fastCommands = new FakeCommands()
+    .on(argv => argv.includes('bench/run.ts'), { exitCode: 0, output: 'bench: 50ms', durationMs: 50 })
+  const fast = contractEngine(fastFs, fastCommands, checks)
+  await fast.establishBaseline()
+  const okRun = await fast.verifyContract({
+    changed: ['src/a.ts'],
+    contract: { kind: 'perf-budget', claim: 'no path got slower', budgetMs: 100 },
+  })
+  assert.equal(okRun.report.grade, 'proven')
+  assert.ok(okRun.contract.obligations.every(o => o.met), 'every perf-budget obligation met')
+})
+
+test('ζ: docs-only — the jury path runs no checks and caps its own confidence', async () => {
+  const fs = MemoryFs.of({
+    [`${ROOT}/package.json`]: JSON.stringify({ name: 'demo' }),
+    [`${ROOT}/src/a.ts`]: 'export const a = 1\n',
+    [`${ROOT}/docs/guide.md`]: '# guide\n',
+  })
+  const commands = new FakeCommands()
+  const engine = contractEngine(fs, commands, [
+    { label: 'src tests', command: ['npm', 'test'], kind: 'test', paths: ['src/**'] },
+  ])
+  await engine.establishBaseline()
+
+  const callsBefore = commands.calls.length
+  const outcome = await engine.verifyContract({
+    changed: ['docs/guide.md'],
+    contract: {
+      kind: 'docs-only',
+      claim: 'rewrote the guide',
+      review: 'Replaced the outdated CLI flags section with the current ones; no code was touched.',
+    },
+  })
+  assert.equal(commands.calls.length, callsBefore, 'a docs-only claim executes zero commands')
+  assert.equal(outcome.report.grade, 'proven')
+  assert.equal(outcome.report.confidence, 0.8, 'jury confidence sits exactly at the cap')
+  assert.equal(outcome.report.confidenceBasis, 'jury-only')
+  assert.equal(outcome.checks.length, 0)
+  assert.equal(outcome.selection.affected.length, 0)
+  assert.equal(outcome.contract.juryConfidenceCap, 0.8)
+  assert.ok(fs.log.some(l => l.includes('claim/jury')), 'the jury verdict is a chain marker')
+  assert.match(proofNarrative(outcome.report), /PROVEN \(p≈0\.80, jury evidence — self-attestation is capped\)/)
+
+  // A code file sneaking into a docs-only claim is caught — still without
+  // running anything: the obligation, not a check, does the catching.
+  const mixed = await engine.verifyContract({
+    changed: ['docs/guide.md', 'src/a.ts'],
+    contract: { kind: 'docs-only', claim: 'just docs', review: 'honest review text' },
+  })
+  assert.equal(commands.calls.length, callsBefore, 'even a failing docs-only claim runs no commands')
+  assert.equal(mixed.report.grade, 'stale')
+  assert.equal(mixed.report.confidenceBasis, 'jury-only')
+  const docs = mixed.contract.obligations.find(o => o.id === 'docs-only-changes')
+  assert.ok(docs)
+  assert.equal(docs.met, false)
+  assert.match(docs.detail, /src\/a\.ts/)
+})
+
+test('ζ: a pre-ζ baseline without apiSurface fails behavior-preserving honestly', async () => {
+  const fs = MemoryFs.of(surfaceProject())
+  const engine = contractEngine(fs, new FakeCommands())
+  await engine.establishBaseline()
+
+  // Hand-strip the surface attachment, exactly like a baseline written before
+  // the field existed: the rest of the file stays intact.
+  const raw = await fs.readFile(`${ROOT}/.proof/baseline.json`)
+  assert.ok(raw !== undefined)
+  const parsed = JSON.parse(raw) as { apiSurface?: unknown }
+  assert.ok(Array.isArray(parsed.apiSurface), 'sanity: the fresh baseline does carry a surface')
+  delete parsed.apiSurface
+  fs.mutate(`${ROOT}/.proof/baseline.json`, JSON.stringify(parsed, null, 2))
+
+  fs.mutate(`${ROOT}/src/b.ts`, "import { a } from './a'\nexport const b = a + 2\n")
+  const outcome = await engine.verifyContract({
+    changed: ['src/b.ts'],
+    contract: { kind: 'behavior-preserving', claim: 'internal refactor only' },
+  })
+  const surface = outcome.contract.obligations.find(o => o.id === 'api-surface-unchanged')
+  assert.ok(surface)
+  assert.equal(surface.met, false, 'an un-comparable surface is never a pass')
+  assert.match(surface.detail, /baseline/, 'the detail tells the user to rebuild the baseline')
+  assert.equal(outcome.report.grade, 'stale')
+})
