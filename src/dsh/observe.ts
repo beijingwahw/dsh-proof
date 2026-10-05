@@ -81,7 +81,7 @@ export class WorkspaceWatch {
     const paths = WorkspaceWatch.pathsIn(exec.arguments)
     const isRead = this.readOnlyTools.has(exec.name)
     for (const raw of paths) {
-      const rel = this.toRelative(raw)
+      const rel = toWorkspaceRelative(raw, this.root)
       if (rel === undefined) continue
       if (isRead) {
         this.read.add(rel)
@@ -171,17 +171,35 @@ export class WorkspaceWatch {
     const content = await this.fs.readFile(`${this.root}/${rel}`)
     return content === undefined ? undefined : sha256(content)
   }
+}
 
-  private toRelative(raw: string): string | undefined {
-    if (raw.length === 0 || raw.length > 4096) return undefined
-    if (raw.includes('\0')) return undefined
-    const normalized = raw.replace(/\\/g, '/')
-    if (normalized.startsWith('/')) {
-      const root = this.root.replace(/\\/g, '/').replace(/\/+$/, '')
-      return normalized.startsWith(`${root}/`) ? normalized.slice(root.length + 1) : undefined
-    }
-    return normalized.replace(/^\.\//, '')
+/**
+ * Project any path a tool can name onto the workspace's relative path space:
+ * POSIX-absolute, Windows drive-absolute (`C:\ws\…` or `C:/ws/…`), and
+ * already-relative forms all describe workspace files. A path that is absolute
+ * but outside the root describes a different filesystem neighbourhood and
+ * yields undefined — treating it as relative would let external files
+ * masquerade as workspace state and agent edits be misattributed as external.
+ *
+ * Drive-absolute paths compare against the root case-insensitively: the same
+ * Windows workspace legitimately arrives as `C:\…` from the host and as
+ * `c:/…` from tools and language servers. POSIX stays case-sensitive.
+ */
+export function toWorkspaceRelative(raw: string, root: string): string | undefined {
+  if (raw.length === 0 || raw.length > 4096) return undefined
+  if (raw.includes('\0')) return undefined
+  const normalized = raw.replace(/\\/g, '/')
+  const normalizedRoot = root.replace(/\\/g, '/').replace(/\/+$/, '')
+  if (/^[A-Za-z]:\//.test(normalized)) {
+    // A drive path can only be inside a drive root; anything else is foreign.
+    if (!/^[A-Za-z]:\//.test(normalizedRoot)) return undefined
+    const inside = normalized.toLowerCase().startsWith(`${normalizedRoot.toLowerCase()}/`)
+    return inside ? normalized.slice(normalizedRoot.length + 1) : undefined
   }
+  if (normalized.startsWith('/')) {
+    return normalized.startsWith(`${normalizedRoot}/`) ? normalized.slice(normalizedRoot.length + 1) : undefined
+  }
+  return normalized.replace(/^\.\//, '')
 }
 
 function looksLikePath(value: string): boolean {

@@ -44,6 +44,14 @@ export interface ChangeSetResolution {
   readonly preExistingExcluded: readonly RelPath[]
   /** The commit the baseline was anchored to, when one existed. */
   readonly baselineHead: string | null
+  /**
+   * git was reported unavailable. Content anchoring (digest comparison against
+   * the baseline's dirty set) remains fully valid — it needs no git — but every
+   * git-derived signal is blind here: files that were *clean* at baseline and
+   * changed since are invisible. To stay fail-safe, callers should treat this
+   * as "force the full check set" rather than trust a narrowed change set.
+   */
+  readonly degraded?: true
 }
 
 export interface ChangeSetInput {
@@ -59,6 +67,19 @@ export interface ChangeSetInput {
   }
   /** Paths the agent's tool stream touched since the baseline, for provenance. */
   readonly touched?: readonly RelPath[]
+}
+
+/**
+ * Three-state git probe. A missing method means "host never implemented the
+ * capability" — treat git as available so existing degradation paths keep
+ * their behaviour. `false` is a definitive "git is unusable here": skip the
+ * git queries entirely (they can only fail) and mark the resolution degraded.
+ * A probe that *throws* is treated as available: we do not know it is broken,
+ * and each git call still carries its own catch.
+ */
+async function gitUsable(workspace: WorkspacePort): Promise<boolean> {
+  if (workspace.gitAvailable === undefined) return true
+  return workspace.gitAvailable().catch(() => true)
 }
 
 /** Resolve which files moved since the baseline, and who moved them. */
@@ -79,8 +100,12 @@ export async function resolveChangeSet(input: ChangeSetInput): Promise<ChangeSet
     }
   }
 
+  const git = await gitUsable(input.workspace)
+
   if (input.baseline === undefined) {
-    const dirty = await input.workspace.gitDirty().catch(() => [])
+    // Without git there is no dirty set to fall back to — the resolution
+    // degrades to "nothing visible", and says so.
+    const dirty = git ? await input.workspace.gitDirty().catch(() => []) : []
     const changed = [...new Set(dirty)].sort()
     return {
       changed,
@@ -88,16 +113,24 @@ export async function resolveChangeSet(input: ChangeSetInput): Promise<ChangeSet
       method: 'dirty-fallback',
       preExistingExcluded: [],
       baselineHead: null,
+      ...(git ? {} : { degraded: true as const }),
     }
   }
 
   const baselineDirty = new Set(input.baseline.dirty)
   const digests = input.baseline.dirtyDigests
-  const trackedDiff: readonly string[] = input.baseline.head !== null
+  // When git is down, every one of these queries is skipped rather than
+  // fired-and-failed: candidates then come from the baseline's own dirty set,
+  // which content digests can still adjudicate without git.
+  const trackedDiff: readonly string[] = git && input.baseline.head !== null
     ? await input.workspace.changedSince?.(input.baseline.head).catch(() => [] as string[]) ?? []
     : []
-  const untrackedNow: readonly string[] = await input.workspace.untracked?.().catch(() => [] as string[]) ?? []
-  const dirtyNow: readonly string[] = await input.workspace.gitDirty().catch(() => [])
+  const untrackedNow: readonly string[] = git
+    ? await input.workspace.untracked?.().catch(() => [] as string[]) ?? []
+    : []
+  const dirtyNow: readonly string[] = git
+    ? await input.workspace.gitDirty().catch(() => [])
+    : []
 
   // Everything that could possibly have moved: differs from the baseline
   // commit, is untracked now, is dirty now, or was already dirty at baseline
@@ -131,6 +164,7 @@ export async function resolveChangeSet(input: ChangeSetInput): Promise<ChangeSet
     method: digests !== undefined ? 'baseline-content' : 'git-head',
     preExistingExcluded: excluded,
     baselineHead: input.baseline.head,
+    ...(git ? {} : { degraded: true as const }),
   }
 }
 

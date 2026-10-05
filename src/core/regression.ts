@@ -11,10 +11,10 @@
  */
 
 import type { CheckReport, CheckVerdict, Evidence, ProofReport } from './evidence.ts'
-import { verdictOf } from './evidence.ts'
+import { isDecisiveStatus, verdictOf } from './evidence.ts'
 import type { CheckSpec } from './ports.ts'
 import type { RelPath } from './impact.ts'
-import { attributeChange, matchesAny } from './impact.ts'
+import { attributeChange, isGlobalInvalidator, matchesAny } from './impact.ts'
 import type { DependencyGraph } from './impact.ts'
 import type { ChangeProvenance } from './changeset.ts'
 import { firstInformativeLine } from './excerpt.ts'
@@ -87,17 +87,16 @@ export function attributeChecks(input: AttributionInput): AttributedCheck[] {
 function rankSuspects(files: readonly RelPath[], spec: CheckSpec): RelPath[] {
   return [...files].sort((a, b) => {
     const score = (f: RelPath) => {
-      if (isGlobalInvalidatorName(f)) return 0
+      // Ranking only — never correctness. Reuse the one true list of global
+      // invalidators instead of a second regex: the old local `.*lock.*`
+      // pattern scored `deadlock.ts` and `blockchain.md` as lockfiles.
+      if (isGlobalInvalidator(f)) return 0
       if (spec.paths.some(p => p !== '*' && matchesAny(f, [p]))) return 1
       return 2
     }
     const d = score(a) - score(b)
     return d !== 0 ? d : a.length - b.length
   })
-}
-
-function isGlobalInvalidatorName(file: RelPath): boolean {
-  return /(^|\/)(package\.json|tsconfig[^/]*\.json|.*lock.*|Makefile|pyproject\.toml|go\.(mod|sum)|Cargo\.(toml|lock))$/.test(file)
 }
 
 function rationaleFor(
@@ -131,6 +130,13 @@ function rationaleFor(
       return `"${spec.label}" is newly discovered${c === 'absent' ? ' and not yet run' : ` and passes (${c})`}.`
     case 'not-run':
       return `"${spec.label}" was not re-run; its evidence is stale relative to this change set.`
+    case 'indeterminate':
+      // Two distinct ignorances, one honest verdict each: a baseline that
+      // never settled the question, or a current run that could not.
+      if (!isDecisiveStatus(baseline?.status)) {
+        return `"${spec.label}" had no decisive result at baseline (${b}) — neither credit nor blame can be derived from an unknown.`
+      }
+      return `"${spec.label}" produced no decisive result this run (${c}) — the question stays open; no credit, no blame.`
   }
 }
 
@@ -166,6 +172,7 @@ export function proofNarrative(report: ProofReport): string {
   if (s.regressions > 0) parts.push(`${s.regressions} regression(s)`)
   if (s.fixed > 0) parts.push(`${s.fixed} fixed`)
   if (s.preExisting > 0) parts.push(`${s.preExisting} pre-existing failure(s)`)
+  if (s.indeterminate > 0) parts.push(`${s.indeterminate} indeterminate`)
   if (report.unverified.length > 0) parts.push(`${report.unverified.length} stale/unrun`)
   return parts.join(' · ')
 }

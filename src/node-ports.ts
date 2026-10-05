@@ -11,6 +11,7 @@
 import { spawn } from 'node:child_process'
 import { existsSync, promises as fsp } from 'node:fs'
 import * as path from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign as edSign, verify as edVerify } from 'node:crypto'
 import type {
   Clock, CommandPort, CommandResult, CommandRunOptions, FileStat, FsPort,
@@ -39,7 +40,12 @@ function resolveWindowsArgv(argv: readonly string[]): string[] {
 
 /** Spawns argv vectors without a shell — no quoting games, no injection surface. */
 export class NodeCommandPort implements CommandPort {
-  run(argv: readonly string[], options: CommandRunOptions): Promise<CommandResult> {
+  async run(argv: readonly string[], options: CommandRunOptions): Promise<CommandResult> {
+    // An already-aborted signal never fires its 'abort' listener, so checking
+    // after spawn would let the child run until the timeout killed it.
+    if (options.signal?.aborted) {
+      return { exitCode: null, output: '', durationMs: 0, aborted: true }
+    }
     const [command, ...args] = process.platform === 'win32' ? resolveWindowsArgv(argv) : [...argv]
     const started = Date.now()
     return new Promise((resolve) => {
@@ -52,10 +58,18 @@ export class NodeCommandPort implements CommandPort {
       let aborted = false
       let timedOut = false
       let settled = false
+      // One decoder per stream: a multi-byte UTF-8 character straddling a
+      // chunk boundary must survive the join instead of becoming U+FFFD —
+      // captured evidence has to be byte-faithful for digests to be stable.
+      const stdoutDecoder = new StringDecoder('utf8')
+      const stderrDecoder = new StringDecoder('utf8')
 
       const child = spawn(command, args, {
         cwd: options.cwd,
-        env: { ...process.env, ...(options.env ?? {}), CI: '1', FORCE_COLOR: '0', NO_COLOR: '1' },
+        // Inherited environment first, deterministic color/CI defaults on
+        // top of it, caller overlay last: hosts stay free to override when
+        // they must, everything else gets deterministic output by default.
+        env: { ...process.env, CI: '1', FORCE_COLOR: '0', NO_COLOR: '1', ...(options.env ?? {}) },
         stdio: ['ignore', 'pipe', 'pipe'],
         shell: false,
       })
@@ -65,6 +79,9 @@ export class NodeCommandPort implements CommandPort {
         settled = true
         clearTimeout(timer)
         options.signal.removeEventListener('abort', onAbort)
+        // Flush decoders: a tail partial sequence (killed process) surfaces
+        // as replacement characters instead of silently vanishing bytes.
+        output += stdoutDecoder.end() + stderrDecoder.end()
         resolve({
           exitCode,
           output: output.slice(0, maxChars),
@@ -82,8 +99,16 @@ export class NodeCommandPort implements CommandPort {
         killChild(child)
       }, Math.max(1, options.timeoutMs))
 
-      child.stdout?.on('data', (chunk: Buffer) => { if (output.length < maxChars * 2) output += chunk.toString('utf8') })
-      child.stderr?.on('data', (chunk: Buffer) => { if (output.length < maxChars * 2) output += chunk.toString('utf8') })
+      // Always feed the decoders (their buffered partial bytes must not
+      // desync), only stop appending once the capture cap is far exceeded.
+      child.stdout?.on('data', (chunk: Buffer) => {
+        const text = stdoutDecoder.write(chunk)
+        if (output.length < maxChars * 2) output += text
+      })
+      child.stderr?.on('data', (chunk: Buffer) => {
+        const text = stderrDecoder.write(chunk)
+        if (output.length < maxChars * 2) output += text
+      })
       child.on('error', (error: NodeJS.ErrnoException) => {
         finish(null, `spawn failed: ${error.code ?? error.message}`)
       })
@@ -255,15 +280,75 @@ export class NodeEd25519Signer implements SignerPort {
   }
 }
 
+/**
+ * Parses `git status --porcelain -z` output into the set of paths it mentions.
+ *
+ * The `-z` stream is a sequence of NUL-terminated fields. Each entry begins
+ * with a status field `XY <path>` (two status letters, a space, the path);
+ * when the status contains `R` (rename) or `C` (copy) the ORIGINAL path
+ * follows as a second bare field with no prefix — both halves are workspace
+ * facts, so both are collected. Paths are emitted verbatim (`-z` performs no
+ * C-quoting, so `sp ace.ts` arrives unquoted).
+ *
+ * Tolerant by design: a field without a status prefix (truncated or garbage
+ * stream) is kept verbatim rather than dropped — dirtiness must never be
+ * under-reported.
+ */
+export function parsePorcelainZ(output: string): string[] {
+  const fields = output.split('\0')
+  const paths: string[] = []
+  for (let i = 0; i < fields.length; i++) {
+    const field = fields[i]
+    if (field === undefined || field.length === 0) continue
+    if (field.length >= 3 && field.charCodeAt(2) === 0x20 /* space */) {
+      // Status field: 'XY <new-path>', possibly followed by the old path.
+      const newPath = field.slice(3)
+      if (newPath.length > 0) paths.push(newPath)
+      const status = field.slice(0, 2)
+      if (status.includes('R') || status.includes('C')) {
+        const oldPath = fields[++i]
+        if (oldPath !== undefined && oldPath.length > 0) paths.push(oldPath)
+      }
+    } else {
+      paths.push(field)
+    }
+  }
+  return paths.sort()
+}
+
 /** Git-backed workspace facts. Degrades to "unknown" outside a work tree. */
 export class GitWorkspace implements WorkspacePort {
   readonly root: string
   private readonly commands: CommandPort
+  /** Cached availability probe: git usability does not flip mid-process. */
+  private gitAvailablePromise: Promise<boolean> | undefined
 
   constructor(root: string, commands: CommandPort = new NodeCommandPort(), clock: Clock = new SystemClock()) {
     this.root = root
     this.commands = commands
     void clock
+  }
+
+  /**
+   * Whether git can answer questions about this workspace at all — the binary
+   * is present AND the root sits inside a work tree (E3). Probed once and
+   * remembered: availability cannot flip while the process lives, and every
+   * re-probe on a git-less host would burn the 5s timeout again.
+   *
+   * `--is-inside-work-tree` exits non-zero outside any repository, but exits
+   * ZERO with "false" inside a bare one — so the output is checked too, not
+   * just the exit code, or a bare repo would pass as verifiable.
+   */
+  gitAvailable(): Promise<boolean> {
+    this.gitAvailablePromise ??= this.commands
+      .run(['git', 'rev-parse', '--is-inside-work-tree'], {
+        cwd: this.root, timeoutMs: 5_000, signal: AbortSignal.timeout(5_000),
+      })
+      .then(
+        result => result.exitCode === 0 && result.output.trim() === 'true',
+        () => false, // a probe that cannot even run is not an availability proof
+      )
+    return this.gitAvailablePromise
   }
 
   async gitHead(): Promise<string | null> {
@@ -278,14 +363,17 @@ export class GitWorkspace implements WorkspacePort {
       cwd: this.root, timeoutMs: 10_000, signal: AbortSignal.timeout(10_000),
     })
     if (result.exitCode !== 0) return []
-    return result.output
-      .split('\0')
-      .map(entry => entry.slice(3).trim())
-      .filter(Boolean)
-      .sort()
+    // Both ends of a rename/copy are workspace facts — see parsePorcelainZ.
+    return parsePorcelainZ(result.output)
   }
 
-  /** Files modified since `ref`, relative to root — the session's change set. */
+  /**
+   * Files modified since `ref`, relative to root — the session's change set.
+   *
+   * `git diff --name-only -z` emits a plain NUL-separated path list: every
+   * path terminated by NUL, no status prefixes, no rename pairing, no
+   * quoting — so `split('\0')` + dropping empty strings is the exact inverse.
+   */
   async changedSince(ref: string): Promise<string[]> {
     const result = await this.commands.run(['git', 'diff', '--name-only', '-z', ref], {
       cwd: this.root, timeoutMs: 15_000, signal: AbortSignal.timeout(15_000),
@@ -294,7 +382,13 @@ export class GitWorkspace implements WorkspacePort {
     return result.output.split('\0').filter(Boolean).sort()
   }
 
-  /** Untracked files (honouring .gitignore), relative to root. */
+  /**
+   * Untracked files (honouring .gitignore), relative to root.
+   *
+   * `git ls-files --others --exclude-standard -z` also emits a plain
+   * NUL-separated path list (no prefixes, no quoting), so `split('\0')` +
+   * dropping empty strings parses it exactly.
+   */
   async untracked(): Promise<string[]> {
     const result = await this.commands.run(['git', 'ls-files', '--others', '--exclude-standard', '-z'], {
       cwd: this.root, timeoutMs: 15_000, signal: AbortSignal.timeout(15_000),

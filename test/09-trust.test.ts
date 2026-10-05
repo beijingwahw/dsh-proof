@@ -182,6 +182,89 @@ test('checkpoint cadence fires without an explicit call', async () => {
   assert.equal(audit.ok, true)
 })
 
+test('concurrent appends never break the hash chain (single-flight writes)', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  // All three racers read the same tail before any of them writes; without
+  // serialized write sections, two of the three `prev` values would point at
+  // a tail the log has already moved past.
+  await Promise.all([
+    store.append(evidence('c1')),
+    store.append(evidence('c2')),
+    store.mark('session/start', { who: 'test' }),
+  ])
+  const audit = await store.audit()
+  assert.deepEqual(audit.chain.breaks, [], `chain breaks at: ${JSON.stringify(audit.chain.breaks)}`)
+  assert.equal(audit.total, 2, 'both evidence records landed (the marker chains through but is not evidence)')
+  assert.equal(audit.ok, true)
+})
+
+test('a failed write does not deadlock the queue behind it', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  const boom = new Error('disk full')
+  const original = fs.appendLine.bind(fs)
+  let armed = true
+  fs.appendLine = async (path: string, line: string) => {
+    if (armed) { armed = false; throw boom }
+    return original(path, line)
+  }
+  await assert.rejects(() => store.append(evidence('c1')), /disk full/)
+  await store.append(evidence('c2')) // must not hang behind the rejected op
+  const audit = await store.audit()
+  assert.equal(audit.total, 1)
+  assert.deepEqual(audit.chain.breaks, [])
+})
+
+test('signed chain audited without the key is UNVERIFIABLE, not forged', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1'))
+  await store.checkpoint()
+
+  // Same log + anchor, but this host holds no signer at all (key lost, or
+  // the log moved machines). A missing capability is not an accusation.
+  const keyless = new EvidenceStore(fs, LOG, BASE, new FakeClock(), { anchorPath: ANCHOR })
+  const audit = await keyless.audit()
+  assert.equal(audit.chain.unverifiableCheckpoints.length, 1, 'one signed checkpoint, no key to adjudicate it')
+  assert.deepEqual(audit.chain.badCheckpoints, [], 'no forgery charge without a refuting key')
+  assert.equal(audit.ok, true, 'unverifiable must not flip ok — the anchor data checks still cover rewind')
+
+  // A host holding a *different* key is equally unable to adjudicate.
+  const foreignKey: SignerPort = {
+    keyId: 'another-key',
+    sign: async () => 'x',
+    verify: async () => false, // would "refute" everything if consulted — it must not be
+  }
+  const foreign = new EvidenceStore(fs, LOG, BASE, new FakeClock(), { signer: async () => foreignKey, anchorPath: ANCHOR })
+  const foreignAudit = await foreign.audit()
+  assert.equal(foreignAudit.chain.unverifiableCheckpoints.length, 1)
+  assert.deepEqual(foreignAudit.chain.badCheckpoints, [])
+  assert.equal(foreignAudit.ok, true)
+})
+
+test('tampering with the anchor file is caught by its own signature', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1'))
+  await store.checkpoint()
+
+  const raw = await fs.readFile(ANCHOR)
+  assert.ok(raw !== undefined, 'anchor must exist after a signed checkpoint')
+  const anchor = JSON.parse(raw) as { workspaceKey?: string }
+  assert.equal(anchor.workspaceKey, 'ws', 'the anchor carries the workspace key its signature commits to')
+
+  // Inflate the high-water count without re-signing: monotonicity alone would
+  // also flag a rewind here, but the signature check is what turns "data
+  // disagrees" into "the anchor was forged".
+  const doctored = { ...JSON.parse(raw) as Record<string, unknown>, count: 99 }
+  fs.mutate(ANCHOR, JSON.stringify(doctored, null, 2))
+
+  const audit = await store.audit()
+  assert.equal(audit.chain.anchorForged, true, 'the anchor sig must refute the tampered fields')
+  assert.equal(audit.ok, false)
+})
+
 test('engine end to end with signing: baseline -> verify -> signed audit + anchor', async () => {
   const fs = MemoryFs.of({
     '/ws/package.json': JSON.stringify({ name: 'demo', scripts: { test: 'vitest run', build: 'tsc -b' } }),

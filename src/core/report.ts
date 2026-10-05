@@ -13,7 +13,7 @@
 import type {
   Baseline, CheckReport, Evidence, ProofGrade, ProofReport, WorkspaceSnapshot,
 } from './evidence.ts'
-import { buildBaseline } from './evidence.ts'
+import { buildBaseline, isDecisiveStatus } from './evidence.ts'
 import { merkleRoot } from './hash.ts'
 import type { CheckSpec, Clock } from './ports.ts'
 import type { RelPath, DependencyGraph } from './impact.ts'
@@ -65,7 +65,7 @@ export function assembleProof(input: AssembleInput): AssembleResult {
   // mean the same thing to a reader: no verdict, so no proof.
   const unverified = [...affectedIds].filter((id) => {
     const record = currentById.get(id)
-    return record === undefined || !DECISIVE.has(record.status)
+    return !isDecisiveStatus(record?.status)
   }).sort()
 
   const grade = decideGrade({
@@ -80,12 +80,13 @@ export function assembleProof(input: AssembleInput): AssembleResult {
   })
 
   const summary = {
-    passing: attributed.filter(c => isPassing(c.verdict)).length,
+    passing: attributed.filter(c => isPassing(c)).length,
     failing: attributed.filter(c => isFailing(c.verdict)).length,
     regressions: attributed.filter(c => c.verdict === 'regression').length,
     fixed: attributed.filter(c => c.verdict === 'fixed').length,
     preExisting: attributed.filter(c => c.verdict === 'still-failing').length,
     newChecks: attributed.filter(c => c.verdict === 'new-check').length,
+    indeterminate: attributed.filter(c => c.verdict === 'indeterminate').length,
   }
 
   const report: ProofReport = {
@@ -114,6 +115,9 @@ export function assembleBaseline(
   workspace: WorkspaceSnapshot,
   clock: Clock,
 ): Baseline {
+  // `specs` is accepted purely for API symmetry with `assembleProof`; the
+  // baselineId deliberately hashes only what the log can recompute later
+  // (records + workspace), never the discovery-time spec list.
   void specs
   return buildBaseline(records, workspace, clock)
 }
@@ -129,8 +133,7 @@ interface GradeInput {
   requireFullCoverage: boolean
 }
 
-/** Statuses that actually answer the question. */
-const DECISIVE = new Set(['pass', 'fail'])
+/** Statuses that actually answer the question — single source: `evidence.ts`. */
 
 function decideGrade(input: GradeInput): ProofGrade {
   const regressions = input.attributed.filter(c => c.verdict === 'regression').length
@@ -145,10 +148,17 @@ function decideGrade(input: GradeInput): ProofGrade {
   return 'proven'
 }
 
-function isPassing(verdict: CheckReport['verdict']): boolean {
-  return verdict === 'still-passing' || verdict === 'fixed' || verdict === 'new-check'
+/**
+ * Credit only goes to checks with a decisive pass on record. A `new-check`
+ * that was never actually run must not dilute the passing number — it is
+ * already accounted for separately by `summary.newChecks`.
+ */
+function isPassing(check: CheckReport): boolean {
+  if (check.verdict === 'new-check') return check.current?.status === 'pass'
+  return check.verdict === 'still-passing' || check.verdict === 'fixed'
 }
 
+/** Blame only attaches to decisive failures; `indeterminate` and `not-run` carry neither. */
 function isFailing(verdict: CheckReport['verdict']): boolean {
   return verdict === 'regression' || verdict === 'still-failing' || verdict === 'new-failure'
 }

@@ -46,6 +46,16 @@ test('windows roots match output in either slash style', () => {
   assert.equal(normalized, 'fail $WORKSPACE\\a.ts and $WORKSPACE/b.ts')
 })
 
+test('root substitution is boundary-anchored: /app must not eat /application', () => {
+  const normalized = normalizeOutput('built /application/config.yml from /app/src/a.ts', { root: '/app' })
+  assert.equal(normalized, 'built /application/config.yml from $WORKSPACE/src/a.ts', 'a longer path sharing the prefix is a different location, not this workspace')
+})
+
+test('root substitution fires at separators, quotes, whitespace and line end — never mid-word', () => {
+  const normalized = normalizeOutput('cd "/app"\nsee /app\\src ok in /app and /appdata', { root: '/app' })
+  assert.equal(normalized, 'cd "$WORKSPACE"\nsee $WORKSPACE\\src ok in $WORKSPACE and /appdata')
+})
+
 test('without canonical roots, legacy behaviour is byte-for-byte unchanged', () => {
   assert.equal(normalizeOutput('plain output\n', {}), 'plain output', 'trailing-empty-line pop is legacy behaviour, unchanged')
   assert.equal(normalizeOutput('fail at /nowhere/here/a.ts\n'), 'fail at /nowhere/here/a.ts', 'no roots given — no substitution, digests stay legacy-stable')

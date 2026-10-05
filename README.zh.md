@@ -86,8 +86,12 @@ DSH 生态已超过 5000 个插件、14 个分类。但把分类摊开看，缺�
 | pass | fail | **`regression`** | **本次会话**，并给出嫌疑文件 |
 | fail | fail | `still-failing` | 本来就是红的，**不记在你头上** |
 | fail | pass | `fixed` | 本次会话修好了 |
-| 无 | fail | `new-failure` | 无法区分，如实标注 |
-| 无 | 未跑 | `not-run` | 证据过期 |
+| 无记录 | pass | `new-check` | 首次纳入视域；**真跑过且决定性通过**才计入 passing |
+| 无记录 | fail | `new-failure` | 无法区分，如实标注 |
+| 有记录 | 本次未跑 | `not-run` | 证据过期 |
+| 任一侧 skipped / timeout / aborted / error | — | `indeterminate` | **既不记功也不记账**——知识格的诚实中间态 |
+
+判定知识格是三值的：**记功**（`still-passing`、`fixed`、决定性通过的 `new-check`）、**记账**（`regression`、`still-failing`、`new-failure`）、**两者都不是**（`indeterminate`、`not-run`、从未运行的 `new-check`）。记账要求基线是决定性 pass，记功要求基线是决定性 fail——任何一侧拿不到决定性结果，判定就是 `indeterminate`，summary 相应有独立的 `indeterminate` 计数。**未知永远不能向任何一方借确定性**（v0.7 之前，`skipped` 曾被当作"通过"参与对比）。
 
 **这是本插件的头号差异点**：在一个本来就红的仓库里工作时，你不需要先修完所有历史遗留才能证明自己没做坏。这正是「大多数用户」的真实处境。
 
@@ -137,7 +141,7 @@ DSH 生态已超过 5000 个插件、14 个分类。但把分类摊开看，缺�
 | `tools/pre-execute`（waterfall） | `requireBaseline: ask` 时，**没有基线就不许改工作区**，走用户审批 |
 | `tools/pre-execute`（waterfall） | `evidenceStore: workspace` 时，**写入证据库的变更类工具一律转用户审批**——被审计者不能改审计记录 |
 | `tools/result`（emit） | 观察每次工具结果，维护脏区与文件指纹 |
-| `agent/turn-stopping` | 本轮改了东西但没做 `proof_claim` → 注入纠正性上下文；检测到漂移 → 注入 stale 警告 |
+| `agent/turn-stopping` | 本轮改了东西但没做 `proof_claim` → 注入纠正性上下文；没有基线且 `requireBaseline: warn` → 注入基线提醒；检测到漂移 → 注入 stale 警告 |
 | `ctx.systemPrompt.section()` | 发布 `proof:policy` 段落，让模型知道规则存在，不必靠失败去摸索 |
 
 ## 五·五、信任模型（v0.2）：对抗被审计者
@@ -151,7 +155,7 @@ DSH 生态已超过 5000 个插件、14 个分类。但把分类摊开看，缺�
 
 配套的存储隔离：默认 `evidenceStore: host` 把日志放到 `$DSH_HOME/proof/workspaces/<工作区指纹>/`，**完全移出智能体沙箱可写范围**；选择 `workspace` 模式（放回项目内）时，写入 `.proof/` 的变更类工具会被转用户审批。
 
-`proof_status` 暴露全部信任遥测：`chainMode`（signed/unsigned/legacy）、`checkpoints`、`chainIntact`、`rewindDetected`、`baselineTampered`。`proven` 评级的可信度从此有了对抗性保证：**日志要么没被动过，要么动了就会被点名。**
+`proof_status` 暴露全部信任遥测：`chainMode`（signed/unsigned/legacy）、`checkpoints`、`chainIntact`、`rewindDetected`、`baselineTampered`，以及 v0.7 加入的三态裁定字段（`unverifiableCheckpoints`、`anchorForged`）与检查点窗口余量（`tailRecords`）。`proven` 评级的可信度从此有了对抗性保证：**日志要么没被动过，要么动了就会被点名。**
 
 ## 五·六、变更集溯源（v0.3）：内容锚定 + 来源归因
 
@@ -199,6 +203,18 @@ v0.6 在 `normalizeOutput` 落地双层归一：**root → `$WORKSPACE`（先具
 - **用户名不再进入任何证据字段**；
 - 不传归一根时行为逐字节保持旧状（存量 digest 稳定），且 `audit()` 的自寻址验证对存量字段重算，天然不受影响。
 
+## 五·十、诚实性加固（v0.7.0）：不确定，就绝不冒充通过
+
+深读一轮之后修的全是「错误的方向性」：不是缺功能，而是存在一整类会把**未知四舍五入成好消息**的路径。v0.7 把它们逐个关掉。
+
+**判定知识格（三值）**。旧判定里 `skipped` / `timeout` 与"通过"同权——一个从未真正跑完的检查，可以凭两边的"非失败"被记成 `still-passing`；没运行过的 `new-check` 也稀释着 passing 数字。v0.7 重写为三值格：非决定性（skipped/timeout/aborted/error）落在 `indeterminate`，既不记功也不记账，summary 新增独立计数；`new-check` 只有真跑过且决定性通过才计入 passing。记账要求基线决定性 pass，记功要求基线决定性 fail——**未知永远不能向任何一方借确定性**。
+
+**信任三态**。audit 的签名裁定从二态改为三态。旧逻辑在**没有 signer 的机器**上（密钥丢失、换机器审计）会把带签名的检查点误读成可疑；现在只有本机实际持有的密钥、面对点名该密钥的检查点，才有资格**驳斥**（`badCheckpoints`，真正的伪造指控）；本机无法裁定的（`unverifiableCheckpoints`）是**能力缺失而非指控**，不再使 audit 失败。锚文件自身的签名现在也会被验证（`anchorForged`），且锚携带 `workspaceKey`——审计可以仅凭锚文件重导出被签名的字节。
+
+**引擎的诚实边界**。git 不可用时（WorkspacePort 新可选能力 `gitAvailable?()`），每条 git 查询各自失败返回空集——"什么都看不见"曾被吞成"什么都没变"，增量选择悄悄缩成空。现在变更集显式标记 `degraded`，引擎**强制全量跑**并在 `VerifyOutcome.degraded` 透出。中止的基线不再落盘——abort 的基线曾照常写盘，之后的回归判定对着半成品真值运行；现在已观测的证据仍全部入链、落 `baseline/aborted` 标记、检查点窗口照常闭合，返回值携带 `aborted` 标志，下一次 verify 诚实报告 `no-baseline`。signer 加载失败大声降级：链内 `trust/signer-unavailable` marker + verbose 日志——静默降级与诚实的 unsigned 部署从此可区分。`requireBaseline: 'warn'` 从"配置了但没接线"变成真通知：本轮动了工作区而没有基线时，回合结束经 `agent.inject` 注入纠正性提示。死配置 `driftNoticeMs` 删除（配置现为 22 项）。
+
+**正确性收口（soundness closure）**。monorepo workspace 子包检查不再丢失：CheckSpec 新增 `cwd`（相对 root），子包检查真正在子包目录执行、id 含 cwd（cwd 缺省时 checkId 与旧格式逐字节一致），`packages/*` 单层 glob 现在真正展开——同 argv 的兄弟包检查不再互相顶替。影响图补盲：动态 `import('...')` 与多行 ESM import 现在产生边；Python dotted import（`pkg.mod`）在扫描集内尝试解析——多出的边只造成过选，绝不漏选。`git status --porcelain -z` 的 rename 条目解析修正（旧路径曾被截掉 3 个字符成为幻影路径；解析提为纯函数 `parsePorcelainZ`）。Windows 盘符绝对路径（`C:\...`）统一进路径域：observe 的 touched 归类、LSP root 前缀比较（大小写不敏感）、证据库守卫均修正。EvidenceStore 写入改单飞队列——并发的 append/mark/checkpoint 曾可能都链到同一个 tail，后一条的 `prev` 指向一条已不存在的行：**正确代码与它自己的竞态**。证据输出捕获改用 StringDecoder，多字节字符跨 chunk 边界不再碎成 U+FFFD。工程卫生：CI 改 `npm ci` 并加 windows 矩阵；`check-bundle` 错误路径不再崩溃；`untouchedChecks` 输出修正。
+
 ---
 
 ## 六、架构：领域核心 + 薄适配层
@@ -208,25 +224,30 @@ v0.6 在 `normalizeOutput` 落地双层归一：**root → `$WORKSPACE`（先具
 ```
 dsh-proof/
 ├── src/
-│   ├── core/                 ← 纯领域层，零 @deepseek-ai/* 依赖
-│   │   ├── ports.ts          # 唯一的对外接口（Command/Fs/Clock/Workspace）
-│   │   ├── hash.ts           # 规范化 JSON + 内容寻址 + Merkle root
-│   │   ├── checks.ts         # 客观检查发现（多语言）
-│   │   ├── evidence.ts       # 证据模型 + append-only 事实源 + 基线
+│   ├── core/                 ← 纯领域层，零 @deepseek-ai/* 依赖（12 个模块）
+│   │   ├── ports.ts          # 唯一的对外接口（Command/Fs/Clock/Workspace/Signer/Resolver）
+│   │   ├── hash.ts           # 规范化 JSON + 内容寻址 + Merkle root + 输出归一
+│   │   ├── checks.ts         # 客观检查发现（多语言 + monorepo 子包 cwd）
+│   │   ├── evidence.ts       # 证据模型 + append-only 事实源 + 基线 + 判定知识格
 │   │   ├── impact.ts         # 反向依赖闭包 + 变更影响选择
+│   │   ├── changeset.ts      # 内容锚定变更集 + 来源归因
 │   │   ├── regression.ts     # 回归判定与嫌疑文件归因
 │   │   ├── runner.ts         # 增量验证调度（并发/超时/预算/可取消）
-│   │   └── report.ts         # 证明装配与五档评级
+│   │   ├── report.ts         # 证明装配与五档评级
+│   │   ├── excerpt.ts        # 智能摘录（balanced / head）
+│   │   ├── trust.ts          # 哈希链 + 检查点签名 + 带外锚点
+│   │   └── index.ts          # 领域导出
 │   ├── engine.ts             # ProofEngine —— 宿主调用的命令式门面
-│   ├── node-ports.ts         # Node 实现（spawn / fs / git）
+│   ├── node-ports.ts         # Node 实现（spawn / fs / git / Ed25519）
+│   ├── config.ts             # Schemastery 配置
+│   ├── index.ts              # Cordis 插件入口
 │   ├── dsh/                  ← 薄 Cordis 适配层
 │   │   ├── tools.ts          # 四个模型可见工具
 │   │   ├── observe.ts        # 脏区追踪 + 漂移检测
-│   │   └── prompt.ts         # proof:policy 段落
-│   ├── vendor/dsh-tools.ts   # 契约快照（pinned to dsh v0.2.1-alpha.1）
-│   ├── config.ts             # Schemastery 配置
-│   └── index.ts              # Cordis 插件入口
-├── test/                     # 100 个测试，含真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录与位置无关寻址
+│   │   ├── prompt.ts         # proof:policy 段落
+│   │   └── lsp-impact.ts     # 宿主 LSP → DefinitionResolverPort 适配
+│   └── vendor/dsh-tools.ts   # 契约快照（pinned to dsh v0.2.1-alpha.1）
+├── test/                     # 14 个测试文件（159 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层
 ├── cordis.patch.yml          # bundle 层
 └── examples/cordis.yml       # --patch 本地调试
 ```
@@ -234,7 +255,7 @@ dsh-proof/
 **为什么领域核心不碰 `@deepseek-ai/*`：**
 
 1. DSH 是开发者预览版，破坏性变更频繁。核心逻辑与 harness 版本解耦 → 升级不重写。
-2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，100 个测试全绿。
+2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，159 个测试全绿。
 3. 同一个核心可以被别的宿主（CLI、CI、其他 harness）复用。
 
 **为什么 `vendor/dsh-tools.ts` 是契约快照而不是活依赖：**
@@ -251,6 +272,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 | **哈希链 + 签名检查点 + 带外锚点**（v0.2） | 每行 `prev = sha256(上一行)`；检查点由宿主 Ed25519 密钥签名并镜像到工作区外的锚点 | 对抗「被审计者自己重写日志」：全量重写/回滚/换基线全部可检测 |
 | **内容锚定变更集 + 来源归因**（v0.3） | 基线快照携带脏文件内容摘要；变更 = 与快照的字节差异；工具触达集区分 agent/external | 陈旧脏区不再冤枉会话；用户 IDE 手改不再记在智能体头上；「还原也是变更」也能抓到 |
 | **LSP 双源影响融合**（v0.4） | `goToDefinition` 放在导入说明符上：验证近似边 + 发现别名导入盲区；并集语义；缓存 + 预算 | 精度提升不牺牲覆盖；monorepo 别名断链不再漏判；降级显式可见 |
+| **诚实性加固**（v0.7） | 判定知识格三值化（`indeterminate`）；签名裁定三态（可驳斥 / 不可裁定 / 未签名）；git 不可用 → `degraded` + 强制全量；abort 基线不落盘；日志写入单飞队列 | 未知永不冒充通过：skipped 不再算通过、能力缺失不再误判伪造、并发写不再断链、半成品真值不再锚定后续判定 |
 | **反向依赖闭包** | import 图 + 传染式 BFS | 增量验证，省时间也省 token |
 | **基线差分回归归因** | `baseline ∘ delta = proof` | 区分「本来就坏」与「被你改坏」 |
 | **接口 / 实现 / 消费者分层** | 领域核心零框架依赖 | 可测、可复用、抗上游抖动 |
@@ -296,7 +318,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 **`requireBaseline` 三档**
 
 - `off` —— 不拦，只做记录与报告
-- `warn` —— 默认。没有基线时给模型注入提醒
+- `warn` —— 默认。本轮动了工作区但还没有基线 → **回合结束时经 `agent.inject` 注入纠正性通知**（提示先跑 `proof_baseline`，之后的失败才能归因到你的改动）
 - `ask` —— **没有基线就不许改工作区**，走用户审批
 
 **显式检查示例**（想要精确的增量验证就配 `paths`）：
@@ -321,7 +343,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit，离线可跑
-npm test              # 100 个测试（node:test）
+npm test              # 159 个测试（node:test）
 npm run build         # 产出 lib/
 npm run bundle:check  # 打包契约自检
 ```
@@ -335,6 +357,10 @@ npm run bundle:check  # 打包契约自检
 - `08` —— 插件接线：四个工具、三个钩子、提示词段落、纯投影、配置校验
 - `09` —— **信任对抗**：链断裂、全量重写（用本包自己的哈希函数）、回滚、基线替换、真实 Ed25519 密钥
 - `10` —— **变更集溯源**：陈旧脏区豁免、还原即变更、未跟踪文件、外部回归不记账、引擎端到端
+- `11` —— **LSP 影响融合**：goToDefinition 验证近似边、别名导入盲区发现、缓存与预算、降级不缩窄
+- `12` —— **智能摘录**：显著失败行优先、整行尾窗、省略记账、（文本， 配置）纯函数确定性
+- `13` —— **位置无关寻址**：跨机器 / 跨检出目录 / 跨用户名同址、`$HOME` 隐私、Windows 双斜杠形态
+- `14` —— **Node 适配层**：`porcelain -z` 解析（rename/copy 双端、幻影路径）、git 能力探测、多字节 UTF-8 跨 chunk 捕获
 
 本地调试：
 
@@ -348,9 +374,9 @@ pnpm dsh web --patch /absolute/path/to/dsh-proof/examples/cordis.yml
 ## 十、诚实边界
 
 - **检查发现是启发式的。** 复杂 monorepo、自定义构建系统、Bazel/Nx/Turborepo 编排请用 `checks` 显式配置，并给出 `paths`，增量验证才会精确。
-- **依赖图是近似的。** 动态 `import()`、反射、运行时字符串拼接的路径无法解析。近似**偏向过覆盖**（多跑一次，绝不漏判）。
-- **检查点存在窗口期（v0.2）。** 最后一个签名检查点之后的记录受哈希链保护但不受检查点保护；窗口由 `checkpointEvery` 界定，且每次基线/验证/断言边界都会闭合它。删除锚点文件可以造成「回滚不可检测」——锚点因此放在智能体沙箱之外；若整台主机被攻陷，本插件的威胁模型不适用。
-- **签名密钥的边界。** 密钥防的是「被审计的智能体」，不是「能读宿主文件的人」；主机被完全攻陷时一切本地信任机制都失效。
+- **依赖图是近似的。** 动态 `import()`、多行 ESM import 与 Python dotted import 已在 v0.7 纳入解析；反射与运行时字符串拼接的路径仍然无法解析。近似**偏向过覆盖**（多跑一次，绝不漏判）。
+- **检查点存在窗口期（v0.2）。** 最后一个签名检查点之后的记录受哈希链保护但不受检查点保护；窗口由 `checkpointEvery` 界定，且每次基线/验证/断言边界都会闭合它。窗口内截删不再是不可见的：`proof_status` 的 `tailRecords` 直接暴露最后一个检查点之后还有多少条记录。删除锚点文件可以造成「回滚不可检测」——锚点因此放在智能体沙箱之外；若整台主机被攻陷，本插件的威胁模型不适用。
+- **签名密钥的边界。** 密钥防的是「被审计的智能体」，不是「能读宿主文件的人」；主机被完全攻陷时一切本地信任机制都失效。在**没有 signer 的机器**上（密钥丢失、换机器审计），带签名的检查点无法本地裁定——审计报告为 `unverifiableCheckpoints`：这是**能力缺失，不是伪造指控**，audit 不会因此失败；rewind 覆盖也不依赖密钥（锚的 count/head 比较仍然约束日志）。
 - **`proven` 允许存在预置红灯。** 一个本来就红的仓库不该让 Agent 无法工作。预置失败会在报告里显著列出，但不计入本次会话的责任。这是刻意设计，不是漏洞。
 - **它不替代测试本身。** `dsh-proof` 编排并归因你已有的客观检查；它不生成测试用例。
 - **DSH 是 v0.1/0.2 开发者预览版。** 插件契约会变。本插件已把依赖面最小化并钉死契约快照（`src/vendor/dsh-tools.ts`），但上游变更时仍需重新对齐。

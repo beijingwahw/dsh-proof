@@ -66,6 +66,96 @@ test('check ids are stable and command-sensitive', () => {
   assert.notEqual(checkId('config', ['a']), checkId('package.json', ['a']))
 })
 
+test('checkId without cwd is byte-identical to the legacy format', () => {
+  // Locked literally: the material is exactly `command.join('\0')` under
+  // sha256, truncated to 12 hex chars. Baselines minted before `cwd` existed
+  // must keep addressing, so any drift here is a breaking change.
+  assert.equal(checkId('config', ['a', 'b']), 'config:59b271ae1bbc')
+  assert.equal(checkId('config', ['a', 'b'], undefined), 'config:59b271ae1bbc')
+  // A cwd joins the material and separates same-argv monorepo siblings.
+  assert.equal(checkId('config', ['a', 'b'], 'packages/a'), 'config:3364fe166591')
+  assert.notEqual(checkId('config', ['a', 'b'], 'packages/a'), checkId('config', ['a', 'b'], 'packages/b'))
+  assert.notEqual(checkId('config', ['a', 'b'], 'packages/a'), checkId('config', ['a', 'b']))
+})
+
+const MONOREPO: Record<string, string> = {
+  '/ws/package.json': JSON.stringify({
+    name: 'root',
+    scripts: { test: 'vitest run' },
+    workspaces: ['packages/*'],
+  }),
+  '/ws/packages/a/package.json': JSON.stringify({ name: '@demo/a', scripts: { test: 'node test.js' } }),
+  '/ws/packages/b/package.json': JSON.stringify({ name: '@demo/b', scripts: { test: 'node test.js', build: 'tsc -b' } }),
+  '/ws/packages/b/README.md': 'not a workspace member on its own',
+}
+
+test('monorepo: glob workspaces discover subpackage scripts with distinct ids', async () => {
+  const checks = await discoverChecks(MemoryFs.of(MONOREPO), '/ws')
+  const labels = checks.map(c => c.label)
+  assert.ok(labels.includes('npm script "test"'), 'root test survives')
+  assert.ok(labels.includes('npm script "test" (packages/a)'), `got ${labels.join(', ')}`)
+  assert.ok(labels.includes('npm script "test" (packages/b)'))
+  assert.ok(labels.includes('npm script "build" (packages/b)'))
+
+  // Root and subpackages share the argv for `test` (npm run --silent test);
+  // only distinct ids keep them from deduping into one invisible check.
+  const testIds = checks.filter(c => c.label.includes('test')).map(c => c.id)
+  assert.equal(new Set(testIds).size, testIds.length, 'same argv in different packages must not collide')
+
+  const sub = checks.find(c => c.label === 'npm script "test" (packages/a)')
+  assert.equal(sub?.cwd, 'packages/a')
+  assert.deepEqual(sub?.paths, ['packages/a/**'])
+  assert.deepEqual(sub?.command, ['npm', 'run', '--silent', 'test'])
+  const root = checks.find(c => c.label === 'npm script "test"')
+  assert.equal(root?.cwd, undefined, 'root checks stay root-scoped')
+})
+
+test('monorepo: literal workspace directories discover subpackages too', async () => {
+  const fs = MemoryFs.of({
+    ...MONOREPO,
+    '/ws/package.json': JSON.stringify({
+      name: 'root',
+      scripts: { test: 'vitest run' },
+      workspaces: ['packages/a', 'packages/b'],
+    }),
+  })
+  const checks = await discoverChecks(fs, '/ws')
+  assert.deepEqual(
+    checks.filter(c => c.cwd !== undefined).map(c => c.cwd).sort(),
+    ['packages/a', 'packages/b', 'packages/b'],
+    'a:test, b:test and b:build — one cwd-bearing check each',
+  )
+})
+
+test('pre/post prefixes only hide scripts whose base name is also a script', async () => {
+  const fs = MemoryFs.of({
+    '/ws/package.json': JSON.stringify({
+      scripts: {
+        test: 'vitest run',
+        pretest: 'echo warm', // base `test` exists -> npm lifecycle hook
+        posttest: 'echo cool', // base `test` exists -> npm lifecycle hook
+        prettier: 'prettier -c .', // base `ttier` is not a script -> ordinary
+        postcss: 'postcss build', // base `css` is not a script -> ordinary
+      },
+    }),
+  })
+  const checks = await discoverChecks(fs, '/ws', {
+    scriptKinds: { test: 'test', pretest: 'other', posttest: 'other', prettier: 'lint', postcss: 'build' },
+  })
+  const labels = checks.map(c => c.label).sort()
+  assert.deepEqual(labels, ['npm script "postcss"', 'npm script "prettier"', 'npm script "test"'])
+})
+
+test('tox.ini is its own source; pytest.ini alone still discovers pytest', async () => {
+  const toxOnly = await discoverChecks(MemoryFs.of({ '/ws/tox.ini': '[tox]\nenvlist = py\n' }), '/ws')
+  assert.equal(toxOnly.length, 1)
+  assert.equal(toxOnly[0]?.source, 'tox.ini')
+  assert.ok(toxOnly[0]?.id.startsWith('tox.ini:'), 'id derives from the honest source')
+
+  const pytestIniOnly = await discoverChecks(MemoryFs.of({ '/ws/pytest.ini': '[pytest]\n' }), '/ws')
+  assert.deepEqual(pytestIniOnly.map(c => c.label), ['pytest'], 'pytest.ini without pyproject.toml is not invisible')
+})
+
 test('a workspace with no build metadata yields no checks', async () => {
   const fs = MemoryFs.of({ '/ws/README.md': '# hi' })
   assert.deepEqual(await discoverChecks(fs, '/ws'), [])

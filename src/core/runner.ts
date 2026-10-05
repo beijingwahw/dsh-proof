@@ -97,11 +97,24 @@ export class VerificationRunner {
     }
 
     await Promise.all(Array.from({ length: Math.min(concurrency, Math.max(1, total)) }, worker))
+    // Workers settle in wall-clock order, but evidence identity is
+    // order-sensitive downstream: `buildBaseline` hashes the checkId sequence,
+    // so a concurrent batch must not leak completion order into baselineIds.
+    // Re-project records (and ran ids) onto the spec order; the stable sort
+    // keeps completion order for any id the spec list does not know.
+    const specRank = new Map<string, number>(specs.map((s, i) => [s.id, i]))
+    const rankOf = (id: string): number => {
+      const rank = specRank.get(id)
+      return rank === undefined ? total : rank
+    }
+    const orderedRecords = [...records].sort((a, b) => rankOf(a.checkId) - rankOf(b.checkId))
+    const orderedRanIds = [...ranIds].sort((a, b) => rankOf(a) - rankOf(b))
+    const orderedSkippedIds = [...skippedIds].sort((a, b) => rankOf(a) - rankOf(b))
     return {
-      records,
+      records: orderedRecords,
       workspace: snapshot,
-      ranIds,
-      skippedIds,
+      ranIds: orderedRanIds,
+      skippedIds: orderedSkippedIds,
       aborted: aborted || options.signal?.aborted === true,
       totalDurationMs: this.clock.now() - started,
     }
@@ -114,7 +127,11 @@ export class VerificationRunner {
     signal?.addEventListener('abort', onAbort, { once: true })
     try {
       const result = await this.commands.run(spec.command, {
-        cwd: this.workspace.root,
+        // Monorepo checks execute inside the subpackage that declares them;
+        // everything else runs at the workspace root, exactly as before.
+        cwd: spec.cwd === undefined
+          ? this.workspace.root
+          : `${this.workspace.root.replace(/[\/]+$/, '')}/${spec.cwd.replace(/^\/+/, '')}`,
         timeoutMs: spec.timeoutMs,
         signal: controller.signal,
         maxOutputChars: 64_000,

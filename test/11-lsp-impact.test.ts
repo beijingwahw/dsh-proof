@@ -130,6 +130,14 @@ test('uriToRelative handles windows drives, unix roots and foreign roots', () =>
   assert.equal(uriToRelative('untitled:Untitled-1', '/home/u/ws'), null)
 })
 
+test('drive-form roots compare case-insensitively so LSP edges are not dropped', () => {
+  assert.equal(uriToRelative('file:///c:/ws/x/src/a.ts', 'C:/ws/x'), 'src/a.ts', 'server lowercases the drive, host does not')
+  assert.equal(uriToRelative('file:///C:/ws/x/src/a.ts', 'c:\\ws\\x'), 'src/a.ts', 'either slash style, either drive case')
+  assert.equal(uriToRelative('file:///D:/ws/x/src/a.ts', 'C:/ws/x'), null, 'a different drive is still outside')
+  // POSIX sensitivity is correct behaviour, not an oversight: /WS != /ws.
+  assert.equal(uriToRelative('file:///WS/x/src/a.ts', '/ws/x'), null)
+})
+
 test('the caching resolver asks the server once per position', async () => {
   const queries: { file: string; line: number; character: number }[] = []
   const lsp: LspLike = {

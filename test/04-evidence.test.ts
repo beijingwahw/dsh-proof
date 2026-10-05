@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import {
   EvidenceStore, buildBaseline, makeEvidence, snapshotWorkspace, verdictOf,
 } from '../src/core/evidence.ts'
+import { assembleProof } from '../src/core/report.ts'
 import { addressOf } from '../src/core/hash.ts'
 import { MemoryFs, FakeClock, FakeWorkspace, spec } from './helpers.ts'
 
@@ -82,6 +83,8 @@ test('verdictOf is the baseline differential', () => {
   const s = spec({ id: 'c1' })
   const pass = makeEvidence(s, { status: 'pass', exitCode: 0, durationMs: 1, output: 'ok' }, WS, clock)
   const fail = makeEvidence(s, { status: 'fail', exitCode: 1, durationMs: 1, output: 'no' }, WS, clock)
+  const skipped = makeEvidence(s, { status: 'skipped', exitCode: null, durationMs: 0, output: 'skipped: budget exhausted' }, WS, clock)
+  const timeout = makeEvidence(s, { status: 'timeout', exitCode: null, durationMs: 9, output: '' }, WS, clock)
 
   assert.equal(verdictOf(pass, pass), 'still-passing')
   assert.equal(verdictOf(fail, fail), 'still-failing')
@@ -90,6 +93,51 @@ test('verdictOf is the baseline differential', () => {
   assert.equal(verdictOf(undefined, fail), 'new-failure')
   assert.equal(verdictOf(undefined, pass), 'new-check')
   assert.equal(verdictOf(pass, undefined), 'not-run')
+
+  // The knowledge lattice: unknown is neither credit nor blame. A baseline
+  // that never produced a result cannot seed a regression (or a fix), and a
+  // current run without a conclusion cannot bank a pass.
+  assert.equal(verdictOf(skipped, fail), 'indeterminate', 'a never-run baseline must not charge a regression')
+  assert.equal(verdictOf(skipped, pass), 'indeterminate', 'a never-run baseline must not mint a pass either')
+  assert.equal(verdictOf(pass, skipped), 'indeterminate', 'skipped this run is not "still passing"')
+  assert.equal(verdictOf(fail, skipped), 'indeterminate', 'skipped this run must not fake a "fixed"')
+  assert.equal(verdictOf(undefined, skipped), 'indeterminate', 'a new check that never ran earns nothing')
+  assert.equal(verdictOf(timeout, pass), 'indeterminate', 'timeout at baseline is not a decisive fail')
+  assert.equal(verdictOf(pass, timeout), 'indeterminate', 'timeout this run is not a decisive regression')
+  assert.equal(verdictOf(skipped, skipped), 'indeterminate')
+})
+
+test('summary counts indeterminate verdicts and never credits unrun new checks', () => {
+  const clock = new FakeClock()
+  const s = spec({ id: 'c1' })
+  const passedAtBaseline = makeEvidence(s, { status: 'pass', exitCode: 0, durationMs: 1, output: 'ok' }, WS, clock)
+  const skippedNow = makeEvidence(s, { status: 'skipped', exitCode: null, durationMs: 0, output: 'skipped: budget exhausted' }, WS, clock)
+
+  const { report } = assembleProof({
+    specs: [s],
+    baseline: buildBaseline([passedAtBaseline], WS, clock),
+    records: [skippedNow],
+    changed: ['src/a.ts'],
+    workspace: WS,
+    clock,
+  })
+  assert.equal(report.checks[0]?.verdict, 'indeterminate')
+  assert.equal(report.summary.indeterminate, 1)
+  assert.equal(report.summary.passing, 0, 'a skipped current run must not count as passing')
+  assert.equal(report.summary.failing, 0, 'nor as failing — blame needs a decisive red')
+
+  // A newly discovered check that was never run: counted as a new check, but
+  // it must not dilute the passing number.
+  const fresh = assembleProof({
+    specs: [spec({ id: 'c-new' })],
+    records: [],
+    changed: ['src/a.ts'],
+    workspace: WS,
+    clock,
+  })
+  assert.equal(fresh.report.checks[0]?.verdict, 'new-check')
+  assert.equal(fresh.report.summary.newChecks, 1)
+  assert.equal(fresh.report.summary.passing, 0, 'an unrun check is not a passing check')
 })
 
 test('snapshotWorkspace digests the dirty set order-independently', () => {

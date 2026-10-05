@@ -53,6 +53,12 @@ export interface AnchorFile {
   readonly head: string
   readonly sig: string
   readonly at: string
+  /**
+   * The workspace identity the signature commits to. Optional because anchors
+   * written before this field existed are still valid high-water marks —
+   * auditors skip (rather than fail) signature verification for them.
+   */
+  readonly workspaceKey?: string
 }
 
 export interface WalkedCheckpoint {
@@ -170,6 +176,9 @@ export function parseAnchor(raw: string | undefined): AnchorFile | undefined {
       head: value.head,
       sig: typeof value.sig === 'string' ? value.sig : '',
       at: typeof value.at === 'string' ? value.at : '',
+      // Present only on newer anchors; absence is tolerated (older anchor,
+      // sig check skipped by the audit layer, data checks still apply).
+      ...(typeof value.workspaceKey === 'string' ? { workspaceKey: value.workspaceKey } : {}),
     }
   } catch {
     return undefined

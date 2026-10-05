@@ -22,29 +22,40 @@ if (!existsSync(pkgPath)) {
 const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
 
 // -- the bundle manifest ----------------------------------------------------
-if (!pkg.dsh?.bundle?.patch) {
+const patchRef = pkg.dsh?.bundle?.patch
+if (!patchRef) {
   bad('dsh.bundle.patch', 'without it `dsh plugin add` installs a plain dependency and activates no layer')
 } else {
-  ok(`dsh.bundle.patch = ${pkg.dsh.bundle.patch}`)
+  ok(`dsh.bundle.patch = ${patchRef}`)
 }
 
-const patchPath = join(root, pkg.dsh?.bundle?.patch ?? '')
-if (!existsSync(patchPath)) {
-  bad('patch file exists', patchPath)
+// File-level checks only make sense when a patch path is declared:
+// `join(root, '')` resolves to the repo root itself, and readFileSync on a
+// directory would crash the script with EISDIR instead of reporting a problem.
+if (!patchRef) {
+  bad('patch file exists', 'no dsh.bundle.patch declared in package.json')
 } else {
-  ok(`patch file present (${pkg.dsh.bundle.patch})`)
-  const patch = readFileSync(patchPath, 'utf8')
-  if (!/^\s*-\s*insert\s*:/m.test(patch)) bad('patch is an insert layer', 'expected a YAML array starting with `- insert:`')
-  else ok('patch is an insert layer')
-  if (!new RegExp(`name:\\s*['"]?${pkg.name}['"]?`).test(patch)) {
-    bad('patch rows reference the package by name', `expected name: ${pkg.name}`)
+  const patchPath = join(root, patchRef)
+  if (!existsSync(patchPath)) {
+    bad('patch file exists', patchPath)
   } else {
-    ok(`patch rows reference "${pkg.name}"`)
-  }
-  if (/(^|\n)\s*name:\s*['"]?\.?\//.test(patch)) {
-    bad('patch uses package names, not relative paths', 'relative paths resolve against the profile and break installs')
-  } else {
-    ok('no relative module paths in the patch')
+    ok(`patch file present (${patchRef})`)
+    const patch = readFileSync(patchPath, 'utf8')
+    if (!/^\s*-\s*insert\s*:/m.test(patch)) bad('patch is an insert layer', 'expected a YAML array starting with `- insert:`')
+    else ok('patch is an insert layer')
+    // Escape regex metacharacters: a scoped name like @scope/pkg.name would
+    // otherwise turn the dot into a wildcard (and worse).
+    const namePattern = String(pkg.name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    if (!new RegExp(`name:\\s*['"]?${namePattern}['"]?`).test(patch)) {
+      bad('patch rows reference the package by name', `expected name: ${pkg.name}`)
+    } else {
+      ok(`patch rows reference "${pkg.name}"`)
+    }
+    if (/(^|\n)\s*name:\s*['"]?\.?\//.test(patch)) {
+      bad('patch uses package names, not relative paths', 'relative paths resolve against the profile and break installs')
+    } else {
+      ok('no relative module paths in the patch')
+    }
   }
 }
 

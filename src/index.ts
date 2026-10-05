@@ -22,7 +22,7 @@ import * as nodePath from 'node:path'
 import type { Config } from './config.ts'
 import { ProofEngine } from './engine.ts'
 import { createProofTools } from './dsh/tools.ts'
-import { WorkspaceWatch, driftNarrative } from './dsh/observe.ts'
+import { WorkspaceWatch, driftNarrative, toWorkspaceRelative } from './dsh/observe.ts'
 import { buildPolicySection } from './dsh/prompt.ts'
 import { createLspResolver } from './dsh/lsp-impact.ts'
 import { sha256 } from './core/hash.ts'
@@ -137,6 +137,8 @@ export function apply(ctx: Context, config: Config): void {
   /** True once a `proof_claim` ran during the current turn. */
   let claimedThisTurn = false
   let mutating = false
+  /** Set when `warn` passes a baseline-less mutation; consumed by turn end. */
+  let pendingBaselineNotice = false
 
   const log = (...args: unknown[]) => { if (config.verbose) console.log('[dsh-proof]', ...args) }
 
@@ -150,10 +152,17 @@ export function apply(ctx: Context, config: Config): void {
   // tools touching it are routed through user approval. In `host` mode the
   // log is outside the sandboxed workspace and needs no gate.
   if (config.evidenceStore === 'workspace') {
-    const evidenceSegment = config.evidenceDir.replace(/^\.\/+/, '').replace(/\/+$/, '')
+    const evidenceSegment = collapseSegments(config.evidenceDir.replace(/^\.\/+/, '').replace(/\/+$/, ''))
     const touchesEvidence = (candidate: string): boolean => {
-      const normalized = candidate.replace(/\\/g, '/')
-      return normalized === evidenceSegment || normalized.includes(`/${evidenceSegment}/`) || normalized.startsWith(`${evidenceSegment}/`)
+      // The guard must reason in one path space. A candidate is first projected
+      // onto the workspace's relative space (absolute host-style paths, either
+      // slash flavour, drive case and all) and its `.`/`..` detours collapsed;
+      // otherwise "can the agent write the evidence log" degenerates into a
+      // string-matching puzzle the agent can simply walk around.
+      const rel = toWorkspaceRelative(candidate, root)
+      if (rel === undefined) return false
+      const target = collapseSegments(rel)
+      return target === evidenceSegment || target.startsWith(`${evidenceSegment}/`)
     }
     host.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
       if (!isMutationTool(exec.name)) return next()
@@ -191,6 +200,9 @@ export function apply(ctx: Context, config: Config): void {
           },
         }
       }
+      // 'warn' owes the model a corrective notice, not a silent pass: flag the
+      // gap now and inject it at turn end, where the model can still act on it.
+      pendingBaselineNotice = true
       log(`warn-gated ${exec.name}`)
       return next()
     })
@@ -210,7 +222,9 @@ export function apply(ctx: Context, config: Config): void {
   })
 
   // -- drift + unproven-claim enforcement ---------------------------------
-  if (config.driftDetection || config.enforceOnTurnEnd) {
+  // The hook must also exist when only `warn` is active: that mode defers its
+  // baseline notice to here.
+  if (config.driftDetection || config.enforceOnTurnEnd || config.requireBaseline === 'warn') {
     host.on('agent/turn-stopping', async (payload) => {
       try {
         const notices: string[] = []
@@ -220,6 +234,14 @@ export function apply(ctx: Context, config: Config): void {
           const narrative = driftNarrative(drift)
           if (narrative !== undefined) notices.push(narrative)
           if (drift.drifted.length > 0) await watch.snapshot(drift.drifted)
+        }
+
+        if (pendingBaselineNotice) {
+          pendingBaselineNotice = false
+          notices.push(
+            '⚠️ dsh-proof: this turn mutated the workspace, but it has no completion-proof baseline. '
+            + 'Run proof_baseline to establish one so later failures can be attributed to your changes.',
+          )
         }
 
         if (config.enforceOnTurnEnd && mutating && !claimedThisTurn) {
@@ -308,6 +330,21 @@ function hostWorkspaceRoot(ctx: Context): string {
 /** The engine's FsPort, reused by the watcher so both see the same filesystem. */
 function engineFs(engine: ProofEngine): FsPort {
   return engine.fsView
+}
+
+/**
+ * Collapse `.` and `..` segments in a workspace-relative path (`a/../b` ->
+ * `b`). A leading `..` that would escape the root is kept, so paths that
+ * leave the workspace never come out looking like they are inside it.
+ */
+function collapseSegments(rel: string): string {
+  const out: string[] = []
+  for (const segment of rel.split('/')) {
+    if (segment === '' || segment === '.') continue
+    if (segment === '..' && out.length > 0 && out[out.length - 1] !== '..') out.pop()
+    else out.push(segment)
+  }
+  return out.join('/')
 }
 
 export { ProofEngine }

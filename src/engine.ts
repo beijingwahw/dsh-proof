@@ -20,9 +20,9 @@ import type {
   RelPath, SelectionResult, SignerPort, WorkspacePort, WorkspaceSnapshot,
 } from './core/index.ts'
 import {
-  EvidenceStore, VerificationRunner, assembleBaseline, assembleProof,
-  buildDependencyGraph, discoverChecks, resolveChangeSet, selectAffectedChecks,
-  sha256, snapshotWorkspace,
+  DEFAULT_IGNORE_DIRS, EvidenceStore, VerificationRunner, assembleBaseline,
+  assembleProof, buildDependencyGraph, discoverChecks, resolveChangeSet,
+  selectAffectedChecks, sha256, snapshotWorkspace,
 } from './core/index.ts'
 import type { AuditReport } from './core/evidence.ts'
 import type { AttributedCheck } from './core/regression.ts'
@@ -61,6 +61,14 @@ export interface EngineOptions {
   readonly headChars?: number
   /** User home directory, canonicalised to `$HOME` in evidence (v0.6). */
   readonly homeDir?: string
+  /**
+   * Line logger for degradation warnings (E2: trust downgrades must be
+   * visible, not just recorded). Hosts wire this to their verbose channel;
+   * without it the warning still lands in the evidence chain.
+   */
+  readonly logger?: (message: string) => void
+  /** Emit degradation warnings through `logger`. */
+  readonly verbose?: boolean
   readonly clock?: Clock
   readonly fs?: FsPort
   readonly commands?: CommandPort
@@ -85,10 +93,41 @@ export interface VerifyOutcome {
   readonly changed: readonly RelPath[]
   /** How the change set was derived and who each change belongs to (v0.3). */
   readonly attribution: ChangeSetResolution
+  /**
+   * Git facts were unavailable for change-set resolution, so the full check
+   * set was forced (E3). Present only on the degraded path; hosts surface it
+   * so "we ran everything because we couldn't tell what moved" stays loud.
+   */
+  readonly degraded?: true
 }
+
+/**
+ * What `establishBaseline` hands back: the assembled baseline plus, when the
+ * batch aborted, a non-addressing flag. The flag rides on top of the
+ * `buildBaseline` product and never enters any hash material — it says "this
+ * object was never persisted", which the persisted form cannot say about
+ * itself.
+ */
+export type EngineBaseline = Baseline & { readonly aborted?: true }
 
 function isAbsolutePath(p: string): boolean {
   return /^([A-Za-z]:[\\/]|\/)/.test(p)
+}
+
+/** Bounded, printable reason a signer load failed — chains store text, not errors. */
+function failureText(reason: unknown): string {
+  const text = reason instanceof Error ? reason.message : String(reason)
+  return text.slice(0, 200)
+}
+
+/**
+ * Parallel contract: `ChangeSetResolution` grows `degraded?: true` when git
+ * facts were unavailable. Read structurally rather than off the declared type
+ * so the engine consumes the flag the moment the core lands it, without
+ * coupling this module's compilation to the core's edit cadence.
+ */
+function resolutionDegraded(attribution: ChangeSetResolution): boolean {
+  return (attribution as { degraded?: unknown }).degraded === true
 }
 
 /** Beyond this many dirty files the per-file digest pass is skipped (conservative mode). */
@@ -108,6 +147,8 @@ export class ProofEngine {
   private baselineSeen = false
   private signerPromise: Promise<SignerPort | undefined> | undefined
   private readonly resolver: DefinitionResolverPort | undefined
+  private readonly logger: ((message: string) => void) | undefined
+  private readonly verbose: boolean
   private readonly options: {
     evidenceDir: string
     autoDiscover: boolean
@@ -133,8 +174,12 @@ export class ProofEngine {
       ? evidenceDir.replace(/[\/]+$/, '')
       : `${options.root.replace(/[\/]+$/, '')}/${evidenceDir}`
     const workspaceKey = options.workspaceKey ?? 'default'
-    const signerProvider = options.signer
+    // E2: whichever provider wins (host-injected or trustDir-derived), it is
+    // wrapped so a load failure can never pass silently — the downgrade itself
+    // becomes a chain marker, and the verbose channel gets a line.
+    const rawSignerProvider = options.signer
       ?? (options.trustDir !== undefined ? () => this.loadSigner(`${options.trustDir}/keys`) : undefined)
+    const signerProvider = rawSignerProvider !== undefined ? () => this.watchSigner(rawSignerProvider) : undefined
     this.store = new EvidenceStore(
       this.fs,
       `${storeDir}/evidence.jsonl`,
@@ -155,6 +200,8 @@ export class ProofEngine {
       },
     })
     this.resolver = options.resolver
+    this.logger = options.logger
+    this.verbose = options.verbose ?? false
     this.options = {
       evidenceDir,
       autoDiscover: options.autoDiscover ?? true,
@@ -170,9 +217,40 @@ export class ProofEngine {
     }
   }
 
-  /** Host-held Ed25519 signer under the trust root; degrades to unsigned on failure. */
+  /** Host-held Ed25519 signer under the trust root; rejects when unavailable. */
   private loadSigner(dir: string): Promise<SignerPort | undefined> {
-    this.signerPromise ??= NodeEd25519Signer.load(dir).catch(() => undefined)
+    return NodeEd25519Signer.load(dir)
+  }
+
+  /**
+   * Any signer provider, watched: a load failure degrades the chain to
+   * unsigned (that part the store already did), but the degradation itself
+   * must be observable — a silent downgrade is indistinguishable from an
+   * honest unsigned deployment, and the audit cannot flag what it cannot see.
+   *
+   * The marker is fired, not awaited: the store calls its provider from inside
+   * a queued `checkpoint()`, so awaiting `mark` here would queue it behind the
+   * very checkpoint that is resolving us — a self-deadlock. Firing it is safe
+   * precisely because the store's single-flight tail (core/evidence.ts)
+   * serialises the marker after that checkpoint completes: no two envelopes
+   * can ever point at the same chain tail. The marker therefore lands one
+   * queue-slot later than the degradation was noticed, which costs nothing —
+   * it is a fact about the signer, not about the checkpoint's position.
+   */
+  private watchSigner(load: () => Promise<SignerPort | undefined>): Promise<SignerPort | undefined> {
+    this.signerPromise ??= (async () => {
+      try {
+        return await load()
+      } catch (reason) {
+        const error = failureText(reason)
+        if (this.verbose && this.logger !== undefined) {
+          this.logger(`[dsh-proof] trust degraded: checkpoint signer unavailable (${error}) — chain continues unsigned`)
+        }
+        void this.store.mark('trust/signer-unavailable', { error })
+          .catch(() => { /* the log itself is unwritable; nothing more to record */ })
+        return undefined
+      }
+    })()
     return this.signerPromise
   }
 
@@ -197,7 +275,12 @@ export class ProofEngine {
     if (this.graph !== undefined && !force) return this.graph
     const files = await this.fs.walk(this.root, {
       limit: this.options.impactGraphLimit,
-      ignoreDirs: ['node_modules', '.git', 'dist', 'build', 'out', 'target', 'coverage', '.next', '.venv', 'venv', '__pycache__', 'vendor', '.proof', 'lib', '.turbo', '.cache'],
+      // E4: one ignore list, owned by discovery (checks.ts) — a second
+      // hand-maintained copy here had already drifted. The only local
+      // addition is 'lib': this repo's own build output lands there
+      // (tsconfig.build.json), and dependency edges into compiled artifacts
+      // would make every build a whole-graph invalidator.
+      ignoreDirs: [...DEFAULT_IGNORE_DIRS, 'lib'],
     })
     this.graph = await buildDependencyGraph(this.fs, this.root, files, {
       limit: this.options.impactGraphLimit,
@@ -241,8 +324,17 @@ export class ProofEngine {
 
   // -- the two verbs ------------------------------------------------------
 
-  /** Run every discovered check and record the result as the new baseline. */
-  async establishBaseline(options: { signal?: AbortSignal; onProgress?: VerifyOptions['onProgress'] } = {}): Promise<{ baseline: Baseline; records: readonly Evidence[] }> {
+  /**
+   * Run every discovered check and record the result as the new baseline.
+   *
+   * E1: a batch that did not observe every check to completion must not
+   * become THE anchor — later regression judgments would run against a
+   * half-built truth. The observed facts still land in the chain (evidence is
+   * never discarded), the abort is marked, the checkpoint window is closed,
+   * but no baseline file is written: the next verify then honestly reports
+   * `no-baseline` instead of silently anchoring on an accident.
+   */
+  async establishBaseline(options: { signal?: AbortSignal; onProgress?: VerifyOptions['onProgress'] } = {}): Promise<{ baseline: EngineBaseline; records: readonly Evidence[] }> {
     const specs = await this.loadChecks()
     // The detailed snapshot digests every dirty file's content: baseline checks
     // ran against the working tree as it was, so those bytes — not the commit —
@@ -257,9 +349,25 @@ export class ProofEngine {
         ? { onEvidence: (ev, i, total) => options.onProgress!(ev.label, i, total) }
         : {}),
     })
+    // Facts first: whatever was observed is appended, abort or not.
     for (const record of batch.records) await this.store.append(record)
-    // saveBaseline records the file digest into the chain and checkpoints.
     const baseline = assembleBaseline(specs, batch.records, snapshot, this.clock)
+    // Two honest abort signals: the batch-level flag (a cancelled run — some
+    // checks were never even attempted) and any record that came back
+    // `aborted` (a check whose process was killed mid-flight). Either means
+    // the run did not observe everything, so it must not anchor anything.
+    const aborted = batch.aborted === true || batch.records.some(r => r.status === 'aborted')
+    if (aborted) {
+      await this.store.mark('baseline/aborted', {
+        baselineId: baseline.baselineId,
+        root: baseline.root,
+        ran: batch.records.length,
+        discovered: specs.length,
+      })
+      await this.store.checkpoint()
+      return { baseline: { ...baseline, aborted: true }, records: batch.records }
+    }
+    // saveBaseline records the file digest into the chain and checkpoints.
     await this.store.saveBaseline(baseline)
     await this.store.mark('baseline/established', { baselineId: baseline.baselineId, root: baseline.root, checks: batch.records.length })
     await this.store.checkpoint()
@@ -276,7 +384,19 @@ export class ProofEngine {
     const provenance = new Map<RelPath, ChangeProvenance>(
       attribution.records.map(r => [r.path, r.provenance] as [RelPath, ChangeProvenance]),
     )
-    const selection = options.all
+    // E3: when git facts were unavailable, the derived change set cannot be
+    // trusted to narrow the run — an under-reported change set hides breaks.
+    // Force the full check set through the same `forced` path `all` uses, and
+    // surface the degradation on the outcome so the honesty is visible, not
+    // just structural.
+    const degraded = resolutionDegraded(attribution) || await this.gitFactsUnavailable()
+    const forceAll = options.all === true || degraded
+    // NOTE (E5, deliberate duplication): assembleProof recomputes its own
+    // internal selection from the same inputs — the report owns that
+    // projection. Deduplicating would mean threading a precomputed selection
+    // through AssembleInput (core surface, out of this module's hands), so the
+    // extra call here stays: it is what feeds VerifyOutcome.selection.
+    const selection = forceAll
       ? { affected: specs, untouched: [], forcedAll: true, closure: changed, uncertain: false, precision: 'forced' as const }
       : selectAffectedChecks(specs, changed, graph)
 
@@ -300,7 +420,7 @@ export class ProofEngine {
       workspace: batch.workspace,
       clock: this.clock,
       requireFullCoverage: true,
-      ...(options.all === true ? { forceAll: true } : {}),
+      ...(forceAll ? { forceAll: true } : {}),
     })
     await this.store.mark('proof/verified', {
       grade: report.grade, root: report.root, changed: changed.length,
@@ -310,7 +430,25 @@ export class ProofEngine {
     })
     // Every claim-grade boundary closes the checkpoint window.
     await this.store.checkpoint()
-    return { report, checks, selection, changed, attribution }
+    return { report, checks, selection, changed, attribution, ...(degraded ? { degraded: true as const } : {}) }
+  }
+
+  /**
+   * Defensive backstop for E3: the change-set resolution is growing its own
+   * `degraded` flag, but a resolution that has not (yet) been taught to emit
+   * it must not let a git-invisible workspace silently narrow verification —
+   * every git-dependent fact would come back empty and look like "nothing
+   * changed". An absent capability means "git available" per the port
+   * contract, so only an explicit `false` (or a probe that itself fails —
+   * conservative direction is the full run) forces the check set.
+   */
+  private async gitFactsUnavailable(): Promise<boolean> {
+    if (this.workspace.gitAvailable === undefined) return false
+    try {
+      return await this.workspace.gitAvailable() === false
+    } catch {
+      return true
+    }
   }
 
   /**

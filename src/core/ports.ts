@@ -124,6 +124,14 @@ export interface WorkspacePort {
   changedSince?(ref: string): Promise<string[]>
   /** Untracked files (honouring .gitignore), relative to root. Optional. */
   untracked?(): Promise<string[]>
+  /**
+   * Whether git is usable in this workspace at all (binary present, inside a
+   * work tree). Optional capability: hosts that omit it are treated as
+   * "git available" so callers keep their current degradation path; hosts
+   * without git should implement it returning `false` so callers can skip
+   * git-dependent work instead of discovering the failure per command.
+   */
+  gitAvailable?(): Promise<boolean>
 }
 
 /** A check the workspace can objectively answer: run this command, expect success. */
@@ -143,6 +151,14 @@ export interface CheckSpec {
    * check's evidence stale. `['*']` means "any change invalidates me".
    */
   readonly paths: readonly string[]
+  /**
+   * Directory the command runs in, relative to the workspace root. Absent
+   * means the root itself — which is every pre-monorepo check. The runner
+   * resolves it to `<root>/<cwd>`; discovery uses it so workspace-subpackage
+   * checks (same argv, different package) get distinct identities and actually
+   * execute inside the subpackage that declares them.
+   */
+  readonly cwd?: string
   /** Cooperative budget for one run. */
   readonly timeoutMs: number
 }
@@ -151,6 +167,7 @@ export type CheckKind = 'test' | 'build' | 'lint' | 'typecheck' | 'other'
 export type CheckSource =
   | 'package.json'
   | 'pyproject.toml'
+  | 'tox.ini'
   | 'Makefile'
   | 'Cargo.toml'
   | 'go.mod'

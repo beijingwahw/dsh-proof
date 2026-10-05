@@ -16,7 +16,7 @@ import type {
   ToolCallView, ToolResultView, ToolRunContext,
 } from '../vendor/dsh-tools.ts'
 import type { ProofEngine } from '../engine.ts'
-import type { ProofGrade, ProofReport } from '../core/evidence.ts'
+import type { AuditReport, ProofGrade, ProofReport } from '../core/evidence.ts'
 import { proofNarrative } from '../core/regression.ts'
 import { firstInformativeLine } from '../core/excerpt.ts'
 
@@ -39,6 +39,15 @@ export interface StatusValue {
   tailRecords: number
   rewindDetected: boolean
   baselineTampered: boolean
+  /**
+   * Present only when > 0 (v0.7): checkpoints carrying a signature this host
+   * cannot adjudicate — key lost or foreign machine. A missing capability is
+   * not an accusation, so it never flips `chainIntact`; it only rides along
+   * when non-zero to keep the normal-path canonical value byte-stable.
+   */
+  unverifiableCheckpoints?: number
+  /** Present only when true (v0.7): the anchor failed its own signature check. */
+  anchorForged?: boolean
   dirtyFiles: number
   summary: string
 }
@@ -54,6 +63,12 @@ export interface BaselineValue {
   durationMs: number
   failingLabels: string[]
   summary: string
+  /**
+   * Present only when the run aborted (v0.7, engine E1): the engine refused to
+   * anchor a batch that did not observe every check, so no baseline file was
+   * written — the next verify will honestly report `no-baseline`.
+   */
+  aborted?: true
 }
 
 export interface VerifyValue {
@@ -65,6 +80,13 @@ export interface VerifyValue {
   impactPrecision: string
   affectedChecks: number
   untouchedChecks: number
+  /**
+   * Present only when the engine flagged degradation (v0.7, engine E3): git
+   * facts were unavailable, so impact analysis was skipped and the full check
+   * set was forced. Surfaced so "we ran everything because we couldn't tell
+   * what moved" stays loud instead of reading like a deliberate `all: true`.
+   */
+  degraded?: true
   regressions: { label: string; suspects: string[]; detail: string }[]
   fixed: string[]
   preExisting: string[]
@@ -79,17 +101,10 @@ export interface ClaimValue {
   grade: ProofGrade
   proven: boolean
   root: string
-  verified: VerifyValue['regressions']
+  /** Checks that regressed against the baseline — blame, not credit. */
+  regressions: VerifyValue['regressions']
   blockers: string[]
   summary: string
-}
-
-// ---------------------------------------------------------------------------
-// Value -> canonical JSON projection (shared by render + presentationMeta)
-// ---------------------------------------------------------------------------
-
-function toStatusValue(value: StatusValue): JsonValue {
-  return JSON.parse(JSON.stringify(value)) as JsonValue
 }
 
 // ---------------------------------------------------------------------------
@@ -168,12 +183,16 @@ function createStatusTool(engine: ProofEngine): ToolDefinition {
           tailRecords: { type: 'integer' },
           rewindDetected: { type: 'boolean' },
           baselineTampered: { type: 'boolean' },
+          // Present only when abnormal (see StatusValue) — declared so the
+          // schema stays truthful about what a degraded host may emit.
+          unverifiableCheckpoints: { type: 'integer' },
+          anchorForged: { type: 'boolean' },
           dirtyFiles: { type: 'integer' },
           summary: { type: 'string' },
         },
       },
       render: (_args, value) => [text(renderStatus(value as unknown as StatusValue))],
-      presentationMeta: (_args, value) => toStatusValue(value as unknown as StatusValue),
+      presentationMeta: (_args, value) => JSON.parse(JSON.stringify(value)) as JsonValue,
     },
     isConcurrencySafe: () => true,
     presentCall: () => ({ card: 'generic', title: 'Proof status', kind: 'read' }),
@@ -192,50 +211,7 @@ function createStatusTool(engine: ProofEngine): ToolDefinition {
       const latest = await engine.latestEvidence()
       const audit = await engine.audit()
       const snapshot = await engine.workspaceSnapshot()
-
-      const checks = specs.map((spec) => {
-        const ev = latest.get(spec.id)
-        return {
-          id: spec.id,
-          label: spec.label,
-          kind: spec.kind,
-          lastStatus: ev?.status ?? null,
-          recordedAt: ev?.recordedAt ?? null,
-        }
-      })
-
-      const trustLine = `chain ${audit.chain.mode}, ${audit.chain.checkpoints} checkpoint(s)`
-        + (audit.chain.tailRecords > 0 ? `, ${audit.chain.tailRecords} record(s) since last checkpoint` : '')
-        + (audit.chain.rewind ? ', REWIND DETECTED' : '')
-        + (audit.chain.anchorMismatch ? ', ANCHOR MISMATCH' : '')
-        + (audit.chain.baselineTampered ? ', BASELINE TAMPERED' : '')
-
-      const value: StatusValue = {
-        hasBaseline: baseline !== undefined,
-        baselineCreatedAt: baseline?.createdAt ?? null,
-        baselineRoot: baseline?.root ?? null,
-        discovered: specs.length,
-        checks,
-        evidenceRecords: audit.total,
-        evidenceLogIntact: audit.ok,
-        chainMode: audit.chain.mode,
-        checkpoints: audit.chain.checkpoints,
-        chainIntact: audit.chain.breaks.length === 0
-          && audit.chain.badCheckpoints.length === 0
-          && audit.chain.unsignedCheckpoints.length === 0
-          && audit.chain.headMismatches.length === 0,
-        tailRecords: audit.chain.tailRecords,
-        rewindDetected: audit.chain.rewind,
-        baselineTampered: audit.chain.baselineTampered,
-        dirtyFiles: snapshot.dirty.length,
-        summary: baseline === undefined
-          ? `No baseline. ${specs.length} objective check(s) discovered. Establish one with proof_baseline before editing. ${trustLine}.`
-          : `Baseline from ${baseline.createdAt} (${baseline.checks.length} checks, root ${baseline.root.slice(0, 12)}). `
-            + `${specs.length} check(s) discovered, ${audit.total} evidence record(s), `
-            + `${audit.ok ? `log intact (${trustLine})` : `LOG CORRUPT (${audit.corrupt.length}; ${trustLine})`}, `
-            + `${snapshot.dirty.length} dirty file(s).`,
-      }
-      return value as unknown as JsonValue
+      return toStatusValue({ specs, baseline, latest, audit, snapshot }) as unknown as JsonValue
     },
   }
 }
@@ -256,6 +232,9 @@ function createBaselineTool(engine: ProofEngine): ToolDefinition {
           ran: { type: 'integer' }, passing: { type: 'integer' }, failing: { type: 'integer' },
           skipped: { type: 'integer' }, durationMs: { type: 'integer' },
           failingLabels: { type: 'array', items: { type: 'string' } }, summary: { type: 'string' },
+          // Present only when the run aborted — declared so the schema stays
+          // truthful about what a cancelled baseline may emit.
+          aborted: { type: 'boolean' },
         },
       },
       render: (_args, value) => [text(renderBaseline(value as unknown as BaselineValue))],
@@ -272,7 +251,10 @@ function createBaselineTool(engine: ProofEngine): ToolDefinition {
       const meta = result.meta as BaselineValue | undefined
       return {
         card: 'generic',
-        title: meta?.ok ? `Baseline established · ${meta.passing}/${meta.ran} passing` : 'Baseline failed',
+        // An aborted run never became the anchor; the title must not imply it did.
+        title: meta?.aborted === true
+          ? 'Baseline aborted — not anchored'
+          : meta?.ok ? `Baseline established · ${meta.passing}/${meta.ran} passing` : 'Baseline failed',
         content: [text(meta ? oneLine(meta.summary) : 'no baseline result')],
       }
     },
@@ -285,21 +267,7 @@ function createBaselineTool(engine: ProofEngine): ToolDefinition {
         },
       })
       void args
-      const passing = records.filter(r => r.status === 'pass').length
-      const failing = records.filter(r => r.status === 'fail' || r.status === 'error' || r.status === 'timeout').length
-      const skipped = records.filter(r => r.status === 'skipped' || r.status === 'aborted').length
-      const value: BaselineValue = {
-        ok: failing === 0 && skipped === 0,
-        baselineId: baseline.baselineId,
-        root: baseline.root,
-        ran: records.length,
-        passing, failing, skipped,
-        durationMs: records.reduce((acc, r) => acc + r.durationMs, 0),
-        failingLabels: records.filter(r => r.status !== 'pass' && r.status !== 'skipped').map(r => r.label),
-        summary: `Baseline ${baseline.baselineId.slice(0, 12)}: ${passing} passing, ${failing} failing, ${skipped} skipped/unrun `
-          + `across ${records.length} check(s). Failures here are pre-existing — they are NOT charged to later work.`,
-      }
-      return value as unknown as JsonValue
+      return toBaselineValue(baseline, records) as unknown as JsonValue
     },
   }
 }
@@ -323,6 +291,8 @@ function createVerifyTool(engine: ProofEngine, touched?: () => readonly string[]
           externalChanged: { type: 'array', items: { type: 'string' } },
           impactPrecision: { type: 'string', enum: ['lsp-verified', 'approximate', 'forced'] },
           affectedChecks: { type: 'integer' }, untouchedChecks: { type: 'integer' },
+          // Present only when git facts were unavailable (see VerifyValue).
+          degraded: { type: 'boolean' },
           regressions: {
             type: 'array',
             items: {
@@ -361,7 +331,9 @@ function createVerifyTool(engine: ProofEngine, touched?: () => readonly string[]
         ...(touched !== undefined ? { touched: touched() } : {}),
         signal: exec.signal,
       })
-      return toVerifyValue(outcome.report, outcome.changed, outcome.checks, outcome.attribution, outcome.selection.precision) as unknown as JsonValue
+      return toVerifyValue(
+        outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
+      ) as unknown as JsonValue
     },
   }
 }
@@ -382,7 +354,7 @@ function createClaimTool(engine: ProofEngine, touched?: () => readonly string[])
           claim: { type: 'string' },
           grade: { type: 'string', enum: ['proven', 'unproven', 'regressed', 'no-baseline', 'stale'] },
           proven: { type: 'boolean' }, root: { type: 'string' },
-          verified: {
+          regressions: {
             type: 'array',
             items: {
               type: 'object',
@@ -424,52 +396,136 @@ function createClaimTool(engine: ProofEngine, touched?: () => readonly string[])
         ...(touched !== undefined ? { touched: touched() } : {}),
         signal: exec.signal,
       })
-      const value = toVerifyValue(outcome.report, outcome.changed, outcome.checks, outcome.attribution, outcome.selection.precision)
-      const blockers: string[] = []
-      if (outcome.report.grade === 'no-baseline') blockers.push('No baseline exists. Run proof_baseline first.')
-      if (outcome.report.grade === 'stale') blockers.push(`Stale evidence: ${outcome.report.unverified.join(', ') || 'affected checks not re-run'}.`)
-      for (const reg of value.regressions) blockers.push(`Regression: ${reg.label} — ${reg.detail}`)
-      if (outcome.report.grade === 'unproven') blockers.push('Verification was incomplete (skipped, aborted or timed out).')
-
-      const claim: ClaimValue = {
-        claim: parsed.claim,
-        grade: outcome.report.grade,
-        proven: outcome.report.grade === 'proven',
-        root: outcome.report.root,
-        verified: value.regressions,
-        blockers,
-        summary: outcome.report.grade === 'proven'
-          ? `PROVEN — "${parsed.claim}" is backed by evidence root ${outcome.report.root.slice(0, 12)}: `
-            + `${outcome.report.summary.passing} check(s) passing, ${outcome.report.summary.regressions} regression(s), `
-            + `${outcome.report.summary.preExisting} pre-existing failure(s) left untouched.`
-          : `NOT PROVEN (${outcome.report.grade}) — "${parsed.claim}". ${blockers.join(' ')}`,
-      }
-      return claim as unknown as JsonValue
+      const verified = toVerifyValue(
+        outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
+      )
+      return toClaimValue(parsed.claim, outcome.report, verified) as unknown as JsonValue
     },
   }
 }
 
 // ---------------------------------------------------------------------------
-// Pure projections
+// Pure projections (engine facts -> canonical values)
+//
+// Exported so the wiring tests can pin the contract with minimal fixtures;
+// every one is a total function of its inputs — no I/O, no clock.
 // ---------------------------------------------------------------------------
 
-function toVerifyValue(
+/** Structural view of the engine facts `toStatusValue` reads; the real engine
+ * types satisfy it, and tests can hand-pick the interesting corner. */
+export interface StatusProjectInput {
+  readonly specs: readonly { id: string; label: string; kind: string }[]
+  readonly baseline?: { readonly createdAt: string; readonly root: string; readonly checks: readonly unknown[] }
+  readonly latest: { get(id: string): { status: string; recordedAt: string } | undefined }
+  readonly audit: AuditReport
+  readonly snapshot: { readonly dirty: readonly string[] }
+}
+
+export function toStatusValue(input: StatusProjectInput): StatusValue {
+  const { specs, baseline, latest, audit, snapshot } = input
+  const checks = specs.map((spec) => {
+    const ev = latest.get(spec.id)
+    return {
+      id: spec.id,
+      label: spec.label,
+      kind: spec.kind,
+      lastStatus: ev?.status ?? null,
+      recordedAt: ev?.recordedAt ?? null,
+    }
+  })
+
+  const trustLine = `chain ${audit.chain.mode}, ${audit.chain.checkpoints} checkpoint(s)`
+    + (audit.chain.tailRecords > 0 ? `, ${audit.chain.tailRecords} record(s) since last checkpoint` : '')
+    + (audit.chain.rewind ? ', REWIND DETECTED' : '')
+    + (audit.chain.anchorMismatch ? ', ANCHOR MISMATCH' : '')
+    + (audit.chain.baselineTampered ? ', BASELINE TAMPERED' : '')
+
+  return {
+    hasBaseline: baseline !== undefined,
+    baselineCreatedAt: baseline?.createdAt ?? null,
+    baselineRoot: baseline?.root ?? null,
+    discovered: specs.length,
+    checks,
+    evidenceRecords: audit.total,
+    evidenceLogIntact: audit.ok,
+    chainMode: audit.chain.mode,
+    checkpoints: audit.chain.checkpoints,
+    chainIntact: audit.chain.breaks.length === 0
+      && audit.chain.badCheckpoints.length === 0
+      && audit.chain.unsignedCheckpoints.length === 0
+      && audit.chain.headMismatches.length === 0,
+    tailRecords: audit.chain.tailRecords,
+    rewindDetected: audit.chain.rewind,
+    baselineTampered: audit.chain.baselineTampered,
+    dirtyFiles: snapshot.dirty.length,
+    // Honest trust signals ride along only when abnormal: the audit
+    // deliberately does not fail on unverifiable checkpoints (a missing key is
+    // not a forgery charge), so they must not flip `chainIntact` either — but
+    // the model still deserves to know protection is weaker than it looks.
+    // Omitted on the clean path so the canonical value stays byte-stable.
+    ...(audit.chain.unverifiableCheckpoints.length > 0
+      ? { unverifiableCheckpoints: audit.chain.unverifiableCheckpoints.length }
+      : {}),
+    ...(audit.chain.anchorForged ? { anchorForged: true } : {}),
+    summary: baseline === undefined
+      ? `No baseline. ${specs.length} objective check(s) discovered. Establish one with proof_baseline before editing. ${trustLine}.`
+      : `Baseline from ${baseline.createdAt} (${baseline.checks.length} checks, root ${baseline.root.slice(0, 12)}). `
+        + `${specs.length} check(s) discovered, ${audit.total} evidence record(s), `
+        + `${audit.ok ? `log intact (${trustLine})` : `LOG CORRUPT (${audit.corrupt.length}; ${trustLine})`}, `
+        + `${snapshot.dirty.length} dirty file(s).`,
+  }
+}
+
+export function toBaselineValue(
+  baseline: { readonly baselineId: string; readonly root: string; readonly aborted?: true },
+  records: readonly { status: string; label: string; durationMs: number }[],
+): BaselineValue {
+  const passing = records.filter(r => r.status === 'pass').length
+  const failing = records.filter(r => r.status === 'fail' || r.status === 'error' || r.status === 'timeout').length
+  const skipped = records.filter(r => r.status === 'skipped' || r.status === 'aborted').length
+  return {
+    ok: failing === 0 && skipped === 0,
+    baselineId: baseline.baselineId,
+    root: baseline.root,
+    ran: records.length,
+    passing, failing, skipped,
+    durationMs: records.reduce((acc, r) => acc + r.durationMs, 0),
+    failingLabels: records.filter(r => r.status !== 'pass' && r.status !== 'skipped').map(r => r.label),
+    summary: `Baseline ${baseline.baselineId.slice(0, 12)}: ${passing} passing, ${failing} failing, ${skipped} skipped/unrun `
+      + `across ${records.length} check(s). Failures here are pre-existing — they are NOT charged to later work.`,
+    // The engine refuses to persist a batch that did not observe every check
+    // (E1); the refusal travels with the value so the model never mistakes an
+    // aborted run for the anchor it did not become. Absent on the normal path
+    // to keep the canonical value byte-stable.
+    ...(baseline.aborted === true ? { aborted: true as const } : {}),
+  }
+}
+
+export function toVerifyValue(
   report: ProofReport,
   changed: readonly string[],
   checks: readonly { label: string; verdict: string; suspects: readonly string[]; current?: { outputHead?: string } }[],
+  selection?: { readonly untouched?: readonly unknown[]; readonly precision?: string },
   attribution?: { method: string; records: readonly { path: string; provenance: string }[] },
-  precision: string = 'approximate',
+  degraded?: true,
 ): VerifyValue {
   const externalChanged = attribution?.records.filter(r => r.provenance === 'external').map(r => r.path) ?? []
+  // The check list covers every discovered spec (attribution included), so the
+  // old `discovered - checks.length` formula was structurally always 0 — the
+  // honest count of proven-untouched checks lives on the selection itself.
+  const untouched = selection?.untouched
   return {
     grade: report.grade,
     root: report.root,
     changed: [...changed],
     attributionMethod: attribution?.method ?? 'explicit',
     externalChanged,
-    impactPrecision: precision,
+    impactPrecision: selection?.precision ?? 'approximate',
     affectedChecks: checks.filter(c => c.verdict !== 'not-run').length,
-    untouchedChecks: Math.max(0, report.discovered - checks.length),
+    untouchedChecks: Array.isArray(untouched) ? untouched.length : 0,
+    // E3 pass-through: forced-because-blind must read differently from
+    // forced-because-asked-for. Present only on the degraded path.
+    ...(degraded === true ? { degraded: true as const } : {}),
     regressions: checks
       .filter(c => c.verdict === 'regression' || c.verdict === 'new-failure')
       .map(c => ({
@@ -486,6 +542,28 @@ function toVerifyValue(
   }
 }
 
+export function toClaimValue(claim: string, report: ProofReport, verified: VerifyValue): ClaimValue {
+  const blockers: string[] = []
+  if (report.grade === 'no-baseline') blockers.push('No baseline exists. Run proof_baseline first.')
+  if (report.grade === 'stale') blockers.push(`Stale evidence: ${report.unverified.join(', ') || 'affected checks not re-run'}.`)
+  for (const reg of verified.regressions) blockers.push(`Regression: ${reg.label} — ${reg.detail}`)
+  if (report.grade === 'unproven') blockers.push('Verification was incomplete (skipped, aborted or timed out).')
+
+  return {
+    claim,
+    grade: report.grade,
+    proven: report.grade === 'proven',
+    root: report.root,
+    regressions: verified.regressions,
+    blockers,
+    summary: report.grade === 'proven'
+      ? `PROVEN — "${claim}" is backed by evidence root ${report.root.slice(0, 12)}: `
+        + `${report.summary.passing} check(s) passing, ${report.summary.regressions} regression(s), `
+        + `${report.summary.preExisting} pre-existing failure(s) left untouched.`
+      : `NOT PROVEN (${report.grade}) — "${claim}". ${blockers.join(' ')}`,
+  }
+}
+
 /**
  * Display path must be TOTAL: these run during live streaming AND session-log
  * replay, so a malformed or older `meta` degrades to prose rather than throws.
@@ -499,6 +577,23 @@ function renderStatus(value: StatusValue): string {
     lines.push('⚠️ Evidence log trust: TAMPER-EVIDENCE TRIPPED — do not trust grades until restored from a known-good copy.')
     lines.push('')
   }
+  // New trust signals, each appearing only in its abnormal state so the
+  // normal render stays byte-identical to what session logs already hold.
+  if (v.anchorForged === true) {
+    lines.push('⚠️ ANCHOR SIGNATURE INVALID — the out-of-band anchor failed its own signature check. '
+      + 'Treat every grade as untrusted and restore the anchor from a known-good copy.')
+    lines.push('')
+  }
+  const tailRecords = typeof v.tailRecords === 'number' ? v.tailRecords : 0
+  const unverifiable = typeof v.unverifiableCheckpoints === 'number' ? v.unverifiableCheckpoints : 0
+  if (tailRecords > 0) {
+    lines.push(`⚠ ${tailRecords} record(s) after the last signed checkpoint — chain-only protection window.`)
+  }
+  if (unverifiable > 0) {
+    lines.push(`ℹ ${unverifiable} checkpoint(s) signed by a key this host cannot verify — protection is weaker than `
+      + '"signed" suggests, but this is a missing key on our side, not a forgery charge.')
+  }
+  if (tailRecords > 0 || unverifiable > 0) lines.push('')
   if (checks.length === 0) lines.push('No objective checks discovered. Add `checks` to the plugin config, or give the project a test/build script.')
   else {
     lines.push('Objective checks:')
@@ -512,6 +607,12 @@ function renderStatus(value: StatusValue): string {
 function renderBaseline(value: BaselineValue): string {
   const v = value ?? ({} as BaselineValue)
   const lines = [typeof v.summary === 'string' ? v.summary : 'no baseline result']
+  if (v.aborted === true) {
+    // The engine already refused to write the baseline (E1); saying so here is
+    // the difference between "try again" and silently anchoring on nothing.
+    lines.push('', '⚠ ABORTED — this run did not observe every check, so nothing was written: it is NOT the baseline '
+      + 'and not an anchor. The next proof_verify will report no-baseline; re-run proof_baseline.')
+  }
   const failing = Array.isArray(v.failingLabels) ? v.failingLabels : []
   if (failing.length > 0) {
     lines.push('', 'Pre-existing failures (not caused by future work):')
@@ -536,6 +637,12 @@ function renderVerify(value: VerifyValue): string {
       ` · impact ${String(v.impactPrecision ?? 'approximate')}`,
     '',
   ]
+  if (v.degraded === true) {
+    // Without this line "impact forced" reads like the caller asked for `all`;
+    // the honest cause is that git facts were missing, so everything ran.
+    lines.push('⚠ DEGRADED — git facts unavailable → full check set forced: impact analysis was skipped and every discovered check ran.')
+    lines.push('')
+  }
   if (externalChanged.length > 0) {
     lines.push('EXTERNAL edits (outside your tool stream, not charged to you):')
     for (const f of externalChanged.slice(0, 10)) lines.push(`  ↗ ${f}`)

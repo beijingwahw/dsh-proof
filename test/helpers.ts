@@ -84,17 +84,17 @@ export class MemoryFs implements FsPort {
 /** A command port driven by a table of predicate -> outcome. */
 export class FakeCommands implements CommandPort {
   calls: { argv: readonly string[]; cwd: string }[] = []
-  private readonly rules: { match: (argv: readonly string[]) => boolean; result: Partial<CommandResult> }[] = []
+  private readonly rules: { match: (argv: readonly string[]) => boolean; result: Partial<CommandResult>; delayMs?: number }[] = []
 
   /** Every command succeeds with empty output unless a rule says otherwise. */
   /** Newest rule wins, so a test can flip an outcome without resetting. */
-  on(match: (argv: readonly string[]) => boolean, result: Partial<CommandResult>): this {
-    this.rules.unshift({ match, result })
+  on(match: (argv: readonly string[]) => boolean, result: Partial<CommandResult>, options?: { delayMs?: number }): this {
+    this.rules.unshift({ match, result, ...(options?.delayMs !== undefined ? { delayMs: options.delayMs } : {}) })
     return this
   }
 
-  onCommand(command: string, result: Partial<CommandResult>): this {
-    return this.on(argv => argv.includes(command), result)
+  onCommand(command: string, result: Partial<CommandResult>, options?: { delayMs?: number }): this {
+    return this.on(argv => argv.includes(command), result, options)
   }
 
   async run(argv: readonly string[], options: CommandRunOptions): Promise<CommandResult> {
@@ -104,6 +104,9 @@ export class FakeCommands implements CommandPort {
     }
     for (const rule of this.rules) {
       if (rule.match(argv)) {
+        // Optional wall-clock delay, so tests can force commands to settle
+        // out of submission order and assert the runner's determinism.
+        if (rule.delayMs !== undefined) await new Promise<void>(resolve => { setTimeout(resolve, rule.delayMs) })
         return {
           exitCode: rule.result.exitCode ?? 0,
           output: rule.result.output ?? '',
@@ -124,10 +127,25 @@ export class FakeWorkspace implements WorkspacePort {
   changedSinceFiles: string[] = []
   /** Files the fake reports as untracked. */
   untrackedFiles: string[] = []
+  /**
+   * What `gitAvailable()` reports (E3). `null` simulates a host that never
+   * implemented the capability: the `gitAvailable` property itself becomes
+   * `undefined`, exactly like a port object without the optional method —
+   * consumers' `gitAvailable?.()` / `!== undefined` checks must see absence,
+   * not a throwing method. Defaults to `true` (the port contract treats an
+   * absent capability as "git available").
+   */
+  gitAvailableValue: boolean | null = true
   readonly root: string
 
   constructor(root: string = '/ws') {
     this.root = root
+  }
+
+  /** Optional capability, re-derived from `gitAvailableValue` on every access. */
+  get gitAvailable(): (() => Promise<boolean>) | undefined {
+    const value = this.gitAvailableValue
+    return value === null ? undefined : () => Promise.resolve(value)
   }
 
   async gitHead(): Promise<string | null> { return this.head }

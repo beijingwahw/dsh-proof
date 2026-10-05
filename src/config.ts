@@ -66,8 +66,6 @@ export interface Config {
   requireBaseline: 'off' | 'warn' | 'ask'
   /** Watch for workspace changes the agent did not make and surface them. */
   driftDetection: boolean
-  /** Staleness threshold for drift notices, in milliseconds. */
-  driftNoticeMs: number
   /** Inject a corrective message when the turn ends with unproven claims. */
   enforceOnTurnEnd: boolean
   /** Add a `proof:policy` section to the system prompt. */
@@ -115,7 +113,6 @@ export const Config: Schema<Config> = Schema.object({
   lspQueryBudget: Schema.number().default(400),
   requireBaseline: Schema.union(['off', 'warn', 'ask']).default('warn'),
   driftDetection: Schema.boolean().default(true),
-  driftNoticeMs: Schema.number().default(1_500),
   enforceOnTurnEnd: Schema.boolean().default(true),
   promptSection: Schema.boolean().default(true),
   promptScope: Schema.string().default('proof:policy'),

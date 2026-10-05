@@ -33,6 +33,51 @@ test('extractImports finds relative ESM and CJS specifiers', () => {
   assert.ok(!found.includes('node:fs'), 'bare node: specifiers are not workspace deps')
 })
 
+test('dynamic import() sites are import sites too', () => {
+  const found = extractImports("export function go() {\n  return import('./lazy')\n}\n")
+  assert.ok(found.includes('./lazy'), 'a lazily loaded chunk depends on its target like anyone else')
+})
+
+test('multi-line ESM imports produce a site on the closing from-line', () => {
+  const found = extractImports("import {\n  a,\n  b,\n} from './multi'\n")
+  assert.ok(found.includes('./multi'), 'the from on a }-prefixed line must not be invisible')
+})
+
+test('dynamic and multi-line imports carry the closure — no silent edge loss', async () => {
+  const files = {
+    '/ws/src/lazy.ts': "export function go() { return import('./dep') }\n",
+    '/ws/src/multi.ts': "import {\n  dep,\n} from './dep'\nexport const m = dep\n",
+    '/ws/src/dep.ts': 'export const dep = 1\n',
+  }
+  const fs = MemoryFs.of(files)
+  const graph = await buildDependencyGraph(fs, '/ws', Object.keys(files).map(stripRoot))
+  const closure = impactClosure(graph, ['src/dep.ts'])
+  assert.ok(closure.has('src/lazy.ts'), 'dynamic import() edges are walkable')
+  assert.ok(closure.has('src/multi.ts'), 'multi-line ESM edges are walkable')
+
+  // Selection follows the closure: a check scoped to the importer is chosen
+  // when only its (dynamically/multi-line imported) dependency changed.
+  const checks = [spec({ id: 'lazy', paths: ['src/lazy.ts'] }), spec({ id: 'orphan', paths: ['docs/**'] })]
+  const result = selectAffectedChecks(checks, ['src/dep.ts'], graph)
+  assert.deepEqual(result.affected.map(c => c.id), ['lazy'])
+  assert.deepEqual(result.untouched.map(c => c.id), ['orphan'])
+})
+
+test('python dotted imports resolve inside the scanned set only', async () => {
+  const files = {
+    '/ws/pkg/mod.py': 'X = 1\n',
+    '/ws/pkg/__init__.py': '',
+    '/ws/app.py': 'from pkg.mod import X\n',
+  }
+  const fs = MemoryFs.of(files)
+  const graph = await buildDependencyGraph(fs, '/ws', Object.keys(files).map(stripRoot))
+  const closure = impactClosure(graph, ['pkg/mod.py'])
+  assert.ok(closure.has('app.py'), 'bare dotted specifier binds to pkg/mod.py')
+  // Edges are added only on proof: a dotted name with no scanned target
+  // (the __init__ form here) adds nothing, so this stays exact, not guessed.
+  assert.deepEqual([...impactClosure(graph, ['pkg/__init__.py'])], ['pkg/__init__.py'])
+})
+
 test('impact closure walks reverse dependencies transitively', async () => {
   const fs = MemoryFs.of(TREE)
   const graph = await buildDependencyGraph(fs, '/ws', Object.keys(TREE).map(stripRoot))

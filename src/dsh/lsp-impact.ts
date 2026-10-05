@@ -95,8 +95,17 @@ export function uriToRelative(uri: string, root: string): string | null {
   if (/^\/[A-Za-z]:\//.test(path)) path = path.slice(1)
   path = path.replace(/\\/g, '/')
   const normalizedRoot = root.replace(/\\/g, '/').replace(/\/+$/, '')
-  if (!path.startsWith(`${normalizedRoot}/`)) return null
-  return path.slice(normalizedRoot.length + 1)
+  // Windows servers routinely disagree with the host on drive-letter case
+  // (`file:///c:/…` vs root `C:/…`), and drive filesystems are themselves
+  // case-insensitive — so a drive-form root must compare its prefix that way
+  // or every edge it resolves is silently dropped. POSIX roots stay
+  // case-sensitive: `/WS` and `/ws` really are different directories there.
+  const prefix = `${normalizedRoot}/`
+  const inside = /^[A-Za-z]:\//.test(normalizedRoot)
+    ? path.toLowerCase().startsWith(prefix.toLowerCase())
+    : path.startsWith(prefix)
+  if (!inside) return null
+  return path.slice(prefix.length)
 }
 
 function decodeURIComponentSafe(value: string): string {

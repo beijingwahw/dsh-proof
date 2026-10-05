@@ -33,7 +33,7 @@ export {
 
 export {
   DEFAULT_BASELINE_RELPATH, DEFAULT_LOG_RELPATH, EvidenceStore,
-  buildBaseline, makeEvidence, snapshotWorkspace, verdictOf,
+  buildBaseline, isDecisiveStatus, makeEvidence, snapshotWorkspace, verdictOf,
   type AuditReport, type Baseline, type CheckReport, type CheckStatus,
   type CheckVerdict, type Evidence, type ProofGrade, type ProofReport,
   type RunOutcome, type StoreTrust, type WorkspaceSnapshot,

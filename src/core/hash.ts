@@ -86,8 +86,19 @@ function pathVariants(path: string | undefined): string[] {
   return path === flipped ? [path] : [path, flipped]
 }
 
+/**
+ * A root always appears in output as a *complete path prefix*, so a match is
+ * only meaningful when it ends at a path boundary: separator, quote,
+ * whitespace, or end of line/text. Without the anchor, root `/app` would chew
+ * into `/application` and mint `$WORKSPACElication` — a false equivalence (or
+ * false diff) between two different locations in a content-addressed digest.
+ * The lookahead consumes nothing, so every legitimately-prefixed path
+ * substitutes exactly as it did before the guard existed.
+ */
+const PATH_BOUNDARY = "(?=[/\\\\'\"`\\s]|$)"
+
 function substituteLiteral(text: string, literal: string, placeholder: string): string {
   if (literal.length === 0) return text
   const escaped = literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return text.replace(new RegExp(escaped, 'g'), placeholder)
+  return text.replace(new RegExp(escaped + PATH_BOUNDARY, 'g'), placeholder)
 }

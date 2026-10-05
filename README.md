@@ -53,9 +53,12 @@ Existing plugins each cover part of it: `dsh-completion-guard` uses checklists t
 | pass | fail | **`regression`** | **this session**, with suspect files |
 | fail | fail | `still-failing` | pre-existing — **not charged to you** |
 | fail | pass | `fixed` | this session fixed it |
+| absent | pass | `new-check` | first sight; counts as passing only if it actually ran |
 | absent | fail | `new-failure` | honestly unattributable |
+| present | not run | `not-run` | evidence stale |
+| either side skipped/timeout/aborted/error | — | `indeterminate` | **neither credit nor blame** — the honest middle |
 
-Working in an already-red repository is the normal condition. `dsh-proof` does not require you to fix history before you can prove you broke nothing.
+Working in an already-red repository is the normal condition. `dsh-proof` does not require you to fix history before you can prove you broke nothing. The verdict lattice is three-valued: credit (`still-passing`, `fixed`, a decisively-run `new-check`), blame (`regression`, `still-failing`, `new-failure`), and neither (`indeterminate`, `not-run`, a `new-check` that never ran) — unknown never borrows certainty from either side, and `summary` carries a separate `indeterminate` count.
 
 ### Grades
 
@@ -83,7 +86,7 @@ All four follow DSH's hard contract: `execute` returns one canonical JSON value,
 | `tools/pre-execute` | with `requireBaseline: ask`, mutations require user approval until a baseline exists |
 | `tools/pre-execute` | with `evidenceStore: workspace`, mutation tools touching the evidence store are routed through user approval |
 | `tools/result` | observes every tool result; maintains the dirty set and file fingerprints |
-| `agent/turn-stopping` | injects corrective context when a turn mutated the workspace without a proven claim, and flags files changed outside the tool stream |
+| `agent/turn-stopping` | injects corrective context when a turn mutated the workspace without a proven claim, flags files changed outside the tool stream, and (with `requireBaseline: warn`) reminds the agent to establish a baseline first |
 | `ctx.systemPrompt.section()` | publishes the `proof:policy` section so the model knows the rules exist |
 
 ## Trust model (v0.2): the adversary is the auditee
@@ -95,7 +98,7 @@ The agent under audit has file-write tools. It could rewrite `.proof/` wholesale
 3. **Out-of-band anchor** — the highest checkpoint ever written is mirrored next to the key, outside the workspace. Truncating or rewinding the log is detected as `rewind`.
 4. **Baseline digest in the chain** — `baseline.json` is plain JSON, so its sha256 is recorded as a chained marker at save time; later substitution trips `baselineTampered`.
 
-By default (`evidenceStore: host`) the log itself lives under `$DSH_HOME/proof/workspaces/<key>/`, outside the agent's sandboxed writable area. `proof_status` surfaces the telemetry: `chainMode`, `checkpoints`, `chainIntact`, `rewindDetected`, `baselineTampered`.
+By default (`evidenceStore: host`) the log itself lives under `$DSH_HOME/proof/workspaces/<key>/`, outside the agent's sandboxed writable area. `proof_status` surfaces the telemetry: `chainMode`, `checkpoints`, `chainIntact`, `rewindDetected`, `baselineTampered`, plus the v0.7 triage fields (`unverifiableCheckpoints`, `anchorForged`) and the checkpoint-window remainder (`tailRecords`).
 
 ## Change-set provenance (v0.3): content-anchored, attribution-aware
 
@@ -123,6 +126,10 @@ The default `balanced` strategy allocates in three segments: the **first salient
 
 Compiler errors and stack traces carry absolute paths, so digests used to vary per machine and per checkout directory — the same test outcome never addressed identically twice across machines, and usernames (`/home/alice/...`) leaked into records that may be exported for audit. v0.6 canonicalises captured output before hashing: **root → `$WORKSPACE` (specific first)**, **home → `$HOME` (general after)** — a workspace under the home directory still collapses to `$WORKSPACE/...` while sibling paths become `$HOME/...`; Windows paths match in either slash style. With `normalizeHome` (default on), the same failure produces the *identical* `outputDigest` and `evidenceId` on any machine, under any checkout, for any user — the dedupe/comparison primitive a proof transparency log rests on — and no username ever enters an evidence field. Without canonical roots, behaviour is byte-for-byte legacy.
 
+## Honesty hardening (v0.7): unknown never rounds up to "ok"
+
+A deep-read pass closed every path that could round uncertainty into good news. The **verdict lattice** is three-valued: non-decisive statuses (`skipped` / `timeout` / `aborted` / `error`) yield `indeterminate` — neither credit nor blame, counted separately — and blame requires a decisive baseline pass, credit a decisive baseline fail. Audit **trust triage** is three-state: a signature this host cannot check (no signer, foreign keyId) is `unverifiableCheckpoints` — a missing capability, not a forgery charge — while the anchor's own signature is now verified (`anchorForged`). Engine honesty edges: when git is unavailable (`gitAvailable?()` reports `false`) the change set is marked `degraded` and the engine **forces the full check set**, surfacing `VerifyOutcome.degraded`; an aborted baseline never lands on disk (evidence still enters the chain under a `baseline/aborted` marker); signer load failures degrade loudly via a `trust/signer-unavailable` chain marker; the evidence log writes through a **single-flight queue** so concurrent appends cannot fork the chain. Soundness closure: monorepo subpackage checks run in their own `cwd`, dynamic and multi-line imports produce impact edges, porcelain `-z` renames parse both paths, Windows drive-letter paths enter the path domain, and multi-byte output survives chunk boundaries.
+
 ## Architecture
 
 ```
@@ -139,7 +146,7 @@ The domain core is framework-free on purpose: it is fully unit-testable offline,
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit
-npm test              # 100 tests, node:test
+npm test              # 159 tests, node:test
 npm run build
 npm run bundle:check  # packaging contract self-check
 ```
@@ -164,8 +171,9 @@ Every tunable is a `cordis.yml` field — no hardcoded knobs. See [README.zh.md 
 ## Honest limits
 
 - Check discovery is heuristic. For monorepos or custom build systems, declare `checks` explicitly with `paths` so incremental verification stays precise.
-- The dependency graph is approximate and errs toward over-inclusion. Dynamic imports and string-built paths cannot be resolved.
-- Checkpoint cadence leaves a window (v0.2): records after the last signed checkpoint are chain-covered but not checkpoint-covered. The window is bounded by `checkpointEvery` and closed at every baseline/verify/claim boundary. The anchor protects against the audited agent, not against a fully compromised host.
+- The dependency graph is approximate and errs toward over-inclusion. Dynamic `import()` calls, multi-line ESM imports and Python dotted imports produce edges since v0.7; reflection and string-built paths still cannot be resolved.
+- Checkpoint cadence leaves a window (v0.2): records after the last signed checkpoint are chain-covered but not checkpoint-covered. The window is bounded by `checkpointEvery`, closed at every baseline/verify/claim boundary, and *visible* — `proof_status` reports `tailRecords`, the count of records since the last checkpoint. The anchor protects against the audited agent, not against a fully compromised host.
+- On machines without the signing key, signed checkpoints cannot be adjudicated locally: the audit reports them as `unverifiableCheckpoints` (a missing capability, not a forgery charge — the audit does not fail on it; anchor count/head comparison still bounds rewind).
 - `proven` permits pre-existing red checks — they are reported prominently but not charged to the session. Deliberate, not a hole.
 - It orchestrates and attributes your existing objective checks; it does not write tests.
 - DSH is a developer preview and its plugin contract changes. This plugin pins a minimal contract snapshot and declares peers rather than bundling, but upstream shifts still need re-alignment.

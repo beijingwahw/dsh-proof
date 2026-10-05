@@ -73,7 +73,7 @@ export async function discoverChecks(fs: FsPort, root: string, options: Discover
   const push = (spec: Omit<CheckSpec, 'id' | 'timeoutMs'> & { timeoutMs?: number }) => {
     found.push({
       ...spec,
-      id: checkId(spec.source, spec.command),
+      id: checkId(spec.source, spec.command, spec.cwd),
       timeoutMs: spec.timeoutMs ?? timeoutMs,
     })
   }
@@ -98,14 +98,17 @@ export async function discoverChecks(fs: FsPort, root: string, options: Discover
     const pkg = parseJson(pkgRaw)
     if (pkg) {
       const scripts = (pkg.scripts ?? {}) as Record<string, unknown>
-      const workspaces = collectWorkspaceDirs(pkg)
+      const workspaces = await expandWorkspacePatterns(fs, root, collectWorkspaceDirs(pkg))
       for (const [name, value] of Object.entries(scripts)) {
         if (typeof value !== 'string') continue
         const kind = scriptKinds[name]
         if (!kind) continue
+        // npm folds `pre<script>`/`post<script>` into the run of `<script>`
+        // itself — but only when that base script exists. Names that merely
+        // *start with* the letters (prettier, postcss, prepare) are ordinary
+        // scripts and must survive discovery.
+        if (isHookScript(name, scripts)) continue
         const argv = packageScriptArgv(pkg, name, value)
-        // `pre`/`post` hooks are folded into the main script by npm; skip them.
-        if (name.startsWith('pre') || name.startsWith('post')) continue
         push({
           label: `npm script "${name}"`,
           command: argv,
@@ -114,7 +117,11 @@ export async function discoverChecks(fs: FsPort, root: string, options: Discover
           paths: workspacePaths(root, workspaces),
         })
       }
-      // Recursive discovery for pnpm/npm workspace members.
+      // Recursive discovery for pnpm/npm workspace members. The argv is
+      // deliberately identical to the root's (`npm run` is the one invocation
+      // that resolves `node_modules/.bin` under every manager); what separates
+      // a subpackage check from the root's is `cwd` — it executes in the
+      // member directory, gets its own id, and only expires on its own paths.
       for (const dir of workspaces) {
         const childRaw = await fs.readFile(join(root, dir, 'package.json'))
         const child = childRaw === undefined ? undefined : parseJson(childRaw)
@@ -124,13 +131,14 @@ export async function discoverChecks(fs: FsPort, root: string, options: Discover
           if (typeof value !== 'string') continue
           const kind = scriptKinds[name]
           if (!kind) continue
-          if (name.startsWith('pre') || name.startsWith('post')) continue
+          if (isHookScript(name, childScripts)) continue
           push({
             label: `npm script "${name}" (${dir})`,
             command: packageScriptArgv(child, name, value),
             kind,
             source: 'package.json',
             paths: [`${dir}/**`],
+            cwd: dir,
           })
         }
       }
@@ -139,11 +147,15 @@ export async function discoverChecks(fs: FsPort, root: string, options: Discover
 
   // ---- Python ---------------------------------------------------------
   const pyRaw = await fs.readFile(join(root, 'pyproject.toml'))
+  // pytest is discoverable through either file; a bare pytest.ini must not be
+  // invisible just because the project never grew a pyproject.toml. The source
+  // stays 'pyproject.toml' so already-minted pytest ids keep addressing.
+  const hasPytestConfig = (pyRaw !== undefined && /(^|\n)\s*\[tool\.pytest/.test(pyRaw))
+    || (await fs.readFile(join(root, 'pytest.ini'))) !== undefined
+  if (hasPytestConfig) {
+    push({ label: 'pytest', command: pythonRunner(root, ['pytest', '-q']), kind: 'test', source: 'pyproject.toml', paths: ['*'] })
+  }
   if (pyRaw !== undefined) {
-    const pytest = /(^|\n)\s*\[tool\.pytest/.test(pyRaw)
-    if (pytest || (await fs.readFile(join(root, 'pytest.ini'))) !== undefined) {
-      push({ label: 'pytest', command: pythonRunner(root, ['pytest', '-q']), kind: 'test', source: 'pyproject.toml', paths: ['*'] })
-    }
     if (/(^|\n)\s*\[tool\.mypy/.test(pyRaw)) {
       push({ label: 'mypy', command: pythonRunner(root, ['mypy', '.']), kind: 'typecheck', source: 'pyproject.toml', paths: ['*'] })
     }
@@ -152,7 +164,7 @@ export async function discoverChecks(fs: FsPort, root: string, options: Discover
     }
   }
   if ((await fs.readFile(join(root, 'tox.ini'))) !== undefined) {
-    push({ label: 'tox', command: pythonRunner(root, ['tox', '-q']), kind: 'test', source: 'pyproject.toml', paths: ['*'] })
+    push({ label: 'tox', command: pythonRunner(root, ['tox', '-q']), kind: 'test', source: 'tox.ini', paths: ['*'] })
   }
 
   // ---- Go -------------------------------------------------------------
@@ -199,8 +211,13 @@ export async function discoverChecks(fs: FsPort, root: string, options: Discover
 }
 
 /** Stable check identity: the discovery source plus the exact command. */
-export function checkId(source: CheckSource, command: readonly string[]): string {
-  return `${source}:${sha256(command.join('\u0000')).slice(0, 12)}`
+export function checkId(source: CheckSource, command: readonly string[], cwd?: string): string {
+  // `cwd` joins the hash material only when present, so ids minted before the
+  // field existed (every root-dir check) stay byte-identical and the baselines
+  // addressing them keep verifying. Monorepo siblings share argv but not cwd,
+  // which is exactly what separates their identities.
+  const material = cwd === undefined ? command.join('\u0000') : `${command.join('\u0000')}\u0000${cwd}`
+  return `${source}:${sha256(material).slice(0, 12)}`
 }
 
 // ---------------------------------------------------------------------------
@@ -224,19 +241,71 @@ function parseJson(raw: string): Record<string, unknown> | undefined {
   }
 }
 
+/**
+ * Workspace member patterns as declared: literals (`apps/web`) and globs
+ * (`packages/*`, `packages/**`) alike. Expansion against the real filesystem
+ * happens in `expandWorkspacePatterns`; keeping them raw here is what lets
+ * single-level globs reach their subpackages at all.
+ */
 function collectWorkspaceDirs(pkg: Record<string, unknown>): string[] {
   const out = new Set<string>()
   const add = (pattern: unknown) => {
     if (typeof pattern !== 'string') return
-    // Only literal-ish directory patterns; globs are expanded by the walker below.
-    out.add(pattern.replace(/\/\*\*?$/, '').replace(/\/+$/, ''))
+    const normalized = pattern.replace(/\/+$/, '')
+    if (normalized.length > 0) out.add(normalized)
   }
   if (Array.isArray(pkg.workspaces)) pkg.workspaces.forEach(add)
   else if (pkg.workspaces && typeof pkg.workspaces === 'object') {
     const w = pkg.workspaces as { packages?: unknown }
     if (Array.isArray(w.packages)) w.packages.forEach(add)
   }
-  return [...out].filter(d => d && !d.includes('*') && !d.includes('?'))
+  return [...out]
+}
+
+/**
+ * Resolve workspace patterns to concrete member directories. Single-level
+ * globs (`packages/*`, `packages/**`) are expanded by listing the parent
+ * directory and keeping every child that owns a package.json — without this,
+ * the most common monorepo layout silently discovers nothing. Deeper or
+ * unrecognised globs degrade to their literal prefix, which the caller's
+ * package.json probe then filters. Missing directories yield nothing: there
+ * are no members to lose.
+ */
+async function expandWorkspacePatterns(fs: FsPort, root: string, patterns: readonly string[]): Promise<string[]> {
+  const out = new Set<string>()
+  for (const pattern of patterns) {
+    if (!/[*?]/.test(pattern)) { out.add(pattern); continue }
+    const segments = pattern.split('/')
+    const globIndex = segments.findIndex(s => /[*?]/.test(s))
+    const deeper = globIndex >= 0 && segments.slice(globIndex + 1).some(s => /[*?]/.test(s))
+    if (globIndex < 0 || deeper) {
+      out.add(pattern.replace(/\/?\*.*$/, '').replace(/\/+$/, ''))
+      continue
+    }
+    const parent = segments.slice(0, globIndex).join('/')
+    const names = await fs.readDir(join(root, parent))
+    if (names === undefined) continue
+    for (const name of names) {
+      const dir = parent === '' ? name : `${parent}/${name}`
+      // Only package.json-owning children are workspace members.
+      if ((await fs.readFile(join(root, dir, 'package.json'))) !== undefined) out.add(dir)
+    }
+  }
+  return [...out]
+}
+
+/**
+ * npm hook semantics: `name` is a lifecycle hook only when stripping its
+ * `pre`/`post` prefix leaves a script the same package actually declares.
+ * A bare `pre`/`post` prefix (prettier, postcss, prepare) is just a name.
+ */
+function isHookScript(name: string, scripts: Record<string, unknown>): boolean {
+  for (const prefix of ['pre', 'post']) {
+    if (!name.startsWith(prefix)) continue
+    const base = name.slice(prefix.length)
+    if (base.length > 0 && typeof scripts[base] === 'string') return true
+  }
+  return false
 }
 
 function workspacePaths(root: string, dirs: string[]): string[] {

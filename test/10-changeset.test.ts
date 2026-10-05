@@ -118,6 +118,58 @@ test('legacy baselines without digests stay conservative (include all candidates
   assert.deepEqual(resolution.changed, ['src/legacy.ts'], 'cannot prove it is unchanged, so include it')
 })
 
+// -- git unavailable: degrade visibly instead of silently under-attributing ----
+// FakeWorkspace.gitAvailableValue (helpers.ts, E3) drives the optional probe:
+// false = git definitively down, null = host never implemented the capability.
+
+test('git reported unavailable: the dirty fallback degrades to empty AND says so', async () => {
+  const fs = MemoryFs.of(project())
+  const ws = new FakeWorkspace('/ws')
+  ws.gitAvailableValue = false
+  ws.dirty = ['src/a.ts'] // what git *would* have said, had git existed
+  const resolution = await resolveChangeSet({ fs, workspace: ws })
+  assert.equal(resolution.method, 'dirty-fallback')
+  assert.deepEqual(resolution.changed, [], 'with git down there is no dirty set to read')
+  assert.equal(resolution.degraded, true, 'the blindness itself must be part of the answer')
+})
+
+test('git unavailable: content anchoring still works (digests need no git) but is marked degraded', async () => {
+  const fs = MemoryFs.of(project({
+    '/ws/src/legacy.ts': 'old but stable\n',
+    '/ws/src/edited.ts': 'changed after baseline\n',
+  }))
+  const ws = new FakeWorkspace('/ws')
+  ws.gitAvailableValue = false
+  const baseline = {
+    head: 'abc123',
+    dirty: ['src/legacy.ts', 'src/edited.ts'],
+    dirtyDigests: {
+      'src/legacy.ts': sha256('old but stable\n'),
+      'src/edited.ts': sha256('original\n'),
+    },
+  }
+  const resolution = await resolveChangeSet({ fs, workspace: ws, baseline, touched: ['src/edited.ts'] })
+  assert.equal(resolution.method, 'baseline-content')
+  assert.deepEqual(resolution.preExistingExcluded, ['src/legacy.ts'], 'stale dirt is still excluded by content')
+  assert.deepEqual(resolution.changed, ['src/edited.ts'], 'moved dirty-at-baseline content is still caught by content')
+  assert.equal(resolution.degraded, true, 'files clean at baseline are invisible without git — surface it')
+})
+
+test('git available (or unprobed): resolutions are NOT marked degraded', async () => {
+  const fs = MemoryFs.of(project())
+  const wsNoProbe = new FakeWorkspace('/ws') // capability absent: gitAvailable === undefined
+  wsNoProbe.gitAvailableValue = null
+  wsNoProbe.dirty = ['src/a.ts']
+  const withoutProbe = await resolveChangeSet({ fs, workspace: wsNoProbe })
+  assert.equal(withoutProbe.degraded, undefined, 'a missing probe keeps the current behaviour')
+
+  const wsYes = new FakeWorkspace('/ws') // capability present, git up
+  wsYes.dirty = ['src/a.ts']
+  const withProbe = await resolveChangeSet({ fs, workspace: wsYes })
+  assert.equal(withProbe.degraded, undefined, 'git up means no degradation flag')
+  assert.deepEqual(withProbe.changed, ['src/a.ts'])
+})
+
 test('ENGINE: stale dirt no longer widens verification, external regressions are not charged', async () => {
   const fs = MemoryFs.of(project({ '/ws/src/legacy.ts': 'old but stable\n' }))
   const ws = new FakeWorkspace('/ws')

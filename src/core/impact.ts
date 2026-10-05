@@ -120,11 +120,17 @@ export async function buildDependencyGraph(
     const content = await fs.readFile(`${root}/${file}`)
     if (content === undefined) continue
     for (const site of extractImportSites(content)) {
-      // Approximate edge: relative specifiers against the filesystem.
-      if (site.kind === 'relative') {
-        const resolved = resolveSpecifier(file, site.specifier, known)
-        if (resolved !== undefined) ensure(resolved).add(file)
-      }
+      // Approximate edges, by specifier kind:
+      // - relative: resolve against the filesystem (the classic case).
+      // - bare: only Python dotted modules (`from pkg.mod import x` arrives
+      //   here because kindOf only recognises `.`/`/` prefixes) get a
+      //   filesystem attempt. A dotted name that happens to collide with a
+      //   scanned file can only add a spurious edge — over-selection, which
+      //   the soundness constitution allows; a missed edge is what it forbids.
+      const resolved = site.kind === 'relative'
+        ? resolveSpecifier(file, site.specifier, known)
+        : resolveBarePythonModule(site.specifier, known)
+      if (resolved !== undefined) ensure(resolved).add(file)
       // Verified edge: ask the language server where this import actually
       // binds. `node:` builtins are external by contract; everything else
       // (bare aliases included) may resolve inside the workspace.
@@ -224,16 +230,16 @@ export function attributeChange(
   changed: readonly RelPath[],
   graph?: DependencyGraph,
 ): Map<string, string[]> {
-  const closure = graph ? impactClosure(graph, changed) : new Set(changed)
   const table = new Map<string, string[]>()
   for (const file of changed) {
     const owners: string[] = []
+    // `reachable` already contains `file` itself, so the per-file path match
+    // needs no separate closure membership test.
     const reachable = graph ? transitiveDependents(graph, file) : new Set<RelPath>()
     reachable.add(file)
     for (const check of checks) {
       const hit = check.paths.includes('*')
         || [...reachable].some(p => matchesAny(p, check.paths))
-        || closure.has(file) && matchesAny(file, check.paths)
       if (hit) owners.push(check.id)
     }
     table.set(file, owners)
@@ -292,6 +298,12 @@ const SITE_ESM_FROM = /(?:^|[;{}])\s*(?:import|export)\b[^\n]*?\bfrom\s+(['"])([
 const SITE_SIDE_EFFECT = /(?:^|[;{}])\s*import\s+(['"])([^'"]+)\1/d
 const SITE_PYTHON = /^from\s+([.\w][\w.]*)\s+import\b/d
 const SITE_REQUIRE = /require\(\s*(['"])([^'"]+)\1\s*\)/d
+// Dynamic `import('...')`: lazy chunks are imports too, and code-split files
+// break exactly like statically imported ones.
+const SITE_DYNAMIC_IMPORT = /\bimport\s*\(\s*(['"])([^'"]+)\1\s*\)/d
+// Multi-line ESM tail: `import {\n ...\n} from './x'` — the `from` lives on a
+// line of its own that starts with `}`, invisible to SITE_ESM_FROM.
+const SITE_MULTILINE_FROM = /^\s*\}\s*from\s+(['"])([^'"]+)\1/d
 
 /** Pull every import site (specifier + cursor position) out of source text. */
 export function extractImportSites(content: string): ImportSite[] {
@@ -300,7 +312,7 @@ export function extractImportSites(content: string): ImportSite[] {
   lines.forEach((rawLine, index) => {
     const trimmed = rawLine.trim()
     if (trimmed.length === 0 || trimmed.startsWith('//') || trimmed.startsWith('#') || trimmed.startsWith('*')) return
-    for (const pattern of [SITE_ESM_FROM, SITE_SIDE_EFFECT, SITE_REQUIRE]) {
+    for (const pattern of [SITE_ESM_FROM, SITE_SIDE_EFFECT, SITE_DYNAMIC_IMPORT, SITE_MULTILINE_FROM, SITE_REQUIRE]) {
       const match = pattern.exec(rawLine)
       const groups = match?.indices
       const start = groups?.[2]?.[0]
@@ -350,23 +362,30 @@ function add(into: Set<string>, specifier: string): void {
 }
 
 function resolveSpecifier(from: RelPath, specifier: string, known: ReadonlySet<RelPath>): RelPath | undefined {
-  if (specifier.startsWith('.')) {
-    const base = dirname(from)
-    const joined = normalizePath(`${base}/${specifier}`)
-    const candidates = [
-      joined,
-      `${joined}.ts`, `${joined}.tsx`, `${joined}.js`, `${joined}.jsx`, `${joined}.mjs`, `${joined}.cjs`,
-      `${joined}/index.ts`, `${joined}/index.tsx`, `${joined}/index.js`, `${joined}/index.py`,
-      `${joined}.py`, `${joined}.go`, `${joined}.rs`,
-    ]
-    for (const candidate of candidates) if (known.has(candidate)) return candidate
-    return undefined
-  }
-  // Python-style absolute import: `from pkg.mod import x` -> pkg/mod.py or pkg/mod/__init__.py
-  if (/^[\w.]+$/.test(specifier)) {
-    const rel = specifier.replace(/\./g, '/')
-    for (const candidate of [`${rel}.py`, `${rel}/__init__.py`]) if (known.has(candidate)) return candidate
-  }
+  if (!specifier.startsWith('.')) return undefined
+  const base = dirname(from)
+  const joined = normalizePath(`${base}/${specifier}`)
+  const candidates = [
+    joined,
+    `${joined}.ts`, `${joined}.tsx`, `${joined}.js`, `${joined}.jsx`, `${joined}.mjs`, `${joined}.cjs`,
+    `${joined}/index.ts`, `${joined}/index.tsx`, `${joined}/index.js`, `${joined}/index.py`,
+    `${joined}.py`, `${joined}.go`, `${joined}.rs`,
+  ]
+  for (const candidate of candidates) if (known.has(candidate)) return candidate
+  return undefined
+}
+
+/**
+ * Python-style absolute import: `from pkg.mod import x` -> pkg/mod.py or
+ * pkg/mod/__init__.py, but only when that target is genuinely in the scanned
+ * set — the edge is added on proof of existence, never on speculation.
+ * JS bare specifiers (`@scope/pkg`, `lodash/get`) fail the shape test and
+ * stay external, as before.
+ */
+function resolveBarePythonModule(specifier: string, known: ReadonlySet<RelPath>): RelPath | undefined {
+  if (!/^[\w.]+$/.test(specifier)) return undefined
+  const rel = specifier.replace(/\./g, '/')
+  for (const candidate of [`${rel}.py`, `${rel}/__init__.py`]) if (known.has(candidate)) return candidate
   return undefined
 }
 

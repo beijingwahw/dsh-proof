@@ -16,7 +16,7 @@
  */
 
 import type { CheckKind, CheckSpec, Clock, FsPort, SignerPort, WorkspacePort } from './ports.ts'
-import { addressOf, canonicalJson, merkleRoot, normalizeOutput, sha256 } from './hash.ts'
+import { addressOf, merkleRoot, normalizeOutput, sha256 } from './hash.ts'
 import type { NormalizeOptions } from './hash.ts'
 import { GENESIS_PREV, checkpointSignedData, lineDigest, parseAnchor, walkChain } from './trust.ts'
 import { excerptOutput, type ExcerptOptions } from './excerpt.ts'
@@ -70,7 +70,19 @@ export interface Baseline {
   readonly root: string
 }
 
-/** Verdict about one check, derived purely from a baseline and fresh evidence. */
+/**
+ * Verdict about one check, derived purely from a baseline and fresh evidence.
+ *
+ * The lattice is three-valued. Every verdict is either *credit*
+ * (`still-passing`, `fixed`, a decisively-run `new-check`), *blame*
+ * (`regression`, `still-failing`, `new-failure`) or *neither*
+ * (`indeterminate`, `not-run`, a `new-check` that never ran). `indeterminate`
+ * is the honest middle: at least one side of the comparison produced no
+ * decisive result (`skipped`, `timeout`, `aborted`, `error`), so the check
+ * deserves neither credit nor blame. Blame requires a decisive baseline pass;
+ * credit requires a decisive baseline fail — anything less is unknown, and
+ * unknown is never silently rounded up to "ok".
+ */
 export type CheckVerdict =
   | 'still-passing'
   | 'still-failing'
@@ -79,6 +91,7 @@ export type CheckVerdict =
   | 'new-failure'
   | 'new-check'
   | 'not-run'
+  | 'indeterminate'
 
 export interface CheckReport {
   readonly checkId: string
@@ -115,6 +128,8 @@ export interface ProofReport {
     readonly fixed: number
     readonly preExisting: number
     readonly newChecks: number
+    /** Checks where at least one side of the comparison was non-decisive — neither credit nor blame. */
+    readonly indeterminate: number
   }
   /** Regressions in plain language, ready to inject into the agent's context. */
   readonly regressions: readonly string[]
@@ -234,7 +249,14 @@ export interface AuditReport {
     readonly mode: 'signed' | 'unsigned' | 'legacy'
     readonly breaks: readonly number[]
     readonly checkpoints: number
+    /** Checkpoints whose signature this host's key actively refutes — a forgery charge. */
     readonly badCheckpoints: readonly number[]
+    /**
+     * Checkpoints that carry a signature this host cannot adjudicate: no
+     * signer is configured (key lost / different machine), or the checkpoint
+     * names a different keyId. A missing capability is not an accusation.
+     */
+    readonly unverifiableCheckpoints: readonly number[]
     readonly unsignedCheckpoints: readonly number[]
     readonly headMismatches: readonly number[]
     /** Records after the last checkpoint — chain-covered, not checkpoint-covered. */
@@ -242,6 +264,8 @@ export interface AuditReport {
     /** The log ends before the best checkpoint the anchor remembers. */
     readonly rewind: boolean
     readonly anchorMismatch: boolean
+    /** The anchor file failed its own signature check — its data was tampered with. */
+    readonly anchorForged: boolean
     /** The baseline file no longer matches the digest recorded in the chain. */
     readonly baselineTampered: boolean
   }
@@ -273,6 +297,15 @@ export class EvidenceStore {
   private recordsSoFar = 0
   private sinceCheckpoint = 0
   private signerPromise: Promise<SignerPort | undefined> | undefined
+  /**
+   * Single-flight tail for every log-mutating operation. Two concurrent
+   * `append`/`mark`/`checkpoint` calls both read the same `this.tail`, both
+   * build envelopes chained to it, and the second line's `prev` then points at
+   * a line that no longer exists — the chain is broken by *correct* code
+   * racing itself. Serialising the write section (tail read → append → tail
+   * update) makes the interleaving impossible; reads stay concurrent.
+   */
+  private tailQueue: Promise<unknown> = Promise.resolve()
 
   constructor(fs: FsPort, logPath: string, baselinePath: string, clock: Clock, trust: StoreTrust = {}) {
     this.fs = fs
@@ -316,8 +349,28 @@ export class EvidenceStore {
     return this.signerPromise
   }
 
+  /**
+   * Run `op` as the one and only log-mutating operation in flight. The queue
+   * swallows the previous operation's rejection (it was already delivered to
+   * its own caller) so one failed write cannot deadlock every later one;
+   * `op`'s own outcome — result or rejection — reaches its caller untouched.
+   */
+  private enqueue<T>(op: () => Promise<T>): Promise<T> {
+    const next = this.tailQueue.then(op)
+    // The chain only tracks *completion*, never the outcome: a rejected op
+    // must not poison the queue for the operations queued behind it.
+    this.tailQueue = next.catch(() => undefined)
+    return next
+  }
+
   /** Append one evidence record. Re-appending an existing address is a no-op. */
-  async append(evidence: Evidence): Promise<void> {
+  append(evidence: Evidence): Promise<void> {
+    // The dedupe check lives inside the queued section: two racing appends of
+    // the same address must both see the cache update from whichever wins.
+    return this.enqueue(() => this.appendInternal(evidence))
+  }
+
+  private async appendInternal(evidence: Evidence): Promise<void> {
     if (this.cache.has(evidence.evidenceId)) return
     await this.ensureTail()
     const envelope: LogEnvelope = {
@@ -335,7 +388,11 @@ export class EvidenceStore {
   }
 
   /** Append a free-form marker (session boundaries, decisions). */
-  async mark(label: string, data: Record<string, unknown> = {}): Promise<void> {
+  mark(label: string, data: Record<string, unknown> = {}): Promise<void> {
+    return this.enqueue(() => this.markInternal(label, data))
+  }
+
+  private async markInternal(label: string, data: Record<string, unknown>): Promise<void> {
     await this.ensureTail()
     const envelope: LogEnvelope = {
       v: 2,
@@ -354,10 +411,14 @@ export class EvidenceStore {
    * Append a signed checkpoint and refresh the out-of-band anchor.
    *
    * A checkpoint commits to "the chain head, after N records". Without the
-   * host's key the writer of the log cannot produce a new one, and without
-   * the anchor the log cannot be quietly rewound past the last checkpoint.
+   * host's key the writer of the log cannot produce a new one, and without the
+   * anchor the log cannot be quietly rewound past the last checkpoint.
    */
-  async checkpoint(): Promise<void> {
+  checkpoint(): Promise<void> {
+    return this.enqueue(() => this.checkpointInternal())
+  }
+
+  private async checkpointInternal(): Promise<void> {
     await this.ensureTail()
     const payload = {
       count: this.recordsSoFar,
@@ -391,15 +452,28 @@ export class EvidenceStore {
     await this.writeEnvelope(envelope)
     this.sinceCheckpoint = 0
     if (signer !== undefined && sig !== undefined && this.trust.anchorPath !== undefined) {
-      const anchor = { v: 1, keyId: signer.keyId, count: payload.count, head: payload.head, sig, at: payload.at }
+      // `workspaceKey` rides along so a later audit can re-derive the exact
+      // signed bytes from the anchor alone (see `audit`). Older anchors that
+      // predate the field simply skip signature verification instead of
+      // failing it.
+      const anchor = {
+        v: 1 as const,
+        keyId: signer.keyId,
+        count: payload.count,
+        head: payload.head,
+        sig,
+        at: payload.at,
+        ...(typeof payload.workspaceKey === 'string' ? { workspaceKey: payload.workspaceKey } : {}),
+      }
       await this.fs.writeFile(this.trust.anchorPath, JSON.stringify(anchor, null, 2))
     }
   }
 
+  /** Must only be called from inside a queued operation (would self-deadlock). */
   private async maybeCheckpoint(): Promise<void> {
     const every = this.trust.checkpointEvery
     if (every !== undefined && every > 0 && this.sinceCheckpoint >= every) {
-      await this.checkpoint()
+      await this.checkpointInternal()
     }
   }
 
@@ -451,25 +525,56 @@ export class EvidenceStore {
 
     const signer = await this.resolveSigner()
     const badCheckpoints: number[] = []
+    const unverifiableCheckpoints: number[] = []
     const unsignedCheckpoints: number[] = []
     const headMismatches: number[] = []
     for (const cp of walk.checkpoints) {
       if (cp.payload.head !== cp.expectedHead) headMismatches.push(cp.index)
       if (cp.sig === null) {
         if (signer !== undefined) unsignedCheckpoints.push(cp.index)
-      } else {
-        const okSig = signer !== undefined && await signer.verify(checkpointSignedData(cp.payload), cp.sig)
-        if (!okSig) badCheckpoints.push(cp.index)
+        continue
       }
+      // Three-state adjudication: only a key we actually hold, facing a
+      // checkpoint that names that very key, gets to *refute* a signature.
+      // No signer at all (key lost, different machine) or a foreign keyId is
+      // a missing capability — recorded as unverifiable, never as forgery:
+      // charging the log with tampering because *we* cannot check it would
+      // invert the burden of proof. Rewind cover does not need the key: the
+      // anchor's count/head comparison below still bounds the log.
+      if (signer === undefined || cp.keyId !== signer.keyId) {
+        unverifiableCheckpoints.push(cp.index)
+        continue
+      }
+      if (!(await signer.verify(checkpointSignedData(cp.payload), cp.sig))) badCheckpoints.push(cp.index)
     }
 
     let rewind = false
     let anchorMismatch = false
+    let anchorForged = false
     const anchor = parseAnchor(this.trust.anchorPath === undefined ? undefined : await this.fs.readFile(this.trust.anchorPath))
     if (anchor !== undefined) {
       const best = walk.checkpoints[walk.checkpoints.length - 1]
       if (best === undefined || best.payload.count < anchor.count) rewind = true
       else if (best.payload.count === anchor.count && best.payload.head !== anchor.head) anchorMismatch = true
+      // The anchor is signed data too, and it is the one artifact the agent
+      // cannot recompute — tampering with its fields while keeping the sig is
+      // exactly the attack the signature exists for. Only adjudicated when
+      // this host holds the writing key AND the anchor carries every field
+      // the signature commits to; anchors predating `workspaceKey` skip the
+      // check (count/head monotonicity still applies) rather than fail it.
+      if (
+        anchor.sig !== '' && signer !== undefined
+        && anchor.keyId === signer.keyId
+        && anchor.workspaceKey !== undefined
+      ) {
+        const signed = checkpointSignedData({
+          count: anchor.count,
+          head: anchor.head,
+          workspaceKey: anchor.workspaceKey,
+          at: anchor.at,
+        })
+        if (!(await signer.verify(signed, anchor.sig))) anchorForged = true
+      }
     }
 
     let baselineTampered = false
@@ -482,13 +587,20 @@ export class EvidenceStore {
       breaks: walk.chainBreaks,
       checkpoints: walk.checkpoints.length,
       badCheckpoints,
+      unverifiableCheckpoints,
       unsignedCheckpoints,
       headMismatches,
       tailRecords: walk.tailRecords,
       rewind,
       anchorMismatch,
+      anchorForged,
       baselineTampered,
     }
+    // `unverifiableCheckpoints` deliberately does NOT fail the audit: a key we
+    // no longer hold must not turn into a forgery verdict against the log.
+    // Every *refutable* claim — corruption, breaks, forged signatures, head
+    // mismatches, unsigned-while-signed, rewind, anchor mismatch/forgery,
+    // baseline substitution — does.
     const ok = corrupt.length === 0
       && walk.corruptLines.length === 0
       && walk.chainBreaks.length === 0
@@ -497,6 +609,7 @@ export class EvidenceStore {
       && unsignedCheckpoints.length === 0
       && !rewind
       && !anchorMismatch
+      && !anchorForged
       && !baselineTampered
     return { ok, total: all.length, corrupt, chain }
   }
@@ -548,22 +661,49 @@ function parseEnvelope(line: string): LogEnvelope | undefined {
 // Verdicts
 // ---------------------------------------------------------------------------
 
+/** Statuses that settle the check's question. Everything else is "ran, but no conclusion". */
+const DECISIVE_STATUSES: ReadonlySet<CheckStatus> = new Set(['pass', 'fail'])
+
+/**
+ * Whether a status is a decisive answer (`pass`/`fail`). `skipped`, `timeout`,
+ * `aborted` and `error` all mean the check ran without producing — or never
+ * got the chance to produce — a verdict, and the knowledge lattice treats
+ * them identically: unknown.
+ */
+export function isDecisiveStatus(status: CheckStatus | undefined): boolean {
+  return status !== undefined && DECISIVE_STATUSES.has(status)
+}
+
 /**
  * Baseline-differential verdict: the entire point of the plugin.
  *
  * `regression` is reserved for "it passed before *this work* and fails now" —
  * a failing check that was already failing at baseline is `still-failing` and
- * must never be charged to the current session.
+ * must never be charged to the current session. And since the knowledge
+ * lattice is three-valued, neither direction of the comparison may borrow
+ * certainty from the other: a check that was *skipped* at baseline (budget
+ * exhausted before it ever ran) can neither prove a regression nor credit a
+ * fix, so it lands on `indeterminate` — the old behaviour of rounding
+ * "never ran" up to "ok" manufactured verdicts out of nothing.
  */
 export function verdictOf(baseline: Evidence | undefined, current: Evidence | undefined): CheckVerdict {
   const b = baseline?.status
   const c = current?.status
-  const ok = (s: CheckStatus | undefined) => s === 'pass' || s === 'skipped'
   if (c === undefined) return b === undefined ? 'new-check' : 'not-run'
-  if (b === undefined) return ok(c) ? 'new-check' : 'new-failure'
-  if (ok(b) && ok(c)) return 'still-passing'
-  if (!ok(b) && !ok(c)) return 'still-failing'
-  if (ok(b) && !ok(c)) return 'regression'
+  // No baseline record at all: the current run is the only knowledge we have,
+  // so a decisive outcome can still be stated (as credit or as new breakage);
+  // a non-decisive one cannot.
+  if (b === undefined) {
+    if (!isDecisiveStatus(c)) return 'indeterminate'
+    return c === 'pass' ? 'new-check' : 'new-failure'
+  }
+  // A baseline that produced no decisive result (skipped/timeout/aborted/
+  // error) is not a pass to regress from nor a fail to fix — whatever the
+  // current run says, credit and blame both require two decisive sides.
+  if (!isDecisiveStatus(b) || !isDecisiveStatus(c)) return 'indeterminate'
+  if (b === 'pass' && c === 'pass') return 'still-passing'
+  if (b === 'fail' && c === 'fail') return 'still-failing'
+  if (b === 'pass' && c === 'fail') return 'regression'
   return 'fixed'
 }
 

@@ -5,6 +5,7 @@ import { ProofEngine } from '../src/engine.ts'
 import { assembleProof } from '../src/core/report.ts'
 import { attributeChecks } from '../src/core/regression.ts'
 import { snapshotWorkspace } from '../src/core/evidence.ts'
+import { VerificationRunner } from '../src/core/runner.ts'
 import { FakeClock, FakeCommands, FakeWorkspace, MemoryFs, spec } from './helpers.ts'
 
 const ROOT = '/ws'
@@ -130,9 +131,12 @@ test('a check that could not produce a verdict makes the claim STALE', async () 
 
 test('an aborted run refuses to claim PROVEN', async () => {
   const commands = new FakeCommands()
-    .on(argv => argv.includes('build'), { exitCode: null, aborted: true })
   const engine = makeEngine(MemoryFs.of(project()), commands)
+  // A green baseline first — an abort observed *during* the baseline batch is
+  // the E1 case and must anchor nothing. This case is the other half: the
+  // verification run itself gets killed mid-flight.
   await engine.establishBaseline()
+  commands.on(argv => argv.includes('build'), { exitCode: null, aborted: true })
   const outcome = await engine.verify({ changed: ['src/a.ts'], all: true })
   assert.equal(outcome.report.grade, 'stale')
 })
@@ -212,6 +216,45 @@ test('the evidence log survives a full cycle and audits clean', async () => {
   assert.ok(audit.total >= 4, `expected >= 4 records, got ${audit.total}`)
 })
 
+test('concurrent completion order never leaks into the baseline (determinism)', async () => {
+  // The slow `test` command is submitted first but settles last; without the
+  // reorder the records — and therefore the baselineId, which hashes the
+  // checkId sequence — would flip with every race.
+  const commands = new FakeCommands()
+    .on(argv => argv.includes('test'), { output: 'tests ok' }, { delayMs: 60 })
+    .on(argv => argv.includes('build'), { output: 'build ok' }, { delayMs: 1 })
+  const engine = makeEngine(MemoryFs.of(project()), commands)
+  const { baseline } = await engine.establishBaseline()
+  assert.deepEqual(
+    baseline.checks.map(c => c.kind),
+    ['test', 'build'],
+    'records follow discovery order, not wall-clock completion order',
+  )
+
+  const reordered = new FakeCommands()
+    .on(argv => argv.includes('test'), { output: 'tests ok' }, { delayMs: 1 })
+    .on(argv => argv.includes('build'), { output: 'build ok' }, { delayMs: 60 })
+  const engine2 = makeEngine(MemoryFs.of(project()), reordered)
+  const second = await engine2.establishBaseline()
+  assert.deepEqual(
+    second.baseline.checks.map(c => c.kind),
+    ['test', 'build'],
+    'flipping which command is slow must not move records around',
+  )
+  assert.deepEqual(baseline.checks.map(c => c.checkId), second.baseline.checks.map(c => c.checkId))
+})
+
+test('the runner executes subpackage checks inside their own directory', async () => {
+  const commands = new FakeCommands()
+  const runner = new VerificationRunner(commands, new FakeWorkspace(ROOT), new FakeClock())
+  await runner.run([
+    spec({ id: 'root-check', command: ['npm', 'run', '--silent', 'test'] }),
+    spec({ id: 'sub-check', command: ['npm', 'run', '--silent', 'test'], cwd: 'packages/a' }),
+  ], { concurrency: 2 })
+  const cwds = commands.calls.map(c => c.cwd).sort()
+  assert.deepEqual(cwds, [ROOT, `${ROOT}/packages/a`], `got ${cwds.join(', ')}`)
+})
+
 test('assembleProof is deterministic for identical inputs', () => {
   const clock = new FakeClock()
   const ws = snapshotWorkspace('h', [])
@@ -243,4 +286,100 @@ test('attributeChecks explains every verdict in one line', () => {
   assert.equal(checks[0]?.verdict, 'regression')
   assert.match(checks[0]?.rationale ?? '', /charged to this session/)
   assert.ok(checks[0]?.attributedTo.includes('src/a.ts'))
+})
+
+// -- E1: aborted baselines must not land on disk --------------------------------
+
+test('E1: an aborted baseline run keeps its evidence but never becomes the anchor', async () => {
+  const commands = new FakeCommands()
+    .on(argv => argv.includes('build'), { exitCode: null, aborted: true })
+  const fs = MemoryFs.of(project())
+  const engine = makeEngine(fs, commands)
+
+  const { baseline, records } = await engine.establishBaseline()
+  // The half-run comes back — flagged as aborted on the returned object...
+  assert.equal(baseline.aborted, true)
+  assert.equal(records.length, 2, 'observed facts are still returned')
+  // ...but nothing anchor-shaped exists on disk.
+  assert.equal(await fs.readFile(`${ROOT}/.proof/baseline.json`), undefined, 'an aborted run must not write baseline.json')
+  assert.equal(await engine.baseline(), undefined)
+  // The chain keeps the facts and names the abort.
+  assert.ok(fs.log.some(l => l.includes('"status":"aborted"')), 'aborted evidence record present')
+  assert.ok(fs.log.some(l => l.includes('baseline/aborted')), 'abort marker present')
+  assert.ok(!fs.log.some(l => l.includes('baseline/saved')), 'no baseline/saved marker may exist')
+  // The next verify anchors on nothing and says so, instead of silently
+  // diffing against a half-built truth.
+  const outcome = await engine.verify({ changed: ['src/a.ts'] })
+  assert.equal(outcome.report.grade, 'no-baseline')
+})
+
+// -- E2: signer degradation must be visible -------------------------------------
+
+test('E2: a signer that cannot load degrades loudly — marker in the chain, chain still intact', async () => {
+  const fs = MemoryFs.of(project())
+  const warnings: string[] = []
+  const engine = new ProofEngine({
+    root: ROOT,
+    fs,
+    commands: new FakeCommands(),
+    workspace: new FakeWorkspace(ROOT),
+    clock: new FakeClock(),
+    // Minimal injection: a host signer provider whose key material is gone.
+    signer: () => Promise.reject(new Error('trust keys dir is not writable')),
+    verbose: true,
+    logger: message => warnings.push(message),
+  })
+  const { baseline } = await engine.establishBaseline()
+  // The marker is fired, not awaited (see watchSigner: awaiting it inside the
+  // signer resolution would self-deadlock the store's single-flight queue), so
+  // it lands one queue-slot behind the in-flight checkpoint — drain
+  // deterministically instead of racing the log read.
+  for (let i = 0; i < 200 && !fs.log.some(l => l.includes('trust/signer-unavailable')); i++) {
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  // The degradation itself is a chain fact, with the reason attached.
+  assert.ok(fs.log.some(l => l.includes('trust/signer-unavailable')), 'degradation marker in the evidence log')
+  assert.ok(fs.log.some(l => l.includes('trust keys dir is not writable')), 'marker carries the failure reason')
+  assert.ok(warnings.some(l => l.includes('signer unavailable')), 'verbose channel warned')
+  // Unsigned — but honestly so, and the chain still audits clean.
+  const audit = await engine.audit()
+  assert.equal(audit.chain.mode, 'unsigned')
+  assert.equal(audit.ok, true, `chain broke: ${JSON.stringify(audit.chain)}`)
+  assert.equal((await engine.baseline())?.baselineId, baseline.baselineId)
+})
+
+// -- E3: git invisibility forces the full check set ------------------------------
+
+test('E3 (port contract): FakeWorkspace.gitAvailableValue models absent, true and false', async () => {
+  const ws = new FakeWorkspace(ROOT)
+  assert.equal(typeof ws.gitAvailable, 'function', 'default: capability present, git available')
+  assert.equal(await ws.gitAvailable?.(), true)
+  ws.gitAvailableValue = false
+  assert.equal(await ws.gitAvailable?.(), false)
+  ws.gitAvailableValue = null
+  assert.equal(ws.gitAvailable, undefined, 'null removes the method entirely, like a port that never had it')
+})
+
+test('E3: git unavailable forces the full check set even for a narrow change', async () => {
+  const fs = MemoryFs.of(project())
+  const ws = new FakeWorkspace(ROOT)
+  ws.gitAvailableValue = false
+  const engine = new ProofEngine({
+    root: ROOT,
+    fs,
+    commands: new FakeCommands(),
+    workspace: ws,
+    clock: new FakeClock(),
+    impactGraphLimit: 1_000,
+  })
+  await engine.establishBaseline()
+  // src/a.ts was clean at baseline; now it moves.
+  fs.mutate(`${ROOT}/src/a.ts`, 'export const a = 2\n')
+  const outcome = await engine.verify({ changed: ['src/a.ts'] })
+  assert.equal(outcome.selection.forcedAll, true, 'a git-less change set must not narrow the run')
+  assert.equal(outcome.selection.precision, 'forced')
+  assert.equal(outcome.selection.affected.length, 2, 'every discovered check is selected')
+  assert.equal(outcome.selection.untouched.length, 0)
+  assert.equal(outcome.degraded, true, 'degradation is surfaced on the outcome')
+  assert.equal(outcome.report.grade, 'proven', 'the forced run itself still grades normally')
 })

@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { WorkspaceWatch, driftNarrative } from '../src/dsh/observe.ts'
+import { WorkspaceWatch, driftNarrative, toWorkspaceRelative } from '../src/dsh/observe.ts'
 import { MemoryFs } from './helpers.ts'
 
 const ROOT = '/ws'
@@ -85,6 +85,33 @@ test('an absolute path outside the workspace is ignored', async () => {
   assert.deepEqual(result.drifted, [])
 })
 
+test('windows drive-letter absolute paths are recognised and land in touched', async () => {
+  const fs = MemoryFs.of({ 'C:/ws/src/a.ts': 'v1\n' })
+  const watch = new WorkspaceWatch(fs, 'C:/ws')
+
+  await watch.observe(exec('write', { path: 'C:\\ws\\src\\a.ts', content: 'v2\n' }), OK)
+  assert.deepEqual(watch.touchedPaths(), ['src/a.ts'], 'a real agent edit must not be misattributed as external drift')
+  assert.deepEqual(watch.sessionTouchedPaths(), ['src/a.ts'])
+})
+
+test('drive-letter case does not defeat root matching', async () => {
+  const fs = MemoryFs.of({ 'c:/ws/src/a.ts': 'v1\n' })
+  const watch = new WorkspaceWatch(fs, 'c:/ws')
+
+  await watch.observe(exec('write', { path: 'C:/ws/src/a.ts', content: 'v2\n' }), OK)
+  assert.deepEqual(watch.sessionTouchedPaths(), ['src/a.ts'], 'the host says c:/ws, the tool says C:/ws — same workspace')
+})
+
+test('a drive-letter path outside the workspace root is ignored', async () => {
+  const fs = MemoryFs.of({ 'C:/ws/src/a.ts': 'v1\n' })
+  const watch = new WorkspaceWatch(fs, 'C:/ws')
+
+  await watch.observe(exec('write', { path: 'D:/elsewhere/src/a.ts', content: 'v2\n' }), OK)
+  assert.deepEqual(watch.touchedPaths(), [])
+  await watch.observe(exec('write', { path: 'C:/other/src/a.ts', content: 'v2\n' }), OK)
+  assert.deepEqual(watch.touchedPaths(), [], 'same drive, different directory: still outside the root')
+})
+
 test('windowStart clears the touched set without losing fingerprints', async () => {
   const fs = MemoryFs.of({ [`${ROOT}/src/a.ts`]: 'v1\n' })
   const watch = new WorkspaceWatch(fs, ROOT)
@@ -94,6 +121,15 @@ test('windowStart clears the touched set without losing fingerprints', async () 
   // The next external edit must still be detected.
   fs.mutate(`${ROOT}/src/a.ts`, 'v2\n')
   assert.deepEqual((await watch.detectDrift()).drifted, ['src/a.ts'])
+})
+
+test('toWorkspaceRelative is the one path discipline for every flavour of input', () => {
+  assert.equal(toWorkspaceRelative('/ws/src/a.ts', '/ws'), 'src/a.ts')
+  assert.equal(toWorkspaceRelative('C:\\ws\\src\\a.ts', 'C:/ws'), 'src/a.ts', 'backslashes and slashes describe the same file')
+  assert.equal(toWorkspaceRelative('C:/ws/src/a.ts', 'c:/ws/'), 'src/a.ts', 'drive case and trailing slash are not distinctions')
+  assert.equal(toWorkspaceRelative('C:/elsewhere/a.ts', 'C:/ws'), undefined, 'absolute but outside the root')
+  assert.equal(toWorkspaceRelative('/etc/passwd', 'C:/ws'), undefined, 'a POSIX path is never inside a drive root')
+  assert.equal(toWorkspaceRelative('./src/a.ts', '/ws'), 'src/a.ts')
 })
 
 test('driftNarrative is silent when nothing drifted', () => {

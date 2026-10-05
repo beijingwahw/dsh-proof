@@ -8,11 +8,12 @@ on:
 
 jobs:
   verify:
-    name: typecheck + test (Node ${{ matrix.node }})
-    runs-on: ubuntu-latest
+    name: typecheck + test (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         node: ['22.19.0', '24']
     steps:
       - uses: actions/checkout@v4
@@ -22,7 +23,7 @@ jobs:
           node-version: ${{ matrix.node }}
 
       - name: Install
-        run: npm install --no-audit --no-fund
+        run: npm ci
 
       - name: Typecheck
         run: npm run typecheck
@@ -45,7 +46,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22.19.0'
-      - run: npm install --no-audit --no-fund
+      - run: npm ci
       - run: npm run build
       - name: Pack must ship the bundle layer
         run: |
