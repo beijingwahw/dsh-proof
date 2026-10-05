@@ -97,12 +97,12 @@ DSH 生态已超过 5000 个插件、14 个分类。但把分类摊开看，缺�
 
 ### 附加：工作区漂移检测
 
-工具流之外的文件改动（IDE 编辑、构建产物、后台进程）会被指纹比对抓到，注入纠正性上下文：
+工具流之外的文件改动（IDE 编辑、构建产物、后台进程）会被指纹比对抓到，注入纠正性上下文（注入文案为英文，以下逐字引自 `observe.ts` 的 `driftNarrative`）：
 
 ```
-⚠️ 你已经读过的文件在你的工具调用之外被改动了。你上下文里的副本已过期：
+⚠️ Files you already read have changed outside your tool calls. Your in-context copies are stale:
   · src/auth/redirect.ts
-重新读取后再依赖它们，然后重新运行 proof_verify。
+Re-read these before relying on them, then re-run proof_verify.
 ```
 
 ---
@@ -215,6 +215,26 @@ v0.6 在 `normalizeOutput` 落地双层归一：**root → `$WORKSPACE`（先具
 
 **正确性收口（soundness closure）**。monorepo workspace 子包检查不再丢失：CheckSpec 新增 `cwd`（相对 root），子包检查真正在子包目录执行、id 含 cwd（cwd 缺省时 checkId 与旧格式逐字节一致），`packages/*` 单层 glob 现在真正展开——同 argv 的兄弟包检查不再互相顶替。影响图补盲：动态 `import('...')` 与多行 ESM import 现在产生边；Python dotted import（`pkg.mod`）在扫描集内尝试解析——多出的边只造成过选，绝不漏选。`git status --porcelain -z` 的 rename 条目解析修正（旧路径曾被截掉 3 个字符成为幻影路径；解析提为纯函数 `parsePorcelainZ`）。Windows 盘符绝对路径（`C:\...`）统一进路径域：observe 的 touched 归类、LSP root 前缀比较（大小写不敏感）、证据库守卫均修正。EvidenceStore 写入改单飞队列——并发的 append/mark/checkpoint 曾可能都链到同一个 tail，后一条的 `prev` 指向一条已不存在的行：**正确代码与它自己的竞态**。证据输出捕获改用 StringDecoder，多字节字符跨 chunk 边界不再碎成 U+FFFD。工程卫生：CI 改 `npm ci` 并加 windows 矩阵；`check-bundle` 错误路径不再崩溃；`untouchedChecks` 输出修正。
 
+## 五·十一、完备性闭合（v0.8.0）：账目对得上，事实守得住
+
+v0.7 关掉的是「未知冒充通过」的路径；v0.8 关掉的是另一类失真——**账目与事实本身**：摘录账面记不齐、日志经不起崩溃与重启、适配层把事实译错。五个方向，每一条都对应一个曾经真实存在的错误行为。
+
+**摘录账目真话（excerpt.ts）**。v0.5 的 balanced 摘录声称"硬夹逼保证永不超预算"，但预算只约束内容、不约束省略 marker——账面可能超支。v0.8 把预算不变量升级为 **`text` 总长（含 marker 与连接换行）≤ budget**，且对两种策略统一成立（`head` 是恰为 budget 的逐字切片，消费者无需知道策略就能信赖 `text.length <= budget`）。账目侧新增 `keptOriginalChars` 字段（`text` 中来自原文的精确字符数），闭合不变量 `omittedChars + keptOriginalChars === normalized.length` 严格成立——marker 会虚增 `text` 长度，所以对账永远对 `keptOriginalChars`，不要对 `text.length`；marker 打印的也永远是最终省略数，不是截断前的估计。显著失败行**永不被截半**：装配超出预算时按「尾窗最早行 → 头窗尾部 → 退化 head 语义」的顺序牺牲，`truncated` 保持为真使损失可见。单巨行场景头窗与尾窗双重计数（同一段字符账面记两遍）的隐藏 bug 一并修复。
+
+**存储完备性（evidence / checks / hash）**。五件曾经"守不住事实"的事：
+
+1. **跨进程证据去重**：append 幂等曾只在进程内成立——进程重启后重放同一条证据会真的再落一行盘。现在首次变更日志时做一次全量扫描，把每个已在链上的地址重建入去重缓存，同一地址的 append 跨进程也是真 no-op。
+2. **半行崩溃自动恢复**：进程在写最后一行中途死掉会留下一条"有前缀、没有闭括号"的撕裂行——下一次启动曾永远把它当 corrupt 报。现在启动扫描发现**尾行**撕裂即原子重写去掉残行，并把修复本身作为 marker `log/recovered-partial-tail` 落链（后续行仍链向新尾）。**中间**行的 corrupt 不恢复：对手重写的是完整行，撕裂是崩溃的物理签名——那是篡改，审计继续报。
+3. **config 与自动发现同命令去重**：显式配置与自动发现命中同一命令时不再跑两遍，显式配置优先。
+4. **canonicalJson 环检测**：循环引用以清晰的 `TypeError` 报错（此前是栈溢出）。
+5. **盘符大小写漂移归一**：`c:\ws\...` 与 `C:/ws` 折叠进 `$WORKSPACE`（Windows 盘符大小写不敏感，工具经常吐出另一种形态）；反斜杠 root 保持历史行为，存量 digest 稳定。
+
+**Node 适配层保真二期（node-ports）**。`npm` / `pnpm` / `yarn` 在 Windows 上是 `.cmd` 垫片，Node 的 spawn 拒绝执行——**pnpm 曾因此在 Windows 上无法作为检查命令**。解法不是开 shell（那是本端口拒绝打开的注入面），而是**解析**垫片：npm 生成的 `.cmd` 遵循稳定模板，解析出目标脚本后直接 `spawn(node, [script])`——无 shell、无注入面；非标准垫片给清晰的 spawnError 而不是乱码。`CommandResult` 新增 `killedBySignal`：被外部信号击杀是事实，此前该事实被吞；win32 下恒缺省——Windows 不跨进程传播信号，诚实地说"不知道"而不是编一个。并发写临时文件名唯一化 + rename 重试（Windows EPERM 竞争：杀毒/索引器短暂锁文件不再丢数据）。
+
+**执行与判定收口（runner / report / engine）**。被外部信号杀死的检查记为 `error` 并在记录中注明信号——此前信号死亡被吞成无退出码、再被误判成 `timeout`，两种死因混为一谈，预算与超时归因全部失真。forcedAll 的选择构造曾在三处重复，收敛为单一函数 `forcedSelection`。runner 首次获得直接单测（`test/15-runner`）：并发 clamp、预算 skip、abort 传播、乱序完成重排、killedBySignal 判定、spawnError、excerpt 贯通——此前这个并发调度核心只被集成测试间接覆盖。
+
+**适配层诚实二期（index / observe）**。启动即探测磁盘基线——首轮 prompt 曾说"尚无基线"的谎（基线可能上一会话就建好了，只是还没读盘）；现在第一句话就是真话。turn-stopping 的等待观察器落盘：等待中的观察器在回合结束曾不落盘，drift 检测下一轮读到的是旧状态。mutation 分类收敛为单一事实源（分类规则移入 observe.ts）：**未知工具默认按 mutation 记**——宁可保守记在 agent 头上，也不把改动漏成 external。`pathsIn` 移除 `'source'` 内容键：`source` 是"代码片段内容"的常见参数名而非路径，带该键的编辑工具曾把整段代码文本混进 touched 集合，把不属于本会话的文件错怪给 agent。
+
 ---
 
 ## 六、架构：领域核心 + 薄适配层
@@ -247,7 +267,7 @@ dsh-proof/
 │   │   ├── prompt.ts         # proof:policy 段落
 │   │   └── lsp-impact.ts     # 宿主 LSP → DefinitionResolverPort 适配
 │   └── vendor/dsh-tools.ts   # 契约快照（pinned to dsh v0.2.1-alpha.1）
-├── test/                     # 14 个测试文件（159 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层
+├── test/                     # 15 个测试文件（195 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测
 ├── cordis.patch.yml          # bundle 层
 └── examples/cordis.yml       # --patch 本地调试
 ```
@@ -255,7 +275,7 @@ dsh-proof/
 **为什么领域核心不碰 `@deepseek-ai/*`：**
 
 1. DSH 是开发者预览版，破坏性变更频繁。核心逻辑与 harness 版本解耦 → 升级不重写。
-2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，159 个测试全绿。
+2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，195 个测试全绿。
 3. 同一个核心可以被别的宿主（CLI、CI、其他 harness）复用。
 
 **为什么 `vendor/dsh-tools.ts` 是契约快照而不是活依赖：**
@@ -273,6 +293,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 | **内容锚定变更集 + 来源归因**（v0.3） | 基线快照携带脏文件内容摘要；变更 = 与快照的字节差异；工具触达集区分 agent/external | 陈旧脏区不再冤枉会话；用户 IDE 手改不再记在智能体头上；「还原也是变更」也能抓到 |
 | **LSP 双源影响融合**（v0.4） | `goToDefinition` 放在导入说明符上：验证近似边 + 发现别名导入盲区；并集语义；缓存 + 预算 | 精度提升不牺牲覆盖；monorepo 别名断链不再漏判；降级显式可见 |
 | **诚实性加固**（v0.7） | 判定知识格三值化（`indeterminate`）；签名裁定三态（可驳斥 / 不可裁定 / 未签名）；git 不可用 → `degraded` + 强制全量；abort 基线不落盘；日志写入单飞队列 | 未知永不冒充通过：skipped 不再算通过、能力缺失不再误判伪造、并发写不再断链、半成品真值不再锚定后续判定 |
+| **完备性闭合**（v0.8） | 摘录预算约束 `text` 本身（含 marker），`keptOriginalChars` 账目闭合；append 跨进程幂等 + 尾行撕裂自愈（`log/recovered-partial-tail`）；Windows `.cmd` 垫片解析直 spawn node；`killedBySignal` 死因事实；临时名唯一化 + rename 重试 | 账目对得上（省略数可复算）、事实守得住（崩溃与重启不再留残行/重复行）、死因不再被译错（信号≠超时） |
 | **反向依赖闭包** | import 图 + 传染式 BFS | 增量验证，省时间也省 token |
 | **基线差分回归归因** | `baseline ∘ delta = proof` | 区分「本来就坏」与「被你改坏」 |
 | **接口 / 实现 / 消费者分层** | 领域核心零框架依赖 | 可测、可复用、抗上游抖动 |
@@ -343,7 +364,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit，离线可跑
-npm test              # 159 个测试（node:test）
+npm test              # 195 个测试（node:test）
 npm run build         # 产出 lib/
 npm run bundle:check  # 打包契约自检
 ```
@@ -360,7 +381,8 @@ npm run bundle:check  # 打包契约自检
 - `11` —— **LSP 影响融合**：goToDefinition 验证近似边、别名导入盲区发现、缓存与预算、降级不缩窄
 - `12` —— **智能摘录**：显著失败行优先、整行尾窗、省略记账、（文本， 配置）纯函数确定性
 - `13` —— **位置无关寻址**：跨机器 / 跨检出目录 / 跨用户名同址、`$HOME` 隐私、Windows 双斜杠形态
-- `14` —— **Node 适配层**：`porcelain -z` 解析（rename/copy 双端、幻影路径）、git 能力探测、多字节 UTF-8 跨 chunk 捕获
+- `14` —— **Node 适配层**：`porcelain -z` 解析（rename/copy 双端、幻影路径）、git 能力探测、多字节 UTF-8 跨 chunk 捕获、Windows `.cmd` 垫片解析（真实 npm 模板、非标准垫片清晰报错）、`killedBySignal`、并发写唯一临时名 + rename 重试
+- `15` —— **runner 直测**：并发 clamp、验证预算 skip、abort 传播、乱序完成重排、`killedBySignal` 判定（信号 ≠ 超时）、spawnError、excerpt 贯通
 
 本地调试：
 
@@ -375,8 +397,11 @@ pnpm dsh web --patch /absolute/path/to/dsh-proof/examples/cordis.yml
 
 - **检查发现是启发式的。** 复杂 monorepo、自定义构建系统、Bazel/Nx/Turborepo 编排请用 `checks` 显式配置，并给出 `paths`，增量验证才会精确。
 - **依赖图是近似的。** 动态 `import()`、多行 ESM import 与 Python dotted import 已在 v0.7 纳入解析；反射与运行时字符串拼接的路径仍然无法解析。近似**偏向过覆盖**（多跑一次，绝不漏判）。
+- **摘录是记账的省略，不是无损摘要（v0.8）。** 预算约束的是 `text` 总长——省略 marker 与连接换行同样计入；对账字段是 `keptOriginalChars`（`omittedChars + keptOriginalChars === normalized.length` 严格闭合），不要用 `text.length` 对账（marker 会虚增它）。`head` 策略是恰为 budget 的逐字切片，同样满足 `text.length <= budget`。
 - **检查点存在窗口期（v0.2）。** 最后一个签名检查点之后的记录受哈希链保护但不受检查点保护；窗口由 `checkpointEvery` 界定，且每次基线/验证/断言边界都会闭合它。窗口内截删不再是不可见的：`proof_status` 的 `tailRecords` 直接暴露最后一个检查点之后还有多少条记录。删除锚点文件可以造成「回滚不可检测」——锚点因此放在智能体沙箱之外；若整台主机被攻陷，本插件的威胁模型不适用。
+- **半行恢复只修尾行撕裂（v0.8）。** 启动时只把「有前缀、没有闭括号」的**最后一条**残行原子重写掉（并落 `log/recovered-partial-tail` marker）；完整行的损坏不恢复、不改写——那可能是篡改，审计继续报。崩溃恢复与篡改检测的界线就在这里：撕裂是崩溃的物理签名，整行重写不是。
 - **签名密钥的边界。** 密钥防的是「被审计的智能体」，不是「能读宿主文件的人」；主机被完全攻陷时一切本地信任机制都失效。在**没有 signer 的机器**上（密钥丢失、换机器审计），带签名的检查点无法本地裁定——审计报告为 `unverifiableCheckpoints`：这是**能力缺失，不是伪造指控**，audit 不会因此失败；rewind 覆盖也不依赖密钥（锚的 count/head 比较仍然约束日志）。
+- **`killedBySignal` 的平台边界（v0.8）。** 该字段只在子进程能如实报告信号死因的平台上出现；win32 下恒缺省——Windows 不跨进程传播信号。信号死亡在本插件记 `error` 并注明信号（不再误判为超时），但 Windows 上外部击杀只能表现为退出码/错误，插件不会编造一个信号名。
 - **`proven` 允许存在预置红灯。** 一个本来就红的仓库不该让 Agent 无法工作。预置失败会在报告里显著列出，但不计入本次会话的责任。这是刻意设计，不是漏洞。
 - **它不替代测试本身。** `dsh-proof` 编排并归因你已有的客观检查；它不生成测试用例。
 - **DSH 是 v0.1/0.2 开发者预览版。** 插件契约会变。本插件已把依赖面最小化并钉死契约快照（`src/vendor/dsh-tools.ts`），但上游变更时仍需重新对齐。

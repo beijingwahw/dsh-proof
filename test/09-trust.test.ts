@@ -216,6 +216,79 @@ test('a failed write does not deadlock the queue behind it', async () => {
   assert.deepEqual(audit.chain.breaks, [])
 })
 
+test('append idempotency survives a restart: existing addresses are re-indexed from the log', async () => {
+  const fs = MemoryFs.of({})
+  const first = new EvidenceStore(fs, LOG, BASE, new FakeClock())
+  const ev = evidence('c1')
+  await first.append(ev)
+
+  // A second instance over the same log stands for a restarted process: the
+  // in-memory cache is gone, but the one full scan the first mutation already
+  // does re-indexes every address on disk — replaying the same evidence is
+  // still a no-op, never a duplicate line.
+  const second = new EvidenceStore(fs, LOG, BASE, new FakeClock())
+  await second.append(ev)
+  assert.equal((await second.all()).length, 1)
+  const audit = await second.audit()
+  assert.equal(audit.total, 1)
+  assert.equal(audit.ok, true)
+})
+
+test('a torn tail line (crash mid-append) is recovered, and the repair is a fact on the chain', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1'))
+  await store.checkpoint()
+  assert.equal((await store.audit()).ok, true)
+
+  // Kill the writer mid-line: the physical end of the log is a JSON prefix.
+  const torn = '{"v":2,"kind":"evidence","at":"2026-10-05T00:00:00.000Z","prev":"deadbeef","payl'
+  const lines = await fs.readLines(LOG)
+  fs.mutate(LOG, `${lines.join('\n')}\n${torn}`)
+  assert.equal(
+    (await new EvidenceStore(fs, LOG, BASE, new FakeClock()).audit()).ok, false,
+    'before repair the torn tail fails audit (audit is read-only and must not self-heal)',
+  )
+
+  // A fresh store's first mutation triggers the recovery inside the queue.
+  const revived = trustedStore(fs).store
+  await revived.append(evidence('c2'))
+
+  const audit = await revived.audit()
+  assert.equal(audit.ok, true, 'recovery must leave a clean, unbroken chain')
+  assert.equal(audit.total, 2, 'the torn line was never a complete evidence record')
+  assert.deepEqual(audit.corrupt, [])
+  assert.deepEqual(audit.chain.breaks, [])
+
+  const markers = (await fs.readLines(LOG))
+    .map(line => JSON.parse(line) as { kind?: string; payload?: { label?: string; droppedChars?: number } })
+    .filter(e => e.kind === 'marker' && e.payload?.label === 'log/recovered-partial-tail')
+  assert.equal(markers.length, 1, 'the repair itself is recorded on the chain')
+  assert.equal(markers[0]?.payload?.droppedChars, torn.length)
+})
+
+test('a corrupt line mid-log is never "recovered" — tampering stays visible', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1'))
+  await store.append(evidence('c2'))
+
+  // Damage that is NOT the crash signature: garbage between two intact lines.
+  const lines = await fs.readLines(LOG)
+  lines.splice(1, 0, 'this is not json')
+  fs.mutate(LOG, `${lines.join('\n')}\n`)
+
+  const revived = trustedStore(fs).store
+  await revived.append(evidence('c3'))
+
+  const logNow = await fs.readLines(LOG)
+  assert.ok(logNow.includes('this is not json'), 'recovery is reserved for torn TAILS; mid-log lines are left in place')
+  assert.equal(logNow.filter(l => l.includes('log/recovered-partial-tail')).length, 0)
+  const audit = await revived.audit()
+  assert.equal(audit.ok, false, 'mid-log corruption must keep failing audit')
+  assert.ok(audit.chain.breaks.length > 0, 'the line after the garbage no longer chains')
+})
+
 test('signed chain audited without the key is UNVERIFIABLE, not forged', async () => {
   const fs = MemoryFs.of({})
   const { store } = trustedStore(fs)

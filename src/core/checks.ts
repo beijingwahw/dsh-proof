@@ -343,9 +343,24 @@ function parseMakeTargets(makefile: string): string[] {
   return [...new Set(targets)]
 }
 
+/**
+ * One invocation, one check. Deduping by id alone is not enough: ids embed
+ * the discovery source, so a user-configured check and an auto-discovered
+ * check running the *same command in the same directory* mint two ids for
+ * one script — which the runner would then execute twice. The key here is
+ * behavioural: `(command, cwd)`. Config entries are pushed before discovery,
+ * so first-wins means explicit user intent overrides machine inference;
+ * same-invocation discoveries are dropped, while different commands and
+ * different cwds (monorepo siblings sharing argv) are untouched. (Identity
+ * dedupe comes free: specs with the same id share source, command and cwd,
+ * hence the same key.)
+ */
 function dedupe(specs: CheckSpec[]): CheckSpec[] {
   const seen = new Map<string, CheckSpec>()
-  for (const spec of specs) if (!seen.has(spec.id)) seen.set(spec.id, spec)
+  for (const spec of specs) {
+    const key = `${spec.command.join('\u0000')}\u0000${spec.cwd ?? ''}`
+    if (!seen.has(key)) seen.set(key, spec)
+  }
   return [...seen.values()]
 }
 

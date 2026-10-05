@@ -192,6 +192,36 @@ export interface SelectionResult {
 }
 
 /**
+ * The forced selection: every check affected, nothing untouched, precision
+ * `forced`. Single source of truth for this shape — it is what
+ * `selectAffectedChecks` returns on a global invalidator, and what the engine
+ * (`verify` with `all`/degraded git facts) and the report (`forceAll`) reach
+ * for when impact analysis is deliberately bypassed. Before this constructor
+ * existed the same literal lived in three modules and had already begun to
+ * drift; one factory keeps them byte-identical.
+ *
+ * `closure` is NOT an impact closure here — no graph was consulted (or none
+ * was allowed to narrow the run). It carries the change set the forced
+ * decision was made on, so reports and attribution still name the files that
+ * triggered the full sweep. `uncertain` is `false` for the same reason: the
+ * selection does not depend on graph coverage, so graph coverage cannot make
+ * it uncertain; `precision: 'forced'` states exactly which regime produced it.
+ */
+export function forcedSelection(
+  specs: readonly CheckSpec[],
+  changed: readonly RelPath[],
+): SelectionResult {
+  return {
+    affected: [...specs],
+    untouched: [],
+    forcedAll: true,
+    closure: [...changed],
+    uncertain: false,
+    precision: 'forced',
+  }
+}
+
+/**
  * Select the checks a change set makes stale. Conservative by construction:
  * uncertainty (unknown file types, truncated graphs, missing path filters)
  * widens the selection rather than narrowing it.
@@ -208,7 +238,7 @@ export function selectAffectedChecks(
   const precision: SelectionPrecision = graph === undefined ? 'approximate' : graph.precision
 
   if (forcedAll) {
-    return { affected: [...checks], untouched: [], forcedAll, closure, uncertain, precision }
+    return forcedSelection(checks, closure)
   }
 
   const affected: CheckSpec[] = []

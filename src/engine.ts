@@ -24,6 +24,9 @@ import {
   assembleProof, buildDependencyGraph, discoverChecks, resolveChangeSet,
   selectAffectedChecks, sha256, snapshotWorkspace,
 } from './core/index.ts'
+// core/index.ts re-exports the stable surface; `forcedSelection` is consumed
+// here straight from its module (the core barrel is not this batch's to edit).
+import { forcedSelection } from './core/impact.ts'
 import type { AuditReport } from './core/evidence.ts'
 import type { AttributedCheck } from './core/regression.ts'
 import type { CheckConfigEntry, DiscoverOptions } from './core/checks.ts'
@@ -391,13 +394,15 @@ export class ProofEngine {
     // just structural.
     const degraded = resolutionDegraded(attribution) || await this.gitFactsUnavailable()
     const forceAll = options.all === true || degraded
-    // NOTE (E5, deliberate duplication): assembleProof recomputes its own
-    // internal selection from the same inputs — the report owns that
-    // projection. Deduplicating would mean threading a precomputed selection
-    // through AssembleInput (core surface, out of this module's hands), so the
-    // extra call here stays: it is what feeds VerifyOutcome.selection.
+    // NOTE (E5): assembleProof recomputes its own internal selection from the
+    // same inputs — the report owns that projection, and deduplicating would
+    // mean threading a precomputed selection through AssembleInput (core
+    // surface, out of this module's hands). The extra call here stays: it is
+    // what feeds VerifyOutcome.selection. The two paths cannot drift apart on
+    // the forced branch, though: both construct it through the single
+    // `forcedSelection` factory (core/impact.ts).
     const selection = forceAll
-      ? { affected: specs, untouched: [], forcedAll: true, closure: changed, uncertain: false, precision: 'forced' as const }
+      ? forcedSelection(specs, changed)
       : selectAffectedChecks(specs, changed, graph)
 
     const batch = await this.runner.run(selection.affected, {

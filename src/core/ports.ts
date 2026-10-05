@@ -22,6 +22,15 @@ export interface CommandResult {
   readonly aborted: boolean
   /** Set when the command could not even be started. */
   readonly spawnError?: string
+  /**
+   * Signal name (e.g. 'SIGTERM') when the process was terminated by an
+   * external signal — one that did not come from this port's own abort or
+   * timeout handling. `exitCode === null` with `aborted === false` alone
+   * cannot distinguish an external kill from a timeout; this field can.
+   * Platforms that do not propagate signals across processes (Windows) leave
+   * it unset rather than inventing one.
+   */
+  readonly killedBySignal?: string
 }
 
 /** Runs an argv vector to completion. Implementations must honour `signal`. */

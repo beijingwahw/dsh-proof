@@ -44,6 +44,27 @@ test('explicit checks always win and exclusive disables discovery', async () => 
   assert.equal(exclusive[0]?.label, 'custom')
 })
 
+test('config and discovery of the same invocation collapse: config wins, different commands coexist', async () => {
+  const fs = MemoryFs.of({
+    '/ws/package.json': JSON.stringify({ scripts: { test: 'vitest run', build: 'tsc -b' } }),
+  })
+  const checks = await discoverChecks(fs, '/ws', {
+    checks: [{ label: 'my tests', command: 'npm run --silent test' }],
+  })
+  // `npm run --silent test` is both configured and discoverable; ids differ
+  // (source is part of the material) but the script is one invocation — it
+  // must surface exactly once, as the config entry (user intent overrides
+  // machine inference), while unrelated commands keep their discovery.
+  const same = checks.filter(c => c.command.join(' ') === 'npm run --silent test')
+  assert.equal(same.length, 1, `one invocation must mean one check, got ${JSON.stringify(checks.map(c => c.label))}`)
+  assert.equal(same[0]?.source, 'config')
+  assert.equal(same[0]?.label, 'my tests')
+  assert.ok(
+    checks.some(c => c.source === 'package.json' && c.label === 'npm script "build"'),
+    'commands the config does not cover are unaffected',
+  )
+})
+
 test('discovers python, go, rust and make checks', async () => {
   const fs = MemoryFs.of({
     '/ws/pyproject.toml': '[tool.pytest.ini_options]\n[tool.mypy]\n[tool.ruff]\n',

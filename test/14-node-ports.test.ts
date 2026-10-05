@@ -11,21 +11,40 @@
  *   D3  An already-aborted signal must prevent the spawn entirely.
  * plus the env-merge contract (D4) and real-git integration for the
  * changedSince/untracked `-z` parsing (D7).
+ *
+ * Node adapter fidelity round 2:
+ *   R1  npm-style `.cmd` shims are PARSED (never shelled) so a user-configured
+ *       `pnpm test` argv vector actually runs on Windows; anything non-standard
+ *       degrades to the clean spawnError, not mojibake.
+ *   R2  `CommandResult.killedBySignal` carries external signal deaths to the
+ *       port boundary (Windows cannot propagate signals — asserted as such).
+ *   R3  concurrent writeFile temp names no longer collide within one process.
  */
 
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { promises as fsp } from 'node:fs'
+import { existsSync, promises as fsp } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 
-import { GitWorkspace, NodeCommandPort, parsePorcelainZ } from '../src/node-ports.ts'
+import { GitWorkspace, NodeCommandPort, NodeFsPort, parsePorcelainZ, resolveCmdShim } from '../src/node-ports.ts'
 import type { CommandPort, CommandResult } from '../src/core/ports.ts'
 
-// <workspace>/.openclaw/tmp/... — the designated scratch area.
+// <workspace>/.openclaw/tmp/... — the designated scratch area (one level
+// ABOVE the repo: the workspace root, not the checkout).
 const WORKSPACE = fileURLToPath(new URL('../../', import.meta.url))
+const REPO = fileURLToPath(new URL('../', import.meta.url))
 const SCRATCH = join(WORKSPACE, '.openclaw', 'tmp')
 const GIT_ROOT = join(SCRATCH, `node-ports-git-${process.pid}`)
+
+// .cmd shim fixtures (R1): npm-template shims in a fake PATH directory, with
+// their target OUTSIDE that directory — the `..\pkg\target` shape real
+// node_modules layouts produce.
+const SHIM_ROOT = join(SCRATCH, `node-ports-shim-${process.pid}`)
+const SHIM_BIN = join(SHIM_ROOT, 'bin')
+const SHIM_TARGET_DIR = join(SHIM_ROOT, 'target')
+const SHIM_ENTRY = join(SHIM_TARGET_DIR, 'entry.js')
+const ATOMIC_DIR = join(SCRATCH, `node-ports-atomic-${process.pid}`)
 
 const commands = new NodeCommandPort()
 
@@ -33,6 +52,40 @@ async function git(...args: string[]): Promise<CommandResult> {
   return commands.run(['git', ...args], {
     cwd: GIT_ROOT, timeoutMs: 20_000, signal: AbortSignal.timeout(20_000),
   })
+}
+
+/** Byte-faithful copy of the npm cmd-shim template (cf. node_modules/.bin/tsc.cmd). */
+function npmStyleCmd(targetRel: string): string {
+  return [
+    '@ECHO off',
+    'GOTO start',
+    ':find_dp0',
+    'SET dp0=%~dp0',
+    'EXIT /b',
+    ':start',
+    'SETLOCAL',
+    'CALL :find_dp0',
+    '',
+    'IF EXIST "%dp0%\\node.exe" (',
+    '  SET "_prog=%dp0%\\node.exe"',
+    ') ELSE (',
+    '  SET "_prog=node"',
+    '  SET PATHEXT=%PATHEXT:;.JS;=;%',
+    ')',
+    '',
+    `endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\${targetRel}" %*`,
+    '',
+  ].join('\r\n')
+}
+
+/**
+ * PATH overlay naming the REAL key Windows handed us ('Path' as often as
+ * 'PATH'): a differently-cased duplicate would leave two PATH entries in the
+ * child env and make the winner undefined.
+ */
+function envWithShimBin(): Record<string, string> {
+  const pathKey = Object.keys(process.env).find((k) => k.toUpperCase() === 'PATH') ?? 'PATH'
+  return { [pathKey]: `${SHIM_BIN};${process.env[pathKey] ?? ''}` }
 }
 
 before(async () => {
@@ -60,10 +113,19 @@ before(async () => {
   await fsp.writeFile(join(GIT_ROOT, 'untracked.ts'), 'untracked\n')
   await fsp.mkdir(join(GIT_ROOT, 'sub'))
   await fsp.writeFile(join(GIT_ROOT, 'sub', 'new.ts'), 'nested\n')
+
+  // R1 fixtures: the fake entry echoes its forwarded argv so the test can
+  // prove args (including ones with spaces) ride along the rewrite.
+  await fsp.mkdir(SHIM_BIN, { recursive: true })
+  await fsp.mkdir(SHIM_TARGET_DIR, { recursive: true })
+  await fsp.writeFile(SHIM_ENTRY, "process.stdout.write('shim-ok:' + process.argv.slice(2).join('|'))\n", 'utf8')
+  await fsp.writeFile(join(SHIM_BIN, 'dshfakeshim.cmd'), npmStyleCmd('..\\target\\entry.js'), 'utf8')
 })
 
 after(async () => {
   await fsp.rm(GIT_ROOT, { recursive: true, force: true })
+  await fsp.rm(SHIM_ROOT, { recursive: true, force: true })
+  await fsp.rm(ATOMIC_DIR, { recursive: true, force: true })
 })
 
 // -- parsePorcelainZ (pure, D1) ----------------------------------------------
@@ -254,4 +316,135 @@ test('GIT: gitAvailable demands "true" output, not just exit 0 (bare repos exit 
     run: async (): Promise<CommandResult> => ({ exitCode: 0, output: 'false\n', durationMs: 1, aborted: false }),
   }
   assert.equal(await new GitWorkspace('/ws', bare).gitAvailable(), false)
+})
+
+// -- .cmd shim parsing, no shell ever (R1) --------------------------------------
+
+test('CMD-SHIM: the real npm-generated tsc.cmd parses to node + typescript/bin/tsc', () => {
+  const shim = join(REPO, 'node_modules', '.bin', 'tsc.cmd')
+  assert.ok(existsSync(shim), `fixture missing: ${shim}`)
+  const resolution = resolveCmdShim(shim)
+  assert.ok(resolution !== undefined, 'the real npm template must parse')
+  assert.ok('script' in resolution, `expected a node+script resolution, got ${JSON.stringify(resolution)}`)
+  if (!('script' in resolution)) return
+  assert.equal(resolution.node, process.execPath, 'no node.exe lives next to the shim')
+  assert.equal(resolution.script, join(REPO, 'node_modules', 'typescript', 'bin', 'tsc').toLowerCase())
+})
+
+test('CMD-SHIM: the legacy two-branch template collapses to one target; ambiguity is refused', async () => {
+  const legacy = join(SHIM_BIN, 'legacy.cmd')
+  await fsp.writeFile(legacy, [
+    '@IF EXIST "%~dp0\\node.exe" (',
+    `  "%~dp0\\node.exe"  "%~dp0\\..\\target\\entry.js" %*`,
+    ') ELSE (',
+    `  node  "%~dp0\\..\\target\\entry.js" %*`,
+    ')',
+    '',
+  ].join('\r\n'), 'utf8')
+  const legacyResolution = resolveCmdShim(legacy)
+  assert.ok(legacyResolution !== undefined, 'both branches name the same target — that is one program')
+  assert.ok('script' in legacyResolution, `expected node+script, got ${JSON.stringify(legacyResolution)}`)
+  if ('script' in legacyResolution) {
+    assert.equal(legacyResolution.script, SHIM_ENTRY.toLowerCase())
+    assert.equal(legacyResolution.node, process.execPath)
+  }
+
+  // Two DIFFERENT targets: refuse outright, even though one is unreadable
+  // garbage — never pick a "most likely" branch.
+  const ambiguous = join(SHIM_BIN, 'ambiguous.cmd')
+  await fsp.writeFile(ambiguous, [
+    '@echo off',
+    `"%_prog%"  "%dp0%\\..\\target\\entry.js" %*`,
+    `node  "%~dp0\\..\\target\\other.js" %*`,
+    '',
+  ].join('\r\n'), 'utf8')
+  assert.equal(resolveCmdShim(ambiguous), undefined)
+})
+
+test('CMD-SHIM: a shim that directly invokes an .exe resolves to that exe', async () => {
+  const exeTarget = join(SHIM_TARGET_DIR, 'tool.exe')
+  await fsp.writeFile(exeTarget, '', 'utf8') // existence is all the resolver can vouch for
+  const shim = join(SHIM_BIN, 'direct-exe.cmd')
+  // npm's non-node tail: same template, but the invocation target IS the exe.
+  await fsp.writeFile(shim, [
+    '@ECHO off',
+    'GOTO start',
+    ':find_dp0',
+    'SET dp0=%~dp0',
+    'EXIT /b',
+    ':start',
+    'SETLOCAL',
+    'CALL :find_dp0',
+    '',
+    `endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%dp0%\\..\\target\\tool.exe" %*`,
+    '',
+  ].join('\r\n'), 'utf8')
+  assert.deepEqual(resolveCmdShim(shim), { exe: exeTarget.toLowerCase() })
+})
+
+test('NODE-PORTS: a user-configured .cmd shim command runs, no shell (R1)', async () => {
+  const result = await commands.run(['dshfakeshim', 'alpha', 'beta gamma'], {
+    cwd: SCRATCH, timeoutMs: 30_000, signal: AbortSignal.timeout(30_000), env: envWithShimBin(),
+  })
+  assert.equal(result.spawnError, undefined)
+  assert.equal(result.exitCode, 0, result.output.slice(0, 300))
+  // Args ride the rewrite verbatim — spaces included, no quoting games.
+  assert.equal(result.output, 'shim-ok:alpha|beta gamma')
+})
+
+test('NODE-PORTS: the same shim command without the PATH entry is a clean ENOENT spawnError', async () => {
+  const result = await commands.run(['dshfakeshim', 'x'], {
+    cwd: SCRATCH, timeoutMs: 15_000, signal: AbortSignal.timeout(15_000),
+  })
+  assert.equal(result.exitCode, null)
+  assert.equal(result.aborted, false)
+  assert.equal(result.spawnError, 'spawn failed: ENOENT')
+})
+
+test('NODE-PORTS: a non-standard .cmd shim degrades to a clean spawnError, never mojibake', async () => {
+  const shim = join(SHIM_BIN, 'dshweirdshim.cmd')
+  await fsp.writeFile(shim, '@echo off\r\npowershell -NoProfile -File "%~dp0\\weird.ps1" %*\r\n', 'utf8')
+  // A powershell tail is shell-only — the parser must refuse it, and the raw
+  // spawn of the bare name then fails ENOENT (probed on node 24.19/win32).
+  assert.equal(resolveCmdShim(shim), undefined)
+  const result = await commands.run(['dshweirdshim', 'x'], {
+    cwd: SCRATCH, timeoutMs: 15_000, signal: AbortSignal.timeout(15_000), env: envWithShimBin(),
+  })
+  assert.equal(result.exitCode, null)
+  assert.equal(result.spawnError, 'spawn failed: ENOENT')
+  assert.ok(/^[\x20-\x7E]+$/.test(result.spawnError ?? ''), 'spawnError must be clean printable ASCII')
+})
+
+// -- killedBySignal (R2) ---------------------------------------------------------
+
+test('NODE-PORTS: a child terminated by an external signal carries killedBySignal (R2)', async () => {
+  const result = await commands.run(
+    [process.execPath, '-e', "process.kill(process.pid, 'SIGTERM')"],
+    { cwd: WORKSPACE, timeoutMs: 15_000, signal: AbortSignal.timeout(15_000) },
+  )
+  assert.equal(result.aborted, false)
+  if (process.platform === 'win32') {
+    // Windows cannot propagate POSIX signals across processes: TerminateProcess
+    // surfaces as a plain exit code with no signal (probed: close(1, null)).
+    // The field must stay unset rather than invent a signal.
+    assert.equal(result.exitCode, 1)
+    assert.equal(result.killedBySignal, undefined)
+  } else {
+    assert.equal(result.exitCode, null)
+    assert.equal(result.killedBySignal, 'SIGTERM')
+  }
+})
+
+// -- concurrent writeFile temp names (R3) ----------------------------------------
+
+test('FS: 100 concurrent writeFile calls leave one intact winner and no temp residue (R3)', async () => {
+  const fs = new NodeFsPort()
+  const target = join(ATOMIC_DIR, 'anchor.json')
+  const payloads = Array.from({ length: 100 }, (_, i) => JSON.stringify({ writer: i, blob: 'x'.repeat(512) }))
+  await Promise.all(payloads.map((p) => fs.writeFile(target, p)))
+  const final = await fs.readFile(target)
+  assert.ok(final !== undefined && payloads.includes(final),
+    `final content is not any single writer's complete write: ${final?.slice(0, 80)}`)
+  const residue = (await fsp.readdir(ATOMIC_DIR)).filter((name) => name.endsWith('.tmp'))
+  assert.deepEqual(residue, [])
 })

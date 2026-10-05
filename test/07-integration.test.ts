@@ -129,5 +129,10 @@ test('INTEGRATION: the plugin never claims PROVEN on a workspace with no objecti
   })
   await eng.establishBaseline()
   const outcome = await eng.verify({ changed: ['README.md'] })
-  assert.notEqual(outcome.report.grade, 'proven', 'with nothing objective to run, the honest grade is not "proven"')
+  // Tightened from `notEqual('proven')`: with discovered === 0, decideGrade
+  // falls through has-baseline / no-regressions / no-unverified and lands on
+  // the explicit "nothing objective speaks for the claim" branch — the exact
+  // grade is `unproven`, not merely "anything but proven".
+  assert.equal(outcome.report.grade, 'unproven', 'with nothing objective to run, the honest grade is exactly unproven')
+  assert.equal(outcome.report.discovered, 0)
 })

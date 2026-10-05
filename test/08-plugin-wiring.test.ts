@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 
 import * as plugin from '../src/index.ts'
+import { WorkspaceWatch } from '../src/dsh/observe.ts'
 import { toBaselineValue, toClaimValue, toStatusValue, toVerifyValue } from '../src/dsh/tools.ts'
 import type { AuditReport, ProofGrade, ProofReport } from '../src/core/evidence.ts'
 import { Config } from '../src/config.ts'
@@ -181,6 +182,43 @@ test('workspace mode cannot be bypassed with absolute paths or dotted detours', 
   }
 })
 
+test('workspace mode gates moves whose source key carries the evidence log out', async () => {
+  const harness = makeHarness()
+  process.env.DSH_PROOF_ROOT = ROOT
+  try {
+    plugin.apply(harness.ctx, config({ evidenceStore: 'workspace', requireBaseline: 'off' }))
+  } finally {
+    delete process.env.DSH_PROOF_ROOT
+  }
+
+  const gate = harness.listeners.get('tools/pre-execute')![0] as (
+    exec: unknown, next: () => Promise<unknown>,
+  ) => Promise<{ kind: string; reason?: string }>
+
+  // `source` is excluded from the watcher's path keys (it usually carries
+  // content, not paths) — but the guard must still see it: moving the log OUT
+  // of the store through the source leg is exactly the exfiltration the gate
+  // exists for, and a false positive only costs one approval prompt.
+  const denied = await gate(
+    { name: 'move', arguments: { source: '.proof/evidence.jsonl', dest: 'exfil.jsonl' }, signal: new AbortController().signal },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(denied.kind, 'ask', 'a move sourcing the evidence log must ask even though the watcher ignores content keys')
+  assert.match(denied.reason ?? '', /evidence/i)
+
+  // The precise view is unchanged: a source holding plain content still
+  // contributes nothing to the watcher's path extraction.
+  assert.deepEqual(
+    WorkspaceWatch.pathsIn({ source: 'src/old/text' }),
+    [],
+    'content under source stays invisible to the watcher',
+  )
+  assert.ok(
+    WorkspaceWatch.pathsIn({ source: 'src/old/text' }, { contentKeys: true }).includes('src/old/text'),
+    'the guard view re-admits the content key',
+  )
+})
+
 test('apply registers exactly the four proof tools', () => {
   const harness = makeHarness()
   process.env.DSH_PROOF_ROOT = ROOT
@@ -345,6 +383,74 @@ test('apply + teardown leaves nothing behind', () => {
   }
   for (const dispose of harness.disposed) dispose()
   assert.ok(true, 'disposers ran without throwing')
+})
+
+// ---------------------------------------------------------------------------
+// Observation/turn-stop ordering (T2): the tools/result watcher is
+// fire-and-forget, but the turn can stop immediately behind the last tool
+// result — the stop hook must wait for the observation to land before it
+// enforces anything.
+// ---------------------------------------------------------------------------
+
+test('turn-stopping waits for a still-in-flight tools/result observation', async () => {
+  const harness = makeHarness()
+  process.env.DSH_PROOF_ROOT = ROOT
+  try {
+    plugin.apply(harness.ctx, config())
+  } finally {
+    delete process.env.DSH_PROOF_ROOT
+  }
+
+  const onResult = harness.listeners.get('tools/result')![0]! as (exec: unknown, result: unknown) => void
+  const turnStop = harness.listeners.get('agent/turn-stopping')![0]! as (payload: unknown) => Promise<void>
+
+  await fsp.writeFile(join(ROOT, 'late.txt'), 'v1\n')
+  const injected: string[] = []
+  const payload = {
+    agent: { inject: (message: unknown) => { injected.push((message as { content: { text: string }[] }).content[0]!.text) } },
+    turn: 1,
+    signal: new AbortController().signal,
+  }
+
+  // Fire the turn's last tool result and the stop hook back-to-back with no
+  // await in between, so the observation's fingerprint read is guaranteed
+  // still in flight when the hook starts (its fs completion needs an event
+  // loop turn; nothing synchronous can outrun it). `mutating` is only set
+  // after that read settles: without the wait, the unproven-claim enforcement
+  // below reads the pre-observation state and the mutation escapes notice.
+  onResult({ name: 'write', arguments: { path: 'late.txt', content: 'v1\n' } }, { isError: false, content: [] })
+  await turnStop(payload)
+
+  assert.equal(injected.length, 1, 'the mutation flag from the pending observe() must be visible to turn-end enforcement')
+  assert.match(injected[0]!, /mutated the workspace but made no proven completion claim/)
+})
+
+test('a hostile observation payload degrades without wedging the turn wind-down', async () => {
+  const harness = makeHarness()
+  process.env.DSH_PROOF_ROOT = ROOT
+  try {
+    plugin.apply(harness.ctx, config({ driftDetection: true }))
+  } finally {
+    delete process.env.DSH_PROOF_ROOT
+  }
+
+  const onResult = harness.listeners.get('tools/result')![0]! as (exec: unknown, result: unknown) => void
+  const turnStop = harness.listeners.get('agent/turn-stopping')![0]! as (payload: unknown) => Promise<void>
+
+  const injected: string[] = []
+  const payload = {
+    agent: { inject: (message: unknown) => { injected.push((message as { content: { text: string }[] }).content[0]!.text) } },
+    turn: 1,
+    signal: new AbortController().signal,
+  }
+
+  // A hostile `arguments` payload (null) must neither crash the observation
+  // nor the hook: pathsIn degrades to "no paths", the call still counts as a
+  // mutation by name, and the turn winds down normally with its notice.
+  onResult({ name: 'write', arguments: null }, { isError: true, content: [] })
+  await turnStop(payload)
+  assert.ok(true, 'turn-stopping completed despite a hostile observation payload')
+  assert.equal(injected.length, 1, 'enforcement still sees the mutation even when no paths could be extracted')
 })
 
 // ---------------------------------------------------------------------------
@@ -522,4 +628,56 @@ test('ClaimValue no longer lies: regressions are named regressions, and `verifie
   const properties = (claimTool.output!.schema.properties ?? {}) as Record<string, unknown>
   assert.ok(!('verified' in properties), 'schema must not advertise the removed field')
   assert.ok('regressions' in properties, 'schema must declare regressions')
+})
+
+// ---------------------------------------------------------------------------
+// First-frame baseline honesty (T1): loading the plugin over a workspace that
+// already has a baseline on disk must not keep the prompt claiming "no
+// baseline yet". apply() prewarms the baseline probe alongside check
+// discovery; the lazy section re-evaluates on every render, so the truth lands
+// on the next frame after the probe settles.
+// ---------------------------------------------------------------------------
+
+test('a pre-existing baseline on disk reaches the prompt section after the prewarm probe', async () => {
+  const proofDir = join(ROOT, '.proof')
+  await fsp.mkdir(proofDir, { recursive: true })
+  // Everything loadBaseline() needs to recognise the document: an id and a
+  // check table.
+  await fsp.writeFile(join(proofDir, 'baseline.json'), JSON.stringify({
+    baselineId: 'b'.repeat(32),
+    root: 'r'.repeat(64),
+    checks: [],
+  }))
+
+  const harness = makeHarness()
+  process.env.DSH_PROOF_ROOT = ROOT
+  try {
+    plugin.apply(harness.ctx, config({ evidenceStore: 'workspace', requireBaseline: 'off' }))
+  } finally {
+    delete process.env.DSH_PROOF_ROOT
+  }
+
+  try {
+    assert.equal(harness.sections.length, 1)
+    const section = harness.sections[0]!
+    const render = (): string => (typeof section.content === 'function' ? section.content() : section.content)
+
+    // The very first frame is rendered synchronously, before the probe's fs
+    // read can complete — it still says no baseline, and that is the boundary
+    // of the fix: honesty starts on the next frame.
+    assert.match(render(), /No baseline is established yet/)
+
+    // Drain the fire-and-forget probe (bounded poll — no timing sensitivity,
+    // just an upper bound on how long a local stat+read may take).
+    const deadline = Date.now() + 5_000
+    let text = render()
+    while (!/A baseline is already established/.test(text) && Date.now() < deadline) {
+      await new Promise(resolve => { setTimeout(resolve, 10) })
+      text = render()
+    }
+    assert.match(text, /A baseline is already established for this workspace\./)
+    assert.ok(!/No baseline is established/.test(text), 'once the probe lands, the lie must stop')
+  } finally {
+    await fsp.rm(proofDir, { recursive: true, force: true })
+  }
 })

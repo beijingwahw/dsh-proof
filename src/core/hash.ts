@@ -15,22 +15,45 @@ import { createHash } from 'node:crypto'
 /**
  * Deterministic JSON: object keys sorted recursively, `undefined` dropped,
  * numbers normalised through `String()` so `-0` and `0` agree.
+ *
+ * A circular structure is rejected with a `TypeError` naming the problem —
+ * this is a public addressing primitive (`addressOf` promises to address
+ * "any canonicalisable value"), and "Maximum call stack size exceeded" from
+ * an exhausted recursion is not an answer a caller can act on.
  */
 export function canonicalJson(value: unknown): string {
-  return stringify(value)
+  return stringify(value, new WeakSet())
 }
 
-function stringify(value: unknown): string {
+function stringify(value: unknown, seen: WeakSet<object>): string {
   if (value === null) return 'null'
   const t = typeof value
   if (t === 'number') return Number.isFinite(value as number) ? JSON.stringify(Object.is(value, -0) ? 0 : value) : 'null'
   if (t === 'boolean' || t === 'string') return JSON.stringify(value)
   if (t === 'bigint') return JSON.stringify(String(value))
   if (t === 'undefined' || t === 'function' || t === 'symbol') return 'null'
-  if (Array.isArray(value)) return `[${value.map(stringify).join(',')}]`
+  if (Array.isArray(value)) {
+    if (seen.has(value)) throw circularError()
+    seen.add(value)
+    try {
+      return `[${value.map(item => stringify(item, seen)).join(',')}]`
+    } finally {
+      seen.delete(value)
+    }
+  }
   const obj = value as Record<string, unknown>
-  const keys = Object.keys(obj).filter(k => obj[k] !== undefined).sort()
-  return `{${keys.map(k => `${JSON.stringify(k)}:${stringify(obj[k])}`).join(',')}}`
+  if (seen.has(obj)) throw circularError()
+  seen.add(obj)
+  try {
+    const keys = Object.keys(obj).filter(k => obj[k] !== undefined).sort()
+    return `{${keys.map(k => `${JSON.stringify(k)}:${stringify(obj[k], seen)}`).join(',')}}`
+  } finally {
+    seen.delete(obj)
+  }
+}
+
+function circularError(): TypeError {
+  return new TypeError('circular structure cannot be canonicalised')
 }
 
 /** SHA-256 of a UTF-8 string, hex-encoded. */
@@ -68,8 +91,10 @@ export interface NormalizeOptions {
 
 export function normalizeOutput(raw: string, opts: NormalizeOptions = {}): string {
   let text = raw.replace(/\r\n/g, '\n')
-  for (const variant of pathVariants(opts.root)) text = substituteLiteral(text, variant, '$WORKSPACE')
-  for (const variant of pathVariants(opts.home)) text = substituteLiteral(text, variant, '$HOME')
+  const foldRoot = foldsSeparators(opts.root)
+  const foldHome = foldsSeparators(opts.home)
+  for (const variant of pathVariants(opts.root)) text = substituteLiteral(text, variant, '$WORKSPACE', foldRoot)
+  for (const variant of pathVariants(opts.home)) text = substituteLiteral(text, variant, '$HOME', foldHome)
   const lines = text
     .split('\n')
     .map(line => line.replace(/[ \t]+$/g, ''))
@@ -79,11 +104,44 @@ export function normalizeOutput(raw: string, opts: NormalizeOptions = {}): strin
   return lines.join('\n')
 }
 
-/** A path and its slash-flipped twin, so Windows output matches in both styles. */
+/**
+ * A path and every spelling output may legitimately use for it: the
+ * slash-flipped twin, so Windows output matches in both styles, plus — for a
+ * drive-form path — the lowercased-drive twins, because Windows drives are
+ * case-insensitive while tools routinely emit the *other* case from the
+ * configured root (`c:\ws\src` vs root `C:/ws`). Variant generation is a pure
+ * function of the path, so canonicalisation stays deterministic.
+ */
 function pathVariants(path: string | undefined): string[] {
   if (path === undefined || path.length === 0) return []
-  const flipped = path.replace(/\\/g, '/')
-  return path === flipped ? [path] : [path, flipped]
+  const out: string[] = []
+  const add = (candidate: string) => { if (!out.includes(candidate)) out.push(candidate) }
+  add(path)
+  add(path.replace(/\\/g, '/'))
+  if (isDriveForm(path)) {
+    const lowered = path.slice(0, 1).toLowerCase() + path.slice(1)
+    add(lowered)
+    add(lowered.replace(/\\/g, '/'))
+    add(lowered.replace(/\//g, '\\'))
+  }
+  return out
+}
+
+/** Windows drive-absolute path (`C:/ws`, `c:\ws`). */
+function isDriveForm(path: string | undefined): boolean {
+  return path !== undefined && /^[A-Za-z]:[\\/]/.test(path)
+}
+
+/**
+ * A drive-form root supplied in forward-slash form (`C:/ws`) declares the
+ * canonical separator for everything under it, so substituted paths fold
+ * their backslash tails: `c:\ws\src\a.ts` and `c:/ws/src/a.ts` are the same
+ * file and must digest identically. Backslash-form roots keep their historic
+ * substitution byte-for-byte (their tails are left as the output spelled
+ * them), so already-minted digests stay stable.
+ */
+function foldsSeparators(path: string | undefined): boolean {
+  return path !== undefined && /^[A-Za-z]:\//.test(path)
 }
 
 /**
@@ -97,8 +155,18 @@ function pathVariants(path: string | undefined): string[] {
  */
 const PATH_BOUNDARY = "(?=[/\\\\'\"`\\s]|$)"
 
-function substituteLiteral(text: string, literal: string, placeholder: string): string {
+/** The path continuation after a root match: separator-led segments, greedily up to the next boundary. */
+const PATH_TAIL = '((?:[/\\\\][^/\\\\\'"`\\s]+)*)'
+
+function substituteLiteral(text: string, literal: string, placeholder: string, foldTail = false): string {
   if (literal.length === 0) return text
   const escaped = literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return text.replace(new RegExp(escaped + PATH_BOUNDARY, 'g'), placeholder)
+  if (!foldTail) return text.replace(new RegExp(escaped + PATH_BOUNDARY, 'g'), placeholder)
+  // Folding mode captures the substituted path's tail and canonicalises its
+  // separators; the boundary lookahead still runs first, so a longer path
+  // sharing the prefix (`c:/wsx`) never matches.
+  return text.replace(
+    new RegExp(escaped + PATH_BOUNDARY + PATH_TAIL, 'g'),
+    (_match: string, tail: string) => placeholder + tail.replace(/\\/g, '/'),
+  )
 }

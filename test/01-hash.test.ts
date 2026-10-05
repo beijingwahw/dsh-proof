@@ -48,3 +48,31 @@ test('normalised output addressing ignores cosmetic differences', () => {
   const b = normalizeOutput('x=1 \r\n', { root: '/r' })
   assert.equal(sha256(a), sha256(b))
 })
+
+test('canonicalJson rejects circular structures with a clear error, DAGs stay legal', () => {
+  const self: Record<string, unknown> = { name: 'a' }
+  self.self = self
+  assert.throws(() => canonicalJson(self), TypeError)
+  assert.throws(() => canonicalJson(self), /circular structure cannot be canonicalised/)
+
+  const cycle: unknown[] = [1]
+  cycle.push(cycle)
+  assert.throws(() => canonicalJson(cycle), /circular structure cannot be canonicalised/)
+  // The public addressing API reports the same clear error instead of a
+  // recursion-depth stack trace.
+  assert.throws(() => addressOf(self), /circular structure cannot be canonicalised/)
+
+  // A shared-but-acyclic reference is NOT a cycle: the guard tracks the
+  // current path (add on enter, remove on exit), so DAGs canonicalise exactly
+  // as they always did.
+  const shared = { v: 1 }
+  assert.equal(canonicalJson({ a: shared, b: shared }), '{"a":{"v":1},"b":{"v":1}}')
+})
+
+test('normalizeOutput folds drive-letter case drift (c:\\ws vs root C:/ws)', () => {
+  const out = normalizeOutput('failed at c:\\ws\\src\\a.ts and c:/ws/src/b.ts', { root: 'C:/ws' })
+  assert.equal(out, 'failed at $WORKSPACE/src/a.ts and $WORKSPACE/src/b.ts', 'either drive case, either slash style — one address')
+  // The new variants stay boundary-anchored: a longer path sharing the prefix
+  // is a different location, never this workspace.
+  assert.equal(normalizeOutput('built c:/wsx/out.js', { root: 'C:/ws' }), 'built c:/wsx/out.js')
+})

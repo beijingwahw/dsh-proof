@@ -319,10 +319,30 @@ export class EvidenceStore {
     return new EvidenceStore(fs, `${root}/${DEFAULT_LOG_RELPATH}`, `${root}/${DEFAULT_BASELINE_RELPATH}`, clock)
   }
 
-  /** Load the chain tail (and record counts) from disk exactly once. */
+  /**
+   * Load the chain state from disk exactly once — the one full scan the first
+   * mutation pays for. The same pass also re-indexes every existing evidence
+   * address into the dedupe cache (so append idempotency survives restarts,
+   * not just the process lifetime) and repairs a torn *tail* line if the
+   * previous process died mid-`appendLine`.
+   */
   private async ensureTail(): Promise<void> {
     if (this.tailReady) return
-    const lines = await this.fs.readLines(this.logPath)
+    let lines = await this.fs.readLines(this.logPath)
+    // A crash mid-`appendLine` leaves a torn final line: a valid prefix, no
+    // closing brace, unparseable JSON. That is the physical signature of a
+    // crash — an adversary rewrites *whole* lines — so the tail is rewritten
+    // away (atomic replace) and the repair itself is recorded on the chain,
+    // keeping every later line linked to the new tail. Damage anywhere but
+    // the last line is NOT repaired: mid-log corruption may be tampering and
+    // must keep failing audit.
+    const torn = lines[lines.length - 1]
+    let droppedChars: number | undefined
+    if (torn !== undefined && torn.trim().length > 0 && !parsesAsJson(torn)) {
+      droppedChars = torn.length
+      lines = lines.slice(0, -1)
+      await this.fs.writeFile(this.logPath, lines.length === 0 ? '' : `${lines.join('\n')}\n`)
+    }
     let lastCheckpointIndex = -1
     let records = 0
     lines.forEach((line, index) => {
@@ -330,6 +350,12 @@ export class EvidenceStore {
       if (envelope === undefined) return
       if (envelope.kind === 'checkpoint') lastCheckpointIndex = index
       if (envelope.kind === 'evidence' || envelope.kind === 'marker') records += 1
+      // Cross-process idempotency for free: the scan already touches every
+      // evidence payload, so collecting its address costs nothing extra.
+      if (envelope.kind === 'evidence') {
+        const payload = envelope.payload as { evidenceId?: unknown }
+        if (typeof payload?.evidenceId === 'string') this.cache.set(payload.evidenceId, payload as Evidence)
+      }
     })
     const last = lines[lines.length - 1]
     this.tail = last === undefined ? GENESIS_PREV : lineDigest(last)
@@ -341,6 +367,12 @@ export class EvidenceStore {
         return envelope?.kind === 'evidence' || envelope?.kind === 'marker'
       }).length
     this.tailReady = true
+    if (droppedChars !== undefined) {
+      // `markInternal`, not `mark`: ensureTail only runs inside the queue, and
+      // re-entering it would self-deadlock. `tailReady` is already true, so
+      // the marker chains straight from the repaired tail.
+      await this.markInternal('log/recovered-partial-tail', { droppedChars })
+    }
   }
 
   private async resolveSigner(): Promise<SignerPort | undefined> {
@@ -363,7 +395,12 @@ export class EvidenceStore {
     return next
   }
 
-  /** Append one evidence record. Re-appending an existing address is a no-op. */
+  /**
+   * Append one evidence record. Re-appending an existing address is a no-op —
+   * in this process *and* across restarts: the first log scan re-indexes
+   * every address already on disk, so replaying a log against a fresh store
+   * instance cannot duplicate records.
+   */
   append(evidence: Evidence): Promise<void> {
     // The dedupe check lives inside the queued section: two racing appends of
     // the same address must both see the cache update from whichever wins.
@@ -371,8 +408,13 @@ export class EvidenceStore {
   }
 
   private async appendInternal(evidence: Evidence): Promise<void> {
-    if (this.cache.has(evidence.evidenceId)) return
     await this.ensureTail()
+    // After ensureTail the cache covers both this process's earlier appends
+    // and — via the initial log scan — every address already on disk, so the
+    // no-op promise holds across restarts, not just within one process. (The
+    // queued section still serialises two racing appends of the same address:
+    // the loser re-runs this check after the winner's cache update.)
+    if (this.cache.has(evidence.evidenceId)) return
     const envelope: LogEnvelope = {
       v: 2,
       kind: 'evidence',
@@ -654,6 +696,21 @@ function parseEnvelope(line: string): LogEnvelope | undefined {
     return value
   } catch {
     return undefined
+  }
+}
+
+/**
+ * Whether the line is complete JSON at all. Torn-write recovery keys on this:
+ * a truncated line cannot parse, while tampering usually leaves *valid* JSON
+ * (rewritten envelopes) — so an unparseable tail is treated as crash residue
+ * and anything else is left for audit to adjudicate.
+ */
+function parsesAsJson(line: string): boolean {
+  try {
+    JSON.parse(line)
+    return true
+  } catch {
+    return false
   }
 }
 

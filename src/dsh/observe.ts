@@ -18,9 +18,37 @@ import type { ToolExecution, ToolExecutionResult } from '../vendor/dsh-tools.ts'
 import type { FsPort } from '../core/ports.ts'
 import { sha256 } from '../core/hash.ts'
 
-/** Tools whose arguments name files this plugin should fingerprint. */
-const PATH_KEYS = ['path', 'file', 'file_path', 'filePath', 'target', 'filename', 'dest', 'destination', 'source']
+/**
+ * Tools whose arguments name files this plugin should fingerprint.
+ *
+ * `source` is deliberately absent: across real tool surfaces it far more often
+ * carries *content* (the old text of a search/replace, a snippet to analyse)
+ * than a path, and a snippet containing `/` or `.` sails through
+ * `looksLikePath` — recording an external edit as the agent's work. The
+ * tradeoff, accepted here: a tool that genuinely names a path under `source`
+ * contributes one file less to fingerprints, which drift detection still
+ * catches at the turn boundary; a content key misclassified as a path wrongly
+ * indicts the agent, which nothing downstream corrects. Take the miss, not
+ * the false charge. Callers that must not miss (the evidence guard) pass
+ * `{contentKeys: true}` to re-admit the key.
+ */
+const PATH_KEYS = ['path', 'file', 'file_path', 'filePath', 'target', 'filename', 'dest', 'destination']
 const PATH_ARRAY_KEYS = ['paths', 'files', 'targets', 'globs', 'patterns']
+
+/**
+ * Tool-name classification — the single source both adapter layers consult
+ * (the pre-execute gates in index.ts and the read/write split below). It lives
+ * here so the watcher cannot drift from the gates again.
+ */
+/** Tools whose calls constitute a workspace mutation. */
+export const MUTATION_TOOL_RE = /(^|[_-])(write|edit|create|patch|delete|remove|move|rename|mkdir|touch|apply|install|update|upsert)([_-]|$)/i
+/** Tools that execute arbitrary host commands (which can mutate anything). */
+export const SHELL_TOOL_RE = /^(bash|shell|exec|run_code|run_command|terminal|process|task|npm|pnpm|yarn|pip|cargo|go|make)$/i
+
+/** True when a tool call of this name can move workspace state. */
+export function isMutationToolName(toolName: string): boolean {
+  return MUTATION_TOOL_RE.test(toolName) || SHELL_TOOL_RE.test(toolName)
+}
 
 export interface DriftReport {
   /** Files whose content changed without a tool call touching them. */
@@ -44,16 +72,35 @@ export class WorkspaceWatch {
   private readonly sessionTouched = new Set<string>()
   /** Paths the agent has read through a tool (so staleness is meaningful). */
   private readonly read = new Set<string>()
-  /** Tool names that only read, so their paths are "read" not "touched". */
-  private readonly readOnlyTools = new Set(['read', 'read_file', 'view', 'cat', 'grep', 'glob', 'ls', 'list', 'search'])
+  /**
+   * Tool names that only read, so their paths are "read" not "touched".
+   * Consulted only after `isMutationToolName` says no (see `observe`).
+   */
+  private readonly readOnlyTools = new Set(['read', 'read_file', 'view', 'cat', 'grep', 'glob', 'ls', 'list', 'search', 'search_files', 'find', 'show', 'head', 'tail'])
 
   constructor(fs: FsPort, root: string) {
     this.fs = fs
     this.root = root
   }
 
-  /** Extract every path named by a tool call's arguments. */
-  static pathsIn(args: unknown): string[] {
+  /**
+   * Extract every path named by a tool call's arguments.
+   *
+   * `contentKeys: true` re-admits the `source` key (and its array form) for
+   * callers that prefer over-detection to precision — the evidence-store
+   * guard in index.ts. A false positive there costs one user approval prompt;
+   * a false negative lets a `move {source: '.proof/evidence.jsonl', dest: …}`
+   * carry the log out of the guarded directory un-asked. The watcher itself
+   * keeps the precise view: its misclassification cost is a wrong attribution,
+   * which no prompt can undo.
+   */
+  static pathsIn(args: unknown, options: { contentKeys?: boolean } = {}): string[] {
+    const keys = options.contentKeys === true
+      ? [...PATH_KEYS, 'source']
+      : PATH_KEYS
+    const arrayKeys = options.contentKeys === true
+      ? [...PATH_ARRAY_KEYS, 'sources']
+      : PATH_ARRAY_KEYS
     const out = new Set<string>()
     const visit = (value: unknown, depth: number): void => {
       if (depth > 4 || value === null || typeof value !== 'object') return
@@ -65,7 +112,7 @@ export class WorkspaceWatch {
         return
       }
       for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
-        if (typeof val === 'string' && (PATH_KEYS.includes(key) || PATH_ARRAY_KEYS.includes(key))) {
+        if (typeof val === 'string' && (keys.includes(key) || arrayKeys.includes(key))) {
           out.add(val)
         } else {
           visit(val, depth + 1)
@@ -79,7 +126,15 @@ export class WorkspaceWatch {
   /** Record one completed tool call. */
   async observe(exec: Readonly<ToolExecution>, _result: Readonly<ToolExecutionResult>): Promise<void> {
     const paths = WorkspaceWatch.pathsIn(exec.arguments)
-    const isRead = this.readOnlyTools.has(exec.name)
+    // Classification precedence, one source of truth (`isMutationToolName`):
+    //   1. the name matches a mutation/shell pattern -> mutation
+    //   2. the name is on the read-only whitelist -> read
+    //   3. anything else -> mutation. Unknown tools default to *mutation* on
+    //      purpose: over-recording a path costs the agent an entry drift
+    //      detection can walk back, but an unknown write classified as a read
+    //      would let a real edit escape attribution entirely. Better to
+    //      over-charge the agent than let it escape responsibility.
+    const isRead = !isMutationToolName(exec.name) && this.readOnlyTools.has(exec.name)
     for (const raw of paths) {
       const rel = toWorkspaceRelative(raw, this.root)
       if (rel === undefined) continue

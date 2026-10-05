@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { WorkspaceWatch, driftNarrative, toWorkspaceRelative } from '../src/dsh/observe.ts'
+import { WorkspaceWatch, driftNarrative, isMutationToolName, MUTATION_TOOL_RE, SHELL_TOOL_RE, toWorkspaceRelative } from '../src/dsh/observe.ts'
 import { MemoryFs } from './helpers.ts'
 
 const ROOT = '/ws'
@@ -30,6 +30,24 @@ test('pathsIn ignores values that cannot be paths', () => {
   assert.deepEqual(WorkspaceWatch.pathsIn(null), [])
 })
 
+// ---------------------------------------------------------------------------
+// `source` is content, not a path (T4): search/replace tools pass the old text
+// under `source`, and a snippet with a slash in it would otherwise be recorded
+// as a touched path — charging the agent with an edit it never made.
+// ---------------------------------------------------------------------------
+
+test('a `source` argument holding content is not mistaken for a path', async () => {
+  // 'src/old/text' is the shape that used to leak through: a code snippet
+  // containing slashes passes looksLikePath with room to spare.
+  assert.deepEqual(WorkspaceWatch.pathsIn({ source: 'src/old/text' }), [])
+
+  const fs = MemoryFs.of({ [`${ROOT}/src/a.ts`]: 'v1\n' })
+  const watch = new WorkspaceWatch(fs, ROOT)
+  await watch.observe(exec('str_replace', { path: 'src/a.ts', source: 'src/old/text' }), OK)
+  assert.deepEqual(watch.touchedPaths(), ['src/a.ts'], 'only the path key names a file')
+  assert.deepEqual(watch.sessionTouchedPaths(), ['src/a.ts'], 'content keys must not enter the provenance set')
+})
+
 test('a tool write is "touched", a tool read is not', async () => {
   const fs = MemoryFs.of({ [`${ROOT}/src/a.ts`]: 'v1\n' })
   const watch = new WorkspaceWatch(fs, ROOT)
@@ -39,6 +57,56 @@ test('a tool write is "touched", a tool read is not', async () => {
 
   await watch.observe(exec('write', { path: 'src/b.ts', content: 'v1\n' }), OK)
   assert.deepEqual(watch.touchedPaths(), ['src/b.ts'])
+})
+
+// ---------------------------------------------------------------------------
+// Single-source classification (T3): the mutation/shell patterns are exported
+// from observe.ts and both adapter layers must consult the same one. Unknown
+// tools stay classified as mutations — the conservative direction.
+// ---------------------------------------------------------------------------
+
+test('isMutationToolName is the one classification the adapter exports', () => {
+  for (const name of ['write', 'edit_file', 'apply_patch', 'create_thing', 'bash', 'npm', 'run_command', 'DELETE_FILE']) {
+    assert.ok(isMutationToolName(name), `${name} mutates workspace state`)
+  }
+  for (const name of ['read', 'read_file', 'grep', 'find', 'head', 'tail', 'view', 'glob']) {
+    assert.ok(!isMutationToolName(name), `${name} only reads`)
+  }
+  // The exported patterns are the contract; both layers import these symbols.
+  assert.ok(MUTATION_TOOL_RE.test('mkdir'), 'a mutation verb matches')
+  assert.ok(SHELL_TOOL_RE.test('pnpm'), 'a shell runner matches')
+  assert.ok(!SHELL_TOOL_RE.test('pnpm_audit_logs'), 'the shell pattern is anchored, not a substring sniff')
+})
+
+test('classification: regex-named mutations touch, whitelist names read, unknowns default to mutation', async () => {
+  const fs = MemoryFs.of({
+    [`${ROOT}/src/a.ts`]: 'v1\n',
+    [`${ROOT}/src/b.ts`]: 'v1\n',
+    [`${ROOT}/src/c.ts`]: 'v1\n',
+    [`${ROOT}/src/d.ts`]: 'v1\n',
+    [`${ROOT}/src/e.ts`]: 'v1\n',
+  })
+  const watch = new WorkspaceWatch(fs, ROOT)
+
+  await watch.observe(exec('bash', { path: 'src/a.ts' }), OK)               // shell-classified -> touched
+  await watch.observe(exec('find', { path: 'src/b.ts' }), OK)               // read whitelist
+  await watch.observe(exec('mystery_analyzer', { path: 'src/c.ts' }), OK)   // unknown -> mutation (conservative)
+  await watch.observe(exec('apply_patch', { target: 'src/d.ts' }), OK)      // mutation verb -> touched
+  await watch.observe(exec('head', { file: 'src/e.ts' }), OK)               // read whitelist
+
+  assert.deepEqual(watch.touchedPaths(), ['src/a.ts', 'src/c.ts', 'src/d.ts'])
+  assert.deepEqual(watch.sessionTouchedPaths(), ['src/a.ts', 'src/c.ts', 'src/d.ts'])
+})
+
+test('a read-sounding name composed around a mutation verb still mutates', async () => {
+  // The whitelist is an exact-name set consulted only after the pattern says
+  // no: "show_update_log" may read like a viewer, but the `update` token makes
+  // it a mutation. The pattern, not the whitelist, has the last word on
+  // attribution.
+  const fs = MemoryFs.of({ [`${ROOT}/src/a.ts`]: 'v1\n' })
+  const watch = new WorkspaceWatch(fs, ROOT)
+  await watch.observe(exec('show_update_log', { path: 'src/a.ts' }), OK)
+  assert.deepEqual(watch.touchedPaths(), ['src/a.ts'], 'the mutation verb inside the name classifies it as a mutation')
 })
 
 test('DRIFT: a file changed outside the tool stream is detected as stale', async () => {

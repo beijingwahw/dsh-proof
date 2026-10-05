@@ -22,7 +22,7 @@ import * as nodePath from 'node:path'
 import type { Config } from './config.ts'
 import { ProofEngine } from './engine.ts'
 import { createProofTools } from './dsh/tools.ts'
-import { WorkspaceWatch, driftNarrative, toWorkspaceRelative } from './dsh/observe.ts'
+import { WorkspaceWatch, driftNarrative, isMutationToolName, toWorkspaceRelative } from './dsh/observe.ts'
 import { buildPolicySection } from './dsh/prompt.ts'
 import { createLspResolver } from './dsh/lsp-impact.ts'
 import { sha256 } from './core/hash.ts'
@@ -75,14 +75,6 @@ interface HostContext extends Emitter {
   /** The host's language-server seam; used for precise impact edges when present. */
   lsp?: LspLike
   effect(disposer: () => void | (() => void)): unknown
-}
-
-/** Tools whose calls constitute a workspace mutation. */
-const MUTATION_TOOL_RE = /(^|[_-])(write|edit|create|patch|delete|remove|move|rename|mkdir|touch|apply|install|update|upsert)([_-]|$)/i
-const SHELL_TOOL_RE = /^(bash|shell|exec|run_code|run_command|terminal|process|task|npm|pnpm|yarn|pip|cargo|go|make)$/i
-
-function isMutationTool(toolName: string): boolean {
-  return MUTATION_TOOL_RE.test(toolName) || SHELL_TOOL_RE.test(toolName)
 }
 
 export function apply(ctx: Context, config: Config): void {
@@ -165,8 +157,12 @@ export function apply(ctx: Context, config: Config): void {
       return target === evidenceSegment || target.startsWith(`${evidenceSegment}/`)
     }
     host.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
-      if (!isMutationTool(exec.name)) return next()
-      const paths = WorkspaceWatch.pathsIn(exec.arguments)
+      if (!isMutationToolName(exec.name)) return next()
+      // contentKeys: the guard prefers over-detection — a `move {source:
+      // '.proof/evidence.jsonl', dest: …}` carries the log out through the
+      // very key the watcher excludes as content-noise. A false positive here
+      // costs one approval prompt; a false negative costs the log.
+      const paths = WorkspaceWatch.pathsIn(exec.arguments, { contentKeys: true })
       if (!paths.some(touchesEvidence)) return next()
       return {
         kind: 'ask',
@@ -181,7 +177,7 @@ export function apply(ctx: Context, config: Config): void {
   // -- policy gate: no baseline, no unreviewed mutation --------------------
   if (config.requireBaseline !== 'off') {
     host.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
-      if (!isMutationTool(exec.name)) return next()
+      if (!isMutationToolName(exec.name)) return next()
       try {
         const baseline = await engine.baseline()
         if (baseline !== undefined) return next()
@@ -209,11 +205,16 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   // -- observation: what actually moved -----------------------------------
+  // Each event is still fire-and-forget (a tool result must never be delayed
+  // by bookkeeping), but the latest observation's promise is kept: the turn
+  // can stop right behind the last tool result, and drift/enforcement computed
+  // from a half-written observation would read yesterday's state.
+  let pendingObserve: Promise<void> = Promise.resolve()
   host.on('tools/result', (exec, result) => {
-    void (async () => {
+    pendingObserve = (async () => {
       try {
         await watch.observe(exec, result)
-        if (isMutationTool(exec.name)) mutating = true
+        if (isMutationToolName(exec.name)) mutating = true
         if (exec.name === 'proof_claim') claimedThisTurn = true
       } catch (error) {
         log('observe failed', error)
@@ -227,6 +228,13 @@ export function apply(ctx: Context, config: Config): void {
   if (config.driftDetection || config.enforceOnTurnEnd || config.requireBaseline === 'warn') {
     host.on('agent/turn-stopping', async (payload) => {
       try {
+        // The last tool result of a turn can still be mid-observation when
+        // this hook fires; drift computed before it lands reads stale
+        // fingerprints/touched state. Wait for it — defensively: an observation
+        // that rejects must be swallowed here too, since a failed fingerprint
+        // can never be allowed to wedge the turn's wind-down.
+        await pendingObserve.catch(() => undefined)
+
         const notices: string[] = []
 
         if (config.driftDetection) {
@@ -289,9 +297,14 @@ export function apply(ctx: Context, config: Config): void {
       })
     }
     // The section reads engine state lazily; register immediately and refresh
-    // discovery in the background so the first prompt is not empty.
+    // discovery in the background so the first prompt is not empty. The same
+    // prewarm probes the baseline: without it, a plugin loaded over a
+    // workspace that already has a baseline on disk keeps saying "no baseline
+    // yet" — `content()` re-evaluates on every render, so once `baselineSeen`
+    // flips, the next frame tells the truth.
     register()
     void engine.loadChecks().catch(() => undefined)
+    void engine.baseline().catch(() => undefined)
   }
 
   // -- teardown -----------------------------------------------------------

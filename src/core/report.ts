@@ -17,7 +17,7 @@ import { buildBaseline, isDecisiveStatus } from './evidence.ts'
 import { merkleRoot } from './hash.ts'
 import type { CheckSpec, Clock } from './ports.ts'
 import type { RelPath, DependencyGraph } from './impact.ts'
-import { selectAffectedChecks } from './impact.ts'
+import { forcedSelection, selectAffectedChecks } from './impact.ts'
 import { attributeChecks, type AttributedCheck } from './regression.ts'
 import type { ChangeProvenance } from './changeset.ts'
 
@@ -56,7 +56,7 @@ export function assembleProof(input: AssembleInput): AssembleResult {
   })
 
   const selection = input.forceAll === true
-    ? { affected: input.specs, untouched: [], forcedAll: true, closure: input.changed, uncertain: false, precision: 'forced' as const }
+    ? forcedSelection(input.specs, input.changed)
     : selectAffectedChecks(input.specs, input.changed, input.graph)
   const affectedIds = new Set(selection.affected.map(c => c.id))
 

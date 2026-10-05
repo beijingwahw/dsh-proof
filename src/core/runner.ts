@@ -136,9 +136,22 @@ export class VerificationRunner {
         signal: controller.signal,
         maxOutputChars: 64_000,
       })
+      // Death-cause honesty: `exitCode === null` alone cannot tell "our
+      // timeout killed it" from "something outside killed it". A port that
+      // observed an external signal (OOM-killer, user `kill -9`) reports it
+      // via `killedBySignal`; that is a different fact from a timeout — the
+      // model reading the evidence must be able to distinguish "ran too slow,
+      // we killed it" from "killed by the outside world" — so it maps to
+      // `error`, with the signal named on the first output line. Both
+      // `aborted` (we chose to stop) and `spawnError` (it never ran) outrank
+      // the signal reading, matching the port contract that leaves
+      // `killedBySignal` unset in exactly those cases.
+      const externalSignal = result.aborted || result.spawnError !== undefined
+        ? undefined
+        : result.killedBySignal
       const status: CheckStatus = result.aborted
         ? 'aborted'
-        : result.spawnError !== undefined
+        : result.spawnError !== undefined || externalSignal !== undefined
           ? 'error'
           : result.exitCode === 0
             ? 'pass'
@@ -151,7 +164,9 @@ export class VerificationRunner {
         durationMs: result.durationMs || this.clock.now() - started,
         output: result.spawnError !== undefined
           ? `${result.spawnError}\n${result.output}`
-          : result.output,
+          : externalSignal !== undefined
+            ? `killed by signal ${externalSignal}\n${result.output}`
+            : result.output,
       }
     } catch (error) {
       return {
