@@ -120,6 +120,10 @@ export class FakeCommands implements CommandPort {
 export class FakeWorkspace implements WorkspacePort {
   dirty: string[] = []
   head: string | null = 'abc123'
+  /** Files the fake reports as differing from `head` (tracked). */
+  changedSinceFiles: string[] = []
+  /** Files the fake reports as untracked. */
+  untrackedFiles: string[] = []
   readonly root: string
 
   constructor(root: string = '/ws') {
@@ -128,6 +132,8 @@ export class FakeWorkspace implements WorkspacePort {
 
   async gitHead(): Promise<string | null> { return this.head }
   async gitDirty(): Promise<string[]> { return [...this.dirty].sort() }
+  async changedSince(ref: string): Promise<string[]> { void ref; return [...this.changedSinceFiles].sort() }
+  async untracked(): Promise<string[]> { return [...this.untrackedFiles].sort() }
 }
 
 export function spec(overrides: Partial<CheckSpec> & { id: string }): CheckSpec {

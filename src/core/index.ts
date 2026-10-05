@@ -48,6 +48,12 @@ export {
 } from './regression.ts'
 
 export {
+  resolveChangeSet,
+  type ChangeProvenance, type ChangeRecord, type ChangeSetInput,
+  type ChangeSetMethod, type ChangeSetResolution,
+} from './changeset.ts'
+
+export {
   assembleBaseline, assembleProof, type AssembleInput, type AssembleResult,
 } from './report.ts'
 

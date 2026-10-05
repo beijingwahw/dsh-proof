@@ -97,6 +97,16 @@ The agent under audit has file-write tools. It could rewrite `.proof/` wholesale
 
 By default (`evidenceStore: host`) the log itself lives under `$DSH_HOME/proof/workspaces/<key>/`, outside the agent's sandboxed writable area. `proof_status` surfaces the telemetry: `chainMode`, `checkpoints`, `chainIntact`, `rewindDetected`, `baselineTampered`.
 
+## Change-set provenance (v0.3): content-anchored, attribution-aware
+
+"What changed" and "who changed it" are now separate questions. The old change set was just `git status` — pre-baseline dirt, the user's IDE edits, and the agent's tool edits all charged to the session together. v0.3 rebuilds it:
+
+1. **Content-anchored baseline** — establishing a baseline digests every dirty file (`dirtyDigests`). Baseline checks ran against the working tree *as it was*, so those bytes, not a commit, are the diff anchor. Dirt unchanged since the baseline is excluded; a dirty file *reverted* to HEAD still counts as changed (`git diff HEAD` cannot see that); clean-at-baseline files resolve through `git diff <baselineHead>` plus untracked files.
+2. **Provenance** — the session-level tool-touch set classifies every changed file as `agent` / `external` / `explicit` / `unknown`.
+3. **Attribution split** — `attributedTo` only charges the session; external edits land in `externalSuspects`. A regression the *user* caused in their IDE is still reported honestly, but its rationale reads "changed outside the agent's tool stream — not charged to this session".
+
+The method is surfaced as `attributionMethod` (`baseline-content` / `git-head` / `dirty-fallback` / `explicit`) so degradation is visible, and `proof_verify` renders an "EXTERNAL edits" section with the files not charged to the agent.
+
 ## Architecture
 
 ```
@@ -113,7 +123,7 @@ The domain core is framework-free on purpose: it is fully unit-testable offline,
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit
-npm test              # 71 tests, node:test
+npm test              # 81 tests, node:test
 npm run build
 npm run bundle:check  # packaging contract self-check
 ```

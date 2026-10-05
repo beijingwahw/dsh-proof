@@ -293,4 +293,13 @@ export class GitWorkspace implements WorkspacePort {
     if (result.exitCode !== 0) return []
     return result.output.split('\0').filter(Boolean).sort()
   }
+
+  /** Untracked files (honouring .gitignore), relative to root. */
+  async untracked(): Promise<string[]> {
+    const result = await this.commands.run(['git', 'ls-files', '--others', '--exclude-standard', '-z'], {
+      cwd: this.root, timeoutMs: 15_000, signal: AbortSignal.timeout(15_000),
+    })
+    if (result.exitCode !== 0) return []
+    return result.output.split('\0').filter(Boolean).sort()
+  }
 }

@@ -45,6 +45,12 @@ export interface WorkspaceSnapshot {
   readonly dirty: readonly string[]
   /** Digest of the dirty-file set, so "the same dirt" compares equal. */
   readonly dirtDigest: string
+  /**
+   * sha256 of each dirty file's *content* at snapshot time. Baseline checks
+   * ran against the working tree as it was, so these digests — not the
+   * commit — are the anchor change-set resolution diffs against (v0.3).
+   */
+  readonly dirtyDigests?: Readonly<Record<string, string>>
 }
 
 /** A named, ordered collection of evidence records. */
@@ -77,6 +83,8 @@ export interface CheckReport {
   readonly current?: Evidence
   /** Files changed in this session that fall inside this check's impact set. */
   readonly attributedTo: readonly string[]
+  /** Suspect files that changed *outside* the agent's tool stream (v0.3). */
+  readonly externalSuspects?: readonly string[]
 }
 
 export type ProofGrade = 'proven' | 'unproven' | 'regressed' | 'no-baseline' | 'stale'

@@ -126,7 +126,7 @@ export function apply(ctx: Context, config: Config): void {
   const log = (...args: unknown[]) => { if (config.verbose) console.log('[dsh-proof]', ...args) }
 
   // -- model-facing tools -------------------------------------------------
-  for (const tool of createProofTools(engine)) {
+  for (const tool of createProofTools(engine, () => watch.sessionTouchedPaths())) {
     host.tools.register(tool)
     log(`registered tool ${tool.name}`)
   }

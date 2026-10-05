@@ -15,12 +15,14 @@
  */
 
 import type {
-  Baseline, CheckSpec, Clock, CommandPort, DependencyGraph, Evidence,
-  FsPort, ProofReport, RelPath, SelectionResult, SignerPort, WorkspacePort, WorkspaceSnapshot,
+  Baseline, ChangeProvenance, ChangeSetResolution, CheckSpec, Clock, CommandPort,
+  DependencyGraph, Evidence, FsPort, ProofReport, RelPath, SelectionResult,
+  SignerPort, WorkspacePort, WorkspaceSnapshot,
 } from './core/index.ts'
 import {
   EvidenceStore, VerificationRunner, assembleBaseline, assembleProof,
-  buildDependencyGraph, discoverChecks, selectAffectedChecks, snapshotWorkspace,
+  buildDependencyGraph, discoverChecks, resolveChangeSet, selectAffectedChecks,
+  sha256, snapshotWorkspace,
 } from './core/index.ts'
 import type { AuditReport } from './core/evidence.ts'
 import type { AttributedCheck } from './core/regression.ts'
@@ -58,8 +60,10 @@ export interface EngineOptions {
 }
 
 export interface VerifyOptions {
-  /** Explicit change set. Defaults to `git status --porcelain` + baseline drift. */
+  /** Explicit change set. Defaults to a content-anchored diff against the baseline. */
   readonly changed?: readonly RelPath[]
+  /** Paths the agent's tool stream touched, for provenance classification. */
+  readonly touched?: readonly RelPath[]
   readonly signal?: AbortSignal
   /** Force the full check set regardless of impact analysis. */
   readonly all?: boolean
@@ -71,11 +75,16 @@ export interface VerifyOutcome {
   readonly checks: readonly AttributedCheck[]
   readonly selection: SelectionResult
   readonly changed: readonly RelPath[]
+  /** How the change set was derived and who each change belongs to (v0.3). */
+  readonly attribution: ChangeSetResolution
 }
 
 function isAbsolutePath(p: string): boolean {
   return /^([A-Za-z]:[\\/]|\/)/.test(p)
 }
+
+/** Beyond this many dirty files the per-file digest pass is skipped (conservative mode). */
+const WORKSPACE_DIGEST_CAP = 2000
 
 export class ProofEngine {
   readonly root: string
@@ -212,9 +221,14 @@ export class ProofEngine {
   /** Run every discovered check and record the result as the new baseline. */
   async establishBaseline(options: { signal?: AbortSignal; onProgress?: VerifyOptions['onProgress'] } = {}): Promise<{ baseline: Baseline; records: readonly Evidence[] }> {
     const specs = await this.loadChecks()
+    // The detailed snapshot digests every dirty file's content: baseline checks
+    // ran against the working tree as it was, so those bytes — not the commit —
+    // are what later change-set resolution diffs against.
+    const snapshot = await this.snapshotWorkspaceDetailed()
     const batch = await this.runner.run(specs, {
       concurrency: this.options.concurrency,
       totalBudgetMs: this.options.verifyBudgetMs,
+      workspace: snapshot,
       ...(options.signal !== undefined ? { signal: options.signal } : {}),
       ...(options.onProgress !== undefined
         ? { onEvidence: (ev, i, total) => options.onProgress!(ev.label, i, total) }
@@ -222,7 +236,7 @@ export class ProofEngine {
     })
     for (const record of batch.records) await this.store.append(record)
     // saveBaseline records the file digest into the chain and checkpoints.
-    const baseline = assembleBaseline(specs, batch.records, batch.workspace, this.clock)
+    const baseline = assembleBaseline(specs, batch.records, snapshot, this.clock)
     await this.store.saveBaseline(baseline)
     await this.store.mark('baseline/established', { baselineId: baseline.baselineId, root: baseline.root, checks: batch.records.length })
     await this.store.checkpoint()
@@ -233,7 +247,12 @@ export class ProofEngine {
   async verify(options: VerifyOptions = {}): Promise<VerifyOutcome> {
     const specs = await this.loadChecks()
     const graph = await this.loadGraph()
-    const changed = await this.resolveChanged(options.changed)
+    const baseline = await this.store.loadBaseline()
+    const attribution = await this.resolveChanges(options, baseline)
+    const changed = attribution.changed
+    const provenance = new Map<RelPath, ChangeProvenance>(
+      attribution.records.map(r => [r.path, r.provenance] as [RelPath, ChangeProvenance]),
+    )
     const selection = options.all
       ? { affected: specs, untouched: [], forcedAll: true, closure: changed, uncertain: false }
       : selectAffectedChecks(specs, changed, graph)
@@ -248,13 +267,13 @@ export class ProofEngine {
     })
     for (const record of batch.records) await this.store.append(record)
 
-    const baseline = await this.store.loadBaseline()
     const { report, checks } = assembleProof({
       specs,
       baseline,
       records: batch.records,
       changed,
       ...(graph !== undefined ? { graph } : {}),
+      ...(provenance.size > 0 ? { provenance } : {}),
       workspace: batch.workspace,
       clock: this.clock,
       requireFullCoverage: true,
@@ -262,20 +281,51 @@ export class ProofEngine {
     })
     await this.store.mark('proof/verified', {
       grade: report.grade, root: report.root, changed: changed.length,
+      attribution: attribution.method,
+      preExistingExcluded: attribution.preExistingExcluded.length,
       regressions: report.summary.regressions,
     })
     // Every claim-grade boundary closes the checkpoint window.
     await this.store.checkpoint()
-    return { report, checks, selection, changed }
+    return { report, checks, selection, changed, attribution }
   }
 
-  /** Which files this session changed, relative to the workspace root. */
-  private async resolveChanged(explicit?: readonly RelPath[]): Promise<RelPath[]> {
-    if (explicit !== undefined) return [...new Set(explicit)].sort()
-    // Without a git ref anchor the honest approximation is every path the
-    // working tree reports as dirty. Over-attribution costs a re-run;
-    // under-attribution hides a break, so we err wide on purpose.
-    const dirty = await this.workspace.gitDirty().catch(() => [])
-    return [...new Set(dirty)].sort()
+  /**
+   * Which files moved since the baseline, and who moved them. Explicit sets
+   * are honoured as-is; otherwise the resolution is content-anchored to the
+   * baseline's working-tree snapshot, with the plain dirty set as the
+   * git-less fallback. Over-attribution costs a re-run; under-attribution
+   * hides a break, so unknowns err towards inclusion.
+   */
+  private async resolveChanges(options: VerifyOptions, baseline: Baseline | undefined): Promise<ChangeSetResolution> {
+    return resolveChangeSet({
+      fs: this.fs,
+      workspace: this.workspace,
+      ...(options.changed !== undefined ? { explicit: options.changed } : {}),
+      ...(baseline !== undefined
+        ? {
+            baseline: {
+              head: baseline.workspace.head,
+              dirty: baseline.workspace.dirty,
+              ...(baseline.workspace.dirtyDigests !== undefined ? { dirtyDigests: baseline.workspace.dirtyDigests } : {}),
+            },
+          }
+        : {}),
+      ...(options.touched !== undefined ? { touched: options.touched } : {}),
+    })
+  }
+
+  /** Snapshot with content digests of the dirty set (capped; skipped when huge). */
+  private async snapshotWorkspaceDetailed(): Promise<WorkspaceSnapshot> {
+    const head = await this.workspace.gitHead().catch(() => null)
+    const dirty = [...new Set(await this.workspace.gitDirty().catch(() => []))].sort()
+    const dirtDigest = sha256(dirty.join('\n'))
+    if (dirty.length > WORKSPACE_DIGEST_CAP) return { head, dirty, dirtDigest }
+    const dirtyDigests: Record<string, string> = {}
+    for (const rel of dirty) {
+      const content = await this.fs.readFile(`${this.root}/${rel}`)
+      if (content !== undefined) dirtyDigests[rel] = sha256(content)
+    }
+    return { head, dirty, dirtDigest, dirtyDigests }
   }
 }

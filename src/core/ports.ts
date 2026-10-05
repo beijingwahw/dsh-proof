@@ -99,6 +99,14 @@ export interface WorkspacePort {
   gitHead(): Promise<string | null>
   /** Files differing from `HEAD`, relative to root. */
   gitDirty(): Promise<string[]>
+  /**
+   * Files differing from `ref` (tracked, worktree + index), relative to root.
+   * Optional capability: hosts without git history support omit it and the
+   * change-set resolution degrades to the dirty-set union.
+   */
+  changedSince?(ref: string): Promise<string[]>
+  /** Untracked files (honouring .gitignore), relative to root. Optional. */
+  untracked?(): Promise<string[]>
 }
 
 /** A check the workspace can objectively answer: run this command, expect success. */

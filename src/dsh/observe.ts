@@ -40,6 +40,8 @@ export class WorkspaceWatch {
   private readonly fingerprints = new Map<string, string>()
   /** Paths touched by tool calls in the current window. */
   private readonly touched = new Set<string>()
+  /** Paths the agent has ever mutated through a tool, across windows (v0.3). */
+  private readonly sessionTouched = new Set<string>()
   /** Paths the agent has read through a tool (so staleness is meaningful). */
   private readonly read = new Set<string>()
   /** Tool names that only read, so their paths are "read" not "touched". */
@@ -81,8 +83,12 @@ export class WorkspaceWatch {
     for (const raw of paths) {
       const rel = this.toRelative(raw)
       if (rel === undefined) continue
-      if (isRead) this.read.add(rel)
-      else this.touched.add(rel)
+      if (isRead) {
+        this.read.add(rel)
+      } else {
+        this.touched.add(rel)
+        this.sessionTouched.add(rel)
+      }
       const hash = await this.fingerprint(rel)
       if (hash !== undefined) this.fingerprints.set(rel, hash)
     }
@@ -91,6 +97,15 @@ export class WorkspaceWatch {
   /** Files touched by tool calls since the last `windowStart`. */
   touchedPaths(): string[] {
     return [...this.touched].sort()
+  }
+
+  /**
+   * Files the agent has mutated through tools since the watcher was created —
+   * the provenance set for change attribution (windows come and go; the
+   * session's responsibility does not).
+   */
+  sessionTouchedPaths(): string[] {
+    return [...this.sessionTouched].sort()
   }
 
   /** Clear the touched window (called at turn boundaries). */

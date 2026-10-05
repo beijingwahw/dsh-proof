@@ -19,6 +19,7 @@ import type { CheckSpec, Clock } from './ports.ts'
 import type { RelPath, DependencyGraph } from './impact.ts'
 import { selectAffectedChecks } from './impact.ts'
 import { attributeChecks, type AttributedCheck } from './regression.ts'
+import type { ChangeProvenance } from './changeset.ts'
 
 export interface AssembleInput {
   readonly specs: readonly CheckSpec[]
@@ -28,6 +29,8 @@ export interface AssembleInput {
   readonly graph?: DependencyGraph
   readonly workspace: WorkspaceSnapshot
   readonly clock: Clock
+  /** Provenance per changed file: agent tool stream vs external edit (v0.3). */
+  readonly provenance?: ReadonlyMap<RelPath, ChangeProvenance>
   /** When true, an incremental run must cover every affected check to be `proven`. */
   readonly requireFullCoverage?: boolean
   /** When true, impact analysis is bypassed and every check counts as affected. */
@@ -49,6 +52,7 @@ export function assembleProof(input: AssembleInput): AssembleResult {
     currentById,
     changed: input.changed,
     ...(input.graph !== undefined ? { graph: input.graph } : {}),
+    ...(input.provenance !== undefined ? { provenance: input.provenance } : {}),
   })
 
   const selection = input.forceAll === true
@@ -158,5 +162,6 @@ function toCheckReport(check: AttributedCheck): CheckReport {
     ...(check.baseline !== undefined ? { baseline: check.baseline } : {}),
     ...(check.current !== undefined ? { current: check.current } : {}),
     attributedTo: check.attributedTo,
+    ...(check.externalSuspects !== undefined ? { externalSuspects: check.externalSuspects } : {}),
   }
 }

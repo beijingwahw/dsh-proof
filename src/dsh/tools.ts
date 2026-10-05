@@ -59,6 +59,8 @@ export interface VerifyValue {
   grade: ProofGrade
   root: string
   changed: string[]
+  attributionMethod: string
+  externalChanged: string[]
   affectedChecks: number
   untouchedChecks: number
   regressions: { label: string; suspects: string[]; detail: string }[]
@@ -121,12 +123,12 @@ const claimParams: ParameterSchemaSpec = {
   },
 }
 
-export function createProofTools(engine: ProofEngine): ToolDefinition[] {
+export function createProofTools(engine: ProofEngine, touched?: () => readonly string[]): ToolDefinition[] {
   return [
     createStatusTool(engine),
     createBaselineTool(engine),
-    createVerifyTool(engine),
-    createClaimTool(engine),
+    createVerifyTool(engine, touched),
+    createClaimTool(engine, touched),
   ]
 }
 
@@ -300,7 +302,7 @@ function createBaselineTool(engine: ProofEngine): ToolDefinition {
   }
 }
 
-function createVerifyTool(engine: ProofEngine): ToolDefinition {
+function createVerifyTool(engine: ProofEngine, touched?: () => readonly string[]): ToolDefinition {
   return {
     name: 'proof_verify',
     description:
@@ -315,6 +317,8 @@ function createVerifyTool(engine: ProofEngine): ToolDefinition {
         properties: {
           grade: { type: 'string', enum: ['proven', 'unproven', 'regressed', 'no-baseline', 'stale'] },
           root: { type: 'string' }, changed: { type: 'array', items: { type: 'string' } },
+          attributionMethod: { type: 'string' },
+          externalChanged: { type: 'array', items: { type: 'string' } },
           affectedChecks: { type: 'integer' }, untouchedChecks: { type: 'integer' },
           regressions: {
             type: 'array',
@@ -351,14 +355,15 @@ function createVerifyTool(engine: ProofEngine): ToolDefinition {
       const outcome = await engine.verify({
         ...(Array.isArray(parsed.changed) ? { changed: parsed.changed } : {}),
         ...(parsed.all === true ? { all: true } : {}),
+        ...(touched !== undefined ? { touched: touched() } : {}),
         signal: exec.signal,
       })
-      return toVerifyValue(outcome.report, outcome.changed, outcome.checks) as unknown as JsonValue
+      return toVerifyValue(outcome.report, outcome.changed, outcome.checks, outcome.attribution) as unknown as JsonValue
     },
   }
 }
 
-function createClaimTool(engine: ProofEngine): ToolDefinition {
+function createClaimTool(engine: ProofEngine, touched?: () => readonly string[]): ToolDefinition {
   return {
     name: 'proof_claim',
     description:
@@ -413,9 +418,10 @@ function createClaimTool(engine: ProofEngine): ToolDefinition {
       const parsed = (args ?? {}) as { claim: string; changed?: string[] }
       const outcome = await engine.verify({
         ...(Array.isArray(parsed.changed) ? { changed: parsed.changed } : {}),
+        ...(touched !== undefined ? { touched: touched() } : {}),
         signal: exec.signal,
       })
-      const value = toVerifyValue(outcome.report, outcome.changed, outcome.checks)
+      const value = toVerifyValue(outcome.report, outcome.changed, outcome.checks, outcome.attribution)
       const blockers: string[] = []
       if (outcome.report.grade === 'no-baseline') blockers.push('No baseline exists. Run proof_baseline first.')
       if (outcome.report.grade === 'stale') blockers.push(`Stale evidence: ${outcome.report.unverified.join(', ') || 'affected checks not re-run'}.`)
@@ -444,11 +450,19 @@ function createClaimTool(engine: ProofEngine): ToolDefinition {
 // Pure projections
 // ---------------------------------------------------------------------------
 
-function toVerifyValue(report: ProofReport, changed: readonly string[], checks: readonly { label: string; verdict: string; suspects: readonly string[]; current?: { outputHead?: string } }[]): VerifyValue {
+function toVerifyValue(
+  report: ProofReport,
+  changed: readonly string[],
+  checks: readonly { label: string; verdict: string; suspects: readonly string[]; current?: { outputHead?: string } }[],
+  attribution?: { method: string; records: readonly { path: string; provenance: string }[] },
+): VerifyValue {
+  const externalChanged = attribution?.records.filter(r => r.provenance === 'external').map(r => r.path) ?? []
   return {
     grade: report.grade,
     root: report.root,
     changed: [...changed],
+    attributionMethod: attribution?.method ?? 'explicit',
+    externalChanged,
     affectedChecks: checks.filter(c => c.verdict !== 'not-run').length,
     untouchedChecks: Math.max(0, report.discovered - checks.length),
     regressions: checks
@@ -505,17 +519,24 @@ function renderVerify(value: VerifyValue): string {
   const v = value ?? ({} as VerifyValue)
   const root = typeof v.root === 'string' ? v.root.slice(0, 12) : '<none>'
   const changed = Array.isArray(v.changed) ? v.changed : []
+  const externalChanged = Array.isArray(v.externalChanged) ? v.externalChanged : []
   const regressions = Array.isArray(v.regressions) ? v.regressions : []
   const fixed = Array.isArray(v.fixed) ? v.fixed : []
   const preExisting = Array.isArray(v.preExisting) ? v.preExisting : []
   const unverified = Array.isArray(v.unverified) ? v.unverified : []
   const lines = [
     `GRADE: ${String(v.grade ?? 'unknown').toUpperCase()}   evidence root ${root}`,
-    `changed: ${changed.length} file(s) · affected ${v.affectedChecks ?? 0} check(s) · untouched ${v.untouchedChecks ?? 0}`,
+    `changed: ${changed.length} file(s) · attribution ${String(v.attributionMethod ?? 'explicit')}` +
+      (externalChanged.length > 0 ? ` · ${externalChanged.length} external edit(s)` : ''),
     '',
   ]
+  if (externalChanged.length > 0) {
+    lines.push('EXTERNAL edits (outside your tool stream, not charged to you):')
+    for (const f of externalChanged.slice(0, 10)) lines.push(`  ↗ ${f}`)
+    lines.push('')
+  }
   if (regressions.length > 0) {
-    lines.push('REGRESSIONS (caused by this work):')
+    lines.push('REGRESSIONS (vs baseline):')
     for (const r of regressions) lines.push(`  ✖ ${r.label}${r.suspects?.length ? ` — suspects: ${r.suspects.join(', ')}` : ''}${r.detail ? `\n      ${r.detail}` : ''}`)
     lines.push('')
   }
