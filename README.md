@@ -68,7 +68,7 @@ Missing evidence is never papered over. Under the default `bayesian` scheduler (
 
 ---
 
-## Four model-facing tools
+## Seven model-facing tools
 
 | tool | purpose |
 |---|---|
@@ -76,8 +76,11 @@ Missing evidence is never papered over. Under the default `bayesian` scheduler (
 | `proof_baseline` | establish/refresh the baseline (runs every discovered check) |
 | `proof_verify` | incremental verification + grade + regression attribution |
 | `proof_claim` | state a claim **and** prove it; `blockers` is the to-do list; v0.10 adds contract params (`kind` + `budgetMs` / `review` / `entryPoints`) binding the claim to typed evidence obligations |
+| `proof_jury` | **Class B evidence, step 1**: request an LLM jury deliberation — returns the frozen deliberation prompt (rubric + claim + context, byte-deterministic) and records the request on-chain, verbatim prompt included |
+| `proof_jury_submit` | **Class B evidence, step 2**: record the verdict (`verdict` / `probability` / verbatim `reasoning`) as permanent evidence with the frozen prompt, declared model identity and independence tier; the claimId must match the pending request; gen auto-increments = appeal |
+| `proof_endorse` | **Class C evidence**: a named human endorses/rejects a claim — the call itself triggers the host approval prompt; endorse = risk acceptance (unlocks the grade gap, never inflates the number), reject = collapse |
 
-All four follow DSH's hard contract: `execute` returns one canonical JSON value, prose lives in `output.render`, and UI cards come from **pure** `presentCall` / `presentResult` / `presentationMeta` projections so a session-log replay reproduces the identical card.
+All seven follow DSH's hard contract: `execute` returns one canonical JSON value, prose lives in `output.render`, and UI cards come from **pure** `presentCall` / `presentResult` / `presentationMeta` projections so a session-log replay reproduces the identical card.
 
 ## Runtime enforcement, not prompt hope
 
@@ -85,6 +88,7 @@ All four follow DSH's hard contract: `execute` returns one canonical JSON value,
 |---|---|
 | `tools/pre-execute` | with `requireBaseline: ask`, mutations require user approval until a baseline exists |
 | `tools/pre-execute` | with `evidenceStore: workspace`, mutation tools touching the evidence store are routed through user approval |
+| `tools/pre-execute` | `proof_endorse` always routes through `ask` — Class C evidence is a human's conscious decision, never the model's say-so |
 | `tools/result` | observes every tool result; maintains the dirty set and file fingerprints |
 | `agent/turn-stopping` | injects corrective context when a turn mutated the workspace without a proven claim, flags files changed outside the tool stream, and (with `requireBaseline: warn`) reminds the agent to establish a baseline first |
 | `ctx.systemPrompt.section()` | publishes the `proof:policy` section so the model knows the rules exist |
@@ -151,6 +155,14 @@ The claim text used to be free prose: the engine could prove "no affected check 
 
 `api-surface-unchanged` diffs the public API surface in **both directions** (added and removed must both be empty): entry points come from `package.json` (`main`, `exports["."]`, `types`) or the `apiEntryPoints` config, are expanded through a bounded relative-import closure (depth ≤ 10, ≤ 500 files, truncation marked on-chain), and each file's exports are extracted per line in five forms — named declarations (including multi-declarator and destructuring lists), brace lists with aliases kept verbatim, `export default` → `#default`, `export *` → `#*` (plus the `ns` of `export * as ns`), and TS `export =` → `#=` — as sorted `file#symbol` strings riding the baseline as a non-addressing `apiSurface` attachment. Extraction deliberately **over-reports**: a missed export is a missed breaking change (a wrong pass), while a phantom export only makes an honest claim work harder (a wrong fail). `new-paths-covered` demands every changed source file be covered by a check that passed decisively this run — new behaviour must ride tested paths. A `perf-budget` claim force-runs **every** benchmark check (kind `benchmark`, from `bench` / `benchmark` / `perf:bench` scripts or explicit config) regardless of impact analysis, and its `durationMs` must stay within the claim's `budgetMs`. A `docs-only` claim runs **no checks at all** — `docs-only-changes` (docs extensions only; `requirements*.txt`-style traps guarded by the global-invalidator set) plus a `jury-review` self-attestation — and when everything holds the grade is `proven` with confidence structurally capped at `juryConfidenceCap` (default 0.8, basis `jury-only`, narrative `PROVEN (p≈0.80, jury evidence — self-attestation is capped)`): jury evidence never impersonates an experiment, and the verdict lands on the chain as a `claim/jury` marker. Contract runs go whole-batch — no bayesian planned skips, since an obligation must not rest on a check the plan skipped — and **a proven run carrying any unmet obligation is downgraded to `stale`** (confidence keeps what the run measured; the obligations say what is missing). Backwards compatibility: a claim without a `kind` behaves exactly as in v0.9, and a pre-v0.10 baseline without a surface fails `api-surface-unchanged` honestly, telling you to re-run `proof_baseline`.
 
+## Graded evidence classes (v0.11): testimony re-enters the proof system
+
+Machine measurement covers only half the world — the other half (readability improved, error messages friendlier, the migration guide accurate) had no exit but capped self-attestation. v0.11 brings **testimony** back as first-class evidence, giving each class the strongest honesty mechanism it can carry: **Class A** is machine measurement (recomputable — re-run the command, compare digests); **Class B** is an LLM jury (auditable — the *complete deliberation packet* lands on the tamper-evident chain: the verbatim prompt with the full `jury-rubric/v1` rubric, the declared model identity, the independence tier, and the entire verbatim output, so any third party can replay the frozen prompt against the same or a different model and compare; a verdict that will not replay is detectable); **Class C** is a named human endorsement (accountable — `proof_endorse` always routes through the host approval seam, and approver / approvedAt / scope ride the chain).
+
+The jury protocol is a request/submit pair: `proof_jury` deterministically assembles and freezes the deliberation prompt (header, versioned rubric, claim, context, output instruction — pure concatenation, byte-stable forever, request recorded on-chain with the verbatim prompt) and `proof_jury_submit` validates the verdict shape, binds it to the pending request's claimId, and appends the full packet at `gen + 1` — **appeals supersede rather than erase**: the chain is append-only, readers resolve to the highest generation per (claimId, kind), so the disputed record stays visible as the appeal's foil, and B/C channels resolve independently. Claims are identified by `claimIdOf` (first 16 hex of the claim's sha256) — rewording a claim is a new claim needing new testimony. The rubric orders one structured JSON ruling `{verdict: uphold|reject|abstain, probability, reasoning}`, demands judgement only from the given materials, and tells the juror its output becomes permanent, public, replayable Class B evidence.
+
+**Explicit trust weights, two maths each in its place.** `classBTrust` (0.7) and `classCTrust` (0.9) are declared policy constants, never learned — there is no labelled dataset of "this witness was right". For **pure-jury paths** (the new engine-level `llm-jury` contract kind: obligations `jury-delivered` + `jury-upholds` — an active on-chain B verdict upholding at probability ≥ 0.5 — zero commands run), confidence is Π `attestationFactor` with factor = p^w, a **log-odds discount**: w ∈ [0,1] and p ∈ [0,1] ⇒ p^w ∈ [p,1], so testimony can only *weaken* a claim, never amplify it — the right direction of skepticism for self-interested proof systems (abstain is exactly factor 1; NaN/out-of-range probabilities degrade to abstain so they can never poison the product). When a **machine certification already exists**, a witness speaking about the whole claim enters as the **reliability mixture** `fused = (1−w)·c + w·p`: pulled toward the asserted probability with strength exactly w, never overshooting it — a jury asserting 0.99 at w = 0.7 carries a 0.94 machine certification across the 0.97 target (the rescue), asserting 0.1 crashes it. **Class C endorsement is risk acceptance, not certainty transfer**: the approval seam is binary, human correctness is modelled as the constant `humanProbability` = 0.95, and 0.95^0.9 ≈ 0.955 can mathematically never cross a 0.97 target — so endorsement leaves the number untouched and unlocks the *grade* instead (stale-by-target-gap + zero regressions + every obligation met → `proven`; the human took the residual the machines could not cross). Endorsement cannot pay for missing work: unmet obligations or regressions do not unlock. The symmetric lock: an explicit reject — human or jury — collapses the number ((1−0.95)^0.9) and demotes a `proven` grade the number no longer supports. `ConfidenceBasis` grows `attested` (machine + B/C fusion, or pure C) and extends `jury-only` to pure-B paths (narrative: `PROVEN (p≈0.97, machine + B/C attested)`). Plain `verify()` never reads attestations at all — v0.9 pure-machine semantics stay byte-locked. Honest limits: v0.11's actual independence tier is the weakest (`same-session`), the model identity is the submitter's declaration (`session-model (unverified)`) verified only by replay audit, the jury's probability is a subjective judgement, and both 0.95 and the mixture are modelling choices, not derived posteriors.
+
 ## Architecture
 
 ```
@@ -167,7 +179,7 @@ The domain core is framework-free on purpose: it is fully unit-testable offline,
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit
-npm test              # 277 tests, node:test
+npm test              # 317 tests, node:test
 npm run build
 npm run bundle:check  # packaging contract self-check
 ```
@@ -188,6 +200,8 @@ Every tunable is a `cordis.yml` field — no hardcoded knobs. See [README.zh.md 
         certifyTarget: 0.97        # claim posterior that certifies `proven` without running everything
         apiEntryPoints: []         # API-surface entry points; [] = derive from package.json main/exports/types
         juryConfidenceCap: 0.8     # confidence ceiling for docs-only jury self-attestation
+        classBTrust: 0.7           # Class B (LLM jury) trust weight: log-odds exponent / mixture strength
+        classCTrust: 0.9           # Class C (human) trust weight: endorse discounts gently, reject collapses
         impactGraph: true
         driftDetection: true
         enforceOnTurnEnd: true
@@ -201,6 +215,10 @@ Every tunable is a `cordis.yml` field — no hardcoded knobs. See [README.zh.md 
 - The API surface (v0.10) is a line-regex extraction that deliberately over-reports: runtime-computed exports (dynamically built export names, string-assembled re-exports) are invisible to it, and a missed export would be a missed breaking change — so when in doubt it reports, and a phantom export only makes an honest claim work harder. Set `apiEntryPoints` when `package.json` does not point at the real entries.
 - The docs-only jury (v0.10) is self-attestation, not experiment: `review` is the author's own note, confidence is capped at `juryConfidenceCap` (default 0.80) with basis `jury-only` — the number is a ceiling, never a measurement.
 - `perf-budget`'s `durationMs` (v0.10) is a wall-clock measurement subject to machine noise (load, frequency scaling, contention) and not comparable across machines; leave headroom in `budgetMs` and expect boundary jitter.
+- Class B testimony's independence is at its weakest tier in v0.11: the tooling records `same-session` (deliberated inside the authoring agent's own context — the most contamination-prone tier, named honestly on the chain), and the model identity is the submitter's declaration (`session-model (unverified)`) — the plugin cannot verify who answered; what catches impersonation is third-party replay of the frozen prompt, not the declaration. The trust weights are declared constants, not learned.
+- The jury's `probability` (v0.11) is a subjective probability, not a measurement: the rubric demands "the number your own reasoning actually supports", but an LLM's self-reported figure carries no calibration guarantee — read p = 0.99 vs 0.9 as wording strength. All the testimony arithmetic consumes this subjective number; it does not make it objective.
+- `humanProbability` = 0.95 (v0.11) is a modelling choice: the Class C approval seam is binary and elicits no number, so human correctness enters as a constant — deliberately below 1, because a human who could never be wrong would make every endorsed claim unfalsifiable.
+- The reliability mixture (v0.11) is a scoring-rule choice, not a derived posterior: `fused = (1−w)·c + w·p` models "the witness is reliable with probability w, else noise" because a witness speaking about the whole claim is not one more independent factor in the product; which maths applies (p^w discount vs mixture vs risk-acceptance unlock) is decided by whether the machines already spoke, never by which number looks better.
 - Checkpoint cadence leaves a window (v0.2): records after the last signed checkpoint are chain-covered but not checkpoint-covered. The window is bounded by `checkpointEvery`, closed at every baseline/verify/claim boundary, and *visible* — `proof_status` reports `tailRecords`, the count of records since the last checkpoint. The anchor protects against the audited agent, not against a fully compromised host.
 - On machines without the signing key, signed checkpoints cannot be adjudicated locally: the audit reports them as `unverifiableCheckpoints` (a missing capability, not a forgery charge — the audit does not fail on it; anchor count/head comparison still bounds rewind).
 - `proven` permits pre-existing red checks — they are reported prominently but not charged to the session. Deliberate, not a hole.

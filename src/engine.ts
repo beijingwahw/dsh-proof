@@ -21,13 +21,13 @@ import type {
 } from './core/index.ts'
 import {
   DEFAULT_IGNORE_DIRS, EvidenceStore, VerificationRunner, assembleBaseline,
-  assembleProof, buildDependencyGraph, discoverChecks, resolveChangeSet,
-  selectAffectedChecks, sha256, snapshotWorkspace,
+  assembleProof, buildDependencyGraph, discoverChecks, isDecisiveStatus,
+  resolveChangeSet, selectAffectedChecks, sha256, snapshotWorkspace,
   claimProbability, computePriors, posteriorHealthy, rankByInformationGain,
   summarizeHistory,
 } from './core/index.ts'
 import type {
-  CheckPrior, ClaimModel, ConfidenceInput, GradedProofReport,
+  CheckPrior, ClaimModel, ConfidenceBasis, ConfidenceInput, GradedProofReport,
 } from './core/index.ts'
 // core/index.ts re-exports the stable surface; `forcedSelection` is consumed
 // here straight from its module (the core barrel is not this batch's to edit).
@@ -41,6 +41,14 @@ import type { CheckConfigEntry, DiscoverOptions } from './core/checks.ts'
 import { evaluateContract, extractApiSurface } from './core/contract.ts'
 import type { ClaimContract, ClaimKind, ObligationResult, SurfaceEntry } from './core/contract.ts'
 import { assembleJuryReport } from './core/report.ts'
+// κ: graded evidence (ι's core/attest.ts) consumed straight from its module —
+// same discipline as the contract import above: the core barrel is not this
+// batch's to edit, and a direct import keeps the dependency explicit.
+import {
+  DEFAULT_TRUST_WEIGHTS, activeAttestations, attestationFactor, attestationsFor,
+  claimIdOf, fuseConfidence,
+} from './core/attest.ts'
+import type { Attestation, TrustWeights } from './core/attest.ts'
 import { NodeCommandPort, NodeEd25519Signer, NodeFsPort, GitWorkspace, SystemClock } from './node-ports.ts'
 
 export interface EngineOptions {
@@ -103,6 +111,18 @@ export interface EngineOptions {
    * plugin config's `juryConfidenceCap` (default 0.8).
    */
   readonly juryConfidenceCap?: number
+  /**
+   * κ: Class B (LLM jury) trust weight — the log-odds exponent applied to a
+   * jury verdict's own probability. Mirrors the plugin config's `classBTrust`
+   * (default 0.7).
+   */
+  readonly classBTrust?: number
+  /**
+   * κ: Class C (human) trust weight — same exponent semantics over the human
+   * probability (0.95). Mirrors the plugin config's `classCTrust` (default
+   * 0.9).
+   */
+  readonly classCTrust?: number
   readonly clock?: Clock
   readonly fs?: FsPort
   readonly commands?: CommandPort
@@ -174,6 +194,19 @@ export interface ContractSummary {
   readonly obligations: readonly ObligationResult[]
   /** Present when the verdict was jury-capped (docs-only self-attestation). */
   readonly juryConfidenceCap?: number
+  /**
+   * κ: the on-chain Class B/C witnesses whose factors were fused into this
+   * verdict's confidence — one entry per *active* attestation for the claim
+   * (highest gen wins; appeals override). Present exactly when at least one
+   * active witness exists for the claim's id. `verdict` is the jury verdict
+   * ('uphold'|'reject'|'abstain') or the human decision ('endorse'|'reject').
+   */
+  readonly attestations?: ReadonlyArray<{
+    readonly class: 'B' | 'C'
+    readonly gen: number
+    readonly verdict?: string
+    readonly factor: number
+  }>
 }
 
 /** ζ: `verify`'s options grown by the claim contract under judgment. */
@@ -279,6 +312,10 @@ export class ProofEngine {
   private readonly resolver: DefinitionResolverPort | undefined
   private readonly logger: ((message: string) => void) | undefined
   private readonly verbose: boolean
+  /** κ: where the evidence log physically lives — marker payloads (attestations) are read back through it. */
+  private readonly logPath: string
+  /** κ: trust weights for Class B/C evidence, synthesised from config passthrough. */
+  private readonly trustWeights: TrustWeights
   private readonly options: {
     evidenceDir: string
     autoDiscover: boolean
@@ -307,6 +344,18 @@ export class ProofEngine {
     const storeDir = isAbsolutePath(evidenceDir)
       ? evidenceDir.replace(/[\/]+$/, '')
       : `${options.root.replace(/[\/]+$/, '')}/${evidenceDir}`
+    // κ: kept separately — EvidenceStore exposes no marker read-back, and the
+    // attestation pass below reads the raw marker lines through the same fs
+    // port instead of growing the store's public surface mid-batch.
+    this.logPath = `${storeDir}/evidence.jsonl`
+    // κ: trust weights for graded evidence. The exponents come from config;
+    // the human probability rides the shared default so B and C factors stay
+    // comparable no matter how a deployment tunes the exponents.
+    this.trustWeights = {
+      classB: options.classBTrust ?? DEFAULT_TRUST_WEIGHTS.classB,
+      classC: options.classCTrust ?? DEFAULT_TRUST_WEIGHTS.classC,
+      humanProbability: DEFAULT_TRUST_WEIGHTS.humanProbability,
+    }
     const workspaceKey = options.workspaceKey ?? 'default'
     // E2: whichever provider wins (host-injected or trustDir-derived), it is
     // wrapped so a load failure can never pass silently — the downgrade itself
@@ -316,7 +365,7 @@ export class ProofEngine {
     const signerProvider = rawSignerProvider !== undefined ? () => this.watchSigner(rawSignerProvider) : undefined
     this.store = new EvidenceStore(
       this.fs,
-      `${storeDir}/evidence.jsonl`,
+      this.logPath,
       `${storeDir}/baseline.json`,
       this.clock,
       {
@@ -646,6 +695,15 @@ export class ProofEngine {
    *   verdict lands on the chain as a `claim/jury` marker, and the report is
    *   the jury report: grade exactly "did every obligation hold", confidence
    *   the capped number, basis `jury-only`.
+   * - llm-jury (κ) likewise never runs a single check (skipChecks): the claim
+   *   is judged by the *chain's* active Class B/C attestations for its
+   *   claimId — highest gen wins, so an appeal overrides. Confidence is the
+   *   product of the class-weighted attestation factors (the machine factor
+   *   is the neutral 1); `proven` demands every obligation met AND that
+   *   product clearing `certifyTarget`. The verdict summary lands as a
+   *   `claim/jury` marker carrying claimId, gen, verdict, probability,
+   *   factor, model and independence — the full prompt/output text already
+   *   lives in the attest marker.
    * - Every other kind runs its whole affected set to decisive outcomes (the
    *   whole-batch regime — a contract's obligations need the evidence, and a
    *   bayesian planned skip could leave precisely the check the claim rests
@@ -655,7 +713,11 @@ export class ProofEngine {
    *   harness affected. Obligations are then evaluated against the fresh
    *   records with the API surface diffed against the baseline, and a
    *   `proven` run carrying any unmet obligation is downgraded to `stale` —
-   *   the engine never co-signs more than the obligations allow.
+   *   the engine never co-signs more than the obligations allow. When the
+   *   chain holds active B/C attestations for the claim (κ), their factors
+   *   multiply into the machine confidence (basis `attested`) — a factor can
+   *   only discount the number, never rescue a grade the machine run did not
+   *   earn.
    */
   async verifyContract(options: ContractVerifyOptions): Promise<ContractVerifyOutcome> {
     const { contract, ...rest } = options
@@ -725,6 +787,109 @@ export class ProofEngine {
           kind: verdict.kind,
           obligations: verdict.obligations,
           juryConfidenceCap: confidence,
+        },
+      }
+    }
+
+    // -- llm-jury: B/C attestation decides, no commands (κ) ------------------
+    //
+    // Same skeleton as docs-only (skipChecks is true for llm-jury, so no
+    // command ever runs), but the judge is the *chain*, not the author: the
+    // active on-chain attestation(s) for this claim — highest gen wins, so an
+    // appeal overrides its predecessor — supply the evidence, and the
+    // confidence is the fused product of their class-weighted factors. The
+    // machine factor is the neutral 1 (nothing ran), so the number is exactly
+    // Π attestationFactor: a strong jury upholding at p=0.99 still pays
+    // 0.99^0.7 ≈ 0.993, and certification needs that product to clear
+    // `certifyTarget` on top of every obligation holding.
+    if (contract.kind === 'llm-jury') {
+      const claimId = claimIdOf(contract.claim)
+      const active = attestationsFor(await this.activeAttestationsAll(), claimId)
+      // `changed` is resolved honestly (context for the evaluator), and
+      // `specs`/`baseline` are handed over — but no command ever runs.
+      const attribution = await this.resolveChanges(rest, baseline)
+      const changed = attribution.changed
+      const verdict = evaluateContract(
+        {
+          contract,
+          changed,
+          specs,
+          records: [],
+          baseline,
+          apiSurfaceBefore: undefined,
+          apiSurfaceAfter: undefined,
+          graph: undefined,
+          ...(active.length > 0 ? { attestations: [...active] } : {}),
+        },
+        this.options.juryConfidenceCap,
+      )
+      const fused = this.attestationProduct(active)
+      const unmet = verdict.obligations.filter(o => !o.met)
+      const grade: GradedProofReport['grade'] =
+        unmet.length === 0 && fused >= this.options.certifyTarget ? 'proven' : 'stale'
+      // Basis: nothing machine-made speaks, so an active Class B witness makes
+      // this jury-only; a human witness alone (or none at all) keeps the
+      // jury-report default rather than claiming a machine factor it never had.
+      const basis: ConfidenceBasis = active.length === 0 || active.some(a => a.kind === 'attest/jury')
+        ? 'jury-only'
+        : 'attested'
+      const jury = assembleJuryReport({
+        contract,
+        obligations: verdict.obligations,
+        confidence: fused,
+        workspace: await this.workspaceSnapshot(),
+        clock: this.clock,
+      })
+      // Engine-side overwrite (κ): the jury assembler's grade rule is "all
+      // obligations met"; the fused regime additionally demands the certify
+      // target, so the engine owns the final grade and basis here.
+      const report: GradedProofReport = { ...jury, grade, confidenceBasis: basis }
+      const selection: SelectionResult = {
+        affected: [],
+        untouched: [...specs],
+        forcedAll: false,
+        closure: [...changed],
+        uncertain: false,
+        precision: 'forced',
+      }
+      const winner = active[0]
+      await this.store.mark('claim/jury', {
+        claim: contract.claim,
+        claimId,
+        grade,
+        unmet: unmet.map(o => o.id),
+        // κ: attestation summary for the boundary marker — the full
+        // prompt/output text already lives in the attest marker itself, so
+        // this records only what the grade rode on.
+        ...(winner === undefined
+          ? { attestations: 0 }
+          : winner.kind === 'attest/jury'
+            ? {
+                gen: winner.gen,
+                verdict: winner.verdict,
+                probability: winner.probability,
+                factor: attestationFactor(winner, this.trustWeights),
+                model: winner.model,
+                independence: winner.independence,
+              }
+            : {
+                gen: winner.gen,
+                verdict: winner.decision,
+                factor: attestationFactor(winner, this.trustWeights),
+                approver: winner.approver,
+              }),
+      })
+      await this.store.checkpoint()
+      return {
+        report,
+        checks: [],
+        selection,
+        changed,
+        attribution,
+        contract: {
+          kind: verdict.kind,
+          obligations: verdict.obligations,
+          ...(active.length > 0 ? { attestations: this.attestationSummary(active) } : {}),
         },
       }
     }
@@ -803,9 +968,55 @@ export class ProofEngine {
     // earned (the number says what was measured, the obligations say what is
     // missing); grades already worse than `proven` keep their more honest
     // verdict untouched.
-    const graded = report.grade === 'proven' && unmet.length > 0
+    let graded = report.grade === 'proven' && unmet.length > 0
       ? { ...report, grade: 'stale' as const }
       : report
+
+    // κ: attestation fusion for machine kinds. The machine grade and
+    // confidence are already on the table; active B/C witnesses for this
+    // claim now speak about the WHOLE claim, so they enter as the reliability
+    // mixture (`fuseConfidence`), not as product factors: a jury asserting a
+    // high probability can carry a certification across the target gap, a
+    // rejecting witness crashes the number, and a human endorsement leaves
+    // the number untouched — its power is risk acceptance, applied to the
+    // GRADE below, because an approval seam transfers responsibility, not
+    // certainty (its asserted constant can never outrun a 0.97 target).
+    // Grades the machine run did not earn regressions for stay exactly what
+    // they were: no witness unlocks a regressed claim. Plain `verify()` never
+    // consults attestations at all (v0.9 semantics locked).
+    const claimActive = attestationsFor(await this.activeAttestationsAll(), claimIdOf(contract.claim))
+    if (claimActive.length > 0 && graded.confidence !== undefined) {
+      let fused = graded.confidence
+      for (const att of claimActive) fused = fuseConfidence(fused, att, this.trustWeights)
+      const machineDecisive = batch.records.some(r => isDecisiveStatus(r.status))
+      const endorsed = claimActive.some(a => a.kind === 'attest/human' && a.decision === 'endorse')
+      // Risk acceptance unlocks ONLY the target gap: every obligation met,
+      // nothing regressed, nothing newly failing — the machine said "0.94 and
+      // I cannot cross 0.97", and the human took the residual. An unmet
+      // obligation or a regression is not residual risk; it is missing work,
+      // and endorsement cannot pay for work.
+      const endorsementUnlock = endorsed
+        && graded.grade === 'stale'
+        && unmet.length === 0
+        && graded.summary.regressions === 0
+        && !checks.some(c => c.verdict === 'new-failure')
+      graded = {
+        ...graded,
+        confidence: fused,
+        grade: endorsementUnlock ? 'proven' as const : graded.grade,
+        confidenceBasis: ProofEngine.fusedBasis(machineDecisive, claimActive),
+      }
+      // The symmetric lock: an explicit negative verdict (a human 'reject', a
+      // jury 'reject') does not merely dent the number — a claim a sworn
+      // witness denies cannot keep a grade the number no longer supports.
+      // Endorsement is excluded from the trigger: it never moved the number,
+      // so it cannot demote on its own.
+      const denied = claimActive.some(a =>
+        a.kind === 'attest/human' ? a.decision === 'reject' : a.verdict === 'reject')
+      if (denied && graded.grade === 'proven' && fused < this.options.certifyTarget) {
+        graded = { ...graded, grade: 'stale' as const }
+      }
+    }
 
     await this.store.mark('proof/verified', {
       grade: graded.grade,
@@ -820,6 +1031,8 @@ export class ProofEngine {
         kind: verdict.kind,
         unmet: unmet.map(o => o.id),
         jury: verdict.skipChecks,
+        // κ: which witnesses were fused in, when any were.
+        ...(claimActive.length > 0 ? { attestations: this.attestationSummary(claimActive) } : {}),
       },
     })
     await this.store.checkpoint()
@@ -836,8 +1049,76 @@ export class ProofEngine {
         ...(verdict.juryCappedConfidence !== undefined
           ? { juryConfidenceCap: verdict.juryCappedConfidence }
           : {}),
+        // κ: the fused-in witnesses, for hosts surfacing who vouched.
+        ...(claimActive.length > 0 ? { attestations: this.attestationSummary(claimActive) } : {}),
       },
     }
+  }
+
+  // -- graded evidence (κ) ----------------------------------------------------
+
+  /**
+   * Every *active* attestation on the chain: marker payloads under the
+   * 'attest/jury' / 'attest/human' labels, deduplicated per claimId by
+   * highest gen (an appeal overrides its predecessor), deterministically
+   * ordered. The store exposes no marker read-back, so the raw log lines are
+   * parsed here through the same fs port — the least invasive route that
+   * leaves `EvidenceStore`'s public surface untouched. Any read or parse
+   * failure degrades to "no witnesses" rather than failing verification.
+   */
+  private async activeAttestationsAll(): Promise<Attestation[]> {
+    try {
+      const payloads: unknown[] = []
+      for (const line of await this.fs.readLines(this.logPath)) {
+        let envelope: { kind?: unknown; payload?: unknown }
+        try {
+          envelope = JSON.parse(line) as { kind?: unknown; payload?: unknown }
+        } catch {
+          continue
+        }
+        if (envelope?.kind !== 'marker') continue
+        const payload = envelope.payload as { label?: unknown } | undefined
+        if (payload?.label === 'attest/jury' || payload?.label === 'attest/human') payloads.push(payload)
+      }
+      return activeAttestations(payloads)
+    } catch {
+      // An unreadable log cannot veto verification — it simply has no
+      // witnesses to fuse. (The log's own integrity is `audit()`'s charge.)
+      return []
+    }
+  }
+
+  /** κ: Π attestationFactor over the active witnesses — the neutral 1 when empty. */
+  private attestationProduct(active: readonly Attestation[]): number {
+    let product = 1
+    for (const att of active) product *= attestationFactor(att, this.trustWeights)
+    return product
+  }
+
+  /**
+   * κ: one-line summary per active witness, for `ContractSummary.attestations`
+   * and the boundary markers. Class, generation, verdict and the exact factor
+   * the fusion paid — everything a host needs to show who vouched, and how
+   * hard, without re-reading the full attest payloads.
+   */
+  private attestationSummary(active: readonly Attestation[]): NonNullable<ContractSummary['attestations']> {
+    return active.map(att => ({
+      class: att.kind === 'attest/jury' ? 'B' as const : 'C' as const,
+      gen: att.gen,
+      verdict: att.kind === 'attest/jury' ? att.verdict : att.decision,
+      factor: attestationFactor(att, this.trustWeights),
+    }))
+  }
+
+  /**
+   * κ: which regime a fused number was earned under. No machine-decisive
+   * record with a Class B witness active is `jury-only` (the verdict is the
+   * jury's, machines never spoke); every other fusion — machine evidence plus
+   * any witness, or a lone Class C witness — is `attested`.
+   */
+  private static fusedBasis(hasMachineDecisive: boolean, active: readonly Attestation[]): ConfidenceBasis {
+    if (!hasMachineDecisive && active.some(a => a.kind === 'attest/jury')) return 'jury-only'
+    return 'attested'
   }
 
   // -- API surface (ζ) ------------------------------------------------------

@@ -10,13 +10,20 @@
 
 export type {
   CheckKind, CheckSource, CheckSpec, Clock, CommandPort, CommandResult,
-  CommandRunOptions, DefinitionResolverPort, FileStat, FsPort, SignerPort,
-  WalkOptions, WorkspacePort,
+  CommandRunOptions, DefinitionResolverPort, FileStat, FsPort, JuryPort,
+  SignerPort, WalkOptions, WorkspacePort,
 } from './ports.ts'
 
 export {
   addressOf, canonicalJson, merkleRoot, normalizeOutput, sha256,
 } from './hash.ts'
+
+export {
+  DEFAULT_TRUST_WEIGHTS, JURY_RUBRIC, RUBRIC_V1, activeAttestations,
+  attestationFactor, attestationsFor, claimIdOf, juryPrompt,
+  type Attestation, type AttestationMarkerPayloads, type EvidenceClass,
+  type HumanAttestation, type JuryAttestation, type TrustWeights,
+} from './attest.ts'
 
 export type { NormalizeOptions } from './hash.ts'
 

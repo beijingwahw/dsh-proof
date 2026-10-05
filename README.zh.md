@@ -123,7 +123,7 @@ Re-read these before relying on them, then re-run proof_verify.
 
 ---
 
-## 四、面向模型的四个工具
+## 四、面向模型的七个工具
 
 | 工具 | 作用 |
 |---|---|
@@ -131,6 +131,9 @@ Re-read these before relying on them, then re-run proof_verify.
 | `proof_baseline` | 建立/刷新基线：跑全部客观检查并记录证据 |
 | `proof_verify` | 增量验证：只跑变更集所影响的检查，对照基线给出评级与归因 |
 | `proof_claim` | **声明 + 证明**：`proven: true` 才算数，否则 `blockers` 就是待办清单；v0.10 起可携带合约参数（`kind` 与 `budgetMs` / `review` / `entryPoints`）把断言绑定到对应的证据义务（§五·十三） |
+| `proof_jury` | **B 类证据·第一步**：为断言申请一次 LLM 陪审审议——冻结审议 prompt（量规全文 + 断言 + 上下文）返还模型，并把请求（含逐字 prompt）落链（§五·十四） |
+| `proof_jury_submit` | **B 类证据·第二步**：把陪审裁决（verdict / probability / reasoning 逐字）连同冻结 prompt、声明模型身份、独立性档位全包落链为永久 Class B 证据；claimId 必须匹配最新请求；gen 自动 +1 = 申诉 |
+| `proof_endorse` | **C 类证据**：具名人类背书/驳回断言——调用本身触发宿主审批（ask），人类批准才落链（approver / scope / approvedAt）；endorse = 风险接受（解锁等级、不抬数字），reject = 崩塌置信 |
 
 所有工具都遵守 DSH 的硬契约：`execute` 只返回**规范 JSON 值**，人类可读文案在 `output.render`，UI 卡片通过 `presentCall` / `presentResult` / `presentationMeta` **纯投影**生成 —— session-log 回放时逐字节复现同一张卡片。
 
@@ -142,6 +145,7 @@ Re-read these before relying on them, then re-run proof_verify.
 |---|---|
 | `tools/pre-execute`（waterfall） | `requireBaseline: ask` 时，**没有基线就不许改工作区**，走用户审批 |
 | `tools/pre-execute`（waterfall） | `evidenceStore: workspace` 时，**写入证据库的变更类工具一律转用户审批**——被审计者不能改审计记录 |
+| `tools/pre-execute`（waterfall） | `proof_endorse` 恒转 `ask` 审批——Class C 证据是**人类的有意识决定**，模型说了不算（§五·十四） |
 | `tools/result`（emit） | 观察每次工具结果，维护脏区与文件指纹 |
 | `agent/turn-stopping` | 本轮改了东西但没做 `proof_claim` → 注入纠正性上下文；没有基线且 `requireBaseline: warn` → 注入基线提醒；检测到漂移 → 注入 stale 警告 |
 | `ctx.systemPrompt.section()` | 发布 `proof:policy` 段落，让模型知道规则存在，不必靠失败去摸索 |
@@ -213,7 +217,7 @@ v0.6 在 `normalizeOutput` 落地双层归一：**root → `$WORKSPACE`（先具
 
 **信任三态**。audit 的签名裁定从二态改为三态。旧逻辑在**没有 signer 的机器**上（密钥丢失、换机器审计）会把带签名的检查点误读成可疑；现在只有本机实际持有的密钥、面对点名该密钥的检查点，才有资格**驳斥**（`badCheckpoints`，真正的伪造指控）；本机无法裁定的（`unverifiableCheckpoints`）是**能力缺失而非指控**，不再使 audit 失败。锚文件自身的签名现在也会被验证（`anchorForged`），且锚携带 `workspaceKey`——审计可以仅凭锚文件重导出被签名的字节。
 
-**引擎的诚实边界**。git 不可用时（WorkspacePort 新可选能力 `gitAvailable?()`），每条 git 查询各自失败返回空集——"什么都看不见"曾被吞成"什么都没变"，增量选择悄悄缩成空。现在变更集显式标记 `degraded`，引擎**强制全量跑**并在 `VerifyOutcome.degraded` 透出。中止的基线不再落盘——abort 的基线曾照常写盘，之后的回归判定对着半成品真值运行；现在已观测的证据仍全部入链、落 `baseline/aborted` 标记、检查点窗口照常闭合，返回值携带 `aborted` 标志，下一次 verify 诚实报告 `no-baseline`。signer 加载失败大声降级：链内 `trust/signer-unavailable` marker + verbose 日志——静默降级与诚实的 unsigned 部署从此可区分。`requireBaseline: 'warn'` 从"配置了但没接线"变成真通知：本轮动了工作区而没有基线时，回合结束经 `agent.inject` 注入纠正性提示。死配置 `driftNoticeMs` 删除（配置降至 22 项，v0.9 增至 24 项，v0.10 增至 26 项）。
+**引擎的诚实边界**。git 不可用时（WorkspacePort 新可选能力 `gitAvailable?()`），每条 git 查询各自失败返回空集——"什么都看不见"曾被吞成"什么都没变"，增量选择悄悄缩成空。现在变更集显式标记 `degraded`，引擎**强制全量跑**并在 `VerifyOutcome.degraded` 透出。中止的基线不再落盘——abort 的基线曾照常写盘，之后的回归判定对着半成品真值运行；现在已观测的证据仍全部入链、落 `baseline/aborted` 标记、检查点窗口照常闭合，返回值携带 `aborted` 标志，下一次 verify 诚实报告 `no-baseline`。signer 加载失败大声降级：链内 `trust/signer-unavailable` marker + verbose 日志——静默降级与诚实的 unsigned 部署从此可区分。`requireBaseline: 'warn'` 从"配置了但没接线"变成真通知：本轮动了工作区而没有基线时，回合结束经 `agent.inject` 注入纠正性提示。死配置 `driftNoticeMs` 删除（配置降至 22 项，v0.9 增至 24 项，v0.10 增至 26 项，v0.11 增至 28 项）。
 
 **正确性收口（soundness closure）**。monorepo workspace 子包检查不再丢失：CheckSpec 新增 `cwd`（相对 root），子包检查真正在子包目录执行、id 含 cwd（cwd 缺省时 checkId 与旧格式逐字节一致），`packages/*` 单层 glob 现在真正展开——同 argv 的兄弟包检查不再互相顶替。影响图补盲：动态 `import('...')` 与多行 ESM import 现在产生边；Python dotted import（`pkg.mod`）在扫描集内尝试解析——多出的边只造成过选，绝不漏选。`git status --porcelain -z` 的 rename 条目解析修正（旧路径曾被截掉 3 个字符成为幻影路径；解析提为纯函数 `parsePorcelainZ`）。Windows 盘符绝对路径（`C:\...`）统一进路径域：observe 的 touched 归类、LSP root 前缀比较（大小写不敏感）、证据库守卫均修正。EvidenceStore 写入改单飞队列——并发的 append/mark/checkpoint 曾可能都链到同一个 tail，后一条的 `prev` 指向一条已不存在的行：**正确代码与它自己的竞态**。证据输出捕获改用 StringDecoder，多字节字符跨 chunk 边界不再碎成 U+FFFD。工程卫生：CI 改 `npm ci` 并加 windows 矩阵；`check-bundle` 错误路径不再崩溃；`untouchedChecks` 输出修正。
 
@@ -322,6 +326,51 @@ PROVEN (p≈0.80, jury evidence — self-attestation is capped)
 
 **运行制度与健全性**。带 kind 的断言走全批（whole-batch）制度而非波式调度——义务需要证据，贝叶斯计划性跳过恰好可能跳过断言所依赖的那个检查，所以合约运行不做提前认证（perf-budget 另加强制 benchmark）。义务判定在运行之后做，依据是本次的新鲜记录与「现在」的工作区面。**义务未 met 绝不 proven**：一次 otherwise-proven 的运行只要携带任何未 met 义务，grade 一律封顶 `stale`（更差的评级保持原样；confidence 与 basis 保留运行挣到的数字——数字说测到了什么，义务说还缺什么）。合约摘要随 `proof/verified` 边界标记入链（kind、未 met 义务 id、是否 jury）。向后兼容：不声明 `kind` 的 claim 与 v0.9 行为**完全一致**，自由文本断言保留为人类陈述。旧基线诚实降级：v0.10 之前建立的基线没有 `apiSurface` 附件，`behavior-preserving` 的 `api-surface-unchanged` 直接判 not met，detail 明确提示重建基线（re-run proof_baseline）——不可比较的面永远不是一次通过。义务判定是纯函数（无时钟、无随机、无文件系统），一切多值 detail 先排序——同一输入永远产出字节级同一裁决。
 
+## 五·十四、证据分级体系（v0.11.0）：把一半的世界请回证明体系
+
+到 v0.10 为止，证明体系只承认能被机器测量的断言——「测试全绿」「API 面没动」「benchmark 在预算内」。剩下的一半世界（可读性提升了、错误信息更友好、迁移指南与代码一致）只有一个出口：docs-only 自证，封顶 0.8。v0.11 把**证词（testimony）**作为一等证据请回体系——不是把证词伪装成测量，而是给每一级证据配上它所能承担的最强诚实机制：测量可复算，审议可审计，背书可问责。三级证据一张表：
+
+| Class | 来源 | 完整性机制 | 信任的表达 |
+|---|---|---|---|
+| **A 机器测量** | 检查运行：退出码 + 归一化输出入链 | **确定性复算**：任何人重跑命令、比对 digest | `claimProbability` 的因子（v0.9 语义，一字不动） |
+| **B LLM 陪审** | 陪审对断言的审议裁决（`attest/jury`） | **可审计**：完整陪审包落链——逐字 prompt（含量规全文）、量规版本、提交方声明的模型身份、独立性档位、完整逐字输出；第三方可重放比对 | `attestationFactor = p^classBTrust`（纯陪审路径）；混合力度 `w = classBTrust`（融合路径） |
+| **C 人类背书** | 具名人类的 endorse / reject（`attest/human`） | **问责到人**：approver / approvedAt / scope（断言全文 + 证据根）入链；经宿主审批 seam，模型说了不算 | endorse 轻折扣 `0.95^classCTrust`；reject 崩塌 `(1−0.95)^classCTrust` |
+
+**Class B：完整陪审协议（request/submit 二段式）**。第一步 `proof_jury(claim, context)`：`juryPrompt` 以纯字符串拼接**确定性**装配审议 prompt——`=== CLASS B JURY DELIBERATION ===` 头、`--- RUBRIC jury-rubric/v1 ---`、量规全文、`=== CLAIM ===`、`=== CONTEXT ===`、`=== OUTPUT ===`——同一（断言， 上下文， 量规， 版本）永远产出字节相同的 prompt，因为 **prompt 本身就是证据**，「重放这个 prompt」才有确定含义。请求落链为 `attest/jury-requested` marker（claimId、promptDigest、rubricVersion、**逐字 prompt**——只有摘要的请求没法被重放）；工具返还 `{claimId, rubricVersion, prompt, instruction}`，渲染以 `ACTION:` 行指示「按量规审议，然后带 JSON 裁决调 proof_jury_submit」。断言身份是 `claimIdOf(claim)` = sha256(断言文本) 前 16 hex——**改写断言就是新断言**，需要新证词。第二步模型审议后调 `proof_jury_submit(claimId, verdict, probability, reasoning, model?)`：防御性校验（verdict 三值、probability 有限且 ∈ [0,1]、reasoning 非空——参数 schema 是对模型的承诺，不是边界）；claimId 必须匹配链上**最新**请求（模型可能落后好几个请求，修法是重新 `proof_jury`）；请求 marker 缺逐字 prompt 则拒绝记录。通过后**全包落链**：kind / claimId / gen / prompt / rubricVersion / model / independence / verdict / probability / output / at——一份可被第三方整体重放的审议记录。
+
+**量规（`JURY_RUBRIC`，版本 `RUBRIC_V1` = `jury-rubric/v1`）**是每份 Class B prompt 携带的审议契约：只依据给定材料裁决（不用断言主题的外部知识、不假设 CONTEXT 之外的工具与会话）；`verdict` 三值——材料支持则 uphold、矛盾则 reject、不足则弃权；`probability` 是「断言为真」的**主观概率**（校准的判断，不是测量——报告你自己的推理真正支持的那个数）；证据不足就弃权，**诚实的 abstain 比自信的猜测对记录更有价值**；`reasoning` 说明哪些材料支持或削弱断言。输出格式：恰一个 JSON 对象 `{"verdict": "uphold"|"reject"|"abstain", "probability": <0..1>, "reasoning": "<text>"}`，前后不许有别的东西。**来源警告**明示：输出、prompt、声明模型身份将逐字作为 Class B 证据落上防篡改链，任何第三方可用同一或不同模型重跑此精确 prompt 并比对输出——「以你的答案是永久、公开、可复算产物的方式审议，因为它就是」。量规文本逐字冻结在源码里：改量规是代码变更，review 可见，无法在链中途静默换尺；`RUBRIC_V1` 标记每条证词审议时用的是哪版文本。
+
+**可复算的具体含义**。陪审不是确定性的，所以 B 类证据不是裁决本身，而是整个复算包。这套包不能让审议像哈希一样可复算——它让审议**可审计**：任何人拿冻结的 prompt 对声明的模型重放，检查记录的输出是否该模型真的倾向于说的话。不会重放的裁决**可被检测**——这是非确定性证人所能提供的诚信上限，也足以支撑争议（篡改的裁决与真实重放的输出分布对不上）。
+
+**可申诉的具体含义**。链是 append-only，再审议不能覆盖它争议的记录——它在 `gen + 1` 追加，读取方（`activeAttestations`）按（claimId, kind）取**最高 gen**（同 gen 后写的赢）：旧裁决留在链上作为申诉的对偶，被超越但可见。B 与 C 两信道**独立解析**：陪审申诉抹不掉人类背书，再背书也抹不掉陪审记录——不同证据信道，不同申诉过程。
+
+**Class C：审批 seam 与风险接受**。`proof_endorse(claim, decision, approver?)` 的 pre-execute 钩子恒返回 `ask`（双语 displayReason）：模型调用、宿主提问、**人类**决定——只有审批通过，execute 才把 `attest/human` marker 落链（approver 默认 `host-approver`、approvedAt、scope = {断言全文, evidenceRoot}、decision、gen——再背书/撤回同样以 gen+1 超越）。证据根是审批时可寻址的最强锚（基线根；无基线记 null——背书一条无锚断言，记录说的就是这个事实）。**为什么背书不改数字——数学必然**：审批 seam 是二值的，从背书方诱导出的自报置信不是证据，于是人类「对」的概率建模为常数 `humanProbability = 0.95`（不是测量，是 Class C 的 seam 拒绝采集数字后顶上来的建模选择；0.95 < 1 是刻意的——永不犯错的人类背书会让每条被背书的断言不可证伪）。endorse 的因子是 `0.95^0.9 ≈ 0.955`，**永远够不着 0.97 的 certifyTarget**——把背书当确定性转移去乘，数学上一次也过不了线。所以 endorse 在融合里根本不碰数字（`fuseConfidence` 原样返回 current）：它买的是**等级**——`endorsementUnlock`：机器 grade 因「差目标」而是 `stale`、零回归、无 new-failure、义务全 met 时，背书把 grade 解锁为 `proven`——人类接过了机器跨不过的剩余风险（**风险接受**，不是确定性转移），confidence 保持机器测得的数字，basis 记为 `attested`。**背书买不了缺失的工作**：义务未 met、有回归、有新失败时解锁不生效——缺失的工作不是剩余风险（测试钉死：扩大 API 面后即使背书在链上，grade 依然不 proven）。**对称锁**：显式 reject（人类驳回或陪审 reject）把数字乘 `(1−0.95)^0.9` 崩塌；崩塌后 fused < target 而 grade 还是 proven 时降回 `stale`——被宣誓证人否认的断言，不能保留数字已不再支持的等级。
+
+**两套权重数学，各有其位**。信任权重是**声明的策略常数**，不是学出来的——不存在「这个证人历史上对了几次」的标注集，一个调好就没人再调的常数不如一个诚实的声明值。配置两项：`classBTrust` 0.7、`classCTrust` 0.9。
+
+1. **`attestationFactor = p^w`（log-odds 指数折扣）——纯陪审路径的货币**。`claimProbability` 是因子乘积，factor = p^w 使 log(factor) = w·log(p)：信任权重是对证据 log-odds 贡献的**线性折扣**。w = 0 → factor 1（零信任零证据——连 p = 0 都动不了断言，0^0 = 1）；w = 1 → factor p（全信）。关键性质：w ∈ [0,1]、p ∈ [0,1] ⇒ p^w ∈ [p,1]（测试做了 [p,1] 网格扫描）——**证词只能弱化，不能放大**：断言不能靠堆证人被论证到高于其先验与机器证据支持的水平，证人最多做到弃权（factor 1）。这是对自利证明系统正确的怀疑方向。方向不需要特判：reject 自带低 p 而来，p^w 恰在此时低——**方向活在概率里，权重只携带信念**。abstain 恒 factor 1（「我说不清」是证据的缺席，缺席不是反面的证据）；读不出概率的值（NaN 会毒化整个乘积、>1 会放大断言）按弃权处理。`llm-jury` 契约的 confidence 就是 Π attestationFactor（机器因子是中性 1——没跑任何命令）：强陪审 uphold p=0.99 付 `0.99^0.7 ≈ 0.993`，过 0.97 线即 proven。
+2. **`fuseConfidence = (1−w)·c + w·p`（可靠性混合）——机器认证已存在时**证人谈论的是**整个断言**，诚实的模型随之不同：以概率 w 证人可靠（置信应成为其断言值），以 1−w 是噪声（机器数站住），期望即线性混合——以力度 w 把数字**拉向**证词值。陪审断言 0.99 @ w=0.7 能把 0.94 的机器认证拉过 0.97 目标（0.3·0.94 + 0.7·0.99 ≈ 0.975——救活），同一陪审断言 0.1 则崩到 ≈ 0.35。混合值**永不超过证人自己的断言**（两个混合端点就是 p 和 current）。Class C 不混合：endorse 数字不动（风险接受，等级解锁），reject 走上面的重折扣乘进 current。
+
+为什么是两套而不是一套：p^w 是「证人作为断言乘积里又一个独立分量」的正确代数——在那里它只能加残余怀疑；混合是「机器已经挣到认证、证人谈论整个断言」的正确模型。**用哪套由「机器是否已经说话」决定，不由哪套数字好看决定**。
+
+**`llm-jury` 契约（引擎合约系统的第五类 kind）**。与 docs-only 一样 `skipChecks` 不跑任何机器检查，但动机相反：docs-only 是没有值得测量的东西，llm-jury 是**已经决定**裁决属于证词——再跑机器检查会让一条机器记录悄悄覆盖（或洗白）断言从未请求的陪审。义务三条（id 固定）：`zero-regressions`（无机器记录时空真，诚实移交审议义务承担）+ `jury-delivered`（链上该 claimId 有 B 类**活动**裁决——任何裁决含 abstain 都算「送达」，是否帮到断言完全是下一条的事；只有 `attest/jury` 能满足，人类背书不能；无裁决时 detail 直接指路 `proof_jury` → `proof_jury_submit`）+ `jury-upholds`（活动裁决为 uphold 且 probability ≥ 0.5——0.5 是「断言为真概率」的一致性下限，低于它的 uphold 是陪审自相矛盾）。grade：义务全 met 且 Π factor ≥ `certifyTarget` 才 `proven`，否则 `stale`；basis：链上无活动证人或存在 B 证人 → `jury-only`（该路径本就没有机器记录），仅 C 证人 → `attested`。裁决摘要随 `claim/jury` 边界标记入链（claimId、gen、verdict、probability、factor、model、independence——完整 prompt/output 已在 attest marker 里，边界不重复倾倒）。**`verify()`（无契约路径）永不读 attestation**——v0.9 纯机器语义逐字节锁定（测试：链上种一条敌意 B 类 reject，verify 的 confidence / basis / grade / schedule 全部不变）。
+
+**`ConfidenceBasis` 的两个新语义**：`attested`——机器证据与 B/C 证人融合后的数字（机器后验被逐证人混合，或无机器记录时纯 C 证人）；`jury-only` 从 v0.10 的 docs-only 专用扩展为「无机器记录的纯 B 路径」。叙事直说 regime：`PROVEN (p≈0.97, machine + B/C attested)`。
+
+**三个新工具的用法**：
+
+| 工具 | 参数 | 行为 |
+|---|---|---|
+| `proof_jury` | `claim`（必填）、`context`（可选，缺省时 CONTEXT 段为 `<no additional context>`） | 冻结审议 prompt（确定性拼装）返还给模型；请求落链 `attest/jury-requested`（含逐字 prompt 与其摘要） |
+| `proof_jury_submit` | `claimId`、`verdict`、`probability`、`reasoning`（必填）、`model`（可选，默认 `'session-model (unverified)'`） | 校验裁决形状与请求绑定后，全包落链 `attest/jury`；gen = 链上该 claim 最高 gen + 1（**再提交即申诉**）；返回 `recorded` / `gen` / `factor`（默认策略的 p^0.7，全精度供第三方复算）与申诉指引 |
+| `proof_endorse` | `claim`、`decision`（`endorse` / `reject`）、`approver`（可选，默认 `'host-approver'`） | pre-execute 恒 `ask`——人类批准才执行；落链 `attest/human`（scope 含断言全文与基线证据根）；再决定以 gen+1 超越 |
+
+模型面进入 B/C 证据的入口就是这三个工具；融合发生在引擎的合约路径上（机器类 kind 的 `verifyContract` 读链上活动证人做混合/解锁，`llm-jury` 契约以证词积认证）。本版 `proof_claim` 的 `kind` 参数面板仍为 v0.10 的四类——`llm-jury` 合约由引擎合约系统定义并消费（§九 `05`/`18` 的引擎级测试直接经 `verifyContract` 驱动它）。
+
+**诚实边界（详见 §十）**：v0.11 的独立性档位实际是三者中最弱的 `same-session`（宿主尚无隔离模型 seam，链上如实标注）；模型身份是提交方声明、插件无法验证；量规判断仍是主观概率；`humanProbability` = 0.95 与混合模型都是建模/评分规则选择，不是推导出的后验。
+
+
+
 ---
 
 ## 六、架构：领域核心 + 薄适配层
@@ -331,7 +380,7 @@ PROVEN (p≈0.80, jury evidence — self-attestation is capped)
 ```
 dsh-proof/
 ├── src/
-│   ├── core/                 ← 纯领域层，零 @deepseek-ai/* 依赖（14 个模块）
+│   ├── core/                 ← 纯领域层，零 @deepseek-ai/* 依赖（15 个模块）
 │   │   ├── ports.ts          # 唯一的对外接口（Command/Fs/Clock/Workspace/Signer/Resolver）
 │   │   ├── hash.ts           # 规范化 JSON + 内容寻址 + Merkle root + 输出归一
 │   │   ├── checks.ts         # 客观检查发现（多语言 + monorepo 子包 cwd）
@@ -344,19 +393,20 @@ dsh-proof/
 │   │   ├── report.ts         # 证明装配与五档评级（含 docs-only 陪审报告）
 │   │   ├── excerpt.ts        # 智能摘录（balanced / head）
 │   │   ├── trust.ts          # 哈希链 + 检查点签名 + 带外锚点
-│   │   ├── contract.ts       # 类型化断言合约（四类 kind 与义务、API 面提取/diff、docs 分类）
+│   │   ├── contract.ts       # 类型化断言合约（五类 kind 与义务、API 面提取/diff、docs 分类）
+│   │   ├── attest.ts         # 证据分级 B/C（量规、陪审包、信任算术、申诉解析，纯函数）
 │   │   └── index.ts          # 领域导出
 │   ├── engine.ts             # ProofEngine —— 宿主调用的命令式门面
 │   ├── node-ports.ts         # Node 实现（spawn / fs / git / Ed25519）
 │   ├── config.ts             # Schemastery 配置
 │   ├── index.ts              # Cordis 插件入口
 │   ├── dsh/                  ← 薄 Cordis 适配层
-│   │   ├── tools.ts          # 四个模型可见工具
+│   │   ├── tools.ts          # 七个模型可见工具（含 B/C 证词三工具）
 │   │   ├── observe.ts        # 脏区追踪 + 漂移检测
 │   │   ├── prompt.ts         # proof:policy 段落
 │   │   └── lsp-impact.ts     # 宿主 LSP → DefinitionResolverPort 适配
 │   └── vendor/dsh-tools.ts   # 契约快照（pinned to dsh v0.2.1-alpha.1）
-├── test/                     # 17 个测试文件（277 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心、类型化断言合约
+├── test/                     # 18 个测试文件（317 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心、类型化断言合约、证据分级 B/C
 ├── cordis.patch.yml          # bundle 层
 └── examples/cordis.yml       # --patch 本地调试
 ```
@@ -364,7 +414,7 @@ dsh-proof/
 **为什么领域核心不碰 `@deepseek-ai/*`：**
 
 1. DSH 是开发者预览版，破坏性变更频繁。核心逻辑与 harness 版本解耦 → 升级不重写。
-2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，277 个测试全绿。
+2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，317 个测试全绿。
 3. 同一个核心可以被别的宿主（CLI、CI、其他 harness）复用。
 
 **为什么 `vendor/dsh-tools.ts` 是契约快照而不是活依赖：**
@@ -426,6 +476,8 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
         normalizeHome: true          # 把用户主目录归一为 $HOME（隐私+跨机器可比）
         apiEntryPoints: []           # API 面入口（工作区相对路径）；缺省 [] = 从 package.json main/exports["."]/types 推导
         juryConfidenceCap: 0.8       # docs-only 陪审自证的置信上限（grade 可 proven，confidence 永不超过此值）
+        classBTrust: 0.7             # B 类证据（LLM 陪审）信任权重：log-odds 指数/混合力度，弱证人只能弱化断言（§五·十四）
+        classCTrust: 0.9             # C 类证据（人类背书/驳回）信任权重：endorse 轻折扣 0.95^0.9≈0.955，reject 崩塌 (1-0.95)^0.9
         verbose: false
 ```
 
@@ -457,7 +509,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit，离线可跑
-npm test              # 277 个测试（node:test）
+npm test              # 317 个测试（node:test）
 npm run build         # 产出 lib/
 npm run bundle:check  # 打包契约自检
 ```
@@ -465,10 +517,10 @@ npm run bundle:check  # 打包契约自检
 测试分层：
 
 - `01`–`04` —— 纯核心：哈希、检查发现、影响分析、证据与判定
-- `05` —— 引擎端到端（内存端口；v0.9 增补波式调度用例：提前认证、首败停、`set` 回归、确定性、预算降级；v0.10 增补四类合约端到端与旧基线无 API 面的诚实降级）
+- `05` —— 引擎端到端（内存端口；v0.9 增补波式调度用例：提前认证、首败停、`set` 回归、确定性、预算降级；v0.10 增补四类合约端到端与旧基线无 API 面的诚实降级；v0.11 增补证据分级 5 例：链种 B 裁决零命令认证、双向申诉覆盖、背书风险接受与 reject 崩塌+对称锁、背书只解目标差不买工作、纯机器隔离——`verify()` 永不读链上证词）
 - `06` —— 漂移检测
 - `07` —— **真实 shell 集成**：真的 `npm run --silent test`，真的退出码，真的回归归因
-- `08` —— 插件接线：四个工具、三个钩子、提示词段落、纯投影、配置校验
+- `08` —— 插件接线：七个工具、pre-execute 钩子（基线门、证据库守卫、`proof_endorse` 恒 ask 的审批 seam）、提示词段落、纯投影、配置校验、陪审请求冻结/裁决校验/审批后落链
 - `09` —— **信任对抗**：链断裂、全量重写（用本包自己的哈希函数）、回滚、基线替换、真实 Ed25519 密钥
 - `10` —— **变更集溯源**：陈旧脏区豁免、还原即变更、未跟踪文件、外部回归不记账、引擎端到端
 - `11` —— **LSP 影响融合**：goToDefinition 验证近似边、别名导入盲区发现、缓存与预算、降级不缩窄
@@ -478,6 +530,7 @@ npm run bundle:check  # 打包契约自检
 - `15` —— **runner 直测**：并发 clamp、验证预算 skip、abort 传播、乱序完成重排、`killedBySignal` 判定（信号 ≠ 超时）、spawnError、excerpt 贯通
 - `16` —— **贝叶斯调度核心**：公式阶梯逐档核对（ρ 平滑、s 的 1.0 / 1/(1+d) / 0.7 / 0.5、π 双侧 clamp、α clamp）、后验单调性与全概率恒等式（鞅）、VOI 非负且与独立转写的公式吻合、确定性 / 乱序不变、(π, α) 网格扫描
 - `17` —— **类型化断言合约**：五形态提取逐形态核对（含别名/字符串别名/多声明符/解构/`export =`/`export * as ns`）、入口推导与闭包截断、义务矩阵全分支（四类 × met/not met × detail 文案）、`requirements*.txt` 陷阱守卫、封顶值逐字兑现、纯函数确定性（同输入同字节、记录乱序不变）
+- `18` —— **证据分级（B/C 证词）**：量规存在性与结构化输出指令（英文 rubric 逐项核对：三值裁决、主观概率、弃权规则、Class B 落盘与重放警告）、`juryPrompt` 字节级确定性与段落结构（含量规版本覆盖）、`claimIdOf` 稳定 16-hex 身份（改写即新断言）、因子数学（p^w 语义、abstain 中性、w=0/w=1 边界、**[p,1] 网格扫描**、NaN/越界防毒、C 类 endorse 0.95^0.9 与 reject 0.05^0.9）、`activeAttestations` 链读纪律（垃圾载荷防御、gen 申诉解析、同 gen 后写者赢、B/C 独立信道、(claimId, kind) 确定性排序）、llm-jury 义务矩阵全分支、模块级确定性
 
 本地调试：
 
@@ -503,6 +556,10 @@ pnpm dsh web --patch /absolute/path/to/dsh-proof/examples/cordis.yml
 - **API 面是正则提取的保守过报近似（v0.10）。** 逐行正则看不见运行时动态生成的导出（动态计算的导出名、字符串拼出的再导出）；提取刻意偏向过报——漏报一个导出等于漏掉一次破坏性变更（错误通过），多报只是让诚实的断言多干活（错误失败）。入口推导依赖 `package.json` 声明与存在性探测，声明与真实入口不符时请显式配置 `apiEntryPoints`。
 - **docs-only 的陪审是自证，不是实验（v0.10）。** `review` 是作者自评：confidence 封顶 `juryConfidenceCap`（默认 0.80）、basis 为 `jury-only`、叙事直说 `self-attestation is capped`。这个数是**上限不是测量**，不得当作实验证据引用。
 - **perf-budget 的 `durationMs` 受机器噪声影响（v0.10）。** 预算判定基于 wall-clock 时长测量，受机器负载、频率漂移与并行进程影响，跨机器不可比。`budgetMs` 应留余量，边界值附近的判定波动是预期行为而非回归。
+- **B 类证词的独立性只有最弱档（v0.11）。** `independence` 分档为 `same-session` / `fresh-context` / `isolated-model`，而本版工具实际写入的是 **`same-session`**——陪审在作者智能体自己的上下文里审议，污染风险最高的一档，链上如实标注。模型身份同样是**提交方声明而非可验证事实**（插件无法验证应答者是谁），记为 `'session-model (unverified)'`；能抓住冒名顶替的不是声明，而是第三方拿同一 prompt 重放比对输出的审计。权重（`classBTrust` 0.7）是声明的策略常数，不是从数据里学出来的——不存在「这个证人历史上对了几次」的标注集。
+- **陪审的 `probability` 是主观概率，不是测量（v0.11）。** 量规要求陪审报告「你的推理真正支持的那个数」，但 LLM 的自报数字没有对标任何频率保证；p=0.99 与 p=0.9 的差别应读作措辞强度而非校准差距。全部证词数学（p^w、混合）都是在**消费**这个主观数，不会让它变得更客观。
+- **`humanProbability` = 0.95 是建模选择（v0.11）。** Class C 的审批 seam 是二值的（批准/驳回），不采集数字置信，于是人类「对」的概率以常数 0.95 入账——不是测量，也不该被调参成「看起来能过 0.97 目标」的值。0.95 < 1 是刻意的：永不犯错的人类背书会让每条被背书的断言不可证伪。
+- **可靠性混合是评分规则选择，不是推导出的后验（v0.11）。** `fuseConfidence = (1−w)·c + w·p` 把「证人以概率 w 可靠、否则是噪声」建模为线性期望——选择「混合」而不是「乘积」是因为机器认证已存在时证词谈论的是**整个断言**而非又一个独立因子；它不是从任何先验推出的后验，边界情况（w→0 保机器数、w→1 采纳证词值）是设计锚点而非定理。两套数学各有其位：纯陪审路径用 p^w 折扣（只能弱化），融合路径用混合（可救活也可崩塌）——用哪套由「机器是否已经说话」决定，而不是由哪套数字好看决定。
 - **`proven` 允许存在预置红灯。** 一个本来就红的仓库不该让 Agent 无法工作。预置失败会在报告里显著列出，但不计入本次会话的责任。这是刻意设计，不是漏洞。
 - **它不替代测试本身。** `dsh-proof` 编排并归因你已有的客观检查；它不生成测试用例。
 - **DSH 是 v0.1/0.2 开发者预览版。** 插件契约会变。本插件已把依赖面最小化并钉死契约快照（`src/vendor/dsh-tools.ts`），但上游变更时仍需重新对齐。

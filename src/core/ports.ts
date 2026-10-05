@@ -10,6 +10,8 @@
  * @module dsh-proof/core/ports
  */
 
+import type { JuryAttestation } from './attest.ts'
+
 /** Result of running one external command to completion. */
 export interface CommandResult {
   /** Process exit code, or `null` when the process was killed by a signal. */
@@ -98,6 +100,20 @@ export interface SignerPort {
   sign(data: string): Promise<string>
   /** True when `signature` was produced by this key over `data`. */
   verify(data: string, signature: string): Promise<boolean>
+}
+
+/**
+ * 陪审端口：宿主若有隔离模型 seam 可实现之；v0.11 适配层用 same-session
+ * 工具协议实现。(ι) The host may implement this with a genuinely isolated
+ * model seam — which is what `independence: 'isolated-model'` is for — while
+ * the default adapter deliberates through the same session's tool protocol
+ * and must record itself as 'same-session'. Either way the implementation's
+ * duty is to build the prompt with `juryPrompt`, run the juror verbatim, and
+ * return the complete deliberation for the chain; it decides, it does not
+ * advocate.
+ */
+export interface JuryPort {
+  deliberate(request: { claim: string; context: string }): Promise<JuryAttestation>
 }
 
 /**

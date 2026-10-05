@@ -129,6 +129,8 @@ export function apply(ctx: Context, config: Config): void {
       ? { apiEntryPoints: config.apiEntryPoints }
       : {}),
     juryConfidenceCap: config.juryConfidenceCap,
+    classBTrust: config.classBTrust,
+    classCTrust: config.classCTrust,
   })
 
   const watch = new WorkspaceWatch(engineFs(engine), root)
@@ -138,10 +140,19 @@ export function apply(ctx: Context, config: Config): void {
   /** Set when `warn` passes a baseline-less mutation; consumed by turn end. */
   let pendingBaselineNotice = false
 
+  // λ: the physical evidence-log location, derived with the same rule
+  // ProofEngine applies to its own private copy (the engine exports neither
+  // the path nor its derivation, and EvidenceStore exposes no marker
+  // read-back). The Class B/C tools read attestation markers back through the
+  // engine's fs port with it — keep in lockstep with engine.ts's constructor.
+  const evidenceLogPath = `${isAbsoluteHostPath(evidenceDir)
+    ? evidenceDir.replace(/[\/]+$/, '')
+    : `${root.replace(/[\/]+$/, '')}/${evidenceDir}`}/evidence.jsonl`
+
   const log = (...args: unknown[]) => { if (config.verbose) console.log('[dsh-proof]', ...args) }
 
   // -- model-facing tools -------------------------------------------------
-  for (const tool of createProofTools(engine, () => watch.sessionTouchedPaths())) {
+  for (const tool of createProofTools(engine, () => watch.sessionTouchedPaths(), evidenceLogPath)) {
     host.tools.register(tool)
     log(`registered tool ${tool.name}`)
   }
@@ -209,6 +220,30 @@ export function apply(ctx: Context, config: Config): void {
       return next()
     })
   }
+  // -- Class C human-endorsement seam (λ) ----------------------------------
+  // proof_endorse records a named human's decision as evidence, and the
+  // human's consciousness IS the evidence — the tool must never run on the
+  // model's say-so alone. Routing it through `ask` hands the call to the
+  // host's approval seam: the model calls, the host prompts, a human decides,
+  // and only an approval lets execute append the attestation. Registered
+  // after the evidence-store guard and the baseline gate, not between them:
+  // the three hooks match on disjoint tool names so their order carries no
+  // behavior, and keeping the established gates' registration order intact
+  // means hosts (and tests) that index this pipeline keep their reading.
+  host.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
+    if (exec.name !== 'proof_endorse') return next()
+    const claim = (exec.arguments as { claim?: unknown } | null | undefined)?.claim
+    const head = typeof claim === 'string' ? claim.slice(0, 80) : '(no claim text)'
+    return {
+      kind: 'ask',
+      reason: `dsh-proof: a human must consciously endorse/reject this claim — approve to record Class C evidence? `
+        + `claim: "${head}"`,
+      displayReason: {
+        en: 'dsh-proof: a human must consciously endorse/reject this claim — approve to record Class C evidence?',
+        'zh-CN': 'dsh-proof：需要人类有意识地背书/否决此主张——批准以记录 Class C 证据？',
+      },
+    }
+  })
 
   // -- observation: what actually moved -----------------------------------
   // Each event is still fire-and-forget (a tool result must never be delayed
@@ -349,6 +384,16 @@ function hostWorkspaceRoot(ctx: Context): string {
 /** The engine's FsPort, reused by the watcher so both see the same filesystem. */
 function engineFs(engine: ProofEngine): FsPort {
   return engine.fsView
+}
+
+/**
+ * Windows drive letter or leading slash — engine.ts's private absolute-path
+ * test, mirrored here so `evidenceLogPath` derives from exactly the same rule
+ * the engine used for its own copy. If engine.ts's rule ever moves, this
+ * mirror must move with it (the wiring test pins the derived path).
+ */
+function isAbsoluteHostPath(p: string): boolean {
+  return /^([A-Za-z]:[\\/]|\/)/.test(p)
 }
 
 /**

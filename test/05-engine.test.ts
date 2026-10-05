@@ -6,6 +6,7 @@ import { assembleProof } from '../src/core/report.ts'
 import { attributeChecks, proofNarrative } from '../src/core/regression.ts'
 import { makeEvidence, snapshotWorkspace } from '../src/core/evidence.ts'
 import { VerificationRunner } from '../src/core/runner.ts'
+import { claimIdOf } from '../src/core/attest.ts'
 import { FakeClock, FakeCommands, FakeWorkspace, MemoryFs, spec } from './helpers.ts'
 
 const ROOT = '/ws'
@@ -778,4 +779,264 @@ test('ζ: a pre-ζ baseline without apiSurface fails behavior-preserving honestl
   assert.equal(surface.met, false, 'an un-comparable surface is never a pass')
   assert.match(surface.detail, /baseline/, 'the detail tells the user to rebuild the baseline')
   assert.equal(outcome.report.grade, 'stale')
+})
+
+// -- κ: graded evidence fused into confidence and contracts --------------------
+
+/** A B-class jury verdict seeded straight onto the chain, as the attest marker writes it. */
+async function seedJuryAttestation(
+  engine: ProofEngine,
+  claim: string,
+  over: { gen: number; verdict: 'uphold' | 'reject' | 'abstain'; probability: number },
+): Promise<void> {
+  // The marker payload is {label, ...data}; ι's parser keys on `kind`, so the
+  // data carries it too. `at` is epoch millis supplied by the caller.
+  await engine.storeView.mark('attest/jury', {
+    kind: 'attest/jury',
+    claimId: claimIdOf(claim),
+    gen: over.gen,
+    prompt: `Judge the claim: "${claim}"`,
+    rubricVersion: 'jury-rubric/v1',
+    model: 'jury-test-model',
+    independence: 'fresh-context',
+    verdict: over.verdict,
+    probability: over.probability,
+    output: 'verdict rendered by the seeded jury',
+    at: 1_767_225_600_000,
+  })
+}
+
+/** A C-class human decision seeded straight onto the chain. */
+async function seedHumanAttestation(
+  engine: ProofEngine,
+  claim: string,
+  over: { gen: number; decision: 'endorse' | 'reject' },
+): Promise<void> {
+  await engine.storeView.mark('attest/human', {
+    kind: 'attest/human',
+    claimId: claimIdOf(claim),
+    gen: over.gen,
+    approver: 'reviewer-1',
+    approvedAt: 1_767_225_600_000,
+    scope: { claim, evidenceRoot: null },
+    decision: over.decision,
+  })
+}
+
+test('κ: llm-jury — a chain-seeded B-class uphold certifies with zero commands', async () => {
+  const fs = MemoryFs.of(surfaceProject())
+  const commands = new FakeCommands()
+  const engine = contractEngine(fs, commands)
+  await engine.establishBaseline()
+
+  const claim = 'refactored b internals; an independent jury reviewed the diff'
+  await seedJuryAttestation(engine, claim, { gen: 0, verdict: 'uphold', probability: 0.99 })
+
+  const callsBefore = commands.calls.length
+  const outcome = await engine.verifyContract({
+    changed: ['src/b.ts'],
+    contract: { kind: 'llm-jury', claim },
+  })
+  assert.equal(commands.calls.length, callsBefore, 'an llm-jury claim executes zero commands')
+  assert.equal(outcome.checks.length, 0)
+  assert.equal(outcome.selection.affected.length, 0, 'llm-jury never goes through check selection')
+
+  // Confidence is exactly the class-weighted factor: 0.99^0.7 ≈ 0.993.
+  assert.ok(outcome.report.confidence !== undefined)
+  assert.ok(Math.abs(outcome.report.confidence - 0.99 ** 0.7) < 1e-12,
+    `confidence ${outcome.report.confidence} vs 0.99^0.7`)
+  assert.equal(outcome.report.grade, 'proven', '0.993 clears the 0.97 certify target')
+  assert.equal(outcome.report.confidenceBasis, 'jury-only', 'no machine record, a B witness: jury-only')
+  assert.ok(outcome.contract.obligations.every(o => o.met), 'every llm-jury obligation met')
+
+  // The contract summary carries the fused witness.
+  assert.ok(outcome.contract.attestations !== undefined && outcome.contract.attestations.length === 1)
+  const summary = outcome.contract.attestations?.[0]
+  assert.equal(summary?.class, 'B')
+  assert.equal(summary?.gen, 0)
+  assert.equal(summary?.verdict, 'uphold')
+  assert.ok(summary !== undefined && Math.abs(summary.factor - 0.99 ** 0.7) < 1e-12)
+
+  // The boundary marker summarises what the grade rode on (no prompt/output dump).
+  assert.ok(fs.log.some(l => l.includes('claim/jury') && l.includes('"verdict":"uphold"') && l.includes('jury-test-model')),
+    'claim/jury marker carries the attestation summary')
+})
+
+test('κ: appeal override — the highest-gen attestation decides, in both directions', async () => {
+  const fs = MemoryFs.of(surfaceProject())
+  const commands = new FakeCommands()
+  const engine = contractEngine(fs, commands)
+  await engine.establishBaseline()
+  const claim = 'appealable claim'
+
+  // Rejected first (gen 0): a reject at p=0.2 collapses the fused confidence.
+  await seedJuryAttestation(engine, claim, { gen: 0, verdict: 'reject', probability: 0.2 })
+  const rejected = await engine.verifyContract({
+    changed: ['src/b.ts'],
+    contract: { kind: 'llm-jury', claim },
+  })
+  assert.equal(rejected.report.grade, 'stale')
+  assert.ok(rejected.report.confidence !== undefined)
+  assert.ok(Math.abs(rejected.report.confidence - 0.2 ** 0.7) < 1e-12, 'reject factor is 0.2^0.7')
+
+  // Appealed and upheld (gen 1): the appeal overrides, confidence follows the NEW verdict.
+  await seedJuryAttestation(engine, claim, { gen: 1, verdict: 'uphold', probability: 0.99 })
+  const upheld = await engine.verifyContract({
+    changed: ['src/b.ts'],
+    contract: { kind: 'llm-jury', claim },
+  })
+  assert.equal(upheld.report.grade, 'proven')
+  assert.ok(Math.abs((upheld.report.confidence ?? 0) - 0.99 ** 0.7) < 1e-12,
+    'the active attestation is the gen-1 uphold, not the gen-0 reject')
+  assert.equal(upheld.contract.attestations?.[0]?.gen, 1)
+  assert.equal(upheld.contract.attestations?.[0]?.verdict, 'uphold')
+
+  // Appealed back to reject (gen 2): the newest verdict wins again.
+  await seedJuryAttestation(engine, claim, { gen: 2, verdict: 'reject', probability: 0.2 })
+  const overturned = await engine.verifyContract({
+    changed: ['src/b.ts'],
+    contract: { kind: 'llm-jury', claim },
+  })
+  assert.equal(overturned.report.grade, 'stale')
+  assert.equal(overturned.contract.attestations?.[0]?.verdict, 'reject')
+  const upholds = overturned.contract.obligations.find(o => o.id === 'jury-upholds')
+  assert.ok(upholds)
+  assert.equal(upholds.met, false, 'a reject cannot satisfy jury-upholds')
+})
+
+/**
+ * Six checks, each failing at baseline and passing at verify: every posterior
+ * lands at 0.99, so the machine confidence is 0.99^6 ≈ 0.9415 — a certification
+ * sitting ~0.03 under the 0.97 target. The Class C endorse then fuses in.
+ */
+function endorsementProject(): Record<string, string> {
+  const files: Record<string, string> = {
+    [`${ROOT}/package.json`]: JSON.stringify({ name: 'demo', main: './src/index.ts' }),
+    [`${ROOT}/src/index.ts`]: '',
+  }
+  for (const name of ['a', 'b', 'c', 'd', 'e', 'f']) {
+    files[`${ROOT}/src/${name}.ts`] = `export const ${name} = 1\n`
+    files[`${ROOT}/src/index.ts`] += `export { ${name} } from './${name}'\n`
+  }
+  return files
+}
+
+const ENDORSEMENT_CHECKS = ['a', 'b', 'c', 'd', 'e', 'f'].map(name => ({
+  label: `${name} tests`, command: ['npm', 'run', '--silent', name], kind: 'test' as const, paths: [`src/${name}.ts`],
+}))
+
+const ENDORSEMENT_CHANGED = ['a', 'b', 'c', 'd', 'e', 'f'].map(name => `src/${name}.ts`)
+
+test('κ: a Class C endorsement fuses into a machine certification — and a rejection drags it down', async () => {
+  const claim = 'refactored six modules, behaviour preserved'
+
+  const setup = async (fs: MemoryFs, commands: FakeCommands): Promise<ProofEngine> => {
+    const engine = contractEngine(fs, commands, ENDORSEMENT_CHECKS)
+    // Baseline: every check fails (decisively — the baseline still anchors).
+    commands.on(() => true, { exitCode: 1, output: 'red' })
+    await engine.establishBaseline()
+    // Verify: everything heals — six `fixed` verdicts, full coverage.
+    commands.on(() => true, { exitCode: 0, output: 'green' })
+    return engine
+  }
+
+  const verify = async (engine: ProofEngine): Promise<Awaited<ReturnType<ProofEngine['verifyContract']>>> =>
+    engine.verifyContract({ changed: ENDORSEMENT_CHANGED, contract: { kind: 'behavior-preserving', claim } })
+
+  // Control: no attestation — pure machine number.
+  const control = await setup(MemoryFs.of(endorsementProject()), new FakeCommands())
+  const machineRun = await verify(control)
+  const machine = machineRun.report.confidence
+  assert.ok(machine !== undefined && machine > 0.9 && machine < 0.97,
+    `machine confidence sits ~0.03 under the target (got ${machine})`)
+  assert.equal(machineRun.report.grade, 'proven', 'full green coverage: the machine run itself proves')
+  assert.equal(machineRun.report.confidenceBasis, 'full-coverage')
+  assert.equal(machineRun.contract.attestations, undefined, 'no witness on chain: no summary')
+
+  // Endorsement: risk acceptance, not certainty transfer. The number the
+  // machines measured is what stands; the basis records who took the residual.
+  const endorseFs = MemoryFs.of(endorsementProject())
+  const endorse = await setup(endorseFs, new FakeCommands())
+  await seedHumanAttestation(endorse, claim, { gen: 0, decision: 'endorse' })
+  const endorsed = await verify(endorse)
+  assert.equal(endorsed.report.grade, 'proven', 'the machine grade survives; endorsement never demotes')
+  assert.equal(endorsed.report.confidenceBasis, 'attested', 'machine + witness: attested')
+  assert.ok(endorsed.report.confidence !== undefined && machine !== undefined)
+  assert.ok(Math.abs(endorsed.report.confidence - machine) < 1e-12,
+    `endorse leaves the machine number untouched (got ${endorsed.report.confidence}, machine ${machine})`)
+  assert.deepEqual(endorsed.contract.attestations, [
+    { class: 'C', gen: 0, verdict: 'endorse', factor: Math.pow(0.95, 0.9) },
+  ])
+  assert.ok(endorseFs.log.some(l => l.includes('proof/verified') && l.includes('"verdict":"endorse"')),
+    'the boundary marker carries the fused witness')
+  assert.match(proofNarrative(endorsed.report), /PROVEN \(p≈0\.\d+, machine \+ B\/C attested\)/)
+
+  // Rejection: the number collapses under the human's error probability, and
+  // the symmetric lock demotes the grade — a claim a sworn witness denies
+  // cannot keep a grade the number no longer supports.
+  const reject = await setup(MemoryFs.of(endorsementProject()), new FakeCommands())
+  await seedHumanAttestation(reject, claim, { gen: 0, decision: 'reject' })
+  const rejected = await verify(reject)
+  assert.equal(rejected.report.confidenceBasis, 'attested')
+  assert.ok(rejected.report.confidence !== undefined && machine !== undefined)
+  assert.ok(Math.abs(rejected.report.confidence - machine * 0.05 ** 0.9) < 1e-12,
+    `reject factor is (1-0.95)^0.9 (got ${rejected.report.confidence})`)
+  assert.ok((rejected.report.confidence ?? 1) < 0.1, 'a human rejection collapses the certified number')
+  assert.equal(rejected.report.grade, 'stale', 'an explicit rejection locks the grade down')
+})
+
+test('κ: endorsement unlocks ONLY the target gap — and never pays for work', async () => {
+  const claim = 'docs and internals tidied, no behaviour change'
+  // Budget-starved machine run: skips land, the bayesian confidence stays
+  // under target, the verdict is honestly stale — with zero regressions and
+  // obligations met. That gap is exactly the residual a human accepts.
+  const fs = MemoryFs.of(endorsementProject())
+  const starved = new ProofEngine({
+    root: ROOT, fs, commands: new FakeCommands(), workspace: new FakeWorkspace(ROOT),
+    clock: new FakeClock(), autoDiscover: false, checks: ENDORSEMENT_CHECKS,
+    verifyBudgetMs: 1,
+  })
+  await starved.establishBaseline()
+  const starvedRun = await starved.verifyContract({ changed: ENDORSEMENT_CHANGED, contract: { kind: 'behavior-preserving', claim } })
+  assert.equal(starvedRun.report.grade, 'stale', 'budget starvation is stale before any witness speaks')
+  assert.equal(starvedRun.report.summary.regressions, 0)
+
+  // Seed the SAME claim's endorsement on the same chain and re-verify.
+  await seedHumanAttestation(starved, claim, { gen: 0, decision: 'endorse' })
+  const unlocked = await starved.verifyContract({ changed: ENDORSEMENT_CHANGED, contract: { kind: 'behavior-preserving', claim } })
+  assert.equal(unlocked.report.grade, 'proven', 'the human took the residual the machines could not cross')
+  assert.equal(unlocked.report.confidenceBasis, 'attested')
+
+  // But an unmet obligation is missing work, not residual risk: endorsement
+  // must not pay for it (grow the API surface, keep the endorsement seeded).
+  const tamperedFs = MemoryFs.of(endorsementProject())
+  const tampered = contractEngine(tamperedFs, new FakeCommands(), ENDORSEMENT_CHECKS)
+  await tampered.establishBaseline()
+  tamperedFs.mutate('/ws/src/a.ts', 'export const a = 1\nexport const a2 = 2\n')
+  await seedHumanAttestation(tampered, claim, { gen: 0, decision: 'endorse' })
+  const paid = await tampered.verifyContract({ changed: ENDORSEMENT_CHANGED, contract: { kind: 'behavior-preserving', claim } })
+  assert.notEqual(paid.report.grade, 'proven', 'endorsement cannot buy off an unmet obligation')
+})
+
+test('κ: plain verify stays pure machine — chain attestations never touch it', async () => {
+  const runOnce = async (withAttestation: boolean) => {
+    const fs = MemoryFs.of(waveProject())
+    const commands = new FakeCommands()
+    const engine = waveEngine(fs, commands)
+    await engine.establishBaseline()
+    if (withAttestation) {
+      // A hostile on-chain witness: a B-class rejection at p=0.2. verify()
+      // must not even read it.
+      await seedJuryAttestation(engine, 'the wave workspace is healthy', { gen: 0, verdict: 'reject', probability: 0.2 })
+    }
+    return engine.verify({ changed: WAVE_CHANGED })
+  }
+  const plain = await runOnce(false)
+  const attested = await runOnce(true)
+  assert.strictEqual(attested.report.confidence, plain.report.confidence,
+    'confidence is byte-identical with a rejection on chain')
+  assert.strictEqual(attested.report.confidenceBasis, plain.report.confidenceBasis,
+    'the basis never becomes attested on the plain verify path')
+  assert.equal(attested.report.grade, plain.report.grade)
+  assert.equal(JSON.stringify(attested.schedule), JSON.stringify(plain.schedule))
 })

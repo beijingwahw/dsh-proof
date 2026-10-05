@@ -10,7 +10,10 @@
  * claim must show every new source path is exercised by a passing check; a
  * `perf-budget` claim must show a benchmark measurement inside the stated
  * budget; a `docs-only` claim must show the change set really is documents —
- * and gets a capped confidence instead of machine checks.
+ * and gets a capped confidence instead of machine checks; an `llm-jury`
+ * claim (ι) outsources its verdict to Class B testimony entirely: it must
+ * show a jury deliberation on the exact claim text, and that the active
+ * verdict upholds it.
  *
  * Purity note: obligation verdicts are destined for the evidence chain, so
  * everything here is a pure function of its inputs — no clock, no randomness,
@@ -24,8 +27,15 @@ import type { CheckSpec } from './ports.ts'
 import type { Baseline, Evidence } from './evidence.ts'
 import { verdictOf } from './evidence.ts'
 import { isGlobalInvalidator, matchesAny } from './impact.ts'
+import { activeAttestations, claimIdOf, type Attestation, type JuryAttestation } from './attest.ts'
 
-export type ClaimKind = 'behavior-preserving' | 'behavior-adding' | 'perf-budget' | 'docs-only'
+export type ClaimKind =
+  | 'behavior-preserving'
+  | 'behavior-adding'
+  | 'perf-budget'
+  | 'docs-only'
+  /** ι: judged by Class B testimony, not machine checks (`skipChecks` is true for it). */
+  | 'llm-jury'
 
 /** The typed half of a `proof_claim`; `claim` itself stays human-readable. */
 export interface ClaimContract {
@@ -279,6 +289,15 @@ export interface ContractInput {
   readonly apiSurfaceAfter: readonly string[] | undefined
   /** Engine dependency graph, tolerated for signature symmetry, never consulted. */
   readonly graph: unknown | undefined
+  /**
+   * Attestations read off the chain (ι), for `llm-jury` claims. Optional so
+   * pre-ι callers (and every other kind) pass their old shape untouched;
+   * `undefined` simply means "no testimony on record", which fails
+   * `jury-delivered` rather than the whole evaluation. Shapes are re-validated
+   * and gens resolved by `activeAttestations` — this input is chain data, not
+   * a promise.
+   */
+  readonly attestations?: readonly Attestation[]
 }
 
 export interface ContractVerdict {
@@ -287,7 +306,7 @@ export interface ContractVerdict {
   readonly obligations: readonly ObligationResult[]
   /** Present only for a fully-met docs-only contract: the jury's confidence cap. */
   readonly juryCappedConfidence?: number
-  /** True only for docs-only: the engine may skip dispatching checks entirely. */
+  /** True only for docs-only and llm-jury: the engine may skip dispatching checks entirely. */
   readonly skipChecks: boolean
 }
 
@@ -307,6 +326,8 @@ export function evaluateContract(input: ContractInput, juryConfidenceCap = 0.8):
     obligations.push(newPathsObligation(input))
   } else if (kind === 'perf-budget') {
     obligations.push(benchmarkEvidenceObligation(input), withinBudgetObligation(input))
+  } else if (kind === 'llm-jury') {
+    obligations.push(juryDeliveredObligation(input), juryUpholdsObligation(input))
   } else {
     obligations.push(docsOnlyChangesObligation(input), juryReviewObligation(input))
   }
@@ -317,7 +338,11 @@ export function evaluateContract(input: ContractInput, juryConfidenceCap = 0.8):
     kind,
     obligations,
     ...(kind === 'docs-only' && allMet ? { juryCappedConfidence: juryConfidenceCap } : {}),
-    skipChecks: kind === 'docs-only',
+    // llm-jury joins docs-only in skipping checks — but for the opposite
+    // reason: docs-only has nothing worth measuring, llm-jury has *decided*
+    // its verdict is testimony, and running checks anyway would let a machine
+    // record quietly override (or launder) a jury the claim never asked for.
+    skipChecks: kind === 'docs-only' || kind === 'llm-jury',
   }
 }
 
@@ -332,12 +357,17 @@ function latestByCheck(records: readonly Evidence[]): Map<string, Evidence> {
 function zeroRegressionsObligation(input: ContractInput): ObligationResult {
   // docs-only runs no checks (skipChecks), so "no regressions in records" is
   // vacuous there; the obligation is honestly re-homed onto docs-only-changes,
-  // which is the check that actually binds for that kind.
-  if (input.contract.kind === 'docs-only' && input.records.length === 0) {
+  // which is the check that actually binds for that kind. llm-jury gets the
+  // same vacuous treatment (ι): a jury claim runs no machine checks either,
+  // and its regression burden is carried by the deliberation obligations.
+  const kind = input.contract.kind
+  if ((kind === 'docs-only' || kind === 'llm-jury') && input.records.length === 0) {
     return {
       id: 'zero-regressions',
       met: true,
-      detail: 'docs-only claims run no checks — the regression obligation is carried by docs-only-changes instead',
+      detail: kind === 'docs-only'
+        ? 'docs-only claims run no checks — the regression obligation is carried by docs-only-changes instead'
+        : 'llm-jury claims run no machine checks — the regression obligation is carried by the jury deliberation (jury-delivered, jury-upholds) instead',
     }
   }
   const baselineById = new Map((input.baseline?.checks ?? []).map(e => [e.checkId, e]))
@@ -501,5 +531,90 @@ function juryReviewObligation(input: ContractInput): ObligationResult {
     id: 'jury-review',
     met: false,
     detail: 'docs-only claims require contract.review — write down what a human reviewer should double-check',
+  }
+}
+
+// ---------------------------------------------------------------------------
+// llm-jury obligations (ι)
+// ---------------------------------------------------------------------------
+
+/**
+ * The probability an upholding verdict must carry before the contract calls
+ * the claim upheld. 0.5 is the coherence floor for "probability the claim is
+ * true": an uphold below it is a juror contradicting its own number, and the
+ * obligation owes the claim more than a coin-flip.
+ */
+const UPHOLD_PROBABILITY_MIN = 0.5
+
+/**
+ * The active Class B verdict for the contract's claim, or `undefined`.
+ *
+ * Bindings, deliberately narrow: the attestation's `claimId` must equal
+ * `claimIdOf(contract.claim)` — testimony transfers between reworded claims
+ * for free otherwise — and only `attest/jury` carries here; a human
+ * endorsement is Class C evidence and must not satisfy a Class B obligation.
+ * `activeAttestations` re-validates shapes and resolves appeal generations,
+ * so a superseded (gen-lower) uphold cannot carry the obligation once a
+ * re-deliberation exists.
+ */
+function activeJuryVerdict(input: ContractInput): JuryAttestation | undefined {
+  const want = claimIdOf(input.contract.claim)
+  const active = activeAttestations(input.attestations ?? [])
+    .filter(att => att.claimId === want && att.kind === 'attest/jury')
+  return active.length > 0 ? (active[0] as JuryAttestation) : undefined
+}
+
+/** llm-jury, obligation 1: a jury deliberation for this claim is on the chain. */
+function juryDeliveredObligation(input: ContractInput): ObligationResult {
+  const att = activeJuryVerdict(input)
+  if (att === undefined) {
+    return {
+      id: 'jury-delivered',
+      met: false,
+      detail: 'no Class B jury verdict on record for this claim — call proof_jury with the claim, then proof_jury_submit to record the deliberation',
+    }
+  }
+  // Any delivered verdict — including abstain — satisfies delivery: the
+  // juror showed up and answered. Whether the answer *helps* the claim is
+  // entirely jury-upholds' question; keeping the two apart is what lets an
+  // abstention be honest evidence without being a pass.
+  return {
+    id: 'jury-delivered',
+    met: true,
+    detail: `jury deliberation on record: ${att.model} (gen ${att.gen}, independence: ${att.independence}, verdict: ${att.verdict})`,
+  }
+}
+
+/** llm-jury, obligation 2: the active verdict upholds the claim at ≥ 0.5. */
+function juryUpholdsObligation(input: ContractInput): ObligationResult {
+  const att = activeJuryVerdict(input)
+  if (att === undefined) {
+    return { id: 'jury-upholds', met: false, detail: 'no jury verdict to uphold the claim — see jury-delivered' }
+  }
+  if (att.verdict === 'uphold') {
+    if (att.probability >= UPHOLD_PROBABILITY_MIN) {
+      return {
+        id: 'jury-upholds',
+        met: true,
+        detail: `jury upholds at probability ${att.probability} (threshold ${UPHOLD_PROBABILITY_MIN})`,
+      }
+    }
+    return {
+      id: 'jury-upholds',
+      met: false,
+      detail: `jury said uphold but only at probability ${att.probability} < ${UPHOLD_PROBABILITY_MIN} — the claim needs a stronger verdict (or a better-evidenced re-deliberation)`,
+    }
+  }
+  if (att.verdict === 'reject') {
+    return {
+      id: 'jury-upholds',
+      met: false,
+      detail: `jury verdict reject at probability ${att.probability} that the claim is true — the deliberation contradicts the claim`,
+    }
+  }
+  return {
+    id: 'jury-upholds',
+    met: false,
+    detail: `jury abstained at probability ${att.probability} — the materials were insufficient to uphold the claim; supply better context and re-deliberate`,
   }
 }

@@ -202,6 +202,14 @@ export function proofNarrative(report: ProofReport, certifyTarget: number = DEFA
       : `${report.grade.toUpperCase()} (jury obligations unmet)`
     return [head, ...parts.slice(1)].join(' — ')
   }
+  // κ attested: machine evidence fused with B/C witnesses — same head shape
+  // as the machine line, with the regime named so nobody mistakes a witnessed
+  // number for a purely measured one.
+  if (graded.confidenceBasis === 'attested') {
+    const p = (graded.confidence ?? 0).toFixed(2)
+    const head = `${report.grade.toUpperCase()} (p≈${p}, machine + B/C attested)`
+    return [head, ...parts.slice(1)].join(' — ')
+  }
   if (graded.confidence !== undefined) {
     const p = graded.confidence.toFixed(2)
     const met = graded.confidenceBasis === 'certified-subset' || graded.confidence >= certifyTarget

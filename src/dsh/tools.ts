@@ -1,5 +1,5 @@
 /**
- * The four model-facing tools.
+ * The seven model-facing tools.
  *
  * Contract discipline (DSH's hard rules, applied):
  *  - `execute` returns exactly one canonical JSON value; all human prose lives
@@ -21,6 +21,11 @@ import type { ConfidenceBasis, GradedProofReport } from '../core/report.ts'
 import type { ClaimContract, ClaimKind, ObligationResult } from '../core/contract.ts'
 import { proofNarrative } from '../core/regression.ts'
 import { firstInformativeLine } from '../core/excerpt.ts'
+import {
+  DEFAULT_TRUST_WEIGHTS, RUBRIC_V1, attestationFactor, claimIdOf, juryPrompt,
+  type HumanAttestation, type JuryAttestation,
+} from '../core/attest.ts'
+import { sha256 } from '../core/hash.ts'
 
 // ---------------------------------------------------------------------------
 // Canonical value shapes (the programmatic API Code Mode sees)
@@ -142,6 +147,49 @@ export interface ClaimValue {
   summary: string
 }
 
+/**
+ * λ: the Class B protocol, step 1 — the frozen deliberation prompt handed to
+ * the juror. The canonical value carries the prompt verbatim because the
+ * prompt is the evidence bundle's replay key: a third party re-runs exactly
+ * these bytes against the declared model and compares outputs.
+ */
+export interface JuryRequestValue {
+  claimId: string
+  rubricVersion: string
+  prompt: string
+  /** The one-line charge to the juror: deliberate, then submit via the tool. */
+  instruction: string
+}
+
+/** λ: the Class B protocol, step 2 — the verdict exactly as it landed on-chain. */
+export interface JurySubmitValue {
+  recorded: true
+  claimId: string
+  /** Deliberation generation: max existing gen for the claim + 1 (appeals supersede). */
+  gen: number
+  verdict: 'uphold' | 'reject' | 'abstain'
+  probability: number
+  /**
+   * The pure Class B factor under the default trust policy — p^classB, full
+   * precision (abstain carries 1). Recomputable by anyone from the record;
+   * the engine's own fusion may weigh it differently, this number never lies
+   * about which policy produced it.
+   */
+  factor: number
+  note: string
+}
+
+/** λ: Class C — a named human's endorsement/rejection exactly as recorded. */
+export interface EndorseValue {
+  recorded: true
+  claimId: string
+  decision: 'endorse' | 'reject'
+  approver: string
+  /** Exactly what the approver took responsibility for. */
+  scope: { claim: string; evidenceRoot: string | null }
+  note: string
+}
+
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
@@ -170,10 +218,11 @@ const claimParams: ParameterSchemaSpec = {
   },
   kind: {
     type: 'string',
-    enum: ['behavior-preserving', 'behavior-adding', 'perf-budget', 'docs-only'],
+    enum: ['behavior-preserving', 'behavior-adding', 'perf-budget', 'docs-only', 'llm-jury'],
     description: 'Optional typed contract for the claim: refactor/optimization → behavior-preserving '
       + '(the public API surface must not move); new feature → behavior-adding (every new source path covered '
-      + 'by a passing check); performance → perf-budget (with budgetMs); documentation → docs-only (with review). '
+      + 'by a passing check); performance → perf-budget (with budgetMs); documentation → docs-only (with review); '
+      + 'a subjective claim machines cannot measure → llm-jury (deliberate via proof_jury / proof_jury_submit first). '
       + 'Omit to verify without a contract.',
   },
   budgetMs: {
@@ -197,19 +246,100 @@ const claimParams: ParameterSchemaSpec = {
   },
 }
 
-const CLAIM_KINDS: readonly string[] = ['behavior-preserving', 'behavior-adding', 'perf-budget', 'docs-only']
+const CLAIM_KINDS: readonly string[] = ['behavior-preserving', 'behavior-adding', 'perf-budget', 'docs-only', 'llm-jury']
+
+const juryParams: ParameterSchemaSpec = {
+  claim: {
+    type: 'string',
+    required: true,
+    description: 'The exact claim the jury deliberates on.',
+  },
+  context: {
+    type: 'string',
+    description: 'Materials the juror may judge from (diff summary, excerpts, how the claim maps to evidence). '
+      + 'Omit to deliberate on the claim text alone.',
+  },
+}
+
+const jurySubmitParams: ParameterSchemaSpec = {
+  claimId: {
+    type: 'string',
+    required: true,
+    description: 'The claimId proof_jury returned — binds the verdict to its pending on-chain request.',
+  },
+  verdict: {
+    type: 'string',
+    required: true,
+    enum: ['uphold', 'reject', 'abstain'],
+    description: 'Your ruling: uphold when the materials support the claim, reject when they contradict it, '
+      + 'abstain when they are insufficient to decide.',
+  },
+  probability: {
+    type: 'number',
+    required: true,
+    description: 'Your subjective probability the claim is true, in [0,1] — the number your own reasoning supports, '
+      + 'not a measurement.',
+  },
+  reasoning: {
+    type: 'string',
+    required: true,
+    description: 'Your complete deliberation output, verbatim — it is recorded on the chain as the jury record '
+      + 'and replayed by third parties.',
+  },
+  model: {
+    type: 'string',
+    description: 'Declared identity of the deliberating model. The plugin cannot verify a model\'s self-report, '
+      + 'so it is recorded as a claim. Defaults to "session-model (unverified)".',
+  },
+}
+
+const endorseParams: ParameterSchemaSpec = {
+  claim: {
+    type: 'string',
+    required: true,
+    description: 'The claim the human endorses or rejects, exactly as it was proven.',
+  },
+  decision: {
+    type: 'string',
+    required: true,
+    enum: ['endorse', 'reject'],
+    description: 'endorse = the human accepts the claim\'s residual risk (unlocks the grade gap, never inflates '
+      + 'the number); reject = the human denies it (collapses the confidence).',
+  },
+  approver: {
+    type: 'string',
+    description: 'Signature name of the endorsing human. Defaults to "host-approver" — the human behind the '
+      + 'host approval prompt.',
+  },
+}
 
 /** ζ: narrow an untrusted `kind` argument to the four-value union, or nothing. */
 function isClaimKind(value: unknown): value is ClaimKind {
   return typeof value === 'string' && CLAIM_KINDS.includes(value)
 }
 
-export function createProofTools(engine: ProofEngine, touched?: () => readonly string[]): ToolDefinition[] {
+/**
+ * λ: `evidenceLogPath` is the physical evidence-log location, derived by the
+ * plugin entry with the same rule ProofEngine applies to its own private copy
+ * (the store exposes no marker read-back, and the engine exports neither the
+ * path nor its derivation). The Class B/C tools read attestation markers off
+ * the chain through the engine's own fs port with it. When absent (direct
+ * construction), every read-backed guard degrades to refusal rather than
+ * trusting an unverifiable submitter.
+ */
+export function createProofTools(
+  engine: ProofEngine,
+  touched?: () => readonly string[],
+  evidenceLogPath?: string,
+): ToolDefinition[] {
   return [
     createStatusTool(engine),
     createBaselineTool(engine),
     createVerifyTool(engine, touched),
     createClaimTool(engine, touched),
+    createJuryTool(engine),
+    createJurySubmitTool(engine, evidenceLogPath),
+    createEndorseTool(engine, evidenceLogPath),
   ]
 }
 
@@ -430,7 +560,7 @@ function createClaimTool(engine: ProofEngine, touched?: () => readonly string[])
           confidence: { type: 'number' },
           // Present only when the claim carried a `kind` (ζ) — declared so the
           // schema stays truthful about what a typed contract may emit.
-          kind: { type: 'string', enum: ['behavior-preserving', 'behavior-adding', 'perf-budget', 'docs-only'] },
+          kind: { type: 'string', enum: ['behavior-preserving', 'behavior-adding', 'perf-budget', 'docs-only', 'llm-jury'] },
           obligations: {
             type: 'array',
             items: {
@@ -527,6 +657,388 @@ function createClaimTool(engine: ProofEngine, touched?: () => readonly string[])
       return toClaimValue(parsed.claim, outcome.report, verified) as unknown as JsonValue
     },
   }
+}
+
+// ---------------------------------------------------------------------------
+// λ: Classes B and C — testimony as evidence. The jury protocol is a
+// request/submit pair (the prompt is frozen on-chain before the juror speaks,
+// so the verdict binds to bytes a third party can replay), and the human
+// endorsement only reaches execute after the host approval seam said yes
+// (the plugin entry registers that gate; here the body assumes a human did).
+// ---------------------------------------------------------------------------
+
+/** The standing charge to the juror, returned with every jury request. */
+const JURY_INSTRUCTION = 'deliberate strictly per the rubric, then call proof_jury_submit with your JSON verdict; '
+  + 'your output becomes permanent Class B evidence, replayable by any third party with this exact prompt'
+
+function createJuryTool(engine: ProofEngine): ToolDefinition {
+  return {
+    name: 'proof_jury',
+    description:
+      'Class B evidence, step 1 of 2: request an LLM jury deliberation on a claim. Returns the frozen deliberation '
+      + 'prompt (rubric, claim, context) and records the request on the evidence chain. Read the returned prompt in '
+      + 'full, deliberate strictly per the rubric, then record your JSON verdict with proof_jury_submit.',
+    parameters: juryParams,
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          claimId: { type: 'string' },
+          rubricVersion: { type: 'string' },
+          prompt: { type: 'string' },
+          instruction: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [text(renderJuryRequest(value as unknown as JuryRequestValue))],
+      presentationMeta: (_args, value) => JSON.parse(JSON.stringify(value)) as JsonValue,
+    },
+    presentCall: (args) => {
+      const parsed = (args ?? {}) as { claim?: string }
+      return {
+        card: 'generic',
+        title: `Jury deliberation: ${truncate(parsed.claim ?? 'claim', 60)}`,
+        kind: 'read',
+        rawInput: args,
+      }
+    },
+    presentResult: (_args, result) => {
+      const meta = result.meta as JuryRequestValue | undefined
+      return {
+        card: 'generic',
+        title: `Jury requested · ${typeof meta?.claimId === 'string' ? meta.claimId : 'claim'}`,
+        content: [text(typeof meta?.instruction === 'string' ? oneLine(meta.instruction) : 'jury prompt issued')],
+      }
+    },
+    async execute(args, exec: ToolRunContext) {
+      assertActive(exec)
+      const parsed = (args ?? {}) as { claim?: unknown; context?: unknown }
+      if (typeof parsed.claim !== 'string' || parsed.claim.trim().length === 0) {
+        throw new Error('proof_jury: claim is required — the exact text the jury deliberates on')
+      }
+      const prompt = juryPrompt(
+        parsed.claim,
+        typeof parsed.context === 'string' ? parsed.context : '<no additional context>',
+      )
+      const claimId = claimIdOf(parsed.claim)
+      // The request marker is the on-chain pre-image of the deliberation. The
+      // prompt rides verbatim (a digest alone cannot be replayed), so the
+      // later submit binds its verdict to exactly these bytes — and anyone
+      // auditing the chain can check promptDigest against them.
+      await engine.storeView.mark('attest/jury-requested', {
+        claimId,
+        promptDigest: sha256(prompt).slice(0, 16),
+        rubricVersion: RUBRIC_V1,
+        prompt,
+      })
+      return {
+        claimId,
+        rubricVersion: RUBRIC_V1,
+        prompt,
+        instruction: JURY_INSTRUCTION,
+      } as unknown as JsonValue
+    },
+  }
+}
+
+function createJurySubmitTool(engine: ProofEngine, evidenceLogPath?: string): ToolDefinition {
+  return {
+    name: 'proof_jury_submit',
+    description:
+      'Class B evidence, step 2 of 2: record a jury verdict as PERMANENT evidence. Your verdict, probability, '
+      + 'reasoning (verbatim), the exact prompt and your declared model identity are appended to the tamper-evident '
+      + 'chain — any third party may replay the prompt and compare outputs, and a re-deliberation supersedes rather '
+      + 'than erases. Only call this after deliberating on the prompt proof_jury returned; the claimId must match the '
+      + 'pending request, or the submission is refused.',
+    parameters: jurySubmitParams,
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          recorded: { type: 'boolean' },
+          claimId: { type: 'string' },
+          gen: { type: 'integer' },
+          verdict: { type: 'string', enum: ['uphold', 'reject', 'abstain'] },
+          probability: { type: 'number' },
+          factor: { type: 'number' },
+          note: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [text(renderJurySubmit(value as unknown as JurySubmitValue))],
+      presentationMeta: (_args, value) => JSON.parse(JSON.stringify(value)) as JsonValue,
+    },
+    presentCall: (args) => {
+      const parsed = (args ?? {}) as { verdict?: string }
+      return {
+        card: 'generic',
+        title: `Record jury verdict: ${truncate(parsed.verdict ?? 'pending', 12)}`,
+        kind: 'read',
+        rawInput: args,
+      }
+    },
+    presentResult: (_args, result) => {
+      const meta = result.meta as JurySubmitValue | undefined
+      return {
+        card: 'generic',
+        title: meta?.recorded === true
+          ? `✓ Jury verdict recorded · gen ${typeof meta.gen === 'number' ? meta.gen : '?'}`
+          : 'Jury verdict',
+        content: [text(meta?.note ? oneLine(meta.note) : 'no verdict result')],
+      }
+    },
+    async execute(args, exec: ToolRunContext) {
+      assertActive(exec)
+      const parsed = (args ?? {}) as {
+        claimId?: unknown; verdict?: unknown; probability?: unknown; reasoning?: unknown; model?: unknown
+      }
+      // Defensive guards: the schema is a promise to the model, not a boundary
+      // — every field is re-checked before anything touches the chain.
+      if (typeof parsed.claimId !== 'string' || parsed.claimId.length === 0) {
+        throw new Error('proof_jury_submit: claimId is required — the value proof_jury returned')
+      }
+      if (parsed.verdict !== 'uphold' && parsed.verdict !== 'reject' && parsed.verdict !== 'abstain') {
+        throw new Error(`proof_jury_submit: verdict must be 'uphold' | 'reject' | 'abstain' `
+          + `(got ${typeof parsed.verdict === 'string' ? JSON.stringify(parsed.verdict) : 'nothing usable'})`)
+      }
+      if (typeof parsed.probability !== 'number' || !Number.isFinite(parsed.probability)
+        || parsed.probability < 0 || parsed.probability > 1) {
+        throw new Error(`proof_jury_submit: probability must be a finite number in [0,1] `
+          + `(got ${typeof parsed.probability === 'string' ? JSON.stringify(parsed.probability) : String(parsed.probability)})`)
+      }
+      if (typeof parsed.reasoning !== 'string' || parsed.reasoning.trim().length === 0) {
+        throw new Error('proof_jury_submit: reasoning is required — the verbatim deliberation output that lands on the chain')
+      }
+      // The verdict must bind to a pending on-chain request: no request, no
+      // record; a claimId that is not the latest request's is a mismatch (the
+      // model may be several requests behind — the fix is a fresh proof_jury).
+      const request = await latestJuryRequest(engine, evidenceLogPath)
+      if (request === undefined) {
+        throw new Error('proof_jury_submit: no attest/jury-requested marker on the chain — call proof_jury for this claim first')
+      }
+      if (request.claimId !== parsed.claimId) {
+        throw new Error(`proof_jury_submit: claimId mismatch — the pending jury request is for claim `
+          + `${String(request.claimId)}, not ${parsed.claimId}. Call proof_jury for this claim before submitting.`)
+      }
+      if (request.prompt === undefined) {
+        throw new Error('proof_jury_submit: the pending request marker carries no verbatim prompt — refusing to record '
+          + 'a deliberation whose prompt is not on file. Call proof_jury again.')
+      }
+      // Appeals supersede by generation: the new deliberation lands at the
+      // highest existing gen for this claim + 1, never overwriting its foil.
+      const gen = (await maxAttestationGen(engine, evidenceLogPath, 'attest/jury', parsed.claimId)) + 1
+      const attestation: JuryAttestation = {
+        kind: 'attest/jury',
+        claimId: parsed.claimId,
+        gen,
+        prompt: request.prompt,
+        rubricVersion: request.rubricVersion ?? RUBRIC_V1,
+        // The submitter's declaration, recorded as exactly that: an LLM's
+        // self-report is not a signature, and a replay that disagrees is the
+        // audit that catches it.
+        model: typeof parsed.model === 'string' && parsed.model.trim().length > 0
+          ? parsed.model
+          : 'session-model (unverified)',
+        // The host exposes no isolated-model seam yet: this deliberation ran
+        // inside the authoring session's own context, and honesty demands
+        // that be named rather than dressed up as independence.
+        independence: 'same-session',
+        verdict: parsed.verdict,
+        probability: parsed.probability,
+        output: parsed.reasoning,
+        at: Date.now(),
+      }
+      await engine.storeView.mark('attest/jury', { ...attestation })
+      return {
+        recorded: true as const,
+        claimId: attestation.claimId,
+        gen,
+        verdict: attestation.verdict,
+        probability: attestation.probability,
+        // The pure Class B factor under the default trust policy, full
+        // precision so a third party recomputing p^classB gets these bytes.
+        factor: attestationFactor(attestation, DEFAULT_TRUST_WEIGHTS),
+        note: 'Class B evidence recorded. Re-deliberation supersedes: call proof_jury again to appeal — '
+          + 'the appeal lands at gen + 1 and readers resolve to the highest gen.',
+      } as unknown as JsonValue
+    },
+  }
+}
+
+function createEndorseTool(engine: ProofEngine, evidenceLogPath?: string): ToolDefinition {
+  return {
+    name: 'proof_endorse',
+    description:
+      'Class C evidence: a named human endorses or rejects a claim. The call itself triggers the host approval '
+      + 'prompt — nothing is recorded until a human consciously approves. Endorsement is risk acceptance: it unlocks '
+      + 'the grade gap a machine run could not cross, it never inflates the number; rejection collapses it. The '
+      + 'decision lands on the tamper-evident chain with the approver name and the reviewed evidence scope.',
+    parameters: endorseParams,
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          recorded: { type: 'boolean' },
+          claimId: { type: 'string' },
+          decision: { type: 'string', enum: ['endorse', 'reject'] },
+          approver: { type: 'string' },
+          scope: {
+            type: 'object',
+            properties: {
+              claim: { type: 'string' },
+              evidenceRoot: { type: ['string', 'null'] },
+            },
+          },
+          note: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [text(renderEndorse(value as unknown as EndorseValue))],
+      presentationMeta: (_args, value) => JSON.parse(JSON.stringify(value)) as JsonValue,
+    },
+    presentCall: (args) => {
+      const parsed = (args ?? {}) as { claim?: string; decision?: string }
+      const decision = parsed.decision === 'endorse' || parsed.decision === 'reject' ? parsed.decision : 'decide on'
+      return {
+        card: 'generic',
+        title: `Human ${decision}: ${truncate(parsed.claim ?? 'claim', 48)}`,
+        kind: 'read',
+        rawInput: args,
+      }
+    },
+    presentResult: (_args, result) => {
+      const meta = result.meta as EndorseValue | undefined
+      return {
+        card: 'generic',
+        title: meta?.recorded === true
+          ? `${meta.decision === 'reject' ? '✗' : '✓'} Human ${String(meta.decision ?? 'decision')} · `
+            + `${typeof meta.approver === 'string' ? meta.approver : 'unknown approver'}`
+          : 'Human endorsement',
+        content: [text(meta?.note ? oneLine(meta.note) : 'no endorsement result')],
+      }
+    },
+    async execute(args, exec: ToolRunContext) {
+      assertActive(exec)
+      // This body only runs once the host approval seam said yes (the plugin
+      // entry routes proof_endorse through `ask`): the human's consciousness
+      // is the evidence being recorded, not the model's say-so.
+      const parsed = (args ?? {}) as { claim?: unknown; decision?: unknown; approver?: unknown }
+      if (typeof parsed.claim !== 'string' || parsed.claim.trim().length === 0) {
+        throw new Error('proof_endorse: claim is required — the exact claim the human is endorsing or rejecting')
+      }
+      if (parsed.decision !== 'endorse' && parsed.decision !== 'reject') {
+        throw new Error(`proof_endorse: decision must be 'endorse' | 'reject' `
+          + `(got ${typeof parsed.decision === 'string' ? JSON.stringify(parsed.decision) : 'nothing usable'})`)
+      }
+      const approver = typeof parsed.approver === 'string' && parsed.approver.trim().length > 0
+        ? parsed.approver
+        : 'host-approver'
+      // v0.1 best-effort evidence root: the audit report exposes no chain-head
+      // digest, so the scope names the baseline root the decision rides on —
+      // the strongest addressable evidence root available — and null when no
+      // baseline exists (an endorsement of an unanchored claim says exactly
+      // that, which is more honest than a made-up root).
+      let evidenceRoot: string | null = null
+      try {
+        const baseline = await engine.baseline()
+        if (typeof baseline?.root === 'string') evidenceRoot = baseline.root
+      } catch {
+        evidenceRoot = null
+      }
+      // A re-endorsement (or retraction) supersedes by generation, exactly like
+      // a jury appeal: gen + 1, readers resolve to the highest gen.
+      const claimId = claimIdOf(parsed.claim)
+      const gen = (await maxAttestationGen(engine, evidenceLogPath, 'attest/human', claimId)) + 1
+      const attestation: HumanAttestation = {
+        kind: 'attest/human',
+        claimId,
+        gen,
+        approver,
+        approvedAt: Date.now(),
+        scope: { claim: parsed.claim, evidenceRoot },
+        decision: parsed.decision,
+      }
+      await engine.storeView.mark('attest/human', { ...attestation })
+      return {
+        recorded: true as const,
+        claimId,
+        decision: attestation.decision,
+        approver,
+        scope: attestation.scope,
+        note: 'Class C evidence recorded. Endorsement is risk acceptance: it unlocks the grade gap, '
+          + 'it never inflates the number; rejection collapses it.',
+      } as unknown as JsonValue
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// λ: chain read-back. The store appends markers but never reads them back, so
+// the attestation tools parse the raw log lines through the engine's own fs
+// port — the same route the engine's fusion pass takes. Parsing is defensive
+// because the input is chain data: anything unreadable degrades to absence,
+// never to a throw, and (per the guards above) absence means refusal.
+// ---------------------------------------------------------------------------
+
+/** Marker payloads under the given labels, in log order (newest last). */
+async function markerPayloads(
+  engine: ProofEngine,
+  logPath: string | undefined,
+  labels: ReadonlySet<string>,
+): Promise<Record<string, unknown>[]> {
+  if (logPath === undefined) return []
+  try {
+    const found: Record<string, unknown>[] = []
+    for (const line of await engine.fsView.readLines(logPath)) {
+      let envelope: { kind?: unknown; payload?: unknown }
+      try {
+        envelope = JSON.parse(line) as { kind?: unknown; payload?: unknown }
+      } catch {
+        continue
+      }
+      if (envelope?.kind !== 'marker') continue
+      const payload = envelope.payload
+      if (typeof payload !== 'object' || payload === null) continue
+      const record = payload as Record<string, unknown>
+      if (labels.has(String(record.label))) found.push(record)
+    }
+    return found
+  } catch {
+    // An unreadable log cannot invent testimony; every caller degrades to
+    // absence (the log's own integrity is audit()'s charge, not this read's).
+    return []
+  }
+}
+
+/** The most recent attest/jury-requested marker, narrowed to its usable fields. */
+async function latestJuryRequest(
+  engine: ProofEngine,
+  logPath: string | undefined,
+): Promise<{ claimId: unknown; prompt: string | undefined; rubricVersion: string | undefined } | undefined> {
+  const payloads = await markerPayloads(engine, logPath, new Set(['attest/jury-requested']))
+  const last = payloads[payloads.length - 1]
+  if (last === undefined) return undefined
+  return {
+    claimId: last.claimId,
+    prompt: typeof last.prompt === 'string' ? last.prompt : undefined,
+    rubricVersion: typeof last.rubricVersion === 'string' ? last.rubricVersion : undefined,
+  }
+}
+
+/**
+ * Highest recorded generation of one attestation kind for one claim, −1 when
+ * none exists — the next record lands at +1, whatever the chain's history.
+ */
+async function maxAttestationGen(
+  engine: ProofEngine,
+  logPath: string | undefined,
+  label: 'attest/jury' | 'attest/human',
+  claimId: string,
+): Promise<number> {
+  const payloads = await markerPayloads(engine, logPath, new Set([label]))
+  let max = -1
+  for (const payload of payloads) {
+    if (payload.claimId !== claimId) continue
+    if (typeof payload.gen === 'number' && Number.isInteger(payload.gen) && payload.gen > max) max = payload.gen
+  }
+  return max
 }
 
 // ---------------------------------------------------------------------------
@@ -930,6 +1442,52 @@ function renderClaim(value: ClaimValue): string {
     lines.push('')
   }
   if (typeof v.summary === 'string') lines.push(v.summary)
+  return lines.join('\n')
+}
+
+/**
+ * λ: the jury request render carries the FULL prompt — the juror must read the
+ * rubric, claim and context exactly as they were frozen, because that is the
+ * text a third party will replay. Total on replay like every render above.
+ */
+function renderJuryRequest(value: JuryRequestValue): string {
+  const v = value ?? ({} as JuryRequestValue)
+  const lines: string[] = []
+  const instruction = typeof v.instruction === 'string' ? v.instruction : ''
+  if (instruction.length > 0) lines.push(`ACTION: ${instruction}`, '')
+  const prompt = typeof v.prompt === 'string' ? v.prompt : ''
+  lines.push(prompt.length > 0 ? prompt : '(no deliberation prompt on record — do not submit a verdict without one)')
+  return lines.join('\n')
+}
+
+function renderJurySubmit(value: JurySubmitValue): string {
+  const v = value ?? ({} as JurySubmitValue)
+  const probability = typeof v.probability === 'number' ? ` (p=${v.probability})` : ''
+  const lines = [
+    `Class B verdict recorded — ${String(v.verdict ?? 'unknown')}${probability}`
+      + ` · gen ${typeof v.gen === 'number' ? v.gen : '?'}`
+      + ` · claim ${typeof v.claimId === 'string' ? v.claimId : 'unknown'}`,
+  ]
+  if (typeof v.factor === 'number') {
+    lines.push(`pure factor ${v.factor} (p^0.7 under the default jury trust policy; an abstain carries 1)`)
+  }
+  if (typeof v.note === 'string' && v.note.length > 0) lines.push('', v.note)
+  return lines.join('\n')
+}
+
+function renderEndorse(value: EndorseValue): string {
+  const v = value ?? ({} as EndorseValue)
+  const scope = (v.scope ?? {}) as { claim?: unknown; evidenceRoot?: unknown }
+  const root = typeof scope.evidenceRoot === 'string'
+    ? scope.evidenceRoot.slice(0, 12)
+    : scope.evidenceRoot === null ? 'none (nothing anchored at endorse time)' : 'unknown'
+  const lines = [
+    `Class C decision recorded — ${String(v.decision ?? 'unknown')} `
+      + `by ${typeof v.approver === 'string' ? v.approver : 'unknown approver'}`,
+    `claim: ${typeof scope.claim === 'string' ? scope.claim : 'unknown'}`,
+    `evidence root reviewed: ${root}`,
+  ]
+  if (typeof v.note === 'string' && v.note.length > 0) lines.push('', v.note)
   return lines.join('\n')
 }
 

@@ -116,6 +116,19 @@ export interface Config {
    * cap — honest self-reporting, structurally bounded.
    */
   juryConfidenceCap: number
+  /**
+   * Trust weight for Class B evidence — an LLM jury's on-chain verdict (κ).
+   * The weight is a log-odds exponent: a B-class factor is the jury's own
+   * `probability` raised to this power, so a weak witness can only ever
+   * *weaken* a claim (any probability below 1 discounts; nothing inflates).
+   */
+  classBTrust: number
+  /**
+   * Trust weight for Class C evidence — a human endorsement or rejection (κ).
+   * Same log-odds-exponent semantics as `classBTrust`: an endorse discounts
+   * gently (0.95^0.9 ≈ 0.955), a reject collapses the claim ((1-0.95)^0.9).
+   */
+  classCTrust: number
   /** Emit plugin diagnostics to stdout. */
   verbose: boolean
 }
@@ -159,5 +172,9 @@ export const Config: Schema<Config> = Schema.object({
   // ζ: docs-only self-attestation tops out below objective proof — the same
   // percent band as certifyTarget (0–1), defaulted to a deliberately humble 0.8.
   juryConfidenceCap: Schema.percent().default(0.8),
+  // κ: graded-evidence trust weights — log-odds exponents, so weak witnesses
+  // can only weaken a claim (probability^weight < 1 whenever probability < 1).
+  classBTrust: Schema.percent().default(0.7),
+  classCTrust: Schema.percent().default(0.9),
   verbose: Schema.boolean().default(false),
 }) as unknown as Schema<Config>

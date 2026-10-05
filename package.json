@@ -1,6 +1,6 @@
 {
   "name": "dsh-proof",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Evidence-Driven Completion Proof & Regression Attribution for DeepSeek Harness. Turns \"I'm done\" from a self-report into a recomputable evidence chain, and turns \"I fixed it but broke something else\" from a post-mortem into in-flight attribution.",
   "keywords": [
     "dsh-plugin",

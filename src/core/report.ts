@@ -39,8 +39,12 @@ import type { ClaimContract, ObligationResult } from './contract.ts'
  * - `jury-only`: no objective check speaks for the claim — a docs-only change
  *   graded by jury review (the author's self-attestation, capped by
  *   `juryConfidenceCap`). The number is a ceiling, not a measurement (ζ).
+ * - `attested`: machine evidence fused with on-chain Class B/C witnesses (κ)
+ *   — a machine posterior (or, with no machine record, the neutral 1)
+ *   discounted by every active attestation factor. Still a measurement at
+ *   heart, but no longer a purely machine-made number.
  */
-export type ConfidenceBasis = 'full-coverage' | 'certified-subset' | 'degraded' | 'jury-only'
+export type ConfidenceBasis = 'full-coverage' | 'certified-subset' | 'degraded' | 'jury-only' | 'attested'
 
 /**
  * `ProofReport` grown by the graded-trust fields (β). Declared here as an
