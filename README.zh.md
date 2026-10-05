@@ -189,6 +189,16 @@ DSH 生态已超过 5000 个插件、14 个分类。但把分类摊开看，缺�
 
 一切是 `(文本, 配置)` 的纯函数——确定性保持，内容寻址不受影响。配套升级：回归叙事与 `proof_verify` 的失败详情改为**优先引用显著行**（`firstInformativeLine`）而非首行——模型第一眼看到的就是「expected 1 to be 2」，不再是「✓ 1 passing」。保守起见 `excerptStrategy: head` 保留了旧行为。
 
+## 五·九、位置无关的证据寻址（v0.6）：同一次失败，任何机器同一个地址
+
+编译错误与栈回溯几乎必然携带绝对路径——digest 因此混入本机路径，同一测试在两台机器、两个检出目录产出**不同的 `evidenceId`**：跨会话比对、证据去重、第三方复算（透明日志的地基）全部无从谈起；而且用户名（`/home/alice/…`、`C:\Users\28646\…`）被写进可能导出审计的证据记录，是一处实打实的**隐私泄漏**。
+
+v0.6 在 `normalizeOutput` 落地双层归一：**root → `$WORKSPACE`（先具体）**，**home → `$HOME`（后一般）**——工作区恰在主目录下时整段先坍缩为 `$WORKSPACE`，兄弟路径归 `$HOME`；Windows 路径的正反斜杠双形态都能匹配。`makeEvidence` 经由 Runner 注入 `{root, home}`（`normalizeHome` 可配置，默认开），于是：
+
+- **同一次失败在任何机器、任何检出目录、任何用户名下，`outputDigest` 与 `evidenceId` 完全相同**——证据天然跨机器去重，这是「证明透明日志」能够比较、合并、第三方复算的前提原语；
+- **用户名不再进入任何证据字段**；
+- 不传归一根时行为逐字节保持旧状（存量 digest 稳定），且 `audit()` 的自寻址验证对存量字段重算，天然不受影响。
+
 ---
 
 ## 六、架构：领域核心 + 薄适配层
@@ -216,7 +226,7 @@ dsh-proof/
 │   ├── vendor/dsh-tools.ts   # 契约快照（pinned to dsh v0.2.1-alpha.1）
 │   ├── config.ts             # Schemastery 配置
 │   └── index.ts              # Cordis 插件入口
-├── test/                     # 95 个测试，含真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合与智能摘录
+├── test/                     # 100 个测试，含真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录与位置无关寻址
 ├── cordis.patch.yml          # bundle 层
 └── examples/cordis.yml       # --patch 本地调试
 ```
@@ -224,7 +234,7 @@ dsh-proof/
 **为什么领域核心不碰 `@deepseek-ai/*`：**
 
 1. DSH 是开发者预览版，破坏性变更频繁。核心逻辑与 harness 版本解耦 → 升级不重写。
-2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，95 个测试全绿。
+2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，100 个测试全绿。
 3. 同一个核心可以被别的宿主（CLI、CI、其他 harness）复用。
 
 **为什么 `vendor/dsh-tools.ts` 是契约快照而不是活依赖：**
@@ -279,6 +289,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
         promptScope: proof:policy
         headChars: 2000            # 每条证据保留的输出摘要长度
         excerptStrategy: balanced # 摘录策略：balanced=头+显著失败行+尾 | head=传统前N字符
+        normalizeHome: true          # 把用户主目录归一为 $HOME（隐私+跨机器可比）
         verbose: false
 ```
 
@@ -310,7 +321,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit，离线可跑
-npm test              # 95 个测试（node:test）
+npm test              # 100 个测试（node:test）
 npm run build         # 产出 lib/
 npm run bundle:check  # 打包契约自检
 ```

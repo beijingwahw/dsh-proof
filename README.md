@@ -119,6 +119,10 @@ Union semantics keep soundness absolute: verified and approximate edges are unio
 
 The default `balanced` strategy allocates in three segments: the **first salient failure line** (AssertionError / expected-received / Traceback / stack frames / ✖ / not ok / timed out …) is always kept when it fits within half the budget; a **line-aligned tail window** keeps stack traces intact (never cut mid-word); and `[... N chars omitted ...]` markers account for every dropped character (`outputTruncated` / `outputOmittedChars` ride on the evidence record). The hard clamp trims tail, never the salient middle. Everything is a pure function of (text, config), so content addressing is unaffected. Regression narratives and `proof_verify` failure details now quote the first *informative* line, not the first line. `excerptStrategy: head` preserves the legacy behaviour.
 
+## Location-independent addressing (v0.6): one failure, one address, any machine
+
+Compiler errors and stack traces carry absolute paths, so digests used to vary per machine and per checkout directory — the same test outcome never addressed identically twice across machines, and usernames (`/home/alice/...`) leaked into records that may be exported for audit. v0.6 canonicalises captured output before hashing: **root → `$WORKSPACE` (specific first)**, **home → `$HOME` (general after)** — a workspace under the home directory still collapses to `$WORKSPACE/...` while sibling paths become `$HOME/...`; Windows paths match in either slash style. With `normalizeHome` (default on), the same failure produces the *identical* `outputDigest` and `evidenceId` on any machine, under any checkout, for any user — the dedupe/comparison primitive a proof transparency log rests on — and no username ever enters an evidence field. Without canonical roots, behaviour is byte-for-byte legacy.
+
 ## Architecture
 
 ```
@@ -135,7 +139,7 @@ The domain core is framework-free on purpose: it is fully unit-testable offline,
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit
-npm test              # 95 tests, node:test
+npm test              # 100 tests, node:test
 npm run build
 npm run bundle:check  # packaging contract self-check
 ```

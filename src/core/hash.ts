@@ -54,17 +54,22 @@ export function merkleRoot(addresses: Iterable<string>): string {
 }
 
 /**
- * Normalise captured process output before hashing so that cosmetic churn does
- * not invalidate evidence: line endings unified, trailing whitespace stripped,
- * absolute workspace paths replaced with a placeholder, and lines carrying
- * timestamps/durations collapsed.
+ * Roots substituted out of captured output before hashing, making evidence
+ * location-independent: the same outcome on any machine, under any checkout
+ * directory, yields the same digest — which is what cross-session dedupe,
+ * cross-machine comparison, and third-party recomputation all rest on.
+ * `root` (more specific) is replaced before `home` (less specific), so a
+ * workspace under the user's home still collapses to `$WORKSPACE/...`.
  */
-export function normalizeOutput(raw: string, opts: { root?: string } = {}): string {
+export interface NormalizeOptions {
+  readonly root?: string
+  readonly home?: string
+}
+
+export function normalizeOutput(raw: string, opts: NormalizeOptions = {}): string {
   let text = raw.replace(/\r\n/g, '\n')
-  if (opts.root) {
-    const escaped = opts.root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    text = text.replace(new RegExp(escaped, 'g'), '$WORKSPACE')
-  }
+  for (const variant of pathVariants(opts.root)) text = substituteLiteral(text, variant, '$WORKSPACE')
+  for (const variant of pathVariants(opts.home)) text = substituteLiteral(text, variant, '$HOME')
   const lines = text
     .split('\n')
     .map(line => line.replace(/[ \t]+$/g, ''))
@@ -72,4 +77,17 @@ export function normalizeOutput(raw: string, opts: { root?: string } = {}): stri
     .map(line => line.replace(/\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?\b/g, '<timestamp>'))
   while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
   return lines.join('\n')
+}
+
+/** A path and its slash-flipped twin, so Windows output matches in both styles. */
+function pathVariants(path: string | undefined): string[] {
+  if (path === undefined || path.length === 0) return []
+  const flipped = path.replace(/\\/g, '/')
+  return path === flipped ? [path] : [path, flipped]
+}
+
+function substituteLiteral(text: string, literal: string, placeholder: string): string {
+  if (literal.length === 0) return text
+  const escaped = literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return text.replace(new RegExp(escaped, 'g'), placeholder)
 }

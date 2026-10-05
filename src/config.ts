@@ -82,6 +82,12 @@ export interface Config {
   excerptStrategy: 'head' | 'balanced'
   /** Excerpt budget per evidence record, in characters. */
   headChars: number
+  /**
+   * Canonicalise the user's home directory to `$HOME` in captured output —
+   * keeps usernames out of evidence records (privacy) and makes digests
+   * identical across machines (cross-machine comparability).
+   */
+  normalizeHome: boolean
   /** Emit plugin diagnostics to stdout. */
   verbose: boolean
 }
@@ -115,5 +121,6 @@ export const Config: Schema<Config> = Schema.object({
   promptScope: Schema.string().default('proof:policy'),
   excerptStrategy: Schema.union(['head', 'balanced']).default('balanced'),
   headChars: Schema.number().default(2_000),
+  normalizeHome: Schema.boolean().default(true),
   verbose: Schema.boolean().default(false),
 }) as unknown as Schema<Config>

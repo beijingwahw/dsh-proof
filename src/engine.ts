@@ -59,6 +59,8 @@ export interface EngineOptions {
   /** How output is excerpted into evidence records (v0.5). */
   readonly excerptStrategy?: 'head' | 'balanced'
   readonly headChars?: number
+  /** User home directory, canonicalised to `$HOME` in evidence (v0.6). */
+  readonly homeDir?: string
   readonly clock?: Clock
   readonly fs?: FsPort
   readonly commands?: CommandPort
@@ -146,8 +148,11 @@ export class ProofEngine {
       },
     )
     this.runner = new VerificationRunner(this.commands, this.workspace, this.clock, {
-      budget: options.headChars ?? 2_000,
-      strategy: options.excerptStrategy ?? 'balanced',
+      excerpt: { budget: options.headChars ?? 2_000, strategy: options.excerptStrategy ?? 'balanced' },
+      canonical: {
+        root: options.root,
+        ...(options.homeDir !== undefined ? { home: options.homeDir } : {}),
+      },
     })
     this.resolver = options.resolver
     this.options = {

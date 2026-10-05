@@ -115,6 +115,7 @@ export function apply(ctx: Context, config: Config): void {
     fs: sharedFs,
     ...(lspResolver !== undefined ? { resolver: lspResolver } : {}),
     excerptStrategy: config.excerptStrategy,
+    ...(config.normalizeHome ? { homeDir: homedir() } : {}),
     autoDiscover: config.autoDiscover,
     checks: config.checks.map(c => ({
       ...(c.label !== undefined ? { label: c.label } : {}),

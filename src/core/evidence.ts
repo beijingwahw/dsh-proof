@@ -17,6 +17,7 @@
 
 import type { CheckKind, CheckSpec, Clock, FsPort, SignerPort, WorkspacePort } from './ports.ts'
 import { addressOf, canonicalJson, merkleRoot, normalizeOutput, sha256 } from './hash.ts'
+import type { NormalizeOptions } from './hash.ts'
 import { GENESIS_PREV, checkpointSignedData, lineDigest, parseAnchor, walkChain } from './trust.ts'
 import { excerptOutput, type ExcerptOptions } from './excerpt.ts'
 
@@ -140,8 +141,11 @@ export function makeEvidence(
   workspace: WorkspaceSnapshot,
   clock: Clock,
   excerpt: ExcerptOptions = DEFAULT_EXCERPT,
+  canonical: NormalizeOptions = {},
 ): Evidence {
-  const normalized = normalizeOutput(outcome.output, {})
+  // Canonical roots make the record location-independent: the same outcome
+  // under any checkout directory (or user home) hashes to the same address.
+  const normalized = normalizeOutput(outcome.output, canonical)
   const exc = excerptOutput(normalized, excerpt)
   const base = {
     checkId: spec.id,

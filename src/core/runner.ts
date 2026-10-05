@@ -13,6 +13,13 @@ import type { CheckSpec, Clock, CommandPort, WorkspacePort } from './ports.ts'
 import type { CheckStatus, Evidence, RunOutcome, WorkspaceSnapshot } from './evidence.ts'
 import { makeEvidence, snapshotWorkspace } from './evidence.ts'
 import type { ExcerptOptions } from './excerpt.ts'
+import type { NormalizeOptions } from './hash.ts'
+
+/** How raw outcomes become evidence records: excerpt budget + canonical roots. */
+export interface EvidenceShape {
+  readonly excerpt?: ExcerptOptions
+  readonly canonical?: NormalizeOptions
+}
 
 export interface RunnerOptions {
   readonly concurrency?: number
@@ -39,12 +46,14 @@ export class VerificationRunner {
   private readonly workspace: WorkspacePort
   private readonly clock: Clock
   private readonly excerpt: ExcerptOptions
+  private readonly canonical: NormalizeOptions
 
-  constructor(commands: CommandPort, workspace: WorkspacePort, clock: Clock, excerpt: ExcerptOptions = { budget: 2_000, strategy: 'head' }) {
+  constructor(commands: CommandPort, workspace: WorkspacePort, clock: Clock, shape: EvidenceShape = {}) {
     this.commands = commands
     this.workspace = workspace
     this.clock = clock
-    this.excerpt = excerpt
+    this.excerpt = shape.excerpt ?? { budget: 2_000, strategy: 'head' }
+    this.canonical = shape.canonical ?? {}
   }
 
   /** Run a batch of checks and turn every outcome into evidence. */
@@ -72,7 +81,7 @@ export class VerificationRunner {
           const skipped = makeEvidence(spec, {
             status: 'skipped', exitCode: null, durationMs: 0,
             output: `skipped: total verification budget of ${options.totalBudgetMs}ms exhausted`,
-          }, snapshot, this.clock, this.excerpt)
+          }, snapshot, this.clock, this.excerpt, this.canonical)
           records.push(skipped)
           skippedIds.push(spec.id)
           options.onEvidence?.(skipped, index++, total)
@@ -80,7 +89,7 @@ export class VerificationRunner {
         }
 
         const outcome = await this.runOne(spec, options.signal, snapshot)
-        const evidence = makeEvidence(spec, outcome, snapshot, this.clock, this.excerpt)
+        const evidence = makeEvidence(spec, outcome, snapshot, this.clock, this.excerpt, this.canonical)
         records.push(evidence)
         ranIds.push(spec.id)
         options.onEvidence?.(evidence, index++, total)

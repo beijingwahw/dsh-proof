@@ -12,6 +12,7 @@
         evidenceDir: .proof
         checkpointEvery: 25
         excerptStrategy: balanced
+        normalizeHome: true
         autoDiscover: true
         checkTimeoutMs: 120000
         verifyBudgetMs: 300000

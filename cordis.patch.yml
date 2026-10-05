@@ -62,4 +62,7 @@
         promptScope: proof:policy
         headChars: 2000
         excerptStrategy: balanced # head+salient failure lines+tail | head = legacy
+        # Canonicalise the user's home directory to $HOME in captured output:
+        # keeps usernames out of records and makes digests machine-independent.
+        normalizeHome: true
         verbose: false

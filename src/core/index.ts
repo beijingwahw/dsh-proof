@@ -18,6 +18,8 @@ export {
   addressOf, canonicalJson, merkleRoot, normalizeOutput, sha256,
 } from './hash.ts'
 
+export type { NormalizeOptions } from './hash.ts'
+
 export {
   GENESIS_PREV, checkpointSignedData, lineDigest, parseAnchor, walkChain,
   type AnchorFile, type ChainMode, type ChainWalk, type CheckpointPayload,
