@@ -68,7 +68,7 @@ Missing evidence is never papered over. Under the default `bayesian` scheduler (
 
 ---
 
-## Seven model-facing tools
+## Nine model-facing tools
 
 | tool | purpose |
 |---|---|
@@ -79,8 +79,10 @@ Missing evidence is never papered over. Under the default `bayesian` scheduler (
 | `proof_jury` | **Class B evidence, step 1**: request an LLM jury deliberation — returns the frozen deliberation prompt (rubric + claim + context, byte-deterministic) and records the request on-chain, verbatim prompt included |
 | `proof_jury_submit` | **Class B evidence, step 2**: record the verdict (`verdict` / `probability` / verbatim `reasoning`) as permanent evidence with the frozen prompt, declared model identity and independence tier; the claimId must match the pending request; gen auto-increments = appeal |
 | `proof_endorse` | **Class C evidence**: a named human endorses/rejects a claim — the call itself triggers the host approval prompt; endorse = risk acceptance (unlocks the grade gap, never inflates the number), reject = collapse |
+| `proof_conjure` | **Synthetic evidence, step 1**: request a conjured verification for an assertion no organic check covers — the plugin freezes the request (claim + paths) on-chain (`synthetic/requested`) and scaffolds a deterministic test template into `.proof-synthetic/` |
+| `proof_conjure_run` | **Synthetic evidence, step 2**: the plugin verifies the on-chain request, digests the sandbox script verbatim, screens its capabilities (refusal = `skipped`, never executed, nothing on chain) and runs it through the plugin's own port; the `scriptDigest`, sandbox tier, screening verdict and authorship ride the content-addressed evidence, closed by a `synthetic/run` marker |
 
-All seven follow DSH's hard contract: `execute` returns one canonical JSON value, prose lives in `output.render`, and UI cards come from **pure** `presentCall` / `presentResult` / `presentationMeta` projections so a session-log replay reproduces the identical card.
+All nine follow DSH's hard contract: `execute` returns one canonical JSON value, prose lives in `output.render`, and UI cards come from **pure** `presentCall` / `presentResult` / `presentationMeta` projections so a session-log replay reproduces the identical card.
 
 ## Runtime enforcement, not prompt hope
 
@@ -163,6 +165,14 @@ The jury protocol is a request/submit pair: `proof_jury` deterministically assem
 
 **Explicit trust weights, two maths each in its place.** `classBTrust` (0.7) and `classCTrust` (0.9) are declared policy constants, never learned — there is no labelled dataset of "this witness was right". For **pure-jury paths** (the new engine-level `llm-jury` contract kind: obligations `jury-delivered` + `jury-upholds` — an active on-chain B verdict upholding at probability ≥ 0.5 — zero commands run), confidence is Π `attestationFactor` with factor = p^w, a **log-odds discount**: w ∈ [0,1] and p ∈ [0,1] ⇒ p^w ∈ [p,1], so testimony can only *weaken* a claim, never amplify it — the right direction of skepticism for self-interested proof systems (abstain is exactly factor 1; NaN/out-of-range probabilities degrade to abstain so they can never poison the product). When a **machine certification already exists**, a witness speaking about the whole claim enters as the **reliability mixture** `fused = (1−w)·c + w·p`: pulled toward the asserted probability with strength exactly w, never overshooting it — a jury asserting 0.99 at w = 0.7 carries a 0.94 machine certification across the 0.97 target (the rescue), asserting 0.1 crashes it. **Class C endorsement is risk acceptance, not certainty transfer**: the approval seam is binary, human correctness is modelled as the constant `humanProbability` = 0.95, and 0.95^0.9 ≈ 0.955 can mathematically never cross a 0.97 target — so endorsement leaves the number untouched and unlocks the *grade* instead (stale-by-target-gap + zero regressions + every obligation met → `proven`; the human took the residual the machines could not cross). Endorsement cannot pay for missing work: unmet obligations or regressions do not unlock. The symmetric lock: an explicit reject — human or jury — collapses the number ((1−0.95)^0.9) and demotes a `proven` grade the number no longer supports. `ConfidenceBasis` grows `attested` (machine + B/C fusion, or pure C) and extends `jury-only` to pure-B paths (narrative: `PROVEN (p≈0.97, machine + B/C attested)`). Plain `verify()` never reads attestations at all — v0.9 pure-machine semantics stay byte-locked. Honest limits: v0.11's actual independence tier is the weakest (`same-session`), the model identity is the submitter's declaration (`session-model (unverified)`) verified only by replay audit, the jury's probability is a subjective judgement, and both 0.95 and the mixture are modelling choices, not derived posteriors.
 
+## PTC evidence synthesis (v0.12): conjured verification for the unchecked
+
+Some assertions land where no existing check looks — the change touched a path no discovered suite covers, and `new-paths-covered` used to be a dead end ("add a check whose paths cover them", which the agent cannot do: check discovery only reads build metadata and host config). v0.12 opens the third path: **the plugin itself constructs a verification for exactly that gap**. The agent's role changes from "the audited" to *a co-conspirator in constructing the evidence* — but the chain lets it influence only the test's truth value (how strict an assertion to write), never the execution result.
+
+The protocol is a two-tool pair. `proof_conjure(claim, paths)` freezes the request *before any script exists*: the claim and its paths land on-chain as a `synthetic/requested` marker (with a null `scriptDigest` — locking the request first is what makes a later script swap visible), and a deterministic scaffold is written into the sandbox (`syntheticDir`, default `.proof-synthetic/`). The scaffold's header warns in the file itself that this exact text becomes the `scriptDigest` of a piece of evidence — deleting an assertion mints a new address, and the old pass stops applying. The agent fills in a property test / minimal repro; `proof_conjure_run(claim, entry)` then checks the chain for the matching request, digests the script on disk verbatim, runs a deny-list capability screen (refusal returns the findings with status `skipped` — no execution, nothing lands on chain), and executes through **the plugin's own command port**. Three structural answers make the evidence unforgeable: the script source is sha256'd into `SyntheticEvidenceMeta` and participates in the `evidenceId` content address (two scripts, same output → two different pieces of evidence); execution never touches the agent's tool surface; and the request→run pair closes with markers, so a script swapped between the two calls runs under its own digest, visibly.
+
+**The math prices the interested party.** A synthetic check's false-pass β rises from 0.02 to `syntheticFalsePass` (default 0.15, 7.5×) — the cheapest false pass here is not a mechanical accident but an omission (write the empty assertion, skip the input that breaks the code), because the test's author is a party to the claim it tests. Same history, same pass: an organic check lifts the posterior to ≈ 0.9960, a conjured one to ≈ 0.9706 (pinned end-to-end). α and π still learn from history like any check — the discount prices *whose hand wrote the assertions*; a failing conjured check damns like any other. The default deliberately lives outside `BAYES_CONSTANTS` (the never-retuned laws): it is an overridable modelling guess. Executed conjured specs join `verify()` / `verifyContract` as ordinary specs, `behavior-adding` accepts them as coverage through a tier ladder (run-organic > run-synthetic > latest-organic > latest-synthetic — fresh beats stale, independent beats self-authored; detail: "covered by synthetic evidence (discounted)"), and when every decisive record this run was conjured, `confidenceBasis` becomes `synthetic` (priority: jury-only > attested > synthetic > certified-subset > full-coverage > degraded) with a narrative that says it out loud: `PROVEN (p≈0.97, synthetic evidence — conjured tests, discounted)`. The sandbox regime is honestly labelled `'screened-subprocess'` — static screening is **not** a sandbox (computed specifiers and `eval`/`createRequire` aliases are invisible to text); the real boundary is the sandbox cwd, the run timeout (`syntheticTimeoutMs`), the output cap, and a future host `ptc-runtime` tier whose probe point is already reserved.
+
 ## Architecture
 
 ```
@@ -179,7 +189,7 @@ The domain core is framework-free on purpose: it is fully unit-testable offline,
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit
-npm test              # 317 tests, node:test
+npm test              # 356 tests, node:test
 npm run build
 npm run bundle:check  # packaging contract self-check
 ```
@@ -202,6 +212,9 @@ Every tunable is a `cordis.yml` field — no hardcoded knobs. See [README.zh.md 
         juryConfidenceCap: 0.8     # confidence ceiling for docs-only jury self-attestation
         classBTrust: 0.7           # Class B (LLM jury) trust weight: log-odds exponent / mixture strength
         classCTrust: 0.9           # Class C (human) trust weight: endorse discounts gently, reject collapses
+        syntheticDir: .proof-synthetic # sandbox where conjured-test scaffolds and scripts live (pinned out of discovery)
+        syntheticFalsePass: 0.15    # β priced into agent-authored (synthetic) checks; organic default is 0.02
+        syntheticTimeoutMs: 60000   # cooperative timeout for one conjured-test execution
         impactGraph: true
         driftDetection: true
         enforceOnTurnEnd: true
@@ -219,10 +232,13 @@ Every tunable is a `cordis.yml` field — no hardcoded knobs. See [README.zh.md 
 - The jury's `probability` (v0.11) is a subjective probability, not a measurement: the rubric demands "the number your own reasoning actually supports", but an LLM's self-reported figure carries no calibration guarantee — read p = 0.99 vs 0.9 as wording strength. All the testimony arithmetic consumes this subjective number; it does not make it objective.
 - `humanProbability` = 0.95 (v0.11) is a modelling choice: the Class C approval seam is binary and elicits no number, so human correctness enters as a constant — deliberately below 1, because a human who could never be wrong would make every endorsed claim unfalsifiable.
 - The reliability mixture (v0.11) is a scoring-rule choice, not a derived posterior: `fused = (1−w)·c + w·p` models "the witness is reliable with probability w, else noise" because a witness speaking about the whole claim is not one more independent factor in the product; which maths applies (p^w discount vs mixture vs risk-acceptance unlock) is decided by whether the machines already spoke, never by which number looks better.
+- Static screening is not a sandbox (v0.12): the conjured-script screen is a text-level deny-list — computed specifiers (`import(buildName())`), alias channels (`createRequire` / `eval` / `new Function`) and case-mangled specifiers are invisible to it, because text cannot see runtime values. What actually bounds a runaway script is the sandbox cwd restriction, the run timeout (`syntheticTimeoutMs`), the output cap and a future host `ptc-runtime` tier; the screen only makes the *easy* exfiltration attempts fail loudly, before execution. The regime label says `'screened-subprocess'`, honestly.
+- The synthetic β = 0.15 (v0.12) is an admitted guess that is unlearnable by construction: a false-pass rate needs breakage ground truth to learn, and a self-serving test (empty assertion, skipped breaking input) produces no breakage signal to learn from — it is forever green in the log. Like the organic 0.02 it is a priced stance, not a measurement; it deliberately lives in the overridable `syntheticFalsePass` rather than the never-retuned `BAYES_CONSTANTS`.
+- Synthetic coverage is always weaker than its organic peer (v0.12): the same pass lifts the posterior less (end-to-end: synthetic ≈ 0.9706 < organic ≈ 0.9960), the obligation tier ladder yields to organic at every tier, and an all-synthetic run renames the basis. Read conjured coverage as "the claim's author ran and passed their own check", never as independent confirmation — the β, the ladder and the basis all encode that one sentence.
 - Checkpoint cadence leaves a window (v0.2): records after the last signed checkpoint are chain-covered but not checkpoint-covered. The window is bounded by `checkpointEvery`, closed at every baseline/verify/claim boundary, and *visible* — `proof_status` reports `tailRecords`, the count of records since the last checkpoint. The anchor protects against the audited agent, not against a fully compromised host.
 - On machines without the signing key, signed checkpoints cannot be adjudicated locally: the audit reports them as `unverifiableCheckpoints` (a missing capability, not a forgery charge — the audit does not fail on it; anchor count/head comparison still bounds rewind).
 - `proven` permits pre-existing red checks — they are reported prominently but not charged to the session. Deliberate, not a hole.
-- It orchestrates and attributes your existing objective checks; it does not write tests.
+- It orchestrates and attributes your existing objective checks. v0.12's evidence synthesis does not change that boundary: the agent drafts the assertions, and the plugin only scaffolds, screens, executes — and prices the result below every independent check.
 - DSH is a developer preview and its plugin contract changes. This plugin pins a minimal contract snapshot and declares peers rather than bundling, but upstream shifts still need re-alignment.
 
 ## License

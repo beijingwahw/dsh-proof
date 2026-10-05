@@ -43,8 +43,26 @@ import type { ClaimContract, ObligationResult } from './contract.ts'
  *   — a machine posterior (or, with no machine record, the neutral 1)
  *   discounted by every active attestation factor. Still a measurement at
  *   heart, but no longer a purely machine-made number.
+ * - `synthetic`: every decisive record this run came from conjured tests (π)
+ *   — checks the claim's own author wrote, on request, after the fact. The
+ *   number is a real measurement, but each factor was priced with the raised
+ *   synthetic β (`syntheticFalsePass`), because the test's author is the
+ *   claim's interested party.
+ *
+ * Priority order, pinned (π): a basis is chosen by the *strongest* regime
+ * present, and the chain is
+ *
+ *     jury-only > attested > synthetic > certified-subset > full-coverage > degraded
+ *
+ * `jury-only` and `attested` outrank `synthetic` because a B/C witness
+ * changes what the number *is* (testimony fused into it), not merely how
+ * much a factor was discounted; `synthetic` outranks the plain machine bases
+ * because a reader must know the only checks that spoke were authored by the
+ * claimant — "full coverage" would be technically true and materially
+ * misleading. The grade itself never branches on `synthetic` (decideGrade is
+ * untouched): the β lift already did the pricing inside the factors.
  */
-export type ConfidenceBasis = 'full-coverage' | 'certified-subset' | 'degraded' | 'jury-only' | 'attested'
+export type ConfidenceBasis = 'full-coverage' | 'certified-subset' | 'degraded' | 'jury-only' | 'attested' | 'synthetic'
 
 /**
  * `ProofReport` grown by the graded-trust fields (β). Declared here as an
@@ -161,9 +179,22 @@ export function assembleProof(input: AssembleInput): AssembleResult {
   // ride together or not at all, so a reader can never see a probability it
   // cannot place in a regime.
   const confidence = input.confidence !== undefined ? productOf(input.confidence.factors) : undefined
-  const confidenceBasis = input.confidence !== undefined && confidence !== undefined
+  let confidenceBasis = input.confidence !== undefined && confidence !== undefined
     ? basisFor(confidence, input.confidence.target, unverified, new Set(input.confidence.skippedByPlan.map(s => s.checkId)))
     : undefined
+  // π: conjured-test-only coverage renames the regime. When every decisive
+  // record this run addressed a synthetic-source spec (and at least one
+  // exists), "full-coverage"/"certified-subset" would be technically true and
+  // materially misleading — the only checks that spoke were authored by the
+  // claim's interested party, and the reader must see that in the basis. The
+  // factors themselves already paid the synthetic β, so the grade never
+  // branches here; and because `jury-only`/`attested` are never produced by
+  // this function (they come from the jury assembler and the engine's κ
+  // fusion, which run after and overwrite), the pinned priority order
+  // jury-only > attested > synthetic > machine bases holds by construction.
+  if (confidenceBasis !== undefined && onlySyntheticDecisive(input.records, input.specs)) {
+    confidenceBasis = 'synthetic'
+  }
 
   const report: GradedProofReport = {
     grade,
@@ -301,6 +332,19 @@ function productOf(factors: ReadonlyMap<string, number>): number {
     product *= factors.get(key) as number
   }
   return product
+}
+
+/**
+ * π: whether every decisive record this run addressed a synthetic-source
+ * spec (with at least one decisive record at all). Records whose checkId no
+ * spec claims count as non-synthetic — an unknown speaker is never evidence
+ * FOR the interested-party discount.
+ */
+function onlySyntheticDecisive(records: readonly Evidence[], specs: readonly CheckSpec[]): boolean {
+  const decisive = records.filter(r => isDecisiveStatus(r.status))
+  if (decisive.length === 0) return false
+  const synthetic = new Set(specs.filter(s => s.source === 'synthetic').map(s => s.id))
+  return decisive.every(r => synthetic.has(r.checkId))
 }
 
 /**

@@ -204,3 +204,10 @@ export type CheckSource =
   | 'go.mod'
   | 'composer.json'
   | 'config'
+  // ο: a check the plugin *constructed* for an assertion no discovered check
+  // covers (see core/synthetic.ts). It counts — the run is real, screened and
+  // content-addressed — but it weighs less than any discovered check, because
+  // its author is a party to the claim it tests. The pricing lives in
+  // core/bayes.ts (falsePass 0.15 vs 0.02); this value is the marker every
+  // consumer (bayes, contract details, reports) keys on, never a record shape.
+  | 'synthetic'

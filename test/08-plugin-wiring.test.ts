@@ -2,7 +2,7 @@
  * Plugin wiring — the DSH adapter surface, exercised without a harness.
  *
  * Loads the real plugin entry point, hands it a stand-in `Context`, and asserts
- * the contract it promises to DSH: seven tools on the registry, the documented
+ * the contract it promises to DSH: nine tools on the registry, the documented
  * pipeline hooks, a `proof:policy` prompt section, and tool bodies that return
  * canonical JSON values with pure presentation projections.
  */
@@ -19,7 +19,9 @@ import { createProofTools, toBaselineValue, toClaimValue, toStatusValue, toVerif
 import { ProofEngine } from '../src/engine.ts'
 import { NodeFsPort } from '../src/node-ports.ts'
 import { DEFAULT_TRUST_WEIGHTS, RUBRIC_V1, claimIdOf, juryPrompt } from '../src/core/attest.ts'
+import { SYNTHETIC_DIR_DEFAULT, SYNTHETIC_TEMPLATE, sandboxEntryFor } from '../src/core/synthetic.ts'
 import { sha256 } from '../src/core/hash.ts'
+import { FakeCommands, FakeWorkspace, MemoryFs } from './helpers.ts'
 import type { AuditReport, ProofGrade, ProofReport } from '../src/core/evidence.ts'
 import type { ConfidenceBasis, GradedProofReport } from '../src/core/report.ts'
 import { Config } from '../src/config.ts'
@@ -224,7 +226,7 @@ test('workspace mode gates moves whose source key carries the evidence log out',
   )
 })
 
-test('apply registers exactly the seven proof tools', () => {
+test('apply registers exactly the nine proof tools', () => {
   const harness = makeHarness()
   process.env.DSH_PROOF_ROOT = ROOT
   try {
@@ -233,12 +235,15 @@ test('apply registers exactly the seven proof tools', () => {
     delete process.env.DSH_PROOF_ROOT
   }
 
-  // λ: the registry grew by the three testimony tools — Class B (jury
-  // request/submit) and Class C (human endorsement). The list is exhaustive
-  // on purpose: a tool added or renamed by accident must break this test.
+  // λ grew the registry by the three testimony tools; ρ grew it again by the
+  // two conjure tools (PTC synthesis request/run). The list is exhaustive on
+  // purpose: a tool added or renamed by accident must break this test.
   assert.deepEqual(
     harness.registered.map(t => t.name).sort(),
-    ['proof_baseline', 'proof_claim', 'proof_endorse', 'proof_jury', 'proof_jury_submit', 'proof_status', 'proof_verify'],
+    [
+      'proof_baseline', 'proof_claim', 'proof_conjure', 'proof_conjure_run', 'proof_endorse',
+      'proof_jury', 'proof_jury_submit', 'proof_status', 'proof_verify',
+    ],
   )
 
   for (const tool of harness.registered) {
@@ -1169,4 +1174,163 @@ test('λ: proof_endorse asks the host for conscious approval, then records Class
   } finally {
     await fsp.rm(dir, { recursive: true, force: true })
   }
+})
+
+// ---------------------------------------------------------------------------
+// ρ: PTC synthesis through the tool surface — the conjure protocol as the
+// model meets it. Step 1 commits the request to the chain and hands back the
+// scaffold verbatim; step 2 executes the written script through the plugin's
+// own port (or refuses it at screening — a protocol result, never a tool
+// error). Like the λ fixtures, each test builds its own engine so its chain
+// is its own.
+// ---------------------------------------------------------------------------
+
+test('ρ: proof_conjure returns the scaffold verbatim and lands synthetic/requested on the chain', async () => {
+  const { tools, logPath, dir } = await attestFixture('conjure')
+  try {
+    const conjure = tools.find(t => t.name === 'proof_conjure')!
+    const claim = 'the parser rejects unbalanced quotes'
+    const value = valueOf(await conjure.execute(
+      { claim, paths: ['src/parse.ts'] },
+      execution('proof_conjure', { claim, paths: ['src/parse.ts'] }),
+    ))
+
+    // The canonical value: the request's identity plus the template IN FULL —
+    // the model writes the test from these exact bytes.
+    assert.equal(value.claimId, claimIdOf(claim))
+    assert.equal(value.entry, sandboxEntryFor(claimIdOf(claim), 0), 'a fresh claim mints entry seq 0')
+    assert.deepEqual(value.paths, ['src/parse.ts'])
+    assert.equal(value.sandboxDir, SYNTHETIC_DIR_DEFAULT)
+    assert.equal(value.template, SYNTHETIC_TEMPLATE, 'the template is the domain scaffold itself, byte for byte')
+    assert.match(String(value.instruction), /proof_conjure_run/, 'the instruction charges the run tool by name')
+
+    // The request is committed BEFORE any script exists: full request, null digest.
+    const requests = (await markersOf(logPath)).filter(p => p.label === 'synthetic/requested')
+    assert.equal(requests.length, 1)
+    assert.equal(requests[0]!.claimId, claimIdOf(claim))
+    assert.equal(requests[0]!.entry, value.entry)
+    assert.deepEqual(requests[0]!.paths, ['src/parse.ts'])
+    assert.equal(requests[0]!.scriptDigest, null, 'at request time there is nothing to digest yet')
+
+    // The render carries the instruction, the weight warning and the template
+    // in full — and the card title names what is being conjured.
+    const rendered = renderedText(conjure, value)
+    assert.ok(rendered.includes(SYNTHETIC_TEMPLATE), 'the scaffold rides the render verbatim')
+    assert.match(rendered, /synthetic evidence/i)
+    assert.match(rendered, /weighted below/i)
+    const call = conjure.presentCall!({ claim }) as { title: string }
+    assert.match(call.title, /Conjure synthetic test/)
+  } finally {
+    await fsp.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('ρ: proof_conjure_run executes through the verifier port and records synthetic evidence', async () => {
+  // Light path, deliberately: a real ProofEngine over deterministic ports with
+  // the node execution FAKED (a rule that answers 'node' with exit 0). The
+  // engine/runner integration of conjureRun — real node, real sandbox — is
+  // 05's charge; what this pins is the tool surface: the canonical value, the
+  // chain facts and the render, projected faithfully from whatever the engine
+  // reports.
+  const fs = MemoryFs.of({
+    '/ws/package.json': JSON.stringify({ name: 'conjure-run', scripts: { test: 'node -e "process.exit(0)"' } }),
+    '/ws/src/a.ts': 'export const a = 1\n',
+  })
+  const commands = new FakeCommands().on(
+    argv => argv.includes('node'),
+    { exitCode: 0, output: 'SYNTHETIC: PASS' },
+  )
+  const engine = new ProofEngine({ root: '/ws', fs, commands, workspace: new FakeWorkspace('/ws'), autoDiscover: false })
+  const run = createProofTools(engine).find(t => t.name === 'proof_conjure_run')!
+  const claim = 'one plus one is two'
+  const cleanScript = [
+    '// conjured test — authored by the agent, executed by the verifier',
+    "console.log('SYNTHETIC: PASS')",
+    '',
+  ].join('\n')
+
+  const { request } = await engine.conjureRequest({ claim, paths: ['src/a.ts'] })
+  fs.mutate(`/ws/.proof-synthetic/${request.entry}`, cleanScript)
+
+  const value = valueOf(await run.execute({ claim, entry: request.entry }, execution('proof_conjure_run', {})))
+
+  assert.equal(value.recorded, true)
+  assert.equal(value.status, 'pass')
+  assert.deepEqual(value.screened, [], 'a clean script screens with no findings')
+  assert.equal(value.sandbox, 'screened-subprocess')
+  assert.equal(value.scriptDigest, sha256(cleanScript), 'the digest proves exactly the bytes that ran')
+  assert.match(String(value.outputHead), /SYNTHETIC: PASS/)
+  assert.match(String(value.note), /synthetic evidence/i)
+  assert.match(String(value.note), /0\.15/)
+  assert.match(String(value.note), /less than organic checks/)
+
+  // Execution went through the engine's own command port — the agent's tools
+  // never touched the script — and the run landed on the chain.
+  assert.equal(commands.calls.length, 1, 'exactly one verifier-side execution')
+  assert.ok(commands.calls[0]!.argv.includes(request.entry))
+  assert.ok(fs.log.some(l => l.includes('"synthetic/run"') && l.includes(value.checkId as string)),
+    'the run marker carries the synthetic check identity')
+
+  // A FAIL keeps the output's first informative line in the render: the one
+  // line that usually names the assertion that broke. Same entry, weakened
+  // script — a different digest, honestly a different piece of evidence.
+  const failingScript = cleanScript.replace('SYNTHETIC: PASS', 'assertion placeholder — never printed')
+  fs.mutate(`/ws/.proof-synthetic/${request.entry}`, failingScript)
+  commands.on(argv => argv.includes('node'), {
+    exitCode: 1,
+    output: 'SYNTHETIC: FAIL: 1/1 assertion(s) failed: one plus one is three',
+  })
+  const failed = valueOf(await run.execute({ claim, entry: request.entry }, execution('proof_conjure_run', {})))
+  assert.equal(failed.recorded, true)
+  assert.equal(failed.status, 'fail')
+  assert.notEqual(failed.scriptDigest, value.scriptDigest, 'a weakened script is a different digest')
+  const rendered = renderedText(run, failed)
+  assert.match(rendered, /SYNTHETIC FAIL/)
+  assert.match(rendered, /SYNTHETIC: FAIL: 1\/1 assertion\(s\) failed/, 'the first informative output line survives the render')
+
+  // The card title speaks the status it recorded.
+  const card = run.presentResult!({}, { meta: failed } as never) as { title: string }
+  assert.match(card.title, /Synthetic evidence · fail/)
+})
+
+test('ρ: proof_conjure_run refuses a screened script as a protocol result, not an error', async () => {
+  const fs = MemoryFs.of({
+    '/ws/package.json': JSON.stringify({ name: 'conjure-refuse', scripts: { test: 'node -e "process.exit(0)"' } }),
+    '/ws/src/a.ts': 'export const a = 1\n',
+  })
+  const commands = new FakeCommands()
+  const engine = new ProofEngine({ root: '/ws', fs, commands, workspace: new FakeWorkspace('/ws'), autoDiscover: false })
+  const run = createProofTools(engine).find(t => t.name === 'proof_conjure_run')!
+  const claim = 'lists the files'
+
+  const { request } = await engine.conjureRequest({ claim, paths: ['src/a.ts'] })
+  fs.mutate(`/ws/.proof-synthetic/${request.entry}`, [
+    "import { exec } from 'node:child_process'",
+    "exec('ls -la')",
+    '',
+  ].join('\n'))
+
+  // A refusal RESOLVES (isError stays false at the host seam): it is a
+  // protocol-internal outcome whose canonical value carries the findings and
+  // the corrective next step, not a broken tool.
+  const value = valueOf(await run.execute({ claim, entry: request.entry }, execution('proof_conjure_run', {})))
+  assert.equal(value.recorded, false)
+  assert.equal(value.entry, request.entry)
+  assert.ok((value.screened as string[]).length > 0, 'the findings travel back to the model')
+  assert.match((value.screened as string[]).join('; '), /child/i, 'the finding names the forbidden capability')
+  assert.match(String(value.reason), /capability screening refused this script — remove the flagged imports and retry/)
+
+  // No execution, no chain writes: a refused test is not evidence of anything
+  // except its own refusal.
+  assert.equal(commands.calls.length, 0, 'a refused script never reaches the command port')
+  assert.ok(!fs.log.some(l => l.includes('"synthetic/run"')), 'a refusal writes no run marker')
+
+  // The render states the refusal and the fix without throwing; the card says
+  // "not recorded", not "error".
+  const rendered = renderedText(run, value)
+  assert.match(rendered, /NOT RECORDED/)
+  assert.match(rendered, /child/)
+  assert.match(rendered, /remove the flagged imports and retry/)
+  const card = run.presentResult!({}, { meta: value } as never) as { title: string }
+  assert.match(card.title, /refused — not recorded/)
 })

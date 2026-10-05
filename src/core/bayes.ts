@@ -25,9 +25,10 @@
  *
  * Assumptions, stated honestly rather than hidden:
  *
- * 1. **β is fixed at 0.02 and never learned.** Estimating β needs ground
- *    truth about *breakage*, and the evidence log only records observations —
- *    there is no labelled "actually broken" column. A constant is an admitted
+ * 1. **β is fixed at 0.02 and never learned** (one exception: synthetic
+ *    checks — see assumption 5). Estimating β needs ground truth about
+ *    *breakage*, and the evidence log only records observations — there is
+ *    no labelled "actually broken" column. A constant is an admitted
  *    guess; a learned number here would be false precision.
  * 2. **Conditionally independent checks.** `claimProbability` multiplies
  *    per-check health probabilities. Two checks that share the changed files
@@ -50,6 +51,11 @@
  *    Non-decisive records (error/timeout/aborted/skipped) count as failures
  *    for ρ: a check that cannot produce an answer is not a check whose pass
  *    we should trust, so the skepticism is directionally right.
+ * 5. **Synthetic checks carry a higher β (ο).** A check the agent wrote for
+ *    its own claim is graded homework: β 0.15, not 0.02. The long version of
+ *    the argument sits at the use site in `computePriors`; the short version
+ *    is that the dominant false-pass mode is different in kind (the author
+ *    can simply not assert the broken thing), not merely in degree.
  *
  * ## Determinism
  *
@@ -110,6 +116,15 @@ export const BAYES_CONSTANTS: {
   impactPrefix: 0.7,
   impactWildcard: 0.5,
 }
+
+/**
+ * ο: β for a check with `source === 'synthetic'` — a test the agent wrote for
+ * its own claim. Kept OUT of BAYES_CONSTANTS on purpose: that object is the
+ * fixed, never-re-tuned law of the model, while this number is a per-call
+ * overridable modelling guess (PriorInput.syntheticFalsePass) — conflating
+ * the two would let a knob masquerade as a law.
+ */
+const SYNTHETIC_FALSE_PASS_DEFAULT = 0.15
 
 function clamp(value: number, low: number, high: number): number {
   return Math.min(high, Math.max(low, value))
@@ -194,7 +209,11 @@ export interface CheckPrior {
   readonly priorHealthy: number
   /** α: P(observed fail | healthy) — the false-fail (flake) rate. */
   readonly falseFail: number
-  /** β: P(observed pass | broken) — fixed 0.02, unlearnable (assumption 1). */
+  /**
+   * β: P(observed pass | broken) — fixed 0.02, unlearnable (assumption 1);
+   * 0.15 for synthetic checks (assumption 5), whose author is a party to the
+   * claim under test.
+   */
   readonly falsePass: number
   /** s ∈ [0,1]: how strongly this change set acts on this check. */
   readonly impact: number
@@ -218,6 +237,16 @@ export interface PriorInput {
   readonly history: Map<string, CheckStats>
   /** Cost assumed for checks with no history. */
   readonly fallbackCostMs: number
+  /**
+   * ο: β (falsePass) for checks with `source === 'synthetic'` — tests the
+   * agent wrote for its own claim. Default 0.15; see the use site in
+   * `computePriors` for why this β is (and must be) a different number from
+   * `BAYES_CONSTANTS.falsePass`. Overridable per call so a host with actual
+   * ground truth about synthetic-check quality can price its own experience —
+   * the fixed constants stay unlearned by policy, this one is a knob because
+   * its value is an admitted guess, not a law.
+   */
+  readonly syntheticFalsePass?: number
 }
 
 /**
@@ -248,13 +277,33 @@ export function computePriors(input: PriorInput): Map<string, CheckPrior> {
     const failures = runs - passes
     const rho = (failures + BAYES_CONSTANTS.laplaceFailures) / (runs + BAYES_CONSTANTS.laplaceRuns)
     const impact = impactStrength(spec, changed, input.graph, distance)
+    // ο — the synthetic β, and why it is 7.5× the organic one. For an
+    // independent maintainer's suite, a false pass needs a mechanical
+    // accident: a stale cache, fixture drift, a check that stopped asserting
+    // without anyone noticing — rare, and priced at 0.02. For a synthetic
+    // check, the author of the test is a *party to the claim it tests*: the
+    // cheap false pass is not an accident but an omission — write the empty
+    // assertion loop, forget the input that breaks the code, or assert the
+    // accidental behaviour the change just introduced and call it intended.
+    // None of those look like failures; they look like a green test. 0.15 is
+    // an admitted modelling guess (assumption 1 applies doubly: β is
+    // unlearnable, and most so exactly here, since a self-serving test by
+    // construction produces no breakage signal to learn from), chosen so a
+    // pass moves the posterior honestly but visibly less than an organic
+    // pass. α and π are untouched by this: a synthetic check still learns
+    // flakiness and failure tendency from history like any other — the
+    // discount prices *whose hand wrote the assertions*, not how the sensor
+    // otherwise behaves.
+    const falsePass = spec.source === 'synthetic'
+      ? (input.syntheticFalsePass ?? SYNTHETIC_FALSE_PASS_DEFAULT)
+      : BAYES_CONSTANTS.falsePass
     out.set(spec.id, {
       checkId: spec.id,
       priorHealthy: clamp(1 - rho * impact, BAYES_CONSTANTS.priorFloor, BAYES_CONSTANTS.priorCeiling),
       falseFail: stats === undefined
         ? BAYES_CONSTANTS.alphaDefault
         : clamp(stats.flips / (2 * Math.max(1, runs - 1)), BAYES_CONSTANTS.alphaMin, BAYES_CONSTANTS.alphaMax),
-      falsePass: BAYES_CONSTANTS.falsePass,
+      falsePass,
       impact,
       expectedCostMs: stats?.medianDurationMs ?? input.fallbackCostMs,
     })

@@ -1,5 +1,8 @@
-import { test } from 'node:test'
+import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
+import { promises as fsp } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
 
 import { ProofEngine } from '../src/engine.ts'
 import { assembleProof } from '../src/core/report.ts'
@@ -7,6 +10,8 @@ import { attributeChecks, proofNarrative } from '../src/core/regression.ts'
 import { makeEvidence, snapshotWorkspace } from '../src/core/evidence.ts'
 import { VerificationRunner } from '../src/core/runner.ts'
 import { claimIdOf } from '../src/core/attest.ts'
+import { SYNTHETIC_TEMPLATE } from '../src/core/synthetic.ts'
+import { NodeCommandPort, NodeFsPort, SystemClock } from '../src/node-ports.ts'
 import { FakeClock, FakeCommands, FakeWorkspace, MemoryFs, spec } from './helpers.ts'
 
 const ROOT = '/ws'
@@ -1039,4 +1044,233 @@ test('κ: plain verify stays pure machine — chain attestations never touch it'
     'the basis never becomes attested on the plain verify path')
   assert.equal(attested.report.grade, plain.report.grade)
   assert.equal(JSON.stringify(attested.schedule), JSON.stringify(plain.schedule))
+})
+
+// -- π: PTC synthesis — the conjure request/execution protocol ------------------
+//
+// Real-process tests mirror 07/14: a scratch workspace under
+// <workspace>/.openclaw/tmp, production Node ports, and `node` actually
+// executing the conjured scripts — because the whole point of conjureRun is
+// that execution happens through the verifier's port, not the agent's word.
+
+const WORKSPACE_DIR = fileURLToPath(new URL('../../', import.meta.url))
+const CONJURE_ROOT = join(WORKSPACE_DIR, '.openclaw', 'tmp', `proof-conjure-${process.pid}`)
+
+before(async () => {
+  await fsp.rm(CONJURE_ROOT, { recursive: true, force: true })
+  await fsp.mkdir(CONJURE_ROOT, { recursive: true })
+})
+
+after(async () => {
+  await fsp.rm(CONJURE_ROOT, { recursive: true, force: true })
+})
+
+/** A real engine over a real scratch directory: conjured scripts really run. */
+function conjureEngine(dir: string, overrides: Partial<ConstructorParameters<typeof ProofEngine>[0]> = {}) {
+  return new ProofEngine({
+    root: dir,
+    fs: new NodeFsPort(),
+    commands: new NodeCommandPort(),
+    workspace: new FakeWorkspace(dir),
+    clock: new SystemClock(),
+    autoDiscover: false,
+    checkTimeoutMs: 10_000,
+    verifyBudgetMs: 30_000,
+    ...overrides,
+  })
+}
+
+/** A minimal real workspace: package.json + one source file. */
+async function makeConjureWorkspace(dir: string): Promise<void> {
+  await fsp.rm(dir, { recursive: true, force: true })
+  await fsp.mkdir(join(dir, 'src'), { recursive: true })
+  await fsp.writeFile(join(dir, 'package.json'), JSON.stringify({ name: 'conjure-fixture', private: true }))
+  await fsp.writeFile(join(dir, 'src', 'feature.ts'), 'export const feature = 2\n')
+}
+
+test('π: conjure closed loop — request scaffolds, the agent writes, the run executes and records', async () => {
+  const root = join(CONJURE_ROOT, 'closed-loop')
+  await makeConjureWorkspace(root)
+  const engine = conjureEngine(root)
+  const claim = 'feature doubles its input'
+  try {
+    const { request, template, instruction } = await engine.conjureRequest({ claim, paths: ['src/feature.ts'] })
+    assert.equal(template, SYNTHETIC_TEMPLATE, 'the template is the module scaffold itself')
+    assert.ok(request.entry.length > 0)
+    assert.equal(request.claimId, claimIdOf(claim))
+    assert.deepEqual(request.paths, ['src/feature.ts'])
+    assert.ok(instruction.includes(request.entry), 'the instruction names the entry to write')
+    // The scaffold is on disk for the model to copy — under the
+    // .template.mjs suffix, so the scaffold itself can never be executed.
+    const scaffold = await engine.fsView.readFile(join(root, '.proof-synthetic', `${request.entry}.template.mjs`))
+    assert.equal(scaffold, SYNTHETIC_TEMPLATE)
+
+    // The "agent": write the test (a real assertion, SYNTHETIC: PASS on success).
+    const script = [
+      '// conjured test — authored by the agent, executed by the verifier',
+      "const check = (ok, msg) => { if (!ok) { console.error('SYNTHETIC: FAIL ' + msg); process.exit(1) } }",
+      'check(1 + 1 === 2, "1+1===2")',
+      "console.log('SYNTHETIC: PASS')",
+      '',
+    ].join('\n')
+    await fsp.writeFile(join(root, '.proof-synthetic', request.entry), script)
+
+    const run = await engine.conjureRun({ claim, entry: request.entry })
+    assert.equal(run.status, 'pass')
+    assert.equal(run.sandbox, 'screened-subprocess')
+    assert.deepEqual(run.screened, [], 'a clean script screens with no findings')
+    assert.match(run.outputHead, /SYNTHETIC: PASS/)
+
+    // Chain facts: the request (digest null — the script did not exist yet)
+    // and the run (digest of what actually executed).
+    const log = await engine.fsView.readLines(join(root, '.proof', 'evidence.jsonl'))
+    assert.ok(log.some(l => l.includes('"synthetic/requested"') && l.includes('"scriptDigest":null')),
+      'the requested marker carries the full request with a null digest')
+    assert.ok(log.some(l => l.includes('"synthetic/run"') && l.includes(run.checkId) && l.includes(run.scriptDigest)),
+      'the run marker carries checkId and the executed digest')
+
+    // The evidence record carries its synthetic metadata — and is the latest
+    // record under its own checkId.
+    const latest = await engine.latestEvidence()
+    const evidence = latest.get(run.checkId)
+    assert.ok(evidence, 'the synthetic run recorded evidence under its checkId')
+    assert.equal(evidence?.synthetic?.scriptDigest, run.scriptDigest)
+    assert.equal(evidence?.synthetic?.author, 'agent')
+    assert.equal(evidence?.synthetic?.sandbox, 'screened-subprocess')
+    assert.deepEqual(evidence?.synthetic?.screened, [])
+
+    // The enriched record still addresses itself.
+    const audit = await engine.audit()
+    assert.equal(audit.ok, true, `corrupt: ${audit.corrupt.join(', ')}`)
+
+    // Phase B (deterministic ports, same file): one changed character in the
+    // script is a different digest, and the digest is addressing material —
+    // same fake outcome, different evidence identity.
+    const fs = MemoryFs.of(project())
+    const engineB = makeEngine(fs, new FakeCommands())
+    const claimB = 'the digest participates in addressing'
+    const { request: requestB } = await engineB.conjureRequest({ claim: claimB, paths: ['src/a.ts'] })
+    fs.mutate(`${ROOT}/.proof-synthetic/${requestB.entry}`, 'const one = 1\n')
+    const first = await engineB.conjureRun({ claim: claimB, entry: requestB.entry })
+    const firstEvidence = (await engineB.latestEvidence()).get(first.checkId)
+    assert.ok(firstEvidence)
+    fs.mutate(`${ROOT}/.proof-synthetic/${requestB.entry}`, 'const one = 2\n')
+    const second = await engineB.conjureRun({ claim: claimB, entry: requestB.entry })
+    const secondEvidence = (await engineB.latestEvidence()).get(second.checkId)
+    assert.ok(secondEvidence)
+    assert.notEqual(second.scriptDigest, first.scriptDigest, 'one character moves the digest')
+    assert.notEqual(secondEvidence.evidenceId, firstEvidence.evidenceId,
+      'a different script is different evidence, even with an identical outcome')
+    assert.equal(secondEvidence.synthetic?.scriptDigest, second.scriptDigest)
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('π: screening refusal — forbidden import rejected before execution, nothing lands on chain', async () => {
+  const fs = MemoryFs.of(project())
+  const commands = new FakeCommands()
+  const engine = makeEngine(fs, commands)
+  const claim = 'lists the files'
+  const { request } = await engine.conjureRequest({ claim, paths: ['src/a.ts'] })
+  fs.mutate(`${ROOT}/.proof-synthetic/${request.entry}`, [
+    "import { exec } from 'node:child_process'",
+    "exec('ls -la')",
+    '',
+  ].join('\n'))
+
+  const run = await engine.conjureRun({ claim, entry: request.entry })
+  assert.equal(run.status, 'skipped', 'a refused script never ran')
+  assert.ok(run.screened.length > 0, 'the findings travel back to the model')
+  assert.match(run.screened.join('; '), /child/i, 'the finding names the forbidden capability')
+  assert.match(run.outputHead, /refus/i)
+  // No execution, no chain writes: the refusal is the tool result, not a fact
+  // about the workspace.
+  assert.equal(commands.calls.length, 0, 'no command port call may happen for a refused script')
+  assert.ok(!fs.log.some(l => l.includes('"synthetic/run"')), 'a refusal writes no run marker')
+  assert.equal((await engine.latestEvidence()).get(run.checkId), undefined,
+    'a refusal writes no evidence')
+})
+
+test('π: synthetic β pricing — a conjured pass certifies less than an organic pass', async () => {
+  // Organic: one configured check covers the file.
+  const organicRoot = join(CONJURE_ROOT, 'beta-organic')
+  await makeConjureWorkspace(organicRoot)
+  const synthRoot = join(CONJURE_ROOT, 'beta-synthetic')
+  await makeConjureWorkspace(synthRoot)
+  try {
+    const organic = conjureEngine(organicRoot, {
+      checks: [{ label: 'feature tests', command: ['node', '-e', 'process.exit(0)'], kind: 'test', paths: ['src/feature.ts'] }],
+    })
+    await organic.establishBaseline()
+    const organicRun = await organic.verify({ changed: ['src/feature.ts'] })
+    assert.ok(organicRun.report.confidence !== undefined)
+    assert.equal(organicRun.report.confidenceBasis, 'full-coverage', 'organic stays an ordinary machine number')
+
+    // Synthetic: same assertion, different authorship — the only covering
+    // check is one the claimant conjured itself.
+    const synth = conjureEngine(synthRoot)
+    const claim = 'feature is sound'
+    const { request } = await synth.conjureRequest({ claim, paths: ['src/feature.ts'] })
+    await fsp.writeFile(join(synthRoot, '.proof-synthetic', request.entry),
+      'if (1 + 1 !== 2) process.exit(1)\nconsole.log("SYNTHETIC: PASS")\n')
+    const conjured = await synth.conjureRun({ claim, entry: request.entry })
+    assert.equal(conjured.status, 'pass')
+    // The organic anchor: an empty baseline, so verify has something to
+    // diff against (the conjured check joins as a new-check, honestly).
+    await synth.establishBaseline()
+    const synthRun = await synth.verify({ changed: ['src/feature.ts'] })
+
+    assert.ok(synthRun.report.confidence !== undefined)
+    assert.ok(synthRun.checks.some(c => c.checkId === conjured.checkId),
+      'the conjured check was part of the verification pool')
+    assert.ok((synthRun.report.confidence ?? 1) < (organicRun.report.confidence ?? 1),
+      `synthetic ${synthRun.report.confidence} must price below organic ${organicRun.report.confidence}`)
+    assert.equal(synthRun.report.confidenceBasis, 'synthetic',
+      'only synthetic checks spoke: the basis names the regime')
+    assert.match(proofNarrative(synthRun.report), /synthetic evidence — conjured tests, discounted/)
+  } finally {
+    await fsp.rm(organicRoot, { recursive: true, force: true })
+    await fsp.rm(synthRoot, { recursive: true, force: true })
+  }
+})
+
+test('π: behavior-adding falls back to conjured coverage — obligation met, basis names the discount', async () => {
+  const root = join(CONJURE_ROOT, 'behavior-adding')
+  await makeConjureWorkspace(root)
+  try {
+    // An organic check covers the OLD path only; src/new.ts has none.
+    const engine = conjureEngine(root, {
+      checks: [{ label: 'feature tests', command: ['node', '-e', 'process.exit(0)'], kind: 'test', paths: ['src/feature.ts'] }],
+    })
+    await engine.establishBaseline()
+    await fsp.writeFile(join(root, 'src', 'new.ts'), 'export const added = 1\n')
+
+    const claim = 'added a new module, covered by a conjured test'
+    const { request } = await engine.conjureRequest({ claim, paths: ['src/new.ts'] })
+    await fsp.writeFile(join(root, '.proof-synthetic', request.entry),
+      'if (2 + 2 !== 4) process.exit(1)\nconsole.log("SYNTHETIC: PASS")\n')
+    const conjured = await engine.conjureRun({ claim, entry: request.entry })
+    assert.equal(conjured.status, 'pass')
+
+    const outcome = await engine.verifyContract({
+      changed: ['src/new.ts'],
+      contract: { kind: 'behavior-adding', claim },
+    })
+    const covered = outcome.contract.obligations.find(o => o.id === 'new-paths-covered')
+    assert.ok(covered)
+    assert.equal(covered.met, true, `detail: ${covered.detail}`)
+    // The conjured check joined the pool as an ordinary spec, so verifyContract
+    // re-ran it; this run's pass is a *synthetic* pass, and the obligation's
+    // tier ladder (run-organic > run-synthetic > latest-organic >
+    // latest-synthetic) names the discount in the detail.
+    assert.match(covered.detail, /covered by synthetic evidence \(discounted\)/)
+    assert.equal(outcome.report.grade, 'proven', `grade: ${outcome.report.grade}`)
+    assert.ok(outcome.report.confidence !== undefined)
+    assert.equal(outcome.report.confidenceBasis, 'synthetic',
+      'every decisive record this run was a conjured test')
+    assert.match(proofNarrative(outcome.report), /synthetic evidence — conjured tests, discounted/)
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true })
+  }
 })

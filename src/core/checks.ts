@@ -68,6 +68,13 @@ const DEFAULT_IGNORE_DIRS = [
   '.next', '.nuxt', '.output', '.cache', '.venv', 'venv', '__pycache__',
   '.pytest_cache', '.mypy_cache', '.ruff_cache', 'vendor', '.turbo', '.proof',
   'tmp', '.openclaw',
+  // ο: the synthetic-evidence sandbox (SYNTHETIC_DIR_DEFAULT in
+  // core/synthetic.ts). The literal is duplicated under this provenance note
+  // rather than imported — core/synthetic.ts imports `checkId` from here, and
+  // a back-import would make the pair a cycle whose entry order decides
+  // whether this array initializer hits the const's TDZ. Mirrors the
+  // SOURCE_EXT precedent in core/contract.ts; test/19 pins the two equal.
+  '.proof-synthetic',
 ]
 
 /** Discover every objective check the workspace declares. */

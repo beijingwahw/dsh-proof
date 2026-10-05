@@ -91,3 +91,15 @@ export {
   type CheckPrior, type CheckStats, type ClaimModel, type PriorInput,
   type ScheduleStep,
 } from './bayes.ts'
+
+// ο: the synthetic-evidence domain — scaffold, request, capability screen,
+// spec minting and the self-certifying metadata synthetic records carry.
+// (bayes/contract/evidence need no new export points of their own: the
+// synthetic surface they consume is exactly these types, PriorInput's new
+// optional knob and Evidence's new optional fields ride types already
+// exported above.)
+export {
+  FORBIDDEN_CAPABILITIES, SYNTHETIC_DIR_DEFAULT, SYNTHETIC_TEMPLATE,
+  sandboxEntryFor, screenScript, syntheticSpec,
+  type ScreenResult, type SyntheticEvidenceMeta, type SyntheticRequest,
+} from './synthetic.ts'

@@ -1,5 +1,5 @@
 /**
- * The seven model-facing tools.
+ * The nine model-facing tools.
  *
  * Contract discipline (DSH's hard rules, applied):
  *  - `execute` returns exactly one canonical JSON value; all human prose lives
@@ -16,7 +16,7 @@ import type {
   ToolCallView, ToolResultView, ToolRunContext,
 } from '../vendor/dsh-tools.ts'
 import type { ProofEngine } from '../engine.ts'
-import type { AuditReport, ProofGrade, ProofReport } from '../core/evidence.ts'
+import type { AuditReport, CheckStatus, ProofGrade, ProofReport } from '../core/evidence.ts'
 import type { ConfidenceBasis, GradedProofReport } from '../core/report.ts'
 import type { ClaimContract, ClaimKind, ObligationResult } from '../core/contract.ts'
 import { proofNarrative } from '../core/regression.ts'
@@ -25,6 +25,7 @@ import {
   DEFAULT_TRUST_WEIGHTS, RUBRIC_V1, attestationFactor, claimIdOf, juryPrompt,
   type HumanAttestation, type JuryAttestation,
 } from '../core/attest.ts'
+import { SYNTHETIC_DIR_DEFAULT } from '../core/synthetic.ts'
 import { sha256 } from '../core/hash.ts'
 
 // ---------------------------------------------------------------------------
@@ -190,6 +191,55 @@ export interface EndorseValue {
   note: string
 }
 
+/**
+ * ρ: PTC synthesis, step 1 — the synthetic-verification request exactly as it
+ * was committed to the chain. The canonical value carries the scaffold
+ * template VERBATIM because the model writes from it: a digest alone cannot be
+ * filled in, and the template's header is where the content-addressing warning
+ * lives (an assertion deleted is a different scriptDigest, forever).
+ */
+export interface ConjureValue {
+  claimId: string
+  /** Sandbox-relative script name the model must copy the template to. */
+  entry: string
+  /** Paths the conjured test must exercise, as the request locked them. */
+  paths: string[]
+  /** Workspace-relative sandbox directory the entry lives in. */
+  sandboxDir: string
+  /** The scaffold, byte for byte — the model's writing surface. */
+  template: string
+  /** The standing charge: copy, fill, run via proof_conjure_run. */
+  instruction: string
+}
+
+/** ρ: PTC synthesis, step 2 — a script that ran and landed as evidence. */
+export interface ConjureRunValue {
+  recorded: true
+  checkId: string
+  status: CheckStatus
+  /** sha256 of the script as it existed at execution time — proves what ran. */
+  scriptDigest: string
+  /** Screening findings for exactly that digest; empty = cleared to run. */
+  screened: string[]
+  sandbox: 'screened-subprocess' | 'ptc-runtime'
+  /** Excerpt of the run's output (or the refusal reason when skipped). */
+  outputHead: string
+  note: string
+}
+
+/**
+ * ρ: a script the capability screen refused — `recorded: false` is a
+ * protocol-internal outcome, NOT a tool error: the model's next move is to
+ * edit the script and call proof_conjure_run again, which an isError result
+ * would only obscure.
+ */
+export interface ConjureRefusedValue {
+  recorded: false
+  entry: string
+  screened: string[]
+  reason: string
+}
+
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
@@ -309,7 +359,40 @@ const endorseParams: ParameterSchemaSpec = {
   approver: {
     type: 'string',
     description: 'Signature name of the endorsing human. Defaults to "host-approver" — the human behind the '
-      + 'host approval prompt.',
+    + 'host approval prompt.',
+  },
+}
+
+const conjureParams: ParameterSchemaSpec = {
+  claim: {
+    type: 'string',
+    required: true,
+    description: 'The exact assertion NO existing check covers — the property or minimal repro the conjured '
+    + 'test must prove, e.g. "parse rejects unbalanced quotes with input positions".',
+  },
+  paths: {
+    type: 'array',
+    items: { type: 'string' },
+    required: true,
+    description: 'Workspace-relative source files the conjured test must exercise. Call this tool only for '
+    + 'assertions no discovered check covers: proof_conjure opens a request that lets you draft a property '
+    + 'test / minimal repro from a scaffold, which the verifier then screens, executes and records as '
+    + 'synthetic evidence.',
+  },
+}
+
+const conjureRunParams: ParameterSchemaSpec = {
+  claim: {
+    type: 'string',
+    required: true,
+    description: 'The exact claim text the proof_conjure request was opened with — the run binds the verdict '
+    + 'to the entry minted for this claim.',
+  },
+  entry: {
+    type: 'string',
+    required: true,
+    description: 'The sandbox script name proof_conjure returned (e.g. synthetic-<claimId>-0.mjs), already '
+    + 'written inside the conjure sandbox with your assertions filled in.',
   },
 }
 
@@ -340,6 +423,8 @@ export function createProofTools(
     createJuryTool(engine),
     createJurySubmitTool(engine, evidenceLogPath),
     createEndorseTool(engine, evidenceLogPath),
+    createConjureTool(engine),
+    createConjureRunTool(engine),
   ]
 }
 
@@ -970,6 +1055,219 @@ function createEndorseTool(engine: ProofEngine, evidenceLogPath?: string): ToolD
 }
 
 // ---------------------------------------------------------------------------
+// ρ: PTC synthesis — the conjure protocol. Some assertions have no existing
+// check (the change touched a path no suite covers, the claim is about a
+// property nobody ever tested), so the plugin lets the AGENT draft the test
+// under structural anti-forgery: the request is committed to the chain BEFORE
+// any script exists, the script is content-addressed into its own evidence,
+// screened against a capability deny-list, executed by the plugin's own port —
+// never the agent's — and priced at a raised false-pass because a test written
+// by the claimant is self-graded homework. The pair mirrors proof_jury's
+// request/submit shape for exactly the same reason: the protocol's first half
+// must be on the record before the second half can bind to it.
+// ---------------------------------------------------------------------------
+
+/**
+ * ρ: the one fact the engine's instruction cannot state for itself — what the
+ * evidence will be worth once it lands. Rendered with every request so the
+ * model prices its own homework honestly before writing it.
+ */
+const CONJURE_WEIGHT_NOTE = 'Your script will enter the evidence chain as synthetic evidence, weighted below '
+  + 'every existing test — it lifts confidence less than an organic check, because you wrote the test that '
+  + 'proves your own claim.'
+
+/** ρ: what a recorded synthetic run is worth — the note rides every success. */
+const CONJURE_RUN_NOTE = 'Synthetic evidence recorded: conjured by the agent, executed by the plugin\'s own port, '
+  + 'priced at elevated false-pass (0.15) — it lifts confidence less than organic checks.'
+
+/** ρ: literal reason a refused run carries; the protocol's corrective next step. */
+const CONJURE_REFUSED_REASON = 'capability screening refused this script — remove the flagged imports and retry'
+
+function createConjureTool(engine: ProofEngine): ToolDefinition {
+  return {
+    name: 'proof_conjure',
+    description:
+      'PTC synthesis, step 1 of 2: construct a synthetic verification for an assertion NO existing check '
+      + 'covers. Commits the claim and the paths it must exercise to the evidence chain, then returns the '
+      + 'scaffold template (verbatim) and the sandbox entry to write it to. Fill the scaffold with a real '
+      + 'property test / minimal repro of the claim, then execute and record it with proof_conjure_run — '
+      + 'the verifier screens and runs the script itself; your script lands as synthetic evidence, weighted '
+      + 'below every organic check.',
+    parameters: conjureParams,
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          claimId: { type: 'string' },
+          entry: { type: 'string' },
+          paths: { type: 'array', items: { type: 'string' } },
+          sandboxDir: { type: 'string' },
+          template: { type: 'string' },
+          instruction: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [text(renderConjure(value as unknown as ConjureValue))],
+      presentationMeta: (_args, value) => JSON.parse(JSON.stringify(value)) as JsonValue,
+    },
+    presentCall: (args) => {
+      const parsed = (args ?? {}) as { claim?: string }
+      return {
+        card: 'generic',
+        title: `Conjure synthetic test: ${truncate(parsed.claim ?? 'claim', 48)}`,
+        kind: 'read',
+        rawInput: args,
+      }
+    },
+    presentResult: (_args, result) => {
+      const meta = result.meta as ConjureValue | undefined
+      return {
+        card: 'generic',
+        title: `Synthetic test requested · ${typeof meta?.entry === 'string' ? meta.entry : 'entry'}`,
+        content: [text(meta?.instruction ? oneLine(meta.instruction) : 'conjure request issued')],
+      }
+    },
+    async execute(args, exec: ToolRunContext) {
+      assertActive(exec)
+      const parsed = (args ?? {}) as { claim?: unknown; paths?: unknown }
+      if (typeof parsed.claim !== 'string' || parsed.claim.trim().length === 0) {
+        throw new Error('proof_conjure: claim is required — the exact assertion no existing check covers')
+      }
+      if (!Array.isArray(parsed.paths) || parsed.paths.length === 0
+        || !parsed.paths.every(p => typeof p === 'string' && p.trim().length > 0)) {
+        throw new Error(`proof_conjure: paths is required — the workspace-relative file(s) the conjured test `
+          + `must exercise (got ${Array.isArray(parsed.paths) ? 'an empty list' : 'nothing usable'})`)
+      }
+      const { request, template, instruction } = await engine.conjureRequest({
+        claim: parsed.claim,
+        paths: parsed.paths as string[],
+      })
+      return {
+        claimId: request.claimId,
+        entry: request.entry,
+        paths: [...request.paths],
+        sandboxDir: sandboxDirOf(instruction, request.entry),
+        template,
+        instruction,
+      } as unknown as JsonValue
+    },
+  }
+}
+
+function createConjureRunTool(engine: ProofEngine): ToolDefinition {
+  return {
+    name: 'proof_conjure_run',
+    description:
+      'PTC synthesis, step 2 of 2: screen, execute and record the conjured script you wrote after '
+      + 'proof_conjure. The capability screen refuses forbidden imports (process spawning, network, workers, '
+      + 'environment reads) BEFORE execution — a refusal returns recorded: false with the findings and nothing '
+      + 'lands on the chain; remove the flagged imports and retry. A clean script is executed by the plugin\'s '
+      + 'own port (never your tools) and its result enters the tamper-evident chain as synthetic evidence, '
+      + 'priced at elevated false-pass — it lifts confidence less than organic checks.',
+    parameters: conjureRunParams,
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          recorded: { type: 'boolean' },
+          // Recorded path — what ran and what it proved.
+          checkId: { type: 'string' },
+          status: { type: 'string', enum: ['pass', 'fail', 'error', 'timeout', 'aborted', 'skipped'] },
+          scriptDigest: { type: 'string' },
+          screened: { type: 'array', items: { type: 'string' } },
+          sandbox: { type: 'string', enum: ['screened-subprocess', 'ptc-runtime'] },
+          outputHead: { type: 'string' },
+          note: { type: 'string' },
+          // Refusal path — the protocol outcome, not an error.
+          entry: { type: 'string' },
+          reason: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [text(renderConjureRun(value as unknown as ConjureRunValue | ConjureRefusedValue))],
+      presentationMeta: (_args, value) => JSON.parse(JSON.stringify(value)) as JsonValue,
+    },
+    timeoutMs: 600_000,
+    presentCall: (args) => {
+      const parsed = (args ?? {}) as { entry?: string }
+      return {
+        card: 'generic',
+        title: `Run synthetic test: ${truncate(parsed.entry ?? 'entry', 48)}`,
+        kind: 'read',
+        rawInput: args,
+      }
+    },
+    presentResult: (_args, result) => {
+      const meta = result.meta as ConjureRunValue | ConjureRefusedValue | undefined
+      const run = meta as ConjureRunValue | undefined
+      return {
+        card: 'generic',
+        title: meta?.recorded === true
+          ? `${run?.status === 'pass' ? '✓' : '✗'} Synthetic evidence · ${String(run?.status ?? 'recorded')}`
+          : 'Synthetic run refused — not recorded',
+        content: [text(
+          meta === undefined ? 'no conjure-run result'
+            : meta.recorded === true
+              ? (typeof run?.note === 'string' && run.note.length > 0 ? oneLine(run.note) : 'synthetic evidence recorded')
+              : (typeof (meta as ConjureRefusedValue).reason === 'string'
+                ? oneLine((meta as ConjureRefusedValue).reason)
+                : 'screening refused this script'),
+        )],
+      }
+    },
+    async execute(args, exec: ToolRunContext) {
+      assertActive(exec)
+      const parsed = (args ?? {}) as { claim?: unknown; entry?: unknown }
+      if (typeof parsed.claim !== 'string' || parsed.claim.trim().length === 0) {
+        throw new Error('proof_conjure_run: claim is required — the exact claim text the proof_conjure request was opened with')
+      }
+      if (typeof parsed.entry !== 'string' || parsed.entry.trim().length === 0) {
+        throw new Error('proof_conjure_run: entry is required — the sandbox script name proof_conjure returned')
+      }
+      const run = await engine.conjureRun({ claim: parsed.claim, entry: parsed.entry })
+      // A screening refusal is a protocol-internal outcome, not a tool error:
+      // returning it as the canonical value (isError stays false) is what tells
+      // the model "edit the script and call me again" instead of "the tool
+      // broke".
+      if (run.status === 'skipped') {
+        return {
+          recorded: false as const,
+          entry: parsed.entry,
+          screened: [...run.screened],
+          reason: CONJURE_REFUSED_REASON,
+        } as unknown as JsonValue
+      }
+      return {
+        recorded: true as const,
+        checkId: run.checkId,
+        status: run.status,
+        scriptDigest: run.scriptDigest,
+        screened: [...run.screened],
+        sandbox: run.sandbox,
+        outputHead: run.outputHead,
+        note: CONJURE_RUN_NOTE,
+      } as unknown as JsonValue
+    },
+  }
+}
+
+/**
+ * ρ: the sandbox directory the engine actually mounted, recovered from the
+ * instruction the engine itself produced (its step 1 names
+ * `<sandboxDir>/<entry>.template.mjs`). The engine's options are private and
+ * growing its public surface is not this batch's to do; an instruction whose
+ * shape is not recognised degrades to the domain default rather than
+ * inventing a path.
+ */
+function sandboxDirOf(instruction: string, entry: string): string {
+  const match = new RegExp(`Copy (.+)/${escapeRegExp(entry)}\\.template\\.mjs to `).exec(instruction)
+  return match?.[1] ?? SYNTHETIC_DIR_DEFAULT
+}
+
+/** ρ: quote regex metacharacters so an engine-minted entry anchors a literal. */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+// ---------------------------------------------------------------------------
 // λ: chain read-back. The store appends markers but never reads them back, so
 // the attestation tools parse the raw log lines through the engine's own fs
 // port — the same route the engine's fusion pass takes. Parsing is defensive
@@ -1487,6 +1785,58 @@ function renderEndorse(value: EndorseValue): string {
     `claim: ${typeof scope.claim === 'string' ? scope.claim : 'unknown'}`,
     `evidence root reviewed: ${root}`,
   ]
+  if (typeof v.note === 'string' && v.note.length > 0) lines.push('', v.note)
+  return lines.join('\n')
+}
+
+/**
+ * ρ: the conjure request render carries the FULL scaffold — the model writes
+ * the test from these exact bytes, and the template's own header is where the
+ * content-addressing warning lives. The weight note rides between instruction
+ * and template so the model knows what the evidence will be worth before it
+ * writes a line. Total on replay like every render above.
+ */
+function renderConjure(value: ConjureValue): string {
+  const v = value ?? ({} as ConjureValue)
+  const lines: string[] = []
+  const instruction = typeof v.instruction === 'string' ? v.instruction : ''
+  if (instruction.length > 0) lines.push(instruction, '')
+  lines.push(CONJURE_WEIGHT_NOTE, '')
+  const template = typeof v.template === 'string' ? v.template : ''
+  lines.push(template.length > 0 ? template : '(no scaffold on record — do not write a conjured test without one)')
+  return lines.join('\n')
+}
+
+/**
+ * ρ: the conjure-run render speaks the two protocol outcomes in their own
+ * voices: a refusal states the findings and the corrective next step (nothing
+ * ran, nothing was recorded), a recorded run states its status, digest and
+ * regime — and on a FAIL keeps the output's first informative line, the one
+ * line that usually names the assertion that broke. Total on replay.
+ */
+function renderConjureRun(value: ConjureRunValue | ConjureRefusedValue): string {
+  const v = (value ?? {}) as Partial<ConjureRunValue> & Partial<ConjureRefusedValue>
+  if (v.recorded !== true) {
+    const lines = ['NOT RECORDED — capability screening refused this script; it never ran.']
+    const screened = Array.isArray(v.screened) ? v.screened : []
+    if (screened.length > 0) {
+      lines.push('Findings:')
+      for (const finding of screened) lines.push(`  · ${String(finding)}`)
+    }
+    if (typeof v.reason === 'string' && v.reason.length > 0) lines.push('', v.reason)
+    return lines.join('\n')
+  }
+  const status = typeof v.status === 'string' ? v.status : 'unknown'
+  const lines = [
+    `SYNTHETIC ${status.toUpperCase()} — recorded on the chain as synthetic evidence.`,
+    `digest ${typeof v.scriptDigest === 'string' ? v.scriptDigest.slice(0, 16) : 'unknown'}`
+      + ` · sandbox ${String(v.sandbox ?? 'unknown')}`
+      + ` · screening ${Array.isArray(v.screened) && v.screened.length > 0 ? `${v.screened.length} finding(s)` : 'clean'}`,
+  ]
+  if (status === 'fail' || status === 'error' || status === 'timeout') {
+    const detail = firstInformativeLine(typeof v.outputHead === 'string' ? v.outputHead : '')
+    if (detail.length > 0) lines.push(`first informative output: ${detail}`)
+  }
   if (typeof v.note === 'string' && v.note.length > 0) lines.push('', v.note)
   return lines.join('\n')
 }

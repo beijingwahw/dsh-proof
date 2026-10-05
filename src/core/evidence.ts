@@ -15,11 +15,12 @@
  * @module dsh-proof/core/evidence
  */
 
-import type { CheckKind, CheckSpec, Clock, FsPort, SignerPort, WorkspacePort } from './ports.ts'
+import type { CheckKind, CheckSource, CheckSpec, Clock, FsPort, SignerPort, WorkspacePort } from './ports.ts'
 import { addressOf, merkleRoot, normalizeOutput, sha256 } from './hash.ts'
 import type { NormalizeOptions } from './hash.ts'
 import { GENESIS_PREV, checkpointSignedData, lineDigest, parseAnchor, walkChain } from './trust.ts'
 import { excerptOutput, type ExcerptOptions } from './excerpt.ts'
+import type { SyntheticEvidenceMeta } from './synthetic.ts'
 
 export type CheckStatus = 'pass' | 'fail' | 'error' | 'timeout' | 'aborted' | 'skipped'
 
@@ -30,6 +31,15 @@ export interface Evidence {
   readonly label: string
   readonly kind: CheckKind
   readonly command: readonly string[]
+  /**
+   * Which discovery source minted the addressed check (ο). Participates in
+   * the content address, so the record says — without consulting any live
+   * spec pool — whether it came from `package.json`, `config`, or was
+   * `synthetic` (agent-constructed; see `core/synthetic.ts`). Downstream
+   * verdicts key on this instead of re-deriving provenance: an evidence log
+   * must stay interpretable from its own bytes.
+   */
+  readonly source?: CheckSource
   readonly status: CheckStatus
   readonly exitCode: number | null
   readonly durationMs: number
@@ -41,6 +51,14 @@ export interface Evidence {
   readonly outputTruncated?: boolean
   /** How many normalised characters are not in the excerpt. */
   readonly outputOmittedChars?: number
+  /**
+   * ο: present only on synthetic-check records — the verbatim script digest,
+   * sandbox tier, screen findings and authorship. Participates in the content
+   * address, so the record *self-certifies what ran*: two runs with the same
+   * observable outcome but different scripts are two different pieces of
+   * evidence, and neither can borrow the other's pass.
+   */
+  readonly synthetic?: SyntheticEvidenceMeta
   readonly recordedAt: string
   /** Workspace state when the evidence was produced. */
   readonly workspace: WorkspaceSnapshot
@@ -149,7 +167,15 @@ export interface RunOutcome {
   readonly output: string
 }
 
-/** Turn one observed run into an addressable evidence record. */
+/**
+ * Turn one observed run into an addressable evidence record.
+ *
+ * ο: the trailing `synthetic` parameter is the self-certifying metadata for
+ * agent-constructed checks (script digest, sandbox tier, screen findings,
+ * authorship). It rides into the content address like every other field —
+ * the point is exactly that a record cannot claim a script it did not run.
+ * Optional and last, so every pre-ο call site is untouched.
+ */
 export function makeEvidence(
   spec: CheckSpec,
   outcome: RunOutcome,
@@ -157,6 +183,7 @@ export function makeEvidence(
   clock: Clock,
   excerpt: ExcerptOptions = DEFAULT_EXCERPT,
   canonical: NormalizeOptions = {},
+  synthetic?: SyntheticEvidenceMeta,
 ): Evidence {
   // Canonical roots make the record location-independent: the same outcome
   // under any checkout directory (or user home) hashes to the same address.
@@ -167,12 +194,16 @@ export function makeEvidence(
     label: spec.label,
     kind: spec.kind,
     command: spec.command,
+    // The spec's source is part of the record itself (see the field): a log
+    // reader learns "this pass was synthetic" from the record's own bytes.
+    source: spec.source,
     status: outcome.status,
     exitCode: outcome.exitCode,
     durationMs: outcome.durationMs,
     outputDigest: sha256(normalized),
     outputHead: exc.text,
     ...(exc.truncated ? { outputTruncated: true, outputOmittedChars: exc.omittedChars } : {}),
+    ...(synthetic !== undefined ? { synthetic } : {}),
     recordedAt: new Date(clock.now()).toISOString(),
     workspace,
   }

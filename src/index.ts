@@ -131,6 +131,9 @@ export function apply(ctx: Context, config: Config): void {
     juryConfidenceCap: config.juryConfidenceCap,
     classBTrust: config.classBTrust,
     classCTrust: config.classCTrust,
+    syntheticDir: config.syntheticDir,
+    syntheticFalsePass: config.syntheticFalsePass,
+    syntheticTimeoutMs: config.syntheticTimeoutMs,
   })
 
   const watch = new WorkspaceWatch(engineFs(engine), root)

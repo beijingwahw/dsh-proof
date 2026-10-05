@@ -15,12 +15,12 @@
  */
 
 import type {
-  Baseline, ChangeProvenance, ChangeSetResolution, CheckSpec, Clock, CommandPort,
+  Baseline, ChangeProvenance, ChangeSetResolution, CheckSpec, CheckStatus, Clock, CommandPort,
   DefinitionResolverPort, DependencyGraph, Evidence, FsPort, RelPath,
   SelectionResult, SignerPort, WorkspacePort, WorkspaceSnapshot,
 } from './core/index.ts'
 import {
-  DEFAULT_IGNORE_DIRS, EvidenceStore, VerificationRunner, assembleBaseline,
+  DEFAULT_IGNORE_DIRS, EvidenceStore, VerificationRunner, addressOf, assembleBaseline,
   assembleProof, buildDependencyGraph, discoverChecks, isDecisiveStatus,
   resolveChangeSet, selectAffectedChecks, sha256, snapshotWorkspace,
   claimProbability, computePriors, posteriorHealthy, rankByInformationGain,
@@ -49,6 +49,15 @@ import {
   claimIdOf, fuseConfidence,
 } from './core/attest.ts'
 import type { Attestation, TrustWeights } from './core/attest.ts'
+// π: the PTC-synthesis primitives (ο's core/synthetic.ts) consumed straight
+// from the module — same discipline as the contract/attest imports above: the
+// core barrel is not this batch's to edit, and a direct import keeps the
+// dependency on `core/synthetic.ts` explicit.
+import {
+  FORBIDDEN_CAPABILITIES, SYNTHETIC_DIR_DEFAULT, SYNTHETIC_TEMPLATE,
+  sandboxEntryFor, screenScript, syntheticSpec,
+} from './core/synthetic.ts'
+import type { SyntheticEvidenceMeta, SyntheticRequest } from './core/synthetic.ts'
 import { NodeCommandPort, NodeEd25519Signer, NodeFsPort, GitWorkspace, SystemClock } from './node-ports.ts'
 
 export interface EngineOptions {
@@ -123,6 +132,19 @@ export interface EngineOptions {
    * 0.9).
    */
   readonly classCTrust?: number
+  /**
+   * π: sandbox directory for conjured tests, relative to the workspace root.
+   * Mirrors the plugin config's `syntheticDir` (default '.proof-synthetic').
+   */
+  readonly syntheticDir?: string
+  /**
+   * π: false-pass rate priced into synthetic checks' posteriors — P(observed
+   * pass | actually broken) for a test authored by the claim's interested
+   * party. Mirrors the plugin config's `syntheticFalsePass` (default 0.15).
+   */
+  readonly syntheticFalsePass?: number
+  /** π: cooperative timeout for one conjured-test run (default 60s). */
+  readonly syntheticTimeoutMs?: number
   readonly clock?: Clock
   readonly fs?: FsPort
   readonly commands?: CommandPort
@@ -214,6 +236,43 @@ export type ContractVerifyOptions = VerifyOptions & { readonly contract: ClaimCo
 
 /** ζ: `verify`'s outcome grown by the contract verdict. */
 export type ContractVerifyOutcome = VerifyOutcome & { readonly contract: ContractSummary }
+
+/**
+ * π: what `conjureRun` reports back to the model-facing tool.
+ *
+ * `status: 'skipped'` means the script was REFUSED at screening and never
+ * ran — the findings then ride `screened` and the refusal reason
+ * `outputHead`; nothing is written to the chain in that case.
+ */
+export interface ConjureRunResult {
+  /** The synthetic check's identity (stable per claim + entry). */
+  readonly checkId: string
+  /** The executed record's status, or `'skipped'` for a screening refusal. */
+  readonly status: CheckStatus
+  /** sha256 of the script as it existed at execution (or refusal) time. */
+  readonly scriptDigest: string
+  /** Screening findings; empty when the script screened clean. */
+  readonly screened: readonly string[]
+  /** The execution regime the evidence records. */
+  readonly sandbox: SyntheticEvidenceMeta['sandbox']
+  /** Excerpt of the run's output, or the refusal reason. */
+  readonly outputHead: string
+}
+
+/**
+ * π: narrow one `synthetic/requested` marker payload back into a
+ * `SyntheticRequest`. Malformed payloads (older chains, foreign writes)
+ * return `undefined` and are skipped by every consumer — a marker that
+ * cannot prove its own shape cannot mint a spec or authorise a run.
+ */
+function syntheticRequestOf(payload: Record<string, unknown>): SyntheticRequest | undefined {
+  const { claimId, claim, paths, entry, requestedAt } = payload as Record<string, unknown>
+  if (typeof claimId !== 'string' || typeof claim !== 'string' || typeof entry !== 'string' || typeof requestedAt !== 'number') {
+    return undefined
+  }
+  if (!Array.isArray(paths) || !paths.every(p => typeof p === 'string')) return undefined
+  return { claimId, claim, paths, entry, requestedAt }
+}
 
 function isAbsolutePath(p: string): boolean {
   return /^([A-Za-z]:[\\/]|\/)/.test(p)
@@ -332,6 +391,9 @@ export class ProofEngine {
     headChars: number
     apiEntryPoints: readonly string[]
     juryConfidenceCap: number
+    syntheticDir: string
+    syntheticFalsePass: number
+    syntheticTimeoutMs: number
   }
 
   constructor(options: EngineOptions) {
@@ -405,6 +467,13 @@ export class ProofEngine {
       // jury cap mirrors the plugin config default when the host says nothing.
       apiEntryPoints: options.apiEntryPoints ?? [],
       juryConfidenceCap: options.juryConfidenceCap ?? 0.8,
+      // π: PTC-synthesis wiring — the sandbox directory, the synthetic β,
+      // and the conjured-test timeout. Defaults mirror core/synthetic.ts and
+      // the plugin config; SYNTHETIC_DIR_DEFAULT is the one source of truth
+      // for the directory name both sides must agree on.
+      syntheticDir: options.syntheticDir ?? SYNTHETIC_DIR_DEFAULT,
+      syntheticFalsePass: options.syntheticFalsePass ?? 0.15,
+      syntheticTimeoutMs: options.syntheticTimeoutMs ?? 60_000,
     }
   }
 
@@ -582,8 +651,14 @@ export class ProofEngine {
 
   /** Re-run the checks this change set made stale, and grade the claim. */
   async verify(options: VerifyOptions = {}): Promise<VerifyOutcome> {
-    const specs = await this.loadChecks()
+    const discovered = await this.loadChecks()
     const graph = await this.loadGraph()
+    // π: conjured tests join the verification pool as ordinary specs — every
+    // synthetic request the chain shows was actually executed. A workspace
+    // with none on chain gets the empty union and behaves bit-for-bit as
+    // before; one with them gets them selected, priced (raised β) and
+    // re-executed exactly like an organic check (P5).
+    const specs = unionChecks(discovered, await this.syntheticSpecs())
     const baseline = await this.store.loadBaseline()
     const attribution = await this.resolveChanges(options, baseline)
     const changed = attribution.changed
@@ -896,6 +971,11 @@ export class ProofEngine {
 
     // -- every other kind: the run, then the contract on top of it ---------
     const graph = await this.loadGraph()
+    // π: same union as verify() — executed conjured tests join the pool as
+    // ordinary specs, so a behavior-adding claim can cover its new paths
+    // with them (the contract's new-paths-covered fallback consumes the
+    // chain's latest synthetic evidence through `latestByCheckId` below).
+    const pool = unionChecks(specs, await this.syntheticSpecs())
     const attribution = await this.resolveChanges(rest, baseline)
     const changed = attribution.changed
     const provenance = new Map<RelPath, ChangeProvenance>(
@@ -904,11 +984,11 @@ export class ProofEngine {
     const degraded = resolutionDegraded(attribution) || await this.gitFactsUnavailable()
     const forceAll = rest.all === true || degraded
     const selection = forceAll
-      ? forcedSelection(specs, changed)
-      : selectAffectedChecks(specs, changed, graph)
+      ? forcedSelection(pool, changed)
+      : selectAffectedChecks(pool, changed, graph)
 
     const runSpecs = contract.kind === 'perf-budget'
-      ? unionChecks(selection.affected, specs.filter(s => s.kind === 'benchmark'))
+      ? unionChecks(selection.affected, pool.filter(s => s.kind === 'benchmark'))
       : selection.affected
 
     const snapshot = await this.workspaceSnapshot()
@@ -928,7 +1008,7 @@ export class ProofEngine {
     const confidence = this.updateFactors(priors, batch.records, runSpecs.length > 0)
 
     const { report, checks } = assembleProof({
-      specs,
+      specs: pool,
       baseline,
       records: batch.records,
       changed,
@@ -947,14 +1027,21 @@ export class ProofEngine {
     // decides what that missing honesty costs the obligation). ContractInput's
     // context fields are required-but-nullable, so both sides are handed over
     // explicitly, `undefined` included.
+    //
+    // π: `latestByCheckId` additionally hands the evaluator the chain's
+    // latest evidence per check — the synthetic fallback for new-paths-
+    // covered rests on it, because a conjured test's own execution record
+    // (proof_conjure_run) lives on the chain, not necessarily in this run's
+    // batch.
     const apiSurfaceAfter = await this.computeApiSurface()
     const apiSurfaceBefore = (baseline as EngineBaseline | undefined)?.apiSurface
     const verdict = evaluateContract(
       {
         contract,
         changed,
-        specs,
+        specs: pool,
         records: batch.records,
+        latestByCheckId: await this.store.latest(),
         baseline,
         apiSurfaceBefore: apiSurfaceBefore === undefined ? undefined : [...apiSurfaceBefore],
         apiSurfaceAfter: apiSurfaceAfter === undefined ? undefined : [...apiSurfaceAfter],
@@ -1053,6 +1140,207 @@ export class ProofEngine {
         ...(claimActive.length > 0 ? { attestations: this.attestationSummary(claimActive) } : {}),
       },
     }
+  }
+
+  // -- PTC synthesis (π) ------------------------------------------------------
+
+  /**
+   * π: open a conjure request — the request/execution protocol's first half.
+   *
+   * The claim's identity (claimId) and its covered paths are committed to
+   * the chain BEFORE any script exists: `synthetic/requested` carries the
+   * full request plus `scriptDigest: null`, because at request time there is
+   * nothing to digest yet. Locking the request first is what makes the
+   * later "request–execution swap" detectable: `conjureRun` digests
+   * whatever is on disk at execution time, so a script substituted between
+   * the two calls runs under its OWN digest, visibly.
+   *
+   * The scaffold template is written next to where the real entry will go
+   * (`<entry>.template.mjs` — the suffix keeps the scaffold itself out of
+   * any accidental execution), and the returned instruction tells the model
+   * exactly what to do with it.
+   */
+  async conjureRequest(input: { claim: string; paths: readonly string[] }): Promise<{ request: SyntheticRequest; template: string; instruction: string }> {
+    const claimId = claimIdOf(input.claim)
+    // seq = requests already on the chain for THIS claim: re-conjuring the
+    // same claim mints a fresh entry (t0, t1, …) instead of overwriting the
+    // previous test's history.
+    const seq = (await this.markersWith('synthetic/requested')).filter(p => p.claimId === claimId).length
+    const entry = sandboxEntryFor(claimId, seq)
+    const request: SyntheticRequest = {
+      claimId,
+      claim: input.claim,
+      paths: [...input.paths],
+      entry,
+      // Epoch millis from the engine's clock — the module owns no clock by
+      // design, and the request's timestamp must be as reproducible (and as
+      // chain-addressable) as every other byte of the marker.
+      requestedAt: this.clock.now(),
+    }
+    const entryDir = dirnameRel(entry)
+    await this.fs.mkdirp(entryDir.length === 0 ? this.syntheticRoot() : `${this.syntheticRoot()}/${entryDir}`)
+    await this.fs.writeFile(`${this.syntheticRoot()}/${entry}.template.mjs`, SYNTHETIC_TEMPLATE)
+    await this.store.mark('synthetic/requested', { ...request, scriptDigest: null })
+    const instruction = [
+      `Conjured-test sandbox ready for the claim "${input.claim}" (covers: ${request.paths.join(', ') || 'no paths'}).`,
+      `1. Copy ${this.options.syntheticDir}/${entry}.template.mjs to ${this.options.syntheticDir}/${entry}.`,
+      '2. Replace the placeholder assertion with a real executable test of the claim: exit code 0 proves it, anything else fails it.',
+      `3. Read and write files only inside ${this.options.syntheticDir}/ — a script importing ${FORBIDDEN_CAPABILITIES.join(', ')} is refused at screening and never runs.`,
+      `4. Call proof_conjure_run with this exact claim text and entry ${entry}: the verifier screens and executes the script itself and records the evidence.`,
+    ].join('\n')
+    return { request, template: SYNTHETIC_TEMPLATE, instruction }
+  }
+
+  /**
+   * π: execute one conjured script — the request/execution protocol's second
+   * half.
+   *
+   * Order of defenses: (1) a matching `synthetic/requested` marker must
+   * already be on the chain — execution without a recorded request is
+   * exactly the "test conjured out of thin air after the fact" move this
+   * protocol exists to prevent (and it double-serves as path validation:
+   * only entries the engine itself minted can match); (2) the script must
+   * exist on disk; (3) `screenScript` must pass — a refusal returns the
+   * findings WITHOUT executing and WITHOUT writing anything to the chain
+   * (the rejection travels in the tool result; a refused test is not
+   * evidence of anything except its own refusal).
+   *
+   * The execution itself goes through the plugin's own CommandPort via the
+   * VerificationRunner — the agent cannot forge the result, it can only
+   * influence the test's truth value (write a stronger or weaker assertion),
+   * and that is precisely what the synthetic β prices. The runner's plain
+   * record is then re-addressed with the synthetic metadata (scriptDigest,
+   * sandbox regime, screening findings, authorship): the metadata
+   * participates in content addressing, so the same output from two
+   * different scripts is two different pieces of evidence.
+   */
+  async conjureRun(input: { claim: string; entry: string }): Promise<ConjureRunResult> {
+    const claimId = claimIdOf(input.claim)
+    const payload = (await this.markersWith('synthetic/requested'))
+      .find(p => p.claimId === claimId && p.entry === input.entry)
+    const request = payload === undefined ? undefined : syntheticRequestOf(payload)
+    if (request === undefined) {
+      throw new Error(`conjureRun: no synthetic/requested marker for claimId ${claimId} with entry ${input.entry} — call proof_conjure_request first`)
+    }
+    const spec = syntheticSpec(request, this.options.syntheticDir, this.options.syntheticTimeoutMs)
+    const source = await this.fs.readFile(`${this.syntheticRoot()}/${input.entry}`)
+    if (source === undefined) {
+      throw new Error(`conjureRun: no script at ${this.options.syntheticDir}/${input.entry} — copy the scaffold ${input.entry}.template.mjs and fill in the assertion first`)
+    }
+    // The digest is computed from the file AS IT IS NOW: the request locked
+    // claimId/entry/paths with a null digest precisely so a script swapped
+    // between request and run cannot hide — whatever runs is what is hashed.
+    const scriptDigest = sha256(source)
+    const screening = screenScript(source)
+    if (!screening.ok) {
+      return {
+        checkId: spec.id,
+        status: 'skipped',
+        scriptDigest,
+        screened: [...screening.findings],
+        sandbox: 'screened-subprocess',
+        outputHead: `screening refused: ${screening.findings.join('; ')}`,
+      }
+    }
+    // One spec, one run, no caller signal: the cooperative timeout on the
+    // spec (syntheticTimeoutMs) is the only budget.
+    const snapshot = await this.workspaceSnapshot()
+    const batch = await this.runner.run([spec], { workspace: snapshot })
+    const record = batch.records[0]
+    if (record === undefined) throw new Error('conjureRun: the verification runner produced no record')
+    const meta: SyntheticEvidenceMeta = {
+      scriptDigest,
+      // The host's ptc-runtime seam (executing inside a sandboxed PTC
+      // runtime instead of a screened subprocess) is deliberately not wired
+      // in this version: no host adapter reports it yet, and a regime label
+      // must be an observation, not an aspiration. Probe point for the host
+      // adaptation layer — until then the honest value is what actually
+      // happened: a screened subprocess.
+      sandbox: 'screened-subprocess',
+      screened: [...screening.findings],
+      author: 'agent',
+    }
+    // Re-address the runner's record over its synthetic metadata (the runner
+    // cannot know the digest): same body, same canonicalisation, one extra
+    // field — audit recomputes exactly this address from the stored record.
+    const { evidenceId: plainAddress, ...body } = record
+    void plainAddress
+    const evidence: Evidence = { ...body, synthetic: meta, evidenceId: addressOf({ ...body, synthetic: meta }) }
+    await this.store.append(evidence)
+    await this.store.mark('synthetic/run', {
+      claimId,
+      entry: input.entry,
+      checkId: evidence.checkId,
+      scriptDigest,
+      screened: [...screening.findings],
+      sandbox: meta.sandbox,
+      status: evidence.status,
+      exitCode: evidence.exitCode,
+    })
+    return {
+      checkId: evidence.checkId,
+      status: evidence.status,
+      scriptDigest,
+      screened: [...screening.findings],
+      sandbox: meta.sandbox,
+      outputHead: evidence.outputHead,
+    }
+  }
+
+  /** π: `<root>/<syntheticDir>` — where every conjured sandbox lives. */
+  private syntheticRoot(): string {
+    return `${this.root.replace(/[\/]+$/, '')}/${this.options.syntheticDir.replace(/^\/+/, '').replace(/[\/]+$/, '')}`
+  }
+
+  /**
+   * π: every marker payload on the chain under one label, in log order. The
+   * store exposes no marker read-back, so — exactly like the attestation
+   * pass (κ) — the raw log lines are parsed here through the same fs port.
+   * Any read failure degrades to "no markers" rather than failing the caller.
+   */
+  private async markersWith(label: string): Promise<Record<string, unknown>[]> {
+    try {
+      const out: Record<string, unknown>[] = []
+      for (const line of await this.fs.readLines(this.logPath)) {
+        let envelope: { kind?: unknown; payload?: unknown }
+        try {
+          envelope = JSON.parse(line) as { kind?: unknown; payload?: unknown }
+        } catch {
+          continue
+        }
+        if (envelope?.kind !== 'marker') continue
+        const payload = envelope.payload as { label?: unknown } | undefined
+        if (payload?.label === label) out.push(payload as Record<string, unknown>)
+      }
+      return out
+    } catch {
+      return []
+    }
+  }
+
+  /**
+   * π: the synthetic specs currently on the chain — every conjured test that
+   * has actually been executed at least once (a request without a run is an
+   * offer, not a check; verify must not silently execute an unexecuted
+   * offer). They join verification as ordinary specs (P5): selection matches
+   * their paths, the runner re-executes their sandbox entry like any other
+   * check, and computePriors prices their history with the raised synthetic
+   * β — the false-pass risk of a test written by the claim's own author.
+   */
+  private async syntheticSpecs(): Promise<CheckSpec[]> {
+    const requested = await this.markersWith('synthetic/requested')
+    if (requested.length === 0) return []
+    const ran = new Set(
+      (await this.markersWith('synthetic/run')).map(p => `${String(p.claimId)}\0${String(p.entry)}`),
+    )
+    const out: CheckSpec[] = []
+    for (const payload of requested) {
+      const request = syntheticRequestOf(payload)
+      if (request === undefined) continue
+      if (!ran.has(`${request.claimId}\0${request.entry}`)) continue
+      out.push(syntheticSpec(request, this.options.syntheticDir, this.options.syntheticTimeoutMs))
+    }
+    return out
   }
 
   // -- graded evidence (κ) ----------------------------------------------------
@@ -1381,6 +1669,10 @@ export class ProofEngine {
       graph,
       history,
       fallbackCostMs: this.options.checkTimeoutMs / 4,
+      // π: the raised false-pass rate for agent-authored checks — computePriors
+      // applies it to source 'synthetic' specs only; organic checks keep the
+      // fixed organic β.
+      syntheticFalsePass: this.options.syntheticFalsePass,
     })
   }
 

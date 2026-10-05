@@ -123,7 +123,7 @@ Re-read these before relying on them, then re-run proof_verify.
 
 ---
 
-## 四、面向模型的七个工具
+## 四、面向模型的九个工具
 
 | 工具 | 作用 |
 |---|---|
@@ -134,6 +134,8 @@ Re-read these before relying on them, then re-run proof_verify.
 | `proof_jury` | **B 类证据·第一步**：为断言申请一次 LLM 陪审审议——冻结审议 prompt（量规全文 + 断言 + 上下文）返还模型，并把请求（含逐字 prompt）落链（§五·十四） |
 | `proof_jury_submit` | **B 类证据·第二步**：把陪审裁决（verdict / probability / reasoning 逐字）连同冻结 prompt、声明模型身份、独立性档位全包落链为永久 Class B 证据；claimId 必须匹配最新请求；gen 自动 +1 = 申诉 |
 | `proof_endorse` | **C 类证据**：具名人类背书/驳回断言——调用本身触发宿主审批（ask），人类批准才落链（approver / scope / approvedAt）；endorse = 风险接受（解锁等级、不抬数字），reject = 崩塌置信 |
+| `proof_conjure` | **合成证据·第一步**：为没有现成检查的断言申请构造验证——插件冻结请求（断言全文 + 待覆盖路径）、把确定性脚手架模板落盘 `.proof-synthetic/`、`synthetic/requested` marker 上链，并返还四步操作指引（§五·十五） |
+| `proof_conjure_run` | **合成证据·第二步**：插件校验链上请求存在 → 读取沙箱脚本并逐字 sha256 → 能力筛检（拒收即 `skipped`，不执行、不落链）→ 经插件自己的执行端口运行；`scriptDigest` 连同沙箱档位/筛检结论/作者归因参与 `evidenceId` 内容寻址，`synthetic/run` marker 上链 |
 
 所有工具都遵守 DSH 的硬契约：`execute` 只返回**规范 JSON 值**，人类可读文案在 `output.render`，UI 卡片通过 `presentCall` / `presentResult` / `presentationMeta` **纯投影**生成 —— session-log 回放时逐字节复现同一张卡片。
 
@@ -217,7 +219,7 @@ v0.6 在 `normalizeOutput` 落地双层归一：**root → `$WORKSPACE`（先具
 
 **信任三态**。audit 的签名裁定从二态改为三态。旧逻辑在**没有 signer 的机器**上（密钥丢失、换机器审计）会把带签名的检查点误读成可疑；现在只有本机实际持有的密钥、面对点名该密钥的检查点，才有资格**驳斥**（`badCheckpoints`，真正的伪造指控）；本机无法裁定的（`unverifiableCheckpoints`）是**能力缺失而非指控**，不再使 audit 失败。锚文件自身的签名现在也会被验证（`anchorForged`），且锚携带 `workspaceKey`——审计可以仅凭锚文件重导出被签名的字节。
 
-**引擎的诚实边界**。git 不可用时（WorkspacePort 新可选能力 `gitAvailable?()`），每条 git 查询各自失败返回空集——"什么都看不见"曾被吞成"什么都没变"，增量选择悄悄缩成空。现在变更集显式标记 `degraded`，引擎**强制全量跑**并在 `VerifyOutcome.degraded` 透出。中止的基线不再落盘——abort 的基线曾照常写盘，之后的回归判定对着半成品真值运行；现在已观测的证据仍全部入链、落 `baseline/aborted` 标记、检查点窗口照常闭合，返回值携带 `aborted` 标志，下一次 verify 诚实报告 `no-baseline`。signer 加载失败大声降级：链内 `trust/signer-unavailable` marker + verbose 日志——静默降级与诚实的 unsigned 部署从此可区分。`requireBaseline: 'warn'` 从"配置了但没接线"变成真通知：本轮动了工作区而没有基线时，回合结束经 `agent.inject` 注入纠正性提示。死配置 `driftNoticeMs` 删除（配置降至 22 项，v0.9 增至 24 项，v0.10 增至 26 项，v0.11 增至 28 项）。
+**引擎的诚实边界**。git 不可用时（WorkspacePort 新可选能力 `gitAvailable?()`），每条 git 查询各自失败返回空集——"什么都看不见"曾被吞成"什么都没变"，增量选择悄悄缩成空。现在变更集显式标记 `degraded`，引擎**强制全量跑**并在 `VerifyOutcome.degraded` 透出。中止的基线不再落盘——abort 的基线曾照常写盘，之后的回归判定对着半成品真值运行；现在已观测的证据仍全部入链、落 `baseline/aborted` 标记、检查点窗口照常闭合，返回值携带 `aborted` 标志，下一次 verify 诚实报告 `no-baseline`。signer 加载失败大声降级：链内 `trust/signer-unavailable` marker + verbose 日志——静默降级与诚实的 unsigned 部署从此可区分。`requireBaseline: 'warn'` 从"配置了但没接线"变成真通知：本轮动了工作区而没有基线时，回合结束经 `agent.inject` 注入纠正性提示。死配置 `driftNoticeMs` 删除（配置降至 22 项，v0.9 增至 24 项，v0.10 增至 26 项，v0.11 增至 28 项，v0.12 增至 31 项）。
 
 **正确性收口（soundness closure）**。monorepo workspace 子包检查不再丢失：CheckSpec 新增 `cwd`（相对 root），子包检查真正在子包目录执行、id 含 cwd（cwd 缺省时 checkId 与旧格式逐字节一致），`packages/*` 单层 glob 现在真正展开——同 argv 的兄弟包检查不再互相顶替。影响图补盲：动态 `import('...')` 与多行 ESM import 现在产生边；Python dotted import（`pkg.mod`）在扫描集内尝试解析——多出的边只造成过选，绝不漏选。`git status --porcelain -z` 的 rename 条目解析修正（旧路径曾被截掉 3 个字符成为幻影路径；解析提为纯函数 `parsePorcelainZ`）。Windows 盘符绝对路径（`C:\...`）统一进路径域：observe 的 touched 归类、LSP root 前缀比较（大小写不敏感）、证据库守卫均修正。EvidenceStore 写入改单飞队列——并发的 append/mark/checkpoint 曾可能都链到同一个 tail，后一条的 `prev` 指向一条已不存在的行：**正确代码与它自己的竞态**。证据输出捕获改用 StringDecoder，多字节字符跨 chunk 边界不再碎成 U+FFFD。工程卫生：CI 改 `npm ci` 并加 windows 矩阵；`check-bundle` 错误路径不再崩溃；`untouchedChecks` 输出修正。
 
@@ -369,7 +371,23 @@ PROVEN (p≈0.80, jury evidence — self-attestation is capped)
 
 **诚实边界（详见 §十）**：v0.11 的独立性档位实际是三者中最弱的 `same-session`（宿主尚无隔离模型 seam，链上如实标注）；模型身份是提交方声明、插件无法验证；量规判断仍是主观概率；`humanProbability` = 0.95 与混合模型都是建模/评分规则选择，不是推导出的后验。
 
+## 五·十五、PTC 证据合成（v0.12.0）：让断言的无检查地带获得构造出来的验证
 
+到 v0.11 为止，一条断言若恰好落在没有任何现成检查的地方，出路只有两条：要么义务如实报 not met（`new-paths-covered` 的 detail 说「add a check whose paths cover them and make it pass」，可检查发现只认仓库自己声明的构建元数据与宿主显式配置——agent 写的测试文件进不了检查池），要么把断言降级成陪审自证。**没有现成检查的断言曾是死路。** v0.12 打开第三条路：**插件自己为这个缺口构造一个验证**——新模块 `src/core/synthetic.ts`（纯函数、零 I/O、零时钟）定义全部领域原语。角色随之改变：agent 从「被验证者」变成「参与构造证据的共谋者」，但边界同样清晰——**它只能左右测试的真值（断言写多严是它的自由），执行结果本身无法伪造**。
+
+**两工具协议（conjure/run 二段式）**。第一步 `proof_conjure(claim, paths)`：插件冻结请求——断言全文与其 claimId（sha256 前 16 hex）、待覆盖路径、确定性的脚手架模板 `SYNTHETIC_TEMPLATE` 落盘到 `syntheticDir`（默认 `.proof-synthetic/synthetic-<claimId>-<seq>.mjs.template.mjs`，seq 只是防覆盖的碰撞保险，不携带任何身份语义），并把完整请求作为 `synthetic/requested` marker 上链——此时 `scriptDigest` 为 `null`，因为请求时还没有可哈希的东西；**先锁请求，正是为了让事后换脚本无处可藏**。模板自带确定性断言循环与固定末行协议（`SYNTHETIC: PASS` / `SYNTHETIC: FAIL: <原因>`），文件头第一屏就警告：这份源码将逐字哈希进它自己证据的 `scriptDigest`——删掉一条断言不是私人编辑，而是铸造新地址、旧 pass 就此失效。agent 照模板把属性测试/最小复现写进沙箱目录（WorkspaceWatch 溯源，作者归因为 `agent`）。第二步 `proof_conjure_run(claim, entry)`：插件按序防御——(1) 链上必须已有匹配的 `synthetic/requested`（无请求的执行正是「事后凭空造测试」这一步要防的动作）；(2) 脚本必须在盘；(3) 能力筛检必须通过——**拒收即返回 findings、status 为 `skipped`、不执行、链上不落任何东西**（被拒的测试除了它自己的被拒之外不证明任何事）。通过后经**插件自己的 CommandPort**（VerificationRunner）执行，记录带合成元数据重新寻址入链，`synthetic/run` marker 闭环。
+
+**「共谋者但不可伪造」的三个结构答案**。1) **内容寻址**：脚本源码的 sha256（`scriptDigest`）连同沙箱档位、筛检结论、作者归因一起进入 `SyntheticEvidenceMeta`，参与 `evidenceId` 的内容寻址——「通过的测试」与「运行的源码」无法悄悄分家，弱化一条断言就是铸造新地址，同一输出的两个不同脚本是两条不同证据。2) **插件持端口执行**：执行走插件持有的执行端口，agent 的工具面碰不到执行结果——它能写空断言（这是 β 定价的），但伪造不了一个没跑过的 `SYNTHETIC: PASS`。3) **marker 闭环**：请求先于脚本上链（digest 为 null），执行时对盘上现状重新哈希——两步之间被调包的脚本只能以它**自己的** digest 运行，可见。
+
+**β 定价：把「自利测试」放进数学而不是禁令里**。合成检查的假阴率 β 从 0.02（organic，`BAYES_CONSTANTS`）升到 `syntheticFalsePass`（默认 0.15，7.5 倍）——测试作者是断言的利害关系方，「写个必过的空测试」这一最廉价的假 pass 不是机械事故而是遗漏，0.02 定价的是独立维护者的套件，这里必须另定价。闭式更新 P(healthy | pass) = π(1−α) / (π(1−α) + (1−π)β)：同样的历史（1 次运行 1 次通过 → π = 5/6，α = 0.01）、同样一次 pass——organic 后验 ≈ **0.9960**，synthetic ≈ **0.9706**（端到端测试逐字断言了这个不等式与 basis）。α 与 π 不受影响：合成检查照常从历史学 flake 与失败倾向，折扣定价的是**谁的手写了断言**，不是传感器其余的行为；失败的合成检查照样定罪——折扣只定价自写的 pass。该默认值刻意**不**放进 `BAYES_CONSTANTS`（那是「不再重调的定律」）：它是承认的建模猜测，故经 `PriorInput.syntheticFalsePass` / 配置可覆盖，有真值数据的宿主可以定价自己的经验。
+
+**义务打通：tier ladder 与普通 spec 并池**。`behavior-adding` 的 `new-paths-covered` 接受合成覆盖，但按档位让路：**当次 organic run > 当次 synthetic run > 链上最新 organic > 链上最新 synthetic**（新鲜胜陈旧、独立胜自证——陈旧的独立证据强于新鲜的自证证据，兜底若开了门却拒收 organic 反而不自洽）。合成覆盖在 detail 里点名：`N covered by synthetic evidence (discounted)`。`verify()` / `verifyContract()` 把链上**已执行过**的 conjure spec 以普通 `CheckSpec` 并入检查池（`source: 'synthetic'` 是唯一特殊处，选择/定价/重执行一切如常；只有请求没有执行的是 offer 不是检查，不会被悄悄执行）。
+
+**`ConfidenceBasis` 的第六个语义**：本次运行的全部决定性记录都来自合成检查时，basis 为 `synthetic`——`full-coverage` 在此技术上为真、实质上误导（唯一说话的检查是断言作者自己写的）。优先序钉死：`jury-only > attested > synthetic > certified-subset > full-coverage > degraded`。叙事直说 regime：`PROVEN (p≈0.97, synthetic evidence — conjured tests, discounted)`。grade 本身绝不在 `synthetic` 上分支——β 抬升已在因子内部完成了定价。
+
+**沙箱档位如实分档**。`SyntheticEvidenceMeta.sandbox` 是字面量联合 `'screened-subprocess' | 'ptc-runtime'`，v0.12 固定落 `'screened-subprocess'`——**静态筛检不是沙箱**，档位标签必须是观察不是愿望；宿主将来提供 ptc-runtime seam（在真沙箱运行时内执行）时切换档位，探测点已留。能力筛检是**deny-list**：`FORBIDDEN_CAPABILITIES`（`child_process`、`net`、`http`、`https`、`dgram`、`worker_threads`）的一切拼写（带/不带 `node:` 前缀、静态/裸/字面量动态 import、`require`、多行列表与 re-export）加上 `process.env` 读取（成员与计算成员形式）都在执行**之前**被拒；`fs` 刻意放行（读不了 fixture 的属性测试测不了任何东西，边界由 cwd 承担）。扫描跑在原始文本上、注释也扫——被注释掉的禁用导入照样报（deny-list 的安全方向是拒绝惰性脚本，绝不放过活脚本）；模板自身干净通过筛检（模块名只以不带引号的形式出现在警告散文里，筛检只匹配带引号的 specifier），所以提交脚本上的任何 finding 都来自作者自己的增改。
+
+**与 v0.9 / v0.10 / v0.11 的咬合（四个子系统互相成就）**。v0.9 的调度器为合成检查定价（β 进 `computePriors`，VOI 排序与提前停一切照常）；v0.10 的合约把合成覆盖接受为 `new-paths-covered` 的兜底（tier ladder 明示折价）；v0.11 的 basis 体系把 `synthetic` 排在证词之后、机器基之前（读者必须知道唯一说话的检查出自谁手）；本版的请求/执行协议则保证进入这条流水线的每条合成证据都真的运行过、真的被筛检过、真的以逐字源码寻址。新配置三项：`syntheticDir`（默认 `.proof-synthetic`，钉进 `DEFAULT_IGNORE_DIRS`，永不进入检查发现——沙箱是验证的**输出**，不是能使验证失效的源输入）、`syntheticFalsePass`（0.15）、`syntheticTimeoutMs`（60000）。
 
 ---
 
@@ -380,7 +398,7 @@ PROVEN (p≈0.80, jury evidence — self-attestation is capped)
 ```
 dsh-proof/
 ├── src/
-│   ├── core/                 ← 纯领域层，零 @deepseek-ai/* 依赖（15 个模块）
+│   ├── core/                 ← 纯领域层，零 @deepseek-ai/* 依赖（16 个模块）
 │   │   ├── ports.ts          # 唯一的对外接口（Command/Fs/Clock/Workspace/Signer/Resolver）
 │   │   ├── hash.ts           # 规范化 JSON + 内容寻址 + Merkle root + 输出归一
 │   │   ├── checks.ts         # 客观检查发现（多语言 + monorepo 子包 cwd）
@@ -395,18 +413,19 @@ dsh-proof/
 │   │   ├── trust.ts          # 哈希链 + 检查点签名 + 带外锚点
 │   │   ├── contract.ts       # 类型化断言合约（五类 kind 与义务、API 面提取/diff、docs 分类）
 │   │   ├── attest.ts         # 证据分级 B/C（量规、陪审包、信任算术、申诉解析，纯函数）
+│   │   ├── synthetic.ts      # PTC 证据合成（脚手架模板、能力筛检、合成 spec，纯函数）
 │   │   └── index.ts          # 领域导出
 │   ├── engine.ts             # ProofEngine —— 宿主调用的命令式门面
 │   ├── node-ports.ts         # Node 实现（spawn / fs / git / Ed25519）
 │   ├── config.ts             # Schemastery 配置
 │   ├── index.ts              # Cordis 插件入口
 │   ├── dsh/                  ← 薄 Cordis 适配层
-│   │   ├── tools.ts          # 七个模型可见工具（含 B/C 证词三工具）
+│   │   ├── tools.ts          # 九个模型可见工具（含 B/C 证词三工具、合成证据二工具）
 │   │   ├── observe.ts        # 脏区追踪 + 漂移检测
 │   │   ├── prompt.ts         # proof:policy 段落
 │   │   └── lsp-impact.ts     # 宿主 LSP → DefinitionResolverPort 适配
 │   └── vendor/dsh-tools.ts   # 契约快照（pinned to dsh v0.2.1-alpha.1）
-├── test/                     # 18 个测试文件（317 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心、类型化断言合约、证据分级 B/C
+├── test/                     # 19 个测试文件（356 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心、类型化断言合约、证据分级 B/C、PTC 证据合成
 ├── cordis.patch.yml          # bundle 层
 └── examples/cordis.yml       # --patch 本地调试
 ```
@@ -414,7 +433,7 @@ dsh-proof/
 **为什么领域核心不碰 `@deepseek-ai/*`：**
 
 1. DSH 是开发者预览版，破坏性变更频繁。核心逻辑与 harness 版本解耦 → 升级不重写。
-2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，317 个测试全绿。
+2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，356 个测试全绿。
 3. 同一个核心可以被别的宿主（CLI、CI、其他 harness）复用。
 
 **为什么 `vendor/dsh-tools.ts` 是契约快照而不是活依赖：**
@@ -478,6 +497,9 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
         juryConfidenceCap: 0.8       # docs-only 陪审自证的置信上限（grade 可 proven，confidence 永不超过此值）
         classBTrust: 0.7             # B 类证据（LLM 陪审）信任权重：log-odds 指数/混合力度，弱证人只能弱化断言（§五·十四）
         classCTrust: 0.9             # C 类证据（人类背书/驳回）信任权重：endorse 轻折扣 0.95^0.9≈0.955，reject 崩塌 (1-0.95)^0.9
+        syntheticDir: .proof-synthetic # π：合成证据沙箱目录（脚手架与测试脚本落于此；钉出检查发现，永不成为客观检查）
+        syntheticFalsePass: 0.15      # π：合成检查假阴率 β（agent 自写测试的定价；organic 为 0.02，见 §五·十五）
+        syntheticTimeoutMs: 60000     # π：单个合成测试执行的协作超时
         verbose: false
 ```
 
@@ -509,7 +531,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit，离线可跑
-npm test              # 317 个测试（node:test）
+npm test              # 356 个测试（node:test）
 npm run build         # 产出 lib/
 npm run bundle:check  # 打包契约自检
 ```
@@ -517,10 +539,10 @@ npm run bundle:check  # 打包契约自检
 测试分层：
 
 - `01`–`04` —— 纯核心：哈希、检查发现、影响分析、证据与判定
-- `05` —— 引擎端到端（内存端口；v0.9 增补波式调度用例：提前认证、首败停、`set` 回归、确定性、预算降级；v0.10 增补四类合约端到端与旧基线无 API 面的诚实降级；v0.11 增补证据分级 5 例：链种 B 裁决零命令认证、双向申诉覆盖、背书风险接受与 reject 崩塌+对称锁、背书只解目标差不买工作、纯机器隔离——`verify()` 永不读链上证词）
+- `05` —— 引擎端到端（内存端口；v0.9 增补波式调度用例：提前认证、首败停、`set` 回归、确定性、预算降级；v0.10 增补四类合约端到端与旧基线无 API 面的诚实降级；v0.11 增补证据分级 5 例：链种 B 裁决零命令认证、双向申诉覆盖、背书风险接受与 reject 崩塌+对称锁、背书只解目标差不买工作、纯机器隔离——`verify()` 永不读链上证词；v0.12 增补合成闭环 4 例：真进程请求-执行闭环、筛检拒收零执行零落链、β 定价端到端（synthetic < organic 且 basis 点名 regime）、behavior-adding 合成兜底）
 - `06` —— 漂移检测
 - `07` —— **真实 shell 集成**：真的 `npm run --silent test`，真的退出码，真的回归归因
-- `08` —— 插件接线：七个工具、pre-execute 钩子（基线门、证据库守卫、`proof_endorse` 恒 ask 的审批 seam）、提示词段落、纯投影、配置校验、陪审请求冻结/裁决校验/审批后落链
+- `08` —— 插件接线：九个工具、pre-execute 钩子（基线门、证据库守卫、`proof_endorse` 恒 ask 的审批 seam）、提示词段落、纯投影、配置校验、陪审请求冻结/裁决校验/审批后落链、合成请求冻结（脚手架逐字返还 + `synthetic/requested` 落链）/合成经端口执行落链/筛检拒收以协议结果（而非报错）返回
 - `09` —— **信任对抗**：链断裂、全量重写（用本包自己的哈希函数）、回滚、基线替换、真实 Ed25519 密钥
 - `10` —— **变更集溯源**：陈旧脏区豁免、还原即变更、未跟踪文件、外部回归不记账、引擎端到端
 - `11` —— **LSP 影响融合**：goToDefinition 验证近似边、别名导入盲区发现、缓存与预算、降级不缩窄
@@ -531,6 +553,7 @@ npm run bundle:check  # 打包契约自检
 - `16` —— **贝叶斯调度核心**：公式阶梯逐档核对（ρ 平滑、s 的 1.0 / 1/(1+d) / 0.7 / 0.5、π 双侧 clamp、α clamp）、后验单调性与全概率恒等式（鞅）、VOI 非负且与独立转写的公式吻合、确定性 / 乱序不变、(π, α) 网格扫描
 - `17` —— **类型化断言合约**：五形态提取逐形态核对（含别名/字符串别名/多声明符/解构/`export =`/`export * as ns`）、入口推导与闭包截断、义务矩阵全分支（四类 × met/not met × detail 文案）、`requirements*.txt` 陷阱守卫、封顶值逐字兑现、纯函数确定性（同输入同字节、记录乱序不变）
 - `18` —— **证据分级（B/C 证词）**：量规存在性与结构化输出指令（英文 rubric 逐项核对：三值裁决、主观概率、弃权规则、Class B 落盘与重放警告）、`juryPrompt` 字节级确定性与段落结构（含量规版本覆盖）、`claimIdOf` 稳定 16-hex 身份（改写即新断言）、因子数学（p^w 语义、abstain 中性、w=0/w=1 边界、**[p,1] 网格扫描**、NaN/越界防毒、C 类 endorse 0.95^0.9 与 reject 0.05^0.9）、`activeAttestations` 链读纪律（垃圾载荷防御、gen 申诉解析、同 gen 后写者赢、B/C 独立信道、(claimId, kind) 确定性排序）、llm-jury 义务矩阵全分支、模块级确定性
+- `19` —— **PTC 证据合成（32 例）**：模板协议（末行 PASS/FAIL、文件内链上警告、脚手架自筛干净）、`sandboxEntryFor` 确定性与「seq 防碰撞不携带身份」、沙箱目录钉出发现的字面量同步、筛检双向精度（deny-list 恰为锁定集、静态/裸/动态/require 各拼写、node: 前缀、多行与 re-export、process.env 成员/计算形式、注释内导入照报、名字仅含禁用模块的本地 fixture 放行、findings 去重排序）、β 定价（同历史 0.15 vs 0.02 且别的不动、`syntheticFalsePass` 只覆盖它、闭式后验、端到端折价）、记录（合成元数据上链、**同结果不同 scriptDigest 即不同 evidenceId**、冻结时钟深度相等）、义务 tier ladder 全分支（latest 合成兜底点名折价、无覆盖维持 not met、organic 兜底不被误称 synthetic、混合覆盖逐桶点名、当次 organic 压过一切兜底、pre-ο 记录经 spec 池判 synthetic）、入口点纯函数确定性
 
 本地调试：
 
@@ -560,8 +583,11 @@ pnpm dsh web --patch /absolute/path/to/dsh-proof/examples/cordis.yml
 - **陪审的 `probability` 是主观概率，不是测量（v0.11）。** 量规要求陪审报告「你的推理真正支持的那个数」，但 LLM 的自报数字没有对标任何频率保证；p=0.99 与 p=0.9 的差别应读作措辞强度而非校准差距。全部证词数学（p^w、混合）都是在**消费**这个主观数，不会让它变得更客观。
 - **`humanProbability` = 0.95 是建模选择（v0.11）。** Class C 的审批 seam 是二值的（批准/驳回），不采集数字置信，于是人类「对」的概率以常数 0.95 入账——不是测量，也不该被调参成「看起来能过 0.97 目标」的值。0.95 < 1 是刻意的：永不犯错的人类背书会让每条被背书的断言不可证伪。
 - **可靠性混合是评分规则选择，不是推导出的后验（v0.11）。** `fuseConfidence = (1−w)·c + w·p` 把「证人以概率 w 可靠、否则是噪声」建模为线性期望——选择「混合」而不是「乘积」是因为机器认证已存在时证词谈论的是**整个断言**而非又一个独立因子；它不是从任何先验推出的后验，边界情况（w→0 保机器数、w→1 采纳证词值）是设计锚点而非定理。两套数学各有其位：纯陪审路径用 p^w 折扣（只能弱化），融合路径用混合（可救活也可崩塌）——用哪套由「机器是否已经说话」决定，而不是由哪套数字好看决定。
+- **静态筛检不是沙箱（v0.12）。** 合成脚本的执行前置筛检是文本层 deny-list：计算式 specifier（`import(buildName())`）、别名通道（`createRequire` / `eval` / `new Function`）与大小写混淆的 specifier 它看不见——文本看不见运行时值。真正约束失控脚本的是沙箱 cwd 限制、执行超时（`syntheticTimeoutMs`）、输出摘录上限与宿主将来的 ptc-runtime 档位；筛检的职责只是让**容易的**外联尝试在执行之前大声失败。档位标签因此如实写 `'screened-subprocess'`，不冒充沙箱。
+- **合成 β = 0.15 是承认的猜测，且这个数按构造学不出来（v0.12）。** 假阴率需要「确实断了」的真值标注才能学习，而一条自利的测试（空断言、漏掉会破的输入）按构造**不产生任何可学的破坏信号**——日志里它永远是绿的。0.15 与 0.02 一样是定价立场而非测量；它刻意放在可覆盖的 `syntheticFalsePass` 而不是「不再重调」的 `BAYES_CONSTANTS` 里，正因为它是建模猜测，不是定律。
+- **合成覆盖永远弱于 organic 同侪（v0.12）。** 同样一次 pass，合成检查的后验抬升天然更少（端到端：synthetic ≈ 0.9706 < organic ≈ 0.9960）；义务 tier ladder 里合成让路于同档 organic；全部决定性记录皆合成时 basis 改名 `synthetic` 并在叙事里点名折扣。合成覆盖应读作「断言作者自己跑过并通过的验证」，不是独立确认——三层机制（β、tier ladder、basis）编码的都是这同一句话。
 - **`proven` 允许存在预置红灯。** 一个本来就红的仓库不该让 Agent 无法工作。预置失败会在报告里显著列出，但不计入本次会话的责任。这是刻意设计，不是漏洞。
-- **它不替代测试本身。** `dsh-proof` 编排并归因你已有的客观检查；它不生成测试用例。
+- **它不替代测试本身。** `dsh-proof` 编排并归因你已有的客观检查。v0.12 的证据合成也不改变这条边界：断言由 agent 起草，插件只冻结脚手架、筛检、执行，并把结果折价记账为弱于任何独立检查的证据。
 - **DSH 是 v0.1/0.2 开发者预览版。** 插件契约会变。本插件已把依赖面最小化并钉死契约快照（`src/vendor/dsh-tools.ts`），但上游变更时仍需重新对齐。
 
 ---

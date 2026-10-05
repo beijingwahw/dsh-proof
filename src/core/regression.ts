@@ -210,6 +210,15 @@ export function proofNarrative(report: ProofReport, certifyTarget: number = DEFA
     const head = `${report.grade.toUpperCase()} (p≈${p}, machine + B/C attested)`
     return [head, ...parts.slice(1)].join(' — ')
   }
+  // π synthetic: every decisive check was conjured by the claim's author —
+  // the number is real but each factor paid the raised synthetic β, and the
+  // head says so. Same shape for every grade: the discount is a property of
+  // the evidence, not of the verdict.
+  if (graded.confidenceBasis === 'synthetic') {
+    const p = (graded.confidence ?? 0).toFixed(2)
+    const head = `${report.grade.toUpperCase()} (p≈${p}, synthetic evidence — conjured tests, discounted)`
+    return [head, ...parts.slice(1)].join(' — ')
+  }
   if (graded.confidence !== undefined) {
     const p = graded.confidence.toFixed(2)
     const met = graded.confidenceBasis === 'certified-subset' || graded.confidence >= certifyTarget

@@ -298,6 +298,20 @@ export interface ContractInput {
    * a promise.
    */
   readonly attestations?: readonly Attestation[]
+  /**
+   * ο: latest evidence per check, read off the store by the engine
+   * (`store.latest()`). `new-paths-covered` uses it as a *fallback*: a
+   * changed source path with no covering pass among this run's records may
+   * still be covered by the latest passing evidence on record. Organic
+   * passes carry that coverage as-is — stale independent evidence is
+   * stronger than fresh self-written evidence, so if the fallback opens at
+   * all, refusing the organic case would be incoherent. Synthetic passes
+   * (record `source`/`synthetic` markers) carry it visibly *discounted*:
+   * met stays true, but the detail says so, and the Bayesian layer already
+   * prices the underlying check lower. Optional and absent in pre-ο callers;
+   * without it the obligation judges exactly as it did before.
+   */
+  readonly latestByCheckId?: ReadonlyMap<string, Evidence>
 }
 
 export interface ContractVerdict {
@@ -426,27 +440,113 @@ function apiSurfaceObligation(input: ContractInput): ObligationResult {
   return { id: 'api-surface-unchanged', met: false, detail: `public API changed — ${parts.join('; ')}` }
 }
 
-/** behavior-adding: every changed source path is covered by a passing check. */
+/**
+ * behavior-adding: every changed source path is covered by a passing check.
+ *
+ * Coverage has a primary and a fallback source (ο):
+ * - **Primary** — a spec whose `paths` match the file and whose *latest
+ *   record this run* is a pass. Unchanged from pre-ο behavior, except that
+ *   a *synthetic* covering pass is named in the detail: the check that
+ *   passed was written by a party to the claim, and "met" must not read as
+ *   independent confirmation (the Bayesian layer already prices the check
+ *   lower; the detail owes the same honesty to the human reader).
+ * - **Fallback** — when this run produced no covering pass anywhere, the
+ *   latest evidence on record (`input.latestByCheckId`) may still cover the
+ *   file: an organic pass carries coverage directly — stale independent
+ *   evidence is stronger than fresh self-written evidence, so if the
+ *   fallback opens at all, refusing the organic case would be incoherent;
+ *   a synthetic pass carries the same "covered by synthetic evidence
+ *   (discounted)" annotation as a this-run one.
+ *
+ * The fallback never *un-covers* anything — it can only rescue paths the run
+ * happened not to touch with a passing check.
+ */
 function newPathsObligation(input: ContractInput): ObligationResult {
   const currentById = latestByCheck(input.records)
   const sourceFiles = [...new Set(input.changed)].filter(isSourcePath).sort()
   if (sourceFiles.length === 0) {
     return { id: 'new-paths-covered', met: true, detail: 'no source paths in the change set' }
   }
-  const uncovered = sourceFiles.filter(file =>
-    !input.specs.some(s => matchesAny(file, s.paths) && currentById.get(s.id)?.status === 'pass'))
-  if (uncovered.length === 0) {
+  const runCovered: string[] = []
+  const organicCovered: string[] = []
+  const syntheticCovered: string[] = []
+  const uncovered: string[] = []
+  for (const file of sourceFiles) {
+    // Fresh beats stale, organic beats synthetic: a this-run pass describes
+    // the workspace as it is now; within a tier, an independent check's pass
+    // is the stronger statement about the same workspace.
+    if (hasCoveringPass(input, currentById, file, 'run')) { runCovered.push(file); continue }
+    if (hasCoveringPass(input, currentById, file, 'run-synthetic')) { syntheticCovered.push(file); continue }
+    if (hasCoveringPass(input, input.latestByCheckId, file, 'latest')) { organicCovered.push(file); continue }
+    if (hasCoveringPass(input, input.latestByCheckId, file, 'latest-synthetic')) { syntheticCovered.push(file); continue }
+    uncovered.push(file)
+  }
+  if (uncovered.length > 0) {
+    return {
+      id: 'new-paths-covered',
+      met: false,
+      detail: `not covered by any passing check: ${uncovered.join(', ')} — add a check whose paths cover them and make it pass`,
+    }
+  }
+  if (syntheticCovered.length === 0 && organicCovered.length === 0) {
     return {
       id: 'new-paths-covered',
       met: true,
       detail: `all ${sourceFiles.length} changed source path(s) covered by a passing check`,
     }
   }
+  // Fallback or synthetic coverage participated: say so, per bucket, in
+  // fixed clause order so the detail is a pure function of the input.
+  const clauses: string[] = [
+    `${runCovered.length} by a passing check this run`,
+  ]
+  if (organicCovered.length > 0) {
+    clauses.push(`${organicCovered.length} by the latest on-record pass`)
+  }
+  if (syntheticCovered.length > 0) {
+    clauses.push(`${syntheticCovered.length} covered by synthetic evidence (discounted)`)
+  }
   return {
     id: 'new-paths-covered',
-    met: false,
-    detail: `not covered by any passing check: ${uncovered.join(', ')} — add a check whose paths cover them and make it pass`,
+    met: true,
+    detail: `all ${sourceFiles.length} changed source path(s) covered: ${clauses.join(', ')}`,
   }
+}
+
+/**
+ * Whether `file` has a covering pass in the given record map, at the wanted
+ * tier: `'run'`/`'run-synthetic'` consult this run's latest-per-check
+ * records, `'latest'`/`'latest-synthetic'` the engine-supplied
+ * latest-on-record map; the `-synthetic` variants match only synthetic
+ * checks, the plain ones only organic checks — the caller's tier ladder then
+ * states the preference order once, instead of interleaving it with the
+ * matching logic. Specs are scanned in id order (deterministic; any covering
+ * pass in the class suffices).
+ */
+function hasCoveringPass(
+  input: ContractInput,
+  records: ReadonlyMap<string, Evidence> | undefined,
+  file: string,
+  tier: 'run' | 'run-synthetic' | 'latest' | 'latest-synthetic',
+): boolean {
+  if (records === undefined) return false
+  const wantSynthetic = tier === 'run-synthetic' || tier === 'latest-synthetic'
+  return input.specs.some(s =>
+    matchesAny(file, s.paths)
+    && records.get(s.id)?.status === 'pass'
+    && isSyntheticRecord(input, records.get(s.id) as Evidence) === wantSynthetic)
+}
+
+/**
+ * Whether a record addresses a synthetic check. The record's own markers are
+ * the authority (`source` / `synthetic`, both written at makeEvidence time);
+ * the spec pool is the fallback for pre-ο-shaped records that predate the
+ * `source` field, so old logs stay interpretable against a live spec list.
+ */
+function isSyntheticRecord(input: ContractInput, record: Evidence): boolean {
+  if (record.synthetic !== undefined) return true
+  if (record.source !== undefined) return record.source === 'synthetic'
+  return input.specs.some(s => s.id === record.checkId && s.source === 'synthetic')
 }
 
 /**

@@ -129,6 +129,24 @@ export interface Config {
    * gently (0.95^0.9 ≈ 0.955), a reject collapses the claim ((1-0.95)^0.9).
    */
   classCTrust: number
+  /**
+   * π: where conjured-test sandboxes live, relative to the workspace root.
+   * `proof_conjure_request` scaffolds templates here, the model writes its
+   * test next to them, and `proof_conjure_run` executes it inside this
+   * directory. Discovery ignores it (it rides `DEFAULT_IGNORE_DIRS`), so a
+   * sandbox never becomes an objective check by accident.
+   */
+  syntheticDir: string
+  /**
+   * π: β priced into agent-authored (synthetic) checks — P(observed pass |
+   * actually broken). A test written by the claim's interested party is
+   * evidence, but weaker evidence than a check the workspace declared
+   * before the claim existed; 0.15 prices that conflict of interest
+   * (vs the 0.02 organic default in `core/bayes.ts`).
+   */
+  syntheticFalsePass: number
+  /** π: cooperative timeout for one conjured-test execution, in milliseconds. */
+  syntheticTimeoutMs: number
   /** Emit plugin diagnostics to stdout. */
   verbose: boolean
 }
@@ -176,5 +194,13 @@ export const Config: Schema<Config> = Schema.object({
   // can only weaken a claim (probability^weight < 1 whenever probability < 1).
   classBTrust: Schema.percent().default(0.7),
   classCTrust: Schema.percent().default(0.9),
+  // π: PTC synthesis — the sandbox the model writes conjured tests into, the
+  // false-pass rate its tests are priced at, and how long one may run. All
+  // three mirror the engine-side defaults (`core/synthetic.ts` /
+  // `ProofEngine`), exposed here because two deployments may disagree on how
+  // much an interested party's own test is worth.
+  syntheticDir: Schema.string().default('.proof-synthetic'),
+  syntheticFalsePass: Schema.percent().default(0.15),
+  syntheticTimeoutMs: Schema.number().default(60_000),
   verbose: Schema.boolean().default(false),
 }) as unknown as Schema<Config>
