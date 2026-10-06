@@ -1,5 +1,5 @@
 /**
- * Agent Proof Protocol (APP/1.0) — the protocol constants layer.
+ * Agent Proof Protocol (APP/1.1) — the protocol constants layer.
  *
  * Everything a producer emits and a consumer interprets is named here: the
  * wire vocabularies (verdicts, grades, check statuses, chain modes, claim
@@ -23,8 +23,22 @@ import { canonicalJson, sha256 } from '../core/hash.ts'
 /** The standard's name, as it identifies itself on the wire. */
 export const PROTOCOL_NAME = 'agent-proof-protocol' as const
 
-/** The version of the vocabulary and rules this module speaks. */
-export const PROTOCOL_VERSION = 'APP/1.0' as const
+/**
+ * The version of the vocabulary and rules this module speaks.
+ *
+ * v0.18 (PROTOCOL.md §6): APP/1.0 → APP/1.1 — the honest version bump for the
+ * transparency-log tool-surface expansion (`proof_publish` / `proof_log_verify`
+ * joining the MCP contract, the PTL/STH artifacts they speak for). The five
+ * vocabularies and the three rule strings are unchanged; what changed is WHAT
+ * THE TOOLS CAN SAY, which is exactly the kind of dialect drift a consumer
+ * must be able to refuse. Because `appFingerprint` digests `PROTOCOL_VERSION`
+ * as material, the bump moves the fingerprint automatically — every APP/1.1
+ * manifest self-identifies as mutually unintelligible with every APP/1.0 one,
+ * and an APP/1.0 verifier refuses the new dialect instead of guessing at it.
+ * Downgrading this constant back is a wire-compatibility break, not a cosmetic
+ * edit: both directions are caught by the fingerprint, on purpose.
+ */
+export const PROTOCOL_VERSION = 'APP/1.1' as const
 
 /** Media type of a single proof document (a `ProofReport`-shaped value). */
 export const PROOF_MEDIA_TYPE = 'application/vnd.app.proof+json' as const
@@ -95,7 +109,7 @@ export const CHECK_STATUSES = ['pass', 'fail', 'error', 'timeout', 'aborted', 's
  * `protocolHeader` returns the empty skeleton.
  */
 export interface BundleManifest {
-  /** The protocol dialect, always `APP/1.0` for this module. */
+  /** The protocol dialect, always `APP/1.1` for this module. */
   protocol: typeof PROTOCOL_VERSION
   /** The producing implementation's vocabulary fingerprint (`appFingerprint()`). */
   appFingerprint: string

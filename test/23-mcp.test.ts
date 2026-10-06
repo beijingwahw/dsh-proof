@@ -3,11 +3,12 @@
  *
  * Spawns `node --experimental-strip-types src/app/mcp-entry.ts` against a
  * minimal real npm project and drives it over newline-delimited JSON-RPC 2.0
- * on stdio: the handshake, the five-tool contract, a real baseline → verify →
- * status → bundle chain (real `npm test`, real evidence, real Ed25519 chain),
- * and the error paths (unknown tool, bogus claim kind, malformed JSON line).
- * Nothing is stubbed — this is the test that proves any foreign harness can
- * drive the proof protocol end to end.
+ * on stdio: the handshake, the seven-tool APP/1.1 contract, a real baseline →
+ * verify → status → bundle → publish → log-verify chain (real `npm test`,
+ * real evidence, real Ed25519 chain, real transparency log), and the error
+ * paths (unknown tool, bogus claim kind, malformed JSON line). Nothing is
+ * stubbed — this is the test that proves any foreign harness can drive the
+ * proof protocol end to end.
  */
 
 import { test, before, after } from 'node:test'
@@ -17,12 +18,18 @@ import { promises as fsp } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 
+import { sha256 } from '../src/core/hash.ts'
+
 // The repo (for the entry script) and the scratch workspace per the task's
 // designated temp area: C:\mimoclaw_workspace\.openclaw\tmp\mcp-it-<pid>.
 const ENTRY = fileURLToPath(new URL('../src/app/mcp-entry.ts', import.meta.url))
 const WORKSPACE = join(fileURLToPath(new URL('../../../.openclaw/tmp', import.meta.url)), `mcp-it-${process.pid}`)
 
-const MCP_TOOLS = ['proof_status', 'proof_baseline', 'proof_verify', 'proof_claim', 'proof_bundle'] as const
+// v0.18 (APP/1.1): the transparency-log tools join the frozen contract.
+const MCP_TOOLS = [
+  'proof_status', 'proof_baseline', 'proof_verify', 'proof_claim', 'proof_bundle',
+  'proof_publish', 'proof_log_verify',
+] as const
 
 const CHECK_SCRIPT = [
   "import assert from 'node:assert/strict'",
@@ -187,7 +194,7 @@ test('initialize handshake answers with the server identity and a supported prot
     serverInfo: { name: string; version: string }
   }
   assert.equal(result.serverInfo.name, 'agent-proof-protocol')
-  assert.equal(result.serverInfo.version, '0.17.0')
+  assert.equal(result.serverInfo.version, '0.18.0')
   assert.equal(result.protocolVersion, '2025-06-18', 'a requested supported version is echoed back')
   assert.equal(result.capabilities.tools.listChanged, false)
 })
@@ -213,7 +220,7 @@ test('notifications/initialized produces no reply and ping answers an empty resu
   assert.deepEqual(pong.result, {})
 })
 
-test('tools/list exposes exactly the five APP/1.0 contract tools', async () => {
+test('tools/list exposes exactly the seven APP/1.1 contract tools', async () => {
   const response = await client.request('tools/list', {})
   assert.equal(response.error, undefined)
   const tools = (response.result as {
@@ -222,7 +229,7 @@ test('tools/list exposes exactly the five APP/1.0 contract tools', async () => {
   assert.deepEqual(
     tools.map(t => t.name).sort(),
     [...MCP_TOOLS].sort(),
-    'the cross-agent contract is exactly five tools',
+    'the cross-agent contract is exactly seven tools',
   )
   for (const tool of tools) {
     assert.equal(tool.inputSchema.type, 'object', `${tool.name} inputSchema must be an object schema`)
@@ -307,11 +314,128 @@ test('proof_bundle exports a manifest that digests the evidence log', async () =
     }
   }
   assert.ok(value.bundle !== undefined, 'a small bundle rides the response in full')
-  assert.equal(value.bundle.manifest.protocol, 'APP/1.0')
+  assert.equal(value.bundle.manifest.protocol, 'APP/1.1')
   const entry = value.bundle.manifest.files.find(f => f.path === 'evidence.jsonl')
   assert.ok(entry !== undefined, 'the manifest digests evidence.jsonl')
   assert.match(entry.sha256, /^[0-9a-f]{64}$/)
   assert.ok(typeof value.bundle.files['evidence.jsonl'] === 'string')
+})
+
+// ---------------------------------------------------------------------------
+// v0.18: the transparency-log tools over the real subprocess (real Ed25519
+// operator key bootstrapped under <trustRoot>/ptl, real Merkle tree on disk)
+// ---------------------------------------------------------------------------
+
+// A type alias (not an interface): anonymous object types carry the implicit
+// index signature that lets `structuredContent as PublishValue` typecheck.
+type PublishValue = {
+  sequence: number
+  duplicate: boolean
+  leafHash: string
+  treeSize: number
+  root: string
+  logId: string
+  at: string
+  inclusionProof: string[]
+  sth: { logId: string; treeSize: number; root: string; at: string; sig: string }
+}
+
+let firstPublish: PublishValue | undefined
+
+test('proof_publish mirrors the latest signed checkpoint and detects the duplicate republish', async () => {
+  const result = await callTool('proof_publish', {}, 60_000)
+  assert.equal(result.isError, undefined, `publish errored: ${result.content[0]?.text}`)
+  const value = result.structuredContent as PublishValue
+  firstPublish = value
+  assert.equal(value.duplicate, false, 'the first publish mints a new leaf')
+  assert.equal(value.sequence, 0)
+  assert.equal(value.treeSize, 1)
+  assert.match(value.leafHash, /^[0-9a-f]{64}$/, 'the entry addresses to a hex sha256 leaf')
+  assert.match(value.root, /^[0-9a-f]{64}$/, 'the tree commits to a hex sha256 root')
+  assert.equal(value.sth.treeSize, 1)
+  assert.equal(value.sth.root, value.root, 'the signed tree head covers the recomputed root')
+  assert.match(value.sth.sig, /^[A-Za-z0-9+/]+={0,2}$/, 'the STH carries a base64 Ed25519 signature')
+  assert.ok(Array.isArray(value.inclusionProof))
+
+  // Republishing without new signed work changes nothing: duplicate detected,
+  // the tree does not grow (re-publishing cannot pad the public log).
+  const again = await callTool('proof_publish', {}, 60_000)
+  assert.equal(again.isError, undefined, `republish errored: ${again.content[0]?.text}`)
+  const dup = again.structuredContent as PublishValue
+  assert.equal(dup.duplicate, true)
+  assert.equal(dup.treeSize, 1, 'the tree is unchanged by a duplicate publish')
+  assert.equal(dup.sequence, 0)
+  assert.equal(dup.leafHash, value.leafHash)
+})
+
+test('proof_log_verify audits the log: self-check, inclusion, consistency — and refuses forgery', async () => {
+  assert.ok(firstPublish !== undefined, 'the publish test ran first (state chains, like baseline → verify)')
+
+  // More signed work on the chain: a fresh verification appends evidence and
+  // a NEW signed checkpoint, so the next publish grows the tree to 2.
+  const verify = await callTool('proof_verify', { changed: ['check.mjs'] }, 60_000)
+  assert.equal((verify.structuredContent as { grade: string }).grade, 'proven')
+  const second = await callTool('proof_publish', {}, 60_000)
+  assert.equal(second.isError, undefined, `second publish errored: ${second.content[0]?.text}`)
+  const secondValue = second.structuredContent as PublishValue
+  assert.equal(secondValue.duplicate, false)
+  assert.equal(secondValue.sequence, 1, 'the second checkpoint lands as the second leaf')
+  assert.equal(secondValue.treeSize, 2)
+
+  // Self-check (no arguments): the root is recomputed from the log's own
+  // bytes and the tree head's signature is adjudicated under the operator
+  // key the publish bootstrapped.
+  const self = await callTool('proof_log_verify', {})
+  assert.equal(self.isError, undefined, `self-check errored: ${self.content[0]?.text}`)
+  const selfValue = self.structuredContent as {
+    ok: boolean
+    treeSize: number
+    root: string
+    treeHead: { logId: string; treeSize: number; root: string; sizeMatches: boolean; rootMatches: boolean; signature: string }
+  }
+  assert.equal(selfValue.ok, true, JSON.stringify(selfValue))
+  assert.equal(selfValue.treeHead.logId, secondValue.logId, 'the head names the operator key that signed it')
+  assert.equal(selfValue.treeSize, 2)
+  assert.equal(selfValue.root, secondValue.root)
+  assert.equal(selfValue.treeHead.signature, 'verified', 'the operator key is present — the STH must genuinely verify')
+  assert.equal(selfValue.treeHead.rootMatches, true)
+  assert.equal(selfValue.treeHead.sizeMatches, true)
+
+  // Full arguments: inclusion of the FIRST leaf (against the grown tree) and
+  // consistency from the first published tree to the current one.
+  const full = await callTool('proof_log_verify', {
+    sequence: firstPublish.sequence,
+    leafHash: firstPublish.leafHash,
+    publishedTreeSize: firstPublish.treeSize,
+    publishedRoot: firstPublish.root,
+  }, 60_000)
+  assert.equal(full.isError, undefined, `full verify errored: ${full.content[0]?.text}`)
+  const fullValue = full.structuredContent as {
+    ok: boolean
+    inclusion: { sequence: number; leafHash: string; verified: boolean }
+    consistency: { fromTreeSize: number; toTreeSize: number; verified: boolean }
+  }
+  assert.equal(fullValue.ok, true, JSON.stringify(fullValue))
+  assert.equal(fullValue.inclusion.sequence, 0)
+  assert.equal(fullValue.inclusion.verified, true, 'the first leaf is committed by the current root')
+  assert.equal(fullValue.consistency.fromTreeSize, 1)
+  assert.equal(fullValue.consistency.toTreeSize, 2)
+  assert.equal(fullValue.consistency.verified, true, 'the current tree provably extends the first published tree')
+
+  // The hostile direction: a root that was never published fails the audit
+  // loudly — the tool recomputes everything, so a forged "published past" is
+  // a finding (ok: false), never a guess.
+  const hostile = await callTool('proof_log_verify', {
+    publishedTreeSize: firstPublish.treeSize,
+    publishedRoot: sha256('a root that was never published'),
+  }, 60_000)
+  assert.equal(hostile.isError, undefined)
+  const hostileValue = hostile.structuredContent as { ok: boolean; problems: string[] }
+  assert.equal(hostileValue.ok, false, 'a fabricated published root must fail the audit')
+  assert.ok(
+    hostileValue.problems.some(p => p.toLowerCase().includes('consistency')),
+    `the problems name the consistency failure: ${JSON.stringify(hostileValue.problems)}`,
+  )
 })
 
 // ---------------------------------------------------------------------------

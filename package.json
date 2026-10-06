@@ -1,6 +1,6 @@
 {
   "name": "dsh-proof",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "description": "Evidence-Driven Completion Proof & Regression Attribution for DeepSeek Harness. Turns \"I'm done\" from a self-report into a recomputable evidence chain, and turns \"I fixed it but broke something else\" from a post-mortem into in-flight attribution.",
   "keywords": [
     "dsh-plugin",
@@ -28,7 +28,8 @@
   },
   "bin": {
     "dsh-proof-mcp": "lib/app/mcp-entry.js",
-    "dsh-proof-cc": "lib/adapters/claude-code/entry.js"
+    "dsh-proof-cc": "lib/adapters/claude-code/entry.js",
+    "dsh-proof-ptl": "lib/app/ptl-entry.js"
   },
   "files": [
     "lib",
@@ -47,6 +48,7 @@
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "mcp": "node --experimental-strip-types src/app/mcp-entry.ts",
     "cc": "node --experimental-strip-types src/adapters/claude-code/entry.ts",
+    "ptl": "node --experimental-strip-types src/app/ptl-entry.ts",
     "bundle:check": "node scripts/check-bundle.mjs"
   },
   "engines": {

@@ -15,6 +15,8 @@
  *                             the same derivation src/index.ts applies)
  *   DSH_PROOF_EVIDENCE_STORE  'host' (default; evidence outside the workspace)
  *                             or 'workspace' (evidence at .proof inside it)
+ *   DSH_PROOF_PTL_DIR         transparency-log directory for proof_publish /
+ *                             proof_log_verify (default <trustRoot>/ptl)
  *   DSH_PROOF_SERVER_VERSION  serverInfo.version override (default '0.14.0')
  *   DSH_HOME                  harness home used by the trust-root default
  *
@@ -64,6 +66,11 @@ async function main(): Promise<void> {
   // same precedence as the plugin (env wins, then DSH_HOME-derived default).
   const trustRoot = envString('DSH_PROOF_TRUST_DIR') ?? nodePath.join(dshHome(), 'proof')
   const evidenceStore = envString('DSH_PROOF_EVIDENCE_STORE') === 'workspace' ? 'workspace' : 'host'
+  // v0.18 (§6): the public transparency log. Default <trustRoot>/ptl — beside
+  // the keys and anchors, never inside the agent-writable workspace, so the
+  // published tree and the operator key (<ptlDir>/operator-key) live on the
+  // host side of the trust boundary. An explicit DSH_PROOF_PTL_DIR wins.
+  const ptlDir = envString('DSH_PROOF_PTL_DIR') ?? nodePath.join(trustRoot, 'ptl')
   const workspaceKey = sha256(root).slice(0, 16)
   // Host mode keeps evidence under the trust root (outside the workspace);
   // workspace mode puts it back at config.ts's default '.proof', relative.
@@ -113,6 +120,10 @@ async function main(): Promise<void> {
     syntheticFalsePass: 0.15,
     syntheticTimeoutMs: 60_000,
     coverage: 'observe',
+    // v0.18: publishing is ON by default in the standalone face — the operator
+    // key (<ptlDir>/operator-key) bootstraps on first publish, exactly like
+    // the workspace chain key under <trustRoot>/keys.
+    ptlDir,
   })
 
   await runMcpServer({
@@ -125,6 +136,7 @@ async function main(): Promise<void> {
     baselinePath: `${storeDir}/baseline.json`,
     anchorPath: `${trustRoot}/anchors/${workspaceKey}/anchor.json`,
     workspaceKey,
+    ptlDir,
     serverVersion: envString('DSH_PROOF_SERVER_VERSION') ?? MCP_DEFAULT_VERSION,
   })
 }

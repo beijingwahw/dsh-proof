@@ -371,6 +371,22 @@ interface LogEnvelope {
   readonly sigError?: string
 }
 
+/**
+ * v0.18: the checkpoint a transparency-log publish mirrors — the payload the
+ * signature covers, the key that signed it, the detached signature, and the
+ * line index it lives at. Returned by `EvidenceStore.latestSignedCheckpoint`.
+ */
+export interface SignedCheckpointView {
+  /** The exact bytes-level material the signature commits to ({count, head, workspaceKey, at}). */
+  readonly payload: { readonly count: number; readonly head: string; readonly workspaceKey: string | null; readonly at: string }
+  /** The signing key's identity (which key the signature must verify under). */
+  readonly keyId: string
+  /** Detached signature over `checkpointSignedData(payload)`. */
+  readonly sig: string
+  /** Index of the checkpoint line within the evidence log. */
+  readonly index: number
+}
+
 /** Content-addressed, append-only, hash-chained evidence store backed by a JSONL file. */
 export class EvidenceStore {
   private readonly fs: FsPort
@@ -831,6 +847,53 @@ export class EvidenceStore {
     // tampering in the log, and failing `ok` on it would conflate "cannot
     // check" with "checked and refuted". Readers consult the flag itself.
     return { ok, total: all.length, corrupt, anchorUnreadable, chain }
+  }
+
+  /**
+   * The last *signature-bearing* checkpoint on the chain, selected with the
+   * audit's own "best" semantics — the checkpoint a transparency-log publish
+   * (v0.18) mirrors into a public, independently verifiable artifact.
+   *
+   * Selection, mirroring `audit`'s anchor answering rule exactly:
+   *
+   * - Candidates are well-formed checkpoints (a count the walk itself refutes
+   *   is excluded — publishing a lying self-report is not "latest", it is
+   *   laundering) that carry a non-empty `sig` AND a non-null `keyId`.
+   * - When the out-of-band anchor exists and names a key, the LAST checkpoint
+   *   by that very key wins — never a positionally-later checkpoint under some
+   *   foreign keyId an attacker appended. No checkpoint of the anchored key at
+   *   all means `undefined`: the anchor is the out-of-band high-water mark of
+   *   OUR key, and nothing on this chain is entitled to stand in for it.
+   * - Without an anchor (never anchored / audited anchor-less), the last
+   *   signed well-formed checkpoint of any key is the honest answer.
+   * - No signed checkpoint at all → `undefined` (an unsigned chain has nothing
+   *   publishable; the caller reports that as a precondition, not a crash).
+   */
+  async latestSignedCheckpoint(): Promise<SignedCheckpointView | undefined> {
+    const lines = await this.fs.readLines(this.logPath)
+    const walk = walkChain(lines)
+    const malformed = new Set(walk.malformedCheckpoints)
+    const signed = walk.checkpoints.filter(cp =>
+      cp.sig !== null && cp.sig.length > 0 && cp.keyId !== null && !malformed.has(cp.index))
+    if (signed.length === 0) return undefined
+    const anchorRaw = this.trust.anchorPath === undefined ? undefined : await this.fs.readFile(this.trust.anchorPath)
+    const anchor = parseAnchor(anchorRaw)
+    const best = anchor !== undefined && anchor.keyId !== ''
+      ? [...signed].findLast(cp => cp.keyId === anchor.keyId) ?? undefined
+      : signed[signed.length - 1]
+    if (best === undefined) return undefined
+    if (best.sig === null || best.keyId === null) return undefined // narrowed for the caller; the filter above already guarantees both
+    return {
+      payload: {
+        count: best.payload.count,
+        head: best.payload.head,
+        workspaceKey: best.payload.workspaceKey,
+        at: best.payload.at,
+      },
+      keyId: best.keyId,
+      sig: best.sig,
+      index: best.index,
+    }
   }
 
   async saveBaseline(baseline: Baseline): Promise<void> {

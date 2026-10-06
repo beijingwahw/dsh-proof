@@ -2169,3 +2169,188 @@ test('M8: loadGraph folds the walk\'s truncation into graph.truncated', async ()
   assert.ok(graph !== undefined)
   assert.equal(graph.truncated, true, 'the walk stopped at its limit; the graph must say so')
 })
+
+// -- v0.18: transparency-log publishing (publishCheckpoint) ----------------------
+
+import { sha256 } from '../src/core/hash.ts'
+import type { SignerPort } from '../src/core/ports.ts'
+import {
+  loadPtl, ptlLeafHash, verifyConsistency, verifyInclusion, verifyTreeHead,
+} from '../src/core/transparency.ts'
+
+/**
+ * Deterministic stand-in keys, one per role: the workspace chain key and the
+ * transparency-log operator key are DIFFERENT keys on purpose — the STH must
+ * speak for the log operator, never borrow the workspace's authority.
+ */
+class FakeKey implements SignerPort {
+  readonly keyId: string
+  constructor(keyId: string) { this.keyId = keyId }
+  async sign(data: string): Promise<string> { return `sig:${this.keyId}:${sha256(data)}` }
+  async verify(data: string, signature: string): Promise<boolean> {
+    return signature === `sig:${this.keyId}:${sha256(data)}`
+  }
+}
+
+const PTL_DIR = `${ROOT}/ptl`
+
+/** The bare signature-check closure T1's verifyTreeHead consumes. */
+const operatorCheck = (key: FakeKey) => (data: string, sig: string): Promise<boolean> => key.verify(data, sig)
+
+/** Engine with a signed chain AND a publishable transparency log. */
+function publishingEngine(fs: MemoryFs, extra: Record<string, unknown> = {}) {
+  return new ProofEngine({
+    root: ROOT,
+    fs,
+    commands: new FakeCommands(),
+    workspace: new FakeWorkspace(ROOT),
+    clock: new FakeClock(),
+    workspaceKey: 'ws',
+    signer: () => Promise.resolve(new FakeKey('ws-key')),
+    ptlDir: PTL_DIR,
+    ptlSigner: () => Promise.resolve(new FakeKey('operator-key')),
+    impactGraphLimit: 1_000,
+    ...extra,
+  })
+}
+
+test('v0.18: publishCheckpoint mirrors the signed checkpoint, signs the tree, and proves inclusion', async () => {
+  const fs = MemoryFs.of(project())
+  const engine = publishingEngine(fs)
+  await engine.establishBaseline()
+
+  const first = await engine.publishCheckpoint()
+  assert.equal(first.duplicate, false, 'the first publish mints a new leaf')
+  assert.equal(first.sequence, 0)
+  assert.equal(first.treeSize, 1)
+  assert.equal(first.logId, 'operator-key', 'the STH names the operator key that signed it')
+
+  // The outcome describes the tree AS PERSISTED: a fresh load through the
+  // same loader a third-party verifier would use recomputes the same root.
+  const { log } = await loadPtl(fs, PTL_DIR)
+  assert.equal(log.size, 1)
+  assert.equal(log.merkleRoot(), first.root, 'sth root is the recomputed Merkle root')
+  assert.equal(first.sth.root, first.root)
+  assert.equal(first.sth.treeSize, 1)
+  assert.equal(first.sth.logId, first.logId)
+  assert.equal(first.at, first.sth.at, 'the outcome timestamp is the STH timestamp')
+
+  // The operator signature genuinely covers the tree head (verifyTreeHead
+  // takes the bare check function — any key-holding party can adjudicate).
+  assert.equal(await verifyTreeHead(first.sth, operatorCheck(new FakeKey('operator-key'))), true)
+  assert.equal(await verifyTreeHead(first.sth, operatorCheck(new FakeKey('ws-key'))), false,
+    'the workspace key does NOT verify the STH — the operator is a separate authority')
+
+  // The published entry is a faithful mirror of the latest signed checkpoint:
+  // same count/head/at/sig/keyId, keyed by the ENGINE's workspace identity.
+  const checkpoint = await engine.storeView.latestSignedCheckpoint()
+  assert.ok(checkpoint !== undefined)
+  const entry = log.entries[0]!
+  assert.equal(entry.v, 1)
+  assert.equal(entry.workspaceKey, 'ws')
+  assert.equal(entry.keyId, checkpoint.keyId)
+  assert.equal(entry.count, checkpoint.payload.count)
+  assert.equal(entry.head, checkpoint.payload.head)
+  assert.equal(entry.at, checkpoint.payload.at)
+  assert.equal(entry.sig, checkpoint.sig)
+  assert.equal(first.leafHash, ptlLeafHash(entry))
+
+  // Inclusion: the leaf is committed by the root, provably. The verifier
+  // takes the ENTRY (it re-derives the leaf hash itself), the proof, and the
+  // recomputed root — exactly the third-party position.
+  assert.equal(
+    verifyInclusion(entry, first.sequence, first.treeSize, first.inclusionProof, first.root),
+    true,
+  )
+})
+
+test('v0.18: republishing the same checkpoint is a duplicate — the tree does not grow', async () => {
+  const fs = MemoryFs.of(project())
+  const engine = publishingEngine(fs)
+  await engine.establishBaseline()
+
+  const first = await engine.publishCheckpoint()
+  const second = await engine.publishCheckpoint()
+  assert.equal(second.duplicate, true, 'nothing new was signed since the first publish')
+  assert.equal(second.treeSize, first.treeSize, 'the tree is unchanged')
+  assert.equal(second.sequence, first.sequence)
+  assert.equal(second.leafHash, first.leafHash)
+  assert.equal(second.root, first.root)
+  assert.equal((await loadPtl(fs, PTL_DIR)).log.size, 1, 'no second leaf landed on the log')
+  assert.equal(await verifyTreeHead(second.sth, operatorCheck(new FakeKey('operator-key'))), true,
+    'a duplicate still returns a genuinely signed (re-asserted) tree head')
+})
+
+test('v0.18: an unsigned chain has nothing publishable — publishCheckpoint throws clean', async () => {
+  const fs = MemoryFs.of(project())
+  // No workspace signer: checkpoints land unsigned, and publishing has
+  // nothing to mirror. The failure must be a clean precondition error, not a
+  // crash or a silently unsigned artifact.
+  const engine = new ProofEngine({
+    root: ROOT,
+    fs,
+    commands: new FakeCommands(),
+    workspace: new FakeWorkspace(ROOT),
+    clock: new FakeClock(),
+    ptlDir: PTL_DIR,
+    ptlSigner: () => Promise.resolve(new FakeKey('operator-key')),
+  })
+  await engine.establishBaseline()
+  assert.equal((await engine.audit()).chain.mode, 'unsigned')
+  await assert.rejects(
+    () => engine.publishCheckpoint(),
+    /no signed checkpoint on the evidence chain.*baseline.*verification/,
+    'the error names the precondition: produce a signed checkpoint first',
+  )
+})
+
+test('v0.18: publishCheckpoint without ptlDir is a configuration error, checked before anything else', async () => {
+  const fs = MemoryFs.of(project())
+  // Fully signed chain, fully provisioned operator — but no ptlDir: the
+  // feature is OFF, and the refusal must say so before touching any state.
+  const engine = publishingEngine(fs, { ptlDir: undefined })
+  await engine.establishBaseline()
+  await assert.rejects(
+    () => engine.publishCheckpoint(),
+    /transparency log not configured \(ptlDir\)/,
+  )
+})
+
+test('v0.18: two checkpoints publish two leaves, and the tree provably extends itself', async () => {
+  const fs = MemoryFs.of(project())
+  const engine = publishingEngine(fs)
+  await engine.establishBaseline()
+  const publish1 = await engine.publishCheckpoint()
+
+  // New work on the chain: verification appends evidence, a marker, and a
+  // NEW signed checkpoint whose count moved past the first one.
+  const outcome = await engine.verify({ changed: ['src/a.ts'] })
+  assert.equal(outcome.report.grade, 'proven')
+  const publish2 = await engine.publishCheckpoint()
+
+  assert.equal(publish2.duplicate, false)
+  assert.equal(publish2.sequence, 1, 'the second checkpoint lands as the second leaf')
+  assert.equal(publish2.treeSize, 2)
+  assert.notEqual(publish2.leafHash, publish1.leafHash)
+
+  const { log } = await loadPtl(fs, PTL_DIR)
+  assert.equal(log.size, 2)
+  assert.ok(log.entries[1]!.count > log.entries[0]!.count,
+    'the second mirror carries the later checkpoint count')
+
+  // Consistency: the size-2 tree provably EXTENDS the size-1 tree publish1
+  // committed to — the log's history cannot have been rewritten between them.
+  assert.equal(
+    verifyConsistency(
+      publish1.treeSize, publish1.sth.root,
+      publish2.treeSize, publish2.sth.root,
+      log.consistencyProof(publish1.treeSize, publish2.treeSize),
+    ),
+    true,
+  )
+  // And the first leaf is still included in the grown tree.
+  assert.equal(
+    verifyInclusion(log.entries[0]!, 0, log.size, log.inclusionProof(0), publish2.root),
+    true,
+  )
+})

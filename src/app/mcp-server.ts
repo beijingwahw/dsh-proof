@@ -8,8 +8,11 @@
  * directly unit-testable) and `runMcpServer` is the thin newline-delimited
  * stdio loop around it.
  *
- * APP/1.0 cross-agent contract: exactly five tools —
- * `MCP_TOOLS` below is the frozen list every consumer agrees on.
+ * APP/1.1 cross-agent contract: exactly seven tools — `MCP_TOOLS` below is
+ * the frozen list every consumer agrees on. (APP/1.0 spoke five; the §6
+ * transparency-log expansion added `proof_publish` and `proof_log_verify`,
+ * and the version bump is what lets an APP/1.0 consumer refuse the wider
+ * dialect instead of guessing at it.)
  *
  * Transport note: MCP stdio is newline-delimited JSON (one JSON-RPC 2.0
  * message per line), NOT LSP-style Content-Length framing. Protocol-level
@@ -23,7 +26,12 @@
 import { createInterface } from 'node:readline'
 
 import type { ProofEngine } from '../engine.ts'
-import { SystemClock } from '../node-ports.ts'
+import { NodeEd25519Signer, SystemClock } from '../node-ports.ts'
+import type { FsPort, SignerPort } from '../core/ports.ts'
+// v0.18 (§6): the transparency-log domain — leaf hashing, Merkle proofs and
+// tree-head verification, all recomputed from the log's own bytes.
+import { loadPtl, ptlLeafHash, verifyConsistency, verifyInclusion, verifyTreeHead } from '../core/transparency.ts'
+import type { PtlEntry } from '../core/transparency.ts'
 import {
   toBaselineValue, toClaimValue, toStatusValue, toVerifyValue,
 } from '../dsh/tools.ts'
@@ -31,10 +39,13 @@ import type { ClaimContract, ClaimKind } from '../core/contract.ts'
 import { buildBundle } from './bundle.ts'
 
 // ---------------------------------------------------------------------------
-// The APP/1.0 contract — frozen with the other agents. Exactly five tools.
+// The APP/1.1 contract — frozen with the other agents. Exactly seven tools.
 // ---------------------------------------------------------------------------
 
-export const MCP_TOOLS = ['proof_status', 'proof_baseline', 'proof_verify', 'proof_claim', 'proof_bundle'] as const
+export const MCP_TOOLS = [
+  'proof_status', 'proof_baseline', 'proof_verify', 'proof_claim', 'proof_bundle',
+  'proof_publish', 'proof_log_verify',
+] as const
 
 /** ζ: the five contract kinds `proof_claim` accepts — mirrors dsh/tools.ts's private list. */
 const CLAIM_KINDS: readonly string[] = ['behavior-preserving', 'behavior-adding', 'perf-budget', 'docs-only', 'llm-jury']
@@ -59,6 +70,13 @@ export interface McpEngineDeps {
   anchorPath: string
   /** Stable workspace identity the bundle manifest is keyed by. */
   workspaceKey: string
+  /**
+   * v0.18: directory of the public transparency log (`proof_publish` /
+   * `proof_log_verify`). Absent = both tools answer a clean configuration
+   * error. The entry derives it from the environment (DSH_PROOF_PTL_DIR,
+   * default `<trustRoot>/ptl`) — the same dir the engine publishes to.
+   */
+  ptlDir?: string
   /** Reported as serverInfo.version (entry injects from env or the constant). */
   serverVersion: string
 }
@@ -75,7 +93,7 @@ export interface McpServerOptions extends McpEngineDeps {
 // ---------------------------------------------------------------------------
 
 export const MCP_SERVER_NAME = 'agent-proof-protocol'
-export const MCP_DEFAULT_VERSION = '0.17.0'
+export const MCP_DEFAULT_VERSION = '0.18.0'
 
 /**
  * Protocol versions this server speaks, newest first. A client asking for a
@@ -160,6 +178,24 @@ const BUNDLE_DESCRIPTION =
   'Export the tamper-evident evidence bundle (evidence log, baseline, anchor) with a digest manifest, for '
   + 'third-party audit or hand-off to another machine. Requires a baseline to exist (run proof_baseline first).'
 
+const PUBLISH_DESCRIPTION =
+  'Publish the latest SIGNED checkpoint of this workspace\'s evidence chain to the public transparency log, and '
+  + 'mint an operator-signed tree head (STH) over the resulting Merkle tree. The published entry carries the '
+  + 'checkpoint\'s own signature, key and {count, head} — publishing mirrors proof, it never re-derives it. Any '
+  + 'third party can then prove with proof_log_verify that this checkpoint was published and not silently '
+  + 'rewritten afterwards. Requires a signed checkpoint on the chain (run proof_baseline or proof_verify first). '
+  + 'Re-publishing the same checkpoint returns duplicate: true and leaves the tree unchanged.'
+
+const LOG_VERIFY_DESCRIPTION =
+  'Audit the public transparency log — every verdict is recomputed from the log\'s own bytes, nothing the caller '
+  + 'asserts is trusted. With no arguments: recompute the Merkle root from the published entries and check the '
+  + 'latest signed tree head against it (its signature is adjudicated when the operator key is present; a missing '
+  + 'key is reported as not-checked, never as valid). With {sequence, leafHash}: re-derive the entry\'s leaf hash '
+  + 'from the log and verify its inclusion proof against the recomputed root. With {publishedTreeSize, '
+  + 'publishedRoot} (they go together): verify the current tree CONSISTENTLY EXTENDS that previously published '
+  + 'tree — proof the history between the two sizes was not rewritten. Arguments combine; any failed check '
+  + 'returns ok: false with the problems named.'
+
 const MCP_TOOL_LIST: ToolDescriptor[] = [
   {
     name: 'proof_status',
@@ -229,6 +265,39 @@ const MCP_TOOL_LIST: ToolDescriptor[] = [
     name: 'proof_bundle',
     description: BUNDLE_DESCRIPTION,
     inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'proof_publish',
+    description: PUBLISH_DESCRIPTION,
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'proof_log_verify',
+    description: LOG_VERIFY_DESCRIPTION,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sequence: {
+          type: 'number',
+          description: 'Verify the inclusion of the entry at this 0-based leaf index. The leaf hash is recomputed '
+            + 'from the log\'s entry — never taken from the caller.',
+        },
+        leafHash: {
+          type: 'string',
+          description: 'A 64-character hex sha256 leaf hash. With `sequence`: compared against the recomputed hash '
+            + 'of that entry. Alone: the entry is located by hash, then inclusion-verified.',
+        },
+        publishedTreeSize: {
+          type: 'number',
+          description: 'A tree size you previously saw published (e.g. from an earlier proof_publish). Must be '
+            + 'paired with publishedRoot; the tool then proves the current tree consistently extends it.',
+        },
+        publishedRoot: {
+          type: 'string',
+          description: 'The 64-character hex Merkle root you previously saw published at that size.',
+        },
+      },
+    },
   },
 ]
 
@@ -419,6 +488,210 @@ async function callBundleTool(deps: McpEngineDeps): Promise<McpToolResult> {
   })
 }
 
+// ---------------------------------------------------------------------------
+// v0.18 (§6): the transparency-log tools
+// ---------------------------------------------------------------------------
+
+async function callPublishTool(deps: McpEngineDeps): Promise<McpToolResult> {
+  // Preconditions (ptlDir configured, a signed checkpoint on the chain, the
+  // operator key resolvable) are the ENGINE's to enforce — each failure throws
+  // a clean error that the dispatcher below answers as an isError result, so
+  // a foreign agent gets the exact precondition it must fix, never a
+  // half-published tree.
+  const outcome = await deps.engine.publishCheckpoint()
+  return toolResult({
+    sequence: outcome.sequence,
+    duplicate: outcome.duplicate,
+    leafHash: outcome.leafHash,
+    treeSize: outcome.treeSize,
+    root: outcome.root,
+    logId: outcome.logId,
+    at: outcome.at,
+    inclusionProof: [...outcome.inclusionProof],
+    sth: outcome.sth,
+  })
+}
+
+/**
+ * The operator key for tree-head adjudication, loaded ONLY when it already
+ * exists on disk. `NodeEd25519Signer.load` bootstraps a missing key — exactly
+ * right for publishing, exactly wrong for a verify tool: minting a key as a
+ * side effect of auditing would write to the very tree under audit and
+ * "verify" against a key that never signed anything.
+ */
+async function operatorSignerFor(fs: FsPort, ptlDir: string): Promise<SignerPort | undefined> {
+  const dir = `${ptlDir.replace(/[\/]+$/, '')}/operator-key`
+  try {
+    const names = await fs.readDir(dir)
+    if (names === undefined || !names.some(name => name.endsWith('proof-signing-key.pem'))) return undefined
+    return await NodeEd25519Signer.load(dir)
+  } catch {
+    // A key directory we cannot even probe is a missing capability, not an
+    // accusation — reported as not-checked by the caller.
+    return undefined
+  }
+}
+
+/** 64-character lowercase hex (a sha256 digest on the wire). */
+function isHexDigest(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value)
+}
+
+async function callLogVerifyTool(deps: McpEngineDeps, args: Record<string, unknown>): Promise<McpToolResult> {
+  if (deps.ptlDir === undefined) {
+    return toolError({
+      error: 'proof_log_verify: transparency log not configured (ptlDir) — start the server with DSH_PROOF_PTL_DIR set',
+    })
+  }
+  // Argument adjudication: usage errors (wrong types, unpairable parameters)
+  // are tool errors; findings about the LOG are audit results (ok: false).
+  // Nothing the caller asserts is trusted — sequence/leafHash are recomputed
+  // from the log's own entries, and only then compared.
+  const sequenceArg = args.sequence
+  if (sequenceArg !== undefined
+    && (typeof sequenceArg !== 'number' || !Number.isInteger(sequenceArg) || sequenceArg < 0)) {
+    return toolError({ error: `proof_log_verify: sequence must be a non-negative integer (got ${JSON.stringify(sequenceArg)})` })
+  }
+  const leafHashArg = args.leafHash
+  if (leafHashArg !== undefined && !isHexDigest(leafHashArg)) {
+    return toolError({ error: `proof_log_verify: leafHash must be a 64-character hex sha256 digest (got ${JSON.stringify(leafHashArg)})` })
+  }
+  const sizeArg = args.publishedTreeSize
+  if (sizeArg !== undefined && (typeof sizeArg !== 'number' || !Number.isInteger(sizeArg) || sizeArg < 1)) {
+    return toolError({ error: `proof_log_verify: publishedTreeSize must be a positive integer (got ${JSON.stringify(sizeArg)})` })
+  }
+  const rootArg = args.publishedRoot
+  if (rootArg !== undefined && !isHexDigest(rootArg)) {
+    return toolError({ error: `proof_log_verify: publishedRoot must be a 64-character hex sha256 digest (got ${JSON.stringify(rootArg)})` })
+  }
+  if ((sizeArg !== undefined) !== (rootArg !== undefined)) {
+    return toolError({
+      error: 'proof_log_verify: publishedTreeSize and publishedRoot must be supplied together — a consistency '
+        + 'proof binds a tree size to its root; one without the other proves nothing',
+    })
+  }
+
+  const fs = deps.engine.fsView
+  const { log, sth: head, badLines } = await loadPtl(fs, deps.ptlDir)
+  if (log.size === 0) {
+    return toolError({
+      error: `proof_log_verify: the transparency log at ${deps.ptlDir} holds no entries — publish with proof_publish first`,
+    })
+  }
+  const problems: string[] = []
+  if (badLines > 0) {
+    problems.push(`${badLines} malformed entry line(s) skipped while loading ${deps.ptlDir} — the readable prefix was audited, but the log is not sound`)
+  }
+  const treeSize = log.size
+  // The root is recomputed from the published leaves before anything else is
+  // said: every later check compares against THIS number, never against a
+  // root the head file or the caller handed over.
+  const root = log.merkleRoot()
+
+  // -- the signed tree head: present, honest about the tree, genuinely signed --
+  let treeHead: Record<string, unknown> | undefined
+  if (head === undefined) {
+    problems.push(`no signed tree head in ${deps.ptlDir} — the published tree carries no operator commitment`)
+  } else {
+    const sizeMatches = head.treeSize === treeSize
+    const rootMatches = head.root === root
+    if (!sizeMatches) {
+      problems.push(`tree head speaks treeSize ${head.treeSize} but the log holds ${treeSize} entries — entries were appended after the last head, or the head was rewritten`)
+    }
+    if (!rootMatches) {
+      problems.push(`tree head root ${head.root} does not match the root recomputed from the log (${root})`)
+    }
+    const operator = await operatorSignerFor(fs, deps.ptlDir)
+    let signature: 'verified' | 'invalid' | 'not-checked (operator key absent)'
+    if (operator === undefined) {
+      signature = 'not-checked (operator key absent)'
+    } else {
+      signature = await verifyTreeHead(head, (data, sig) => operator.verify(data, sig))
+        ? 'verified'
+        : 'invalid'
+      if (signature === 'invalid') {
+        problems.push('tree head signature does not verify under the operator key — the head file was rewritten, or signed by a different key')
+      }
+    }
+    treeHead = {
+      logId: head.logId,
+      treeSize: head.treeSize,
+      root: head.root,
+      at: head.at,
+      sizeMatches,
+      rootMatches,
+      signature,
+    }
+  }
+
+  // -- inclusion: the entry at `sequence` (or by leafHash) is committed by the root --
+  let inclusion: Record<string, unknown> | undefined
+  if (sequenceArg !== undefined || leafHashArg !== undefined) {
+    let sequence: number | undefined
+    let entry: PtlEntry | undefined
+    let leaf: string | undefined
+    if (sequenceArg !== undefined) {
+      if (sequenceArg >= treeSize) {
+        return toolError({
+          error: `proof_log_verify: sequence ${sequenceArg} is outside the log (treeSize ${treeSize}) — the log never shrinks`,
+        })
+      }
+      sequence = sequenceArg
+      entry = log.entries[sequence]
+      // Recomputed from the log's own entry: the caller's leafHash (when
+      // given) is compared against THIS, never the other way round.
+      leaf = entry !== undefined ? ptlLeafHash(entry) : undefined
+    } else {
+      const found = log.entries.findIndex(candidate => ptlLeafHash(candidate) === leafHashArg)
+      if (found < 0) {
+        problems.push(`no entry in the log hashes to ${leafHashArg}`)
+      } else {
+        sequence = found
+        entry = log.entries[found]
+        leaf = leafHashArg
+      }
+    }
+    if (sequence !== undefined && leaf !== undefined && leafHashArg !== undefined && leafHashArg !== leaf) {
+      problems.push(`the entry at sequence ${sequence} hashes to ${leaf}, not the asserted ${leafHashArg}`)
+    }
+    if (sequence !== undefined && entry !== undefined && leaf !== undefined) {
+      const proof = log.inclusionProof(sequence)
+      const verified = verifyInclusion(entry, sequence, treeSize, proof, root)
+      if (!verified) {
+        problems.push(`inclusion proof for sequence ${sequence} does not verify against the recomputed root`)
+      }
+      inclusion = { sequence, leafHash: leaf, verified }
+    }
+  }
+
+  // -- consistency: the current tree extends the previously published one --
+  let consistency: Record<string, unknown> | undefined
+  if (sizeArg !== undefined && rootArg !== undefined) {
+    if (sizeArg > treeSize) {
+      return toolError({
+        error: `proof_log_verify: publishedTreeSize ${sizeArg} exceeds the current tree size ${treeSize} — the log never shrinks, so no consistency proof to a larger "past" can exist`,
+      })
+    }
+    // Equal sizes are the identity case T1's verifyConsistency adjudicates
+    // itself (empty proof, roots must be equal).
+    const verified = verifyConsistency(sizeArg, rootArg, treeSize, root, log.consistencyProof(sizeArg, treeSize))
+    if (!verified) {
+      problems.push(`consistency proof from tree size ${sizeArg} to ${treeSize} does not verify — the current tree is not an extension of the published one (history was rewritten)`)
+    }
+    consistency = { fromTreeSize: sizeArg, fromRoot: rootArg, toTreeSize: treeSize, verified }
+  }
+
+  return toolResult({
+    ok: problems.length === 0,
+    treeSize,
+    root,
+    ...(treeHead !== undefined ? { treeHead } : {}),
+    ...(inclusion !== undefined ? { inclusion } : {}),
+    ...(consistency !== undefined ? { consistency } : {}),
+    ...(problems.length > 0 ? { problems } : {}),
+  })
+}
+
 async function callTool(deps: McpEngineDeps, params: unknown): Promise<McpToolResult> {
   const name = typeof params === 'object' && params !== null
     ? (params as { name?: unknown }).name
@@ -431,6 +704,8 @@ async function callTool(deps: McpEngineDeps, params: unknown): Promise<McpToolRe
       case 'proof_verify': return await callVerifyTool(deps, args)
       case 'proof_claim': return await callClaimTool(deps, args)
       case 'proof_bundle': return await callBundleTool(deps)
+      case 'proof_publish': return await callPublishTool(deps)
+      case 'proof_log_verify': return await callLogVerifyTool(deps, args)
       default:
         // Unknown tool: MCP tool-error semantics (isError result), with the
         // name spelled out so a foreign agent can self-correct.

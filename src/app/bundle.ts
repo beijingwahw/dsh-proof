@@ -1,5 +1,5 @@
 /**
- * APP/1.0 proof bundles — the portable exchange format for a dsh-proof
+ * APP/1.1 proof bundles — the portable exchange format for a dsh-proof
  * evidence chain.
  *
  * A bundle is the minimal set of artifacts a *third party* needs to
@@ -27,7 +27,8 @@ import { Buffer } from 'node:buffer'
 import { addressOf, sha256 } from '../core/hash.ts'
 import { checkpointSignedData, parseAnchor, walkChain } from '../core/trust.ts'
 import type { ChainMode } from '../core/trust.ts'
-import { appFingerprint, protocolHeader } from './protocol.ts'
+import type { SignedTreeHead } from '../core/transparency.ts'
+import { appFingerprint, protocolHeader, PROTOCOL_VERSION } from './protocol.ts'
 import type { BundleManifest } from './protocol.ts'
 
 /** The log file every bundle carries; the format `core/trust.ts` walks. */
@@ -53,13 +54,50 @@ export interface BundleInput {
 }
 
 /**
+ * The transparency-log publication record a manifest may carry: where the
+ * bundle's evidence chain was published in an append-only Proof Transparency
+ * Log, so a third party can later prove the published history was not
+ * quietly rewritten (a consistency proof between `publishedHead` and any
+ * newer signed tree head cannot be forged for a rewritten log).
+ *
+ * `leafHash` binds the bundle's latest signed checkpoint to one log entry;
+ * `publishedHead` is the signed tree head exactly as it stood at publication
+ * time; `inclusionProof` is the auditor's merkle path at that tree size.
+ */
+export interface ManifestTransparency {
+  /** Identity of the log the entry landed in (the log operator's key id). */
+  readonly logId: string
+  /** Zero-based position of the entry in the log. */
+  readonly sequence: number
+  /** `ptlLeafHash(entry)` — the value inclusion proofs attest. */
+  readonly leafHash: string
+  /** The signed tree head at publication time. */
+  readonly publishedHead: SignedTreeHead
+  /** Merkle inclusion path (node digests, bottom-up) at publication size. */
+  readonly inclusionProof: readonly string[]
+}
+
+/**
+ * A manifest that may carry a transparency publication record. The field is
+ * optional and additive — bundles built before it existed verify exactly as
+ * they always did.
+ */
+export type TransparentBundleManifest = BundleManifest & { readonly transparency?: ManifestTransparency }
+
+/** Optional extras `buildBundle` can stamp into the manifest. */
+export interface BundleExtras {
+  /** Transparency-log publication record; absent means "not published". */
+  readonly transparency?: ManifestTransparency
+}
+
+/**
  * A portable proof bundle: the manifest (protocol header + file digests) and
  * the files themselves, keyed by path. JSON-serialisable as-is; `buildBundle`
  * fixes the key order (`manifest` first, then `files` in the canonical file
  * order) so two producers packing the same input emit identical bytes.
  */
 export interface ProofBundle {
-  readonly manifest: BundleManifest
+  readonly manifest: TransparentBundleManifest
   readonly files: Record<string, string>
 }
 
@@ -98,6 +136,12 @@ export interface BundleVerification {
   readonly baselineId?: string
   /** Whether the baseline's `baselineId` still addresses its own material. */
   readonly baselineSelfAddressed: boolean
+  /**
+   * Adjudication of the manifest's transparency record, when it carries one:
+   * `recorded` (structurally valid) or `malformed` (with a problem naming
+   * why). Structural only — see the transparency section of `verifyBundle`.
+   */
+  readonly transparency?: 'recorded' | 'malformed'
   /** Human-readable anomaly list; empty means the bundle verified clean. */
   readonly problems: readonly string[]
 }
@@ -106,9 +150,18 @@ export interface BundleVerification {
  * Pack a proof bundle. Deterministic: the same input, workspace key and
  * timestamp always produce byte-identical JSON — `manifest` first, `files`
  * in the canonical order (`evidence.jsonl` → `baseline.json`? → `anchor.json`?),
- * manifest fields in `protocolHeader` order.
+ * manifest fields in `protocolHeader` order with `transparency` (when
+ * supplied) appended last.
+ *
+ * `extras` is optional and additive; every pre-existing three-argument call
+ * keeps its exact bytes.
  */
-export function buildBundle(input: BundleInput, workspaceKey: string, createdAt: string): ProofBundle {
+export function buildBundle(
+  input: BundleInput,
+  workspaceKey: string,
+  createdAt: string,
+  extras?: BundleExtras,
+): ProofBundle {
   const files: Record<string, string> = {}
   const entries: ManifestFileEntry[] = []
   const pack = (path: string, contents: string): void => {
@@ -118,7 +171,11 @@ export function buildBundle(input: BundleInput, workspaceKey: string, createdAt:
   pack(EVIDENCE_FILE, input.evidenceLog)
   if (input.baselineJson !== undefined) pack(BASELINE_FILE, input.baselineJson)
   if (input.anchorJson !== undefined) pack(ANCHOR_FILE, input.anchorJson)
-  const manifest: BundleManifest = { ...protocolHeader(workspaceKey, createdAt), files: entries }
+  const manifest: TransparentBundleManifest = {
+    ...protocolHeader(workspaceKey, createdAt),
+    ...(extras?.transparency !== undefined ? { transparency: extras.transparency } : {}),
+    files: entries,
+  }
   return { manifest, files }
 }
 
@@ -130,9 +187,10 @@ export function buildBundle(input: BundleInput, workspaceKey: string, createdAt:
  * promise exists only because the optional anchor-signature check is async.
  *
  * Checks, in order:
- * 1. **Protocol identity** — the manifest speaks `APP/1.0` and carries this
- *    implementation's `appFingerprint()`. A dialect we cannot reproduce must
- *    be refused, not guessed at.
+ * 1. **Protocol identity** — the manifest speaks this module's
+ *    `PROTOCOL_VERSION` and carries this implementation's
+ *    `appFingerprint()`. A dialect we cannot reproduce must be refused, not
+ *    guessed at.
  * 2. **Manifest vs files** — every listed path is present with a matching
  *    digest and byte length; files the manifest does not list are anomalies.
  * 3. **Chain walk** — `walkChain` over the log's lines; breaks and corrupt
@@ -148,6 +206,13 @@ export function buildBundle(input: BundleInput, workspaceKey: string, createdAt:
  * 5. **Baseline** (when carried) — parsed; its `baselineId` must still
  *    address the same material `buildBaseline` hashed (`createdAt`,
  *    `workspace`, `checkIds`, `root`).
+ * 6. **Transparency record** (when the manifest carries one) — structural
+ *    adjudication only: shapes, ranges and the proof-length bound that can
+ *    be judged from the manifest alone. Whether the entry actually sits in
+ *    the log (leaf hash match, inclusion, consistency against the current
+ *    head) requires the log itself, which a bundle deliberately does not
+ *    carry — that adjudication belongs to the PTL CLI / MCP auditor holding
+ *    the log, and this verifier must not pretend to have done it.
  */
 export async function verifyBundle(
   bundle: ProofBundle,
@@ -157,13 +222,16 @@ export async function verifyBundle(
 
   // Untrusted input: the bundle may be hand-crafted, so read it defensively.
   const raw = (bundle ?? {}) as unknown as Partial<ProofBundle>
-  const manifest = (raw.manifest ?? {}) as Partial<BundleManifest>
+  const manifest = (raw.manifest ?? {}) as Partial<TransparentBundleManifest>
   const files = (raw.files ?? {}) as Record<string, string>
 
   // -- 1. protocol identity ------------------------------------------------
-  const protocolOk = manifest.protocol === 'APP/1.0' && manifest.appFingerprint === appFingerprint()
-  if (manifest.protocol !== 'APP/1.0') {
-    problems.push(`unsupported bundle protocol: ${JSON.stringify(manifest.protocol)} (expected "APP/1.0")`)
+  // The dialect spoken is whatever THIS module speaks (PROTOCOL_VERSION,
+  // APP/1.1 since the §6 tool-surface expansion) — never a hardcoded string,
+  // so a version bump moves the check and the producer in the same commit.
+  const protocolOk = manifest.protocol === PROTOCOL_VERSION && manifest.appFingerprint === appFingerprint()
+  if (manifest.protocol !== PROTOCOL_VERSION) {
+    problems.push(`unsupported bundle protocol: ${JSON.stringify(manifest.protocol)} (expected "${PROTOCOL_VERSION}")`)
   } else if (manifest.appFingerprint !== appFingerprint()) {
     problems.push('app fingerprint mismatch: the manifest was produced by a different implementation')
   }
@@ -291,6 +359,25 @@ export async function verifyBundle(
     }
   }
 
+  // -- 6. transparency record (optional) ------------------------------------
+  // Structural adjudication ONLY (see the doc comment above): the manifest
+  // alone can prove a record could never be valid — a leaf hash that is not
+  // a digest, a sequence below zero, a proof longer than the tree has nodes
+  // to explain, a published head missing its own fields. It cannot prove a
+  // well-shaped record is *true*; that needs the log, and pretending
+  // otherwise here would hand a forger a check the bundle never cashed.
+  let transparency: 'recorded' | 'malformed' | undefined
+  const rawTransparency = manifest.transparency
+  if (rawTransparency !== undefined) {
+    const reason = transparencyMalformation(rawTransparency)
+    if (reason === undefined) {
+      transparency = 'recorded'
+    } else {
+      transparency = 'malformed'
+      problems.push(`malformed transparency record: ${reason}`)
+    }
+  }
+
   return {
     protocolOk,
     manifestOk,
@@ -302,8 +389,61 @@ export async function verifyBundle(
     ...(anchor !== undefined ? { anchor } : {}),
     ...(baselineId !== undefined ? { baselineId } : {}),
     baselineSelfAddressed,
+    ...(transparency !== undefined ? { transparency } : {}),
     problems,
   }
+}
+
+/**
+ * Why a manifest's transparency record could never be valid, or `undefined`
+ * when it is structurally sound. Pure shape/bound checking — no hashes over
+ * material the bundle does not carry, no log lookups.
+ */
+function transparencyMalformation(value: unknown): string | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return 'not an object'
+  const record = value as Partial<ManifestTransparency> & { publishedHead?: unknown; inclusionProof?: unknown }
+  if (typeof record.logId !== 'string' || record.logId.length === 0) {
+    return 'logId must be a non-empty string'
+  }
+  if (typeof record.sequence !== 'number' || !Number.isSafeInteger(record.sequence) || record.sequence < 0) {
+    return 'sequence must be a non-negative safe integer'
+  }
+  if (typeof record.leafHash !== 'string' || !/^[0-9a-f]{64}$/.test(record.leafHash)) {
+    return 'leafHash must be 64 lowercase hex characters'
+  }
+  const head = record.publishedHead
+  if (head === null || typeof head !== 'object' || Array.isArray(head)) {
+    return 'publishedHead must be an object'
+  }
+  const published = head as Partial<SignedTreeHead>
+  if (typeof published.logId !== 'string' || published.logId.length === 0) {
+    return 'publishedHead.logId must be a non-empty string'
+  }
+  // treeSize >= 1: a head over zero leaves attests nothing, and a proof bound
+  // computed from it (ceil(log2 0) + 1) would be meaningless.
+  if (typeof published.treeSize !== 'number' || !Number.isSafeInteger(published.treeSize) || published.treeSize < 1) {
+    return 'publishedHead.treeSize must be a positive safe integer'
+  }
+  if (typeof published.root !== 'string' || !/^[0-9a-f]{64}$/.test(published.root)) {
+    return 'publishedHead.root must be 64 lowercase hex characters'
+  }
+  if (typeof published.at !== 'string' || published.at.length === 0) {
+    return 'publishedHead.at must be a non-empty string'
+  }
+  if (typeof published.sig !== 'string' || published.sig.length === 0) {
+    return 'publishedHead.sig must be a non-empty string'
+  }
+  const proof = record.inclusionProof
+  if (!Array.isArray(proof) || proof.some(node => typeof node !== 'string')) {
+    return 'inclusionProof must be an array of strings'
+  }
+  // A merkle tree of N leaves explains at most ceil(log2(N)) + 1 proof nodes;
+  // anything longer can never be a valid path, whatever the log later says.
+  const maxNodes = Math.ceil(Math.log2(published.treeSize)) + 1
+  if (proof.length > maxNodes) {
+    return `inclusionProof has ${proof.length} nodes but a tree of ${published.treeSize} leaves explains at most ${maxNodes}`
+  }
+  return undefined
 }
 
 /** Split a log into lines, dropping the trailing empty line of a newline-terminated file. */

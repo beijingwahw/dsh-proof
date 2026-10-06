@@ -36,3 +36,18 @@ export {
   MCP_TOOLS, createMcpHandler, runMcpServer,
   type McpEngineDeps,
 } from './mcp-server.ts'
+
+// v0.18: the transparency-log domain the bundle manifest (`transparency`
+// record) and the MCP tools (`proof_publish` / `proof_log_verify`) publish
+// into. Re-exported from the app barrel — not the core barrel — because it
+// is the audit vocabulary of the artifacts this layer defines: a third party
+// holding a bundle with a transparency record needs exactly these functions
+// to adjudicate it against any log copy. The write path (appendPtlEntry /
+// savePtlHead) and the CLI entry (ptl-entry.ts) stay unexported — appending
+// is the operator's job, and `ptl-entry` is a process entry like
+// `mcp-entry`, not a library.
+export {
+  TransparencyLog, loadPtl, ptlLeafHash, sthSignedData, verifyConsistency,
+  verifyInclusion, verifyTreeHead,
+  type PtlEntry, type SignedTreeHead,
+} from '../core/transparency.ts'

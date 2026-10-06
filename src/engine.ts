@@ -68,6 +68,14 @@ import {
   coverageGate, parseV8CoverageReport, summarizeCoverage,
 } from './core/coverage.ts'
 import type { CoverageSummary } from './core/coverage.ts'
+// v0.18: the transparency-log domain (PTL entries, signed tree heads, Merkle
+// proofs). Consumed straight from its module — the same discipline as the
+// contract/attestation/synthetic/coverage imports above: the core barrel is
+// not this batch's to edit, and a direct import keeps the dependency explicit.
+import {
+  appendPtlEntry, loadPtl, ptlLeafHash, savePtlHead, sthSignedData,
+} from './core/transparency.ts'
+import type { PtlEntry, SignedTreeHead } from './core/transparency.ts'
 import { NodeCommandPort, NodeEd25519Signer, NodeFsPort, GitWorkspace, SystemClock } from './node-ports.ts'
 
 export interface EngineOptions {
@@ -86,6 +94,25 @@ export interface EngineOptions {
   readonly checkpointEvery?: number
   /** Explicit signer provider; overrides trustDir-derived Ed25519. */
   readonly signer?: () => Promise<SignerPort | undefined>
+  /**
+   * v0.18: directory of the public transparency log (PTL) this engine
+   * publishes signed checkpoints to (`publishCheckpoint`). Absent = the
+   * feature is off and `publishCheckpoint` throws a clean configuration
+   * error. The directory is owned by the transparency-log operator, not by
+   * the agent — hosts place it under the trust root, outside the workspace.
+   */
+  readonly ptlDir?: string
+  /**
+   * v0.18: provider for the transparency-log OPERATOR key — the key that
+   * signs SignedTreeHeads over the published log. Deliberately a separate
+   * key from the workspace chain signer (`signer`): the chain signer speaks
+   * for the host over its own evidence log; the operator key speaks for the
+   * LOG OPERATOR over the public Merkle tree, and rotating one must never
+   * rotate the other. When omitted, the engine defaults to an Ed25519 key
+   * loaded from `<ptlDir>/operator-key` (created on first use), with v0.17
+   * M15 resolution semantics: only a successful load is cached.
+   */
+  readonly ptlSigner?: () => Promise<SignerPort | undefined>
   readonly autoDiscover?: boolean
   readonly checks?: readonly CheckConfigEntry[]
   readonly checkTimeoutMs?: number
@@ -321,6 +348,36 @@ export type ContractVerifyOptions = VerifyOptions & { readonly contract: ClaimCo
 export type ContractVerifyOutcome = VerifyOutcome & { readonly contract: ContractSummary }
 
 /**
+ * v0.18: what one transparency-log publish produced. The entry mirrors the
+ * latest signed checkpoint into the public Merkle tree; the SignedTreeHead is
+ * the operator's signature over that tree ({logId, treeSize, root, at}); the
+ * inclusion proof lets any third party verify the entry is committed by the
+ * root WITHOUT trusting the publisher. `duplicate: true` means the exact
+ * checkpoint was already on the public log — the tree is unchanged, and the
+ * returned values describe the entry's existing position.
+ */
+export interface PublishOutcome {
+  /** Position of the entry in the public log (0-based leaf index). */
+  readonly sequence: number
+  /** True when the checkpoint was already published — the tree did not grow. */
+  readonly duplicate: boolean
+  /** The entry's Merkle leaf hash (`ptlLeafHash(entry)`). */
+  readonly leafHash: string
+  /** Leaves in the tree after this publish. */
+  readonly treeSize: number
+  /** Merkle root over every published leaf. */
+  readonly root: string
+  /** Stable identity of the public log the STH speaks for. */
+  readonly logId: string
+  /** ISO timestamp of the SignedTreeHead (NOT of the mirrored checkpoint). */
+  readonly at: string
+  /** Audit path from the entry's leaf to the root. */
+  readonly inclusionProof: readonly string[]
+  /** The operator-signed tree head, also persisted as the log's head file. */
+  readonly sth: SignedTreeHead
+}
+
+/**
  * π: what `conjureRun` reports back to the model-facing tool.
  *
  * `status: 'skipped'` means the script was REFUSED at screening and never
@@ -506,9 +563,27 @@ export class ProofEngine {
   private graph: DependencyGraph | undefined
   private baselineSeen = false
   private signerPromise: Promise<SignerPort | undefined> | undefined
+  /** v0.18: the transparency log's directory, when publishing is configured. */
+  private readonly ptlDir: string | undefined
+  /** v0.18: operator-key provider for SignedTreeHeads (default: `<ptlDir>/operator-key`). */
+  private readonly ptlSignerProvider: (() => Promise<SignerPort | undefined>) | undefined
+  /** v0.18: M15 memoization for the operator signer — only a SUCCESSFUL load is cached. */
+  private ptlSignerPromise: Promise<SignerPort | undefined> | undefined
+  /** v0.18: bounded reason the last operator-signer resolution failed, for the clean throw. */
+  private ptlSignerError: string | undefined
+  /**
+   * v0.18: single-flight for every PTL-mutating operation. Two racing
+   * `publishCheckpoint` calls would both `loadPtl` at the same size and both
+   * append — the public log would then carry the same leaf twice and the tree
+   * would grow on a duplicate. Same discipline as the store's tail queue:
+   * serialise the read–append–sign section; reads elsewhere stay concurrent.
+   */
+  private ptlQueue: Promise<unknown> = Promise.resolve()
   private readonly resolver: DefinitionResolverPort | undefined
   private readonly logger: ((message: string) => void) | undefined
   private readonly verbose: boolean
+  /** v0.18: the stable workspace identity checkpoints (and PTL entries) carry. */
+  private readonly workspaceKey: string
   /** κ: where the evidence log physically lives — marker payloads (attestations) are read back through it. */
   private readonly logPath: string
   /** κ: trust weights for Class B/C evidence, synthesised from config passthrough. */
@@ -562,6 +637,17 @@ export class ProofEngine {
       humanProbability: DEFAULT_TRUST_WEIGHTS.humanProbability,
     }
     const workspaceKey = options.workspaceKey ?? 'default'
+    // v0.18: transparency-log wiring. `ptlDir` is normalised once (trailing
+    // slashes folded — every composition below is `${ptlDir}/...`); the
+    // operator-signer default loads an Ed25519 key from `<ptlDir>/operator-key`
+    // (NodeEd25519Signer.load bootstraps it on first use, the same rule the
+    // workspace chain key follows under trustDir).
+    this.workspaceKey = workspaceKey
+    this.ptlDir = options.ptlDir !== undefined ? options.ptlDir.replace(/[\/]+$/, '') : undefined
+    this.ptlSignerProvider = options.ptlSigner
+      ?? (this.ptlDir !== undefined
+        ? () => NodeEd25519Signer.load(`${this.ptlDir}/operator-key`)
+        : undefined)
     // E2: whichever provider wins (host-injected or trustDir-derived), it is
     // wrapped so a load failure can never pass silently — the downgrade itself
     // becomes a chain marker, and the verbose channel gets a line.
@@ -753,6 +839,138 @@ export class ProofEngine {
   /** Integrity check of the evidence log: chain, signatures, anchor, baseline. */
   async audit(): Promise<AuditReport> {
     return this.store.audit()
+  }
+
+  // -- transparency log (v0.18) -----------------------------------------------
+
+  /**
+   * v0.18: publish the latest signed checkpoint to the public transparency
+   * log and mint an operator-signed tree head over it.
+   *
+   * The publish is a MIRROR, not a re-derivation: the entry carries the
+   * checkpoint's own {count, head, at, sig, keyId} (the exact bytes the
+   * host's signature already committed to), keyed by THIS engine's
+   * workspaceKey, and nothing else. Because the entry is a pure function of
+   * the checkpoint, republishing the same checkpoint mints the byte-identical
+   * leaf — detected as `duplicate: true` and the tree does not grow, so the
+   * public log cannot be padded by re-publishing.
+   *
+   * Preconditions, each failing with a clean throw (never a half-published
+   * tree):
+   * - `ptlDir` configured — otherwise 'transparency log not configured'.
+   * - a signed checkpoint exists on the chain (baseline/verify produce one;
+   *   an unsigned chain has nothing publishable).
+   * - the operator signer resolves — a SignedTreeHead cannot be unsigned.
+   *
+   * Order of operations: load → (append + reload) → sign STH over the tree
+   * {logId, treeSize, root, at} → persist the head → inclusion proof for the
+   * entry's (possibly pre-existing) sequence. All under the PTL single-flight
+   * queue — see `ptlQueue`.
+   */
+  async publishCheckpoint(): Promise<PublishOutcome> {
+    return this.enqueuePtl(() => this.publishCheckpointInternal())
+  }
+
+  private enqueuePtl<T>(op: () => Promise<T>): Promise<T> {
+    const next = this.ptlQueue.then(op)
+    // Completion, never outcome: a rejected publish must not poison the queue
+    // for the publishes queued behind it (the store's tail queue discipline).
+    this.ptlQueue = next.catch(() => undefined)
+    return next
+  }
+
+  private async publishCheckpointInternal(): Promise<PublishOutcome> {
+    if (this.ptlDir === undefined) {
+      throw new Error('transparency log not configured (ptlDir) — pass EngineOptions.ptlDir to enable publishCheckpoint')
+    }
+    const checkpoint = await this.store.latestSignedCheckpoint()
+    if (checkpoint === undefined) {
+      throw new Error(
+        'no signed checkpoint on the evidence chain — establish a baseline or run a verification first '
+        + '(publishCheckpoint mirrors the latest SIGNED checkpoint; an unsigned chain has nothing publishable)',
+      )
+    }
+    // Precondition before any mutation: a publish that cannot end in a signed
+    // tree head must not leave a headless entry on the public log.
+    const operator = await this.resolvePtlSigner()
+    if (operator === undefined) {
+      throw new Error(
+        `transparency log operator signer unavailable${this.ptlSignerError !== undefined ? ` (${this.ptlSignerError})` : ' (no ptlSigner provider)'}`
+        + ' — a SignedTreeHead cannot be minted unsigned',
+      )
+    }
+    // Pure function of the checkpoint: `at` comes from the payload, not from
+    // the clock, so the same checkpoint always addresses to the same leaf —
+    // appendPtlEntry dedupes by leaf hash, which is what keeps a re-publish
+    // from padding the tree.
+    const entry: PtlEntry = {
+      v: 1,
+      workspaceKey: this.workspaceKey,
+      keyId: checkpoint.keyId,
+      count: checkpoint.payload.count,
+      head: checkpoint.payload.head,
+      at: checkpoint.payload.at,
+      sig: checkpoint.sig,
+    }
+    const { sequence, duplicate } = await appendPtlEntry(this.fs, this.ptlDir, entry)
+    // Reload through the same loader a third-party verifier will use: the
+    // outcome's treeSize/root/proof describe the tree AS PERSISTED, never an
+    // in-memory projection of it.
+    const { log } = await loadPtl(this.fs, this.ptlDir)
+    // Per the STH contract, `logId` names the OPERATOR key that signed the
+    // head — it is how a verifier knows whose signature to adjudicate under.
+    const unsignedHead = {
+      logId: operator.keyId,
+      treeSize: log.size,
+      root: log.merkleRoot(),
+      at: new Date(this.clock.now()).toISOString(),
+    }
+    // Even a duplicate publish re-signs the head: the STH is an independent
+    // operator assertion over the (unchanged) tree, stamped with its own `at`.
+    // Re-asserting the same root under a fresh signature is harmless; quietly
+    // returning a stale head would smuggle an old timestamp into a new answer.
+    // (savePtlHead enforces exactly this: same tree must not rewind its root
+    // or timestamp.)
+    const sth: SignedTreeHead = { ...unsignedHead, sig: await operator.sign(sthSignedData(unsignedHead)) }
+    await savePtlHead(this.fs, this.ptlDir, sth)
+    return {
+      sequence,
+      duplicate,
+      leafHash: ptlLeafHash(entry),
+      treeSize: sth.treeSize,
+      root: sth.root,
+      logId: sth.logId,
+      at: sth.at,
+      inclusionProof: [...log.inclusionProof(sequence)],
+      sth,
+    }
+  }
+
+  /**
+   * v0.18: resolve the operator signer with v0.17 M15 semantics — only a
+   * SUCCESSFUL resolution is memoized. A rejected or empty resolution resets
+   * the memo (the next publish retries the provider, so a transient key-dir
+   * lock heals on the next boundary) and, unlike the store's signer, the
+   * failure text is kept: publishing has no unsigned degradation to fall back
+   * on, so the next attempt's clean throw can name the actual reason.
+   */
+  private async resolvePtlSigner(): Promise<SignerPort | undefined> {
+    if (this.ptlSignerProvider === undefined) return undefined
+    if (this.ptlSignerPromise === undefined) {
+      const attempt = this.ptlSignerProvider().then(
+        signer => {
+          if (signer === undefined) this.ptlSignerPromise = undefined // not provisioned yet — ask again next time
+          return signer
+        },
+        reason => {
+          this.ptlSignerError = failureText(reason)
+          this.ptlSignerPromise = undefined // transient failure — retry on the next publish
+          return undefined
+        },
+      )
+      this.ptlSignerPromise = attempt
+    }
+    return this.ptlSignerPromise
   }
 
   // -- the two verbs ------------------------------------------------------
