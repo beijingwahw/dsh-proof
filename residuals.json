@@ -1,0 +1,212 @@
+[
+  {
+    "id": "H-17",
+    "title": "V8 coverage defense is isolation plus an mtime window, not cryptography — an in-window self-forged profile still defeats the require gate",
+    "boundary": "结构性不可判：被测进程能在运行中向本轮暂存目录写入 mtime 落窗内的伪造 V8 profile（与被检代码同手时尤甚）。require 档已拒绝 synthetic 见证（N-3）并对自删脚本记 error（X-H-05），但有机检查的自伪造窗口防御只抬高成本、不构成不可能。",
+    "backstop": "每轮独立暂存目录 + mtime 窗 + 一份窗外 profile 毒化整轮（coverage/untrusted 上链、basis 降 'none'）；walk 审计可见；漂移检测兜底归因。README Honest limits v0.22 条目明示『不是密码学』。",
+    "evidence": "README.md Honest limits『The V8 coverage defense is isolation plus an mtime window, not cryptography』；test/05（H-17/X-H-05/Y-L-34 半边钉）、test/20（coverage 门）"
+  },
+  {
+    "id": "H-19",
+    "title": "session ledger digest binds content, not authorship — a same-host process can forge the behavioural cache",
+    "boundary": "设计权衡：会话摘要算法公开且不绑定作者，同用户进程可对整本伪造账本重算出合法 digest 并经合法写路径注入（洗白归因/烧通知）。信任锚被刻意放在签名证据日志而非会话缓存。",
+    "backstop": "信任决策全部走签名链（v0.25 地板以下才采信）；会话体不符址即重置 + stderr 广播；每 workspaceKey 隔离；session.ts 注释自认『chain integrity lives in the signed evidence log, not here』。",
+    "evidence": "README.md Honest limits v0.26『The adapter session ledger is a behavioural cache, not a trust anchor』；src/adapters/shared/session.ts 头注；test/25、test/26（H-19 摘要重置钉）"
+  },
+  {
+    "id": "H-10",
+    "title": "delegation waiver is knowledge, not identity, at the library boundary — the issuing workspace string is public chain data",
+    "boundary": "知识认证而非身份认证：issuedByWorkspace 是链上公开串，能直调引擎 API 的调用方抄串即可豁免他人义务（Y-M-18 同根）。产品面（MCP）不暴露 waive 缓解了主攻击面。",
+    "backstop": "非签发方且不持锚键 → delegation/waive-refused marker + throw；锚键路径要求持有私钥；豁免本身是可见链上事实，审计与 DAG 重建可复核。",
+    "evidence": "README.md Honest limits v0.26『A delegation waiver authenticates knowledge, not identity, at the library boundary』；src/engine.ts waiveDelegation（H-10 注释）；test/05（H-10 钉）"
+  },
+  {
+    "id": "N-8",
+    "title": "PTL operator key may resolve beside the log it signs when no trust root is set",
+    "boundary": "部署边界：未设 DSH_PROOF_TRUST_DIR 时操作者键可解析到 <ptlDir>/ptl-operator-key（及其 legacy 拼写）——与被公证数据同目录的自指键位仍被接受为回退候选（v0.24 起启动告警）。",
+    "backstop": "键落信任根时强制分离；同目录命中给 stderr 警告（V4-M7/M-47 收容规则，绝不静默）；显式 --operator-key / DSH_PROOF_OPERATOR_KEY_DIR 可分离；README 明示该形态。",
+    "evidence": "README.md Honest limits v0.22『The PTL operator key separates from the log only when a trust root is known』；src/app/mcp-entry.ts（V4-M7 告警）"
+  },
+  {
+    "id": "M11",
+    "title": "the synthetic screen is a text deny-list, not a sandbox — computed specifiers and alias channels pass",
+    "boundary": "静态筛检固有边界：文本层看不见运行时值——计算式 specifier、别名/值引用形态（X-M-57/Y-M-08 家族）、node:vm 级逃逸在筛检之外；v0.22 起全局 fetch/WebSocket/cluster/dns/tls 与计算成员/别名形态已入列，但静态黑名单永不完备。",
+    "backstop": "真实边界是沙箱 cwd 限制、syntheticTimeoutMs、输出上限与宿主 profile；β=syntheticFalsePass 把自写测试定价为弱证据；require 档拒绝 synthetic 覆盖见证。README『Static screening is not a sandbox』条目。",
+    "evidence": "README.md Honest limits v0.12/v0.17/v0.22 系列条目；src/dsh/synthetic.ts 文件头自认；test/19（H-31/M-57 钉）"
+  },
+  {
+    "id": "M17",
+    "title": "canonicalJson keeps the legacy non-finite fold to null as a pinned decision",
+    "boundary": "设计权衡：NaN/±Infinity 折叠为 'null' 保持单射性破缺——裁定读路径消费 JSON.parse 产出的 Infinity（伪造 1e999），此处抛错会杀死走链审计而非判 malformed；翻转该行为需先给全部调用点前置门。",
+    "backstop": "bigint/symbol/function/Map/Set 已抛 TypeError（单射性主体已修，H-33）；伪造 1e999 走折叠后签名验证必败 + 安全整数门点名；by-design 决策被 test/01 钉开。",
+    "evidence": "README.md Honest limits v0.17『canonicalJson is injective for ordinary JSON, and deliberately not for non-finite numbers』；test/01（pinned-open 钉）"
+  },
+  {
+    "id": "X-M-47",
+    "title": "hook wiring matcher enumerates host tool names — a name outside the list never triggers the gate",
+    "boundary": "接线层名单制：随包示例 settings.json 的 PreToolUse matcher 枚举宿主变异工具名，宿主新铸/插件型写工具（如 filesystem MCP write_file）不在名单即根本不触发钩子——分类层对任何名字全量，但宿主只对 matcher 命中的名字调用。",
+    "backstop": "插件内部分类（observe.ts 锚定名单+默认变异）对它见到的任何名字全量；值扫描覆盖一切变异类调用的字符串值；README 示例注释点名应按宿主工具面扩名单。",
+    "evidence": "README.md Honest limits v0.23『Hook wiring is host-configured』；examples/claude-code.settings.json matcher"
+  },
+  {
+    "id": "U1-F6",
+    "title": "a directly constructed ProofEngine without workspaceKey shares the literal default identity",
+    "boundary": "库 API 面：new ProofEngine({}) 不传 workspaceKey 得到字面 'default'——所有直接构造的部署共享同一身份，发布洗钱拒绝与外来检查点引导告警退化为 'default'==='default' 比对。接线面（适配器/MCP）从根派生键，不受影响。",
+    "backstop": "接线面身份派生（paths.ts）+ V2-L8 引导告警在命名键部署下照常触发；文档要求库嵌入方自传 workspaceKey（README v0.26 条目）。",
+    "evidence": "README.md Honest limits v0.26『A directly constructed ProofEngine without a workspaceKey…』；src/engine.ts workspaceKey ?? 'default'"
+  },
+  {
+    "id": "U1-F8",
+    "title": "publish refusal markers can over-describe skipped candidates never adjudicated",
+    "boundary": "记账精度（化妆级）：ptl/publish-unadjudicated 的 skipped 清单把『从未尝试/仅池排除』的检查点与『被裁定拒绝』混记为 'failed adjudication and were skipped'——对发布结果无影响，对链上诊断有误导。",
+    "backstop": "发布结果本身 fail-closed 且逐条点名拒绝理由；marker 为旁路记录不参与信任决策。",
+    "evidence": "README.md Honest limits v0.26『publish refusal markers can over-describe skipped candidates never adjudicated』；src/engine.ts selectPublishableCheckpoint skipped 分支"
+  },
+  {
+    "id": "U1-F9",
+    "title": "the foreign-checkpoint bootstrap warning is issued regardless of the verbose flag",
+    "boundary": "文档-代码不符（过度警告方向，无害）：注释称引导告警 read-only 且 verbose-only，实现只判 foreign && logger 存在，不看 verbose——只多报不漏报。对外来无检查点链（身份只由检查点携带）检测是结构盲区。",
+    "backstop": "方向为过度警告（永不漏报）；告警不改变行为；workspaceKey 身份防御由发布/地板过滤器承担。",
+    "evidence": "README.md Honest limits v0.26『the foreign-checkpoint bootstrap warning is issued regardless of the verbose flag』；src/engine.ts establishBaseline 引导分支"
+  },
+  {
+    "id": "U1-F10",
+    "title": "the vouched floor is recomputed per trust verb — garbage checkpoints make every verb pay failing verifies",
+    "boundary": "CPU 放大（有定价的可见性）：vouchedFloor 无记忆化，activeAttestationsAll 每次两算、taskVerdict 四算，各为全量 rawLines 走链 + 每个本键检查点一次 ed25519 验签；攻击者追加 N 条本键垃圾检查点让每个信任动词付 N 次失败验签。",
+    "backstop": "计数诚实（aboveFloor* 对扣留行逐条计数，操作者可见）；地板三滤只丢不可担保行；无信任反转——纯资源定价问题。",
+    "evidence": "README.md Honest limits v0.26『the floor is recomputed per trust verb』；src/engine.ts vouchedFloor"
+  },
+  {
+    "id": "U1-F11",
+    "title": "the engine publish selection keeps a dead parameter beside the shared candidate core",
+    "boundary": "化妆级死代码：selectPublishableCheckpoint(best) 的 best 形参从未被函数体引用（内部重走 rawLines 重建候选池），与共享 publishableCandidates 核心的收敛未完成。",
+    "backstop": "行为正确性由 test/09 候选序列钉与 test/32 claim 7 发布谓词钉承担；死参仅造成签名噪音。",
+    "evidence": "README.md Honest limits v0.25『the engine publish selection keeps a dead parameter beside the shared candidate core』；src/engine.ts:1645"
+  },
+  {
+    "id": "U2-F3",
+    "title": "maxLine sinceLine windows slice the currently adjudicated pool, not the pool as it stood",
+    "boundary": "导出 API 语义边界：verified view 的窗口读对全标签人口先做世代裁定、再切窗口——『N 时刻的池』与『maxLine=N 的读』在标签于 N 后才获得首个 trusted marker 时不一致。方向保守（读得更少、无伪造），生产零接线，仅取证工具受影响。",
+    "backstop": "窗口算术闭区间与文档一致并被 test/04 钉；生产消费者全部无界读取经 verified view；接口文档明示语义。",
+    "evidence": "README.md Honest limits v0.25『The verified view's maxLine/sinceLine windows slice the currently adjudicated pool』；src/core/evidence.ts 接口文档；test/04"
+  },
+  {
+    "id": "U2-F4",
+    "title": "pre-adoption synthetic run markers drop silently on mixed-generation chains",
+    "boundary": "已文档化的代际规则：混代链（存在任一带见证 synthetic/run）上，收养前的无 headRef run 行从 ran-set 静默蒸发——对应 offer 的 spec 不再铸造、检查从发现池消失、零信号。诚实方向（拒信），但可用性损失不可见。",
+    "backstop": "拒绝方向（不产生假阳性信任）；恢复路径为重跑 conjure 重铸 witnessed marker；requested 侧对称一致；evidence.ts:526 注释明示 accepted。",
+    "evidence": "README.md Honest limits v0.25『Synthetic run markers from before headRef adoption drop silently』；src/core/evidence.ts P5 混代规则注释"
+  },
+  {
+    "id": "U2-F5",
+    "title": "the engine publish selection re-derives the candidate pool beside the shared core",
+    "boundary": "结构性收敛未完成（与 U1-F11 同根）：引擎发布路径内联重造候选池（多一条核心池没有的 anchorless+signer→own-key 规则），未消费 publishableCandidates 共享核心——两规则分歧理由未在注释声明。",
+    "backstop": "两池行为等价性由 test/09 候选序列/锚失效钉与 test/28 CLI 面身份钉覆盖；发布谓词完整由 test/32 claim 7 契约钉。",
+    "evidence": "README.md Honest limits v0.25『the engine publish selection keeps a dead parameter beside the shared candidate core it re-derives』；src/engine.ts:1645"
+  },
+  {
+    "id": "U2-F6",
+    "title": "refused-signature candidates deliberately stay listed in the publish pool — adjudicate before trusting candidates",
+    "boundary": "设计接受（API 契约面）：publishableCandidates 只查结构（良构 count、非 head-liar、有 sig+keyId），不裁定签名——为 first-verifiable-wins 而设计；取 candidates[0] 不裁定即发布等于发布可反驳行。当前两个消费者都裁定，但契约无防御。",
+    "backstop": "两个真实消费者（transparency selectPublishable、引擎回退）均先裁定再发布；发布谓词契约（test/32 claim 7）钉 head-liared 永不入选。",
+    "evidence": "README.md Honest limits v0.25『refused-signature candidates deliberately stay listed in the publish pool』；src/core/evidence.ts publishableCandidates 文档"
+  },
+  {
+    "id": "U2-F7",
+    "title": "a transplanted checkpoint copy can silence the anchor rewind answer; the audit stays red and pre-sign refuses",
+    "boundary": "H-08 时代遗留：answerAnchor 候选只按 keyId+良构 count 滤，携带锚记忆 (count,head) 的移植行可让 answered=true（rewind/mismatch 双 false）——纯顺序性补偿，选路不受影响。",
+    "backstop": "走链 headMismatches 必红（headLiared 通道）；preSignAudit 的 head-liars 检查先于锚检查 → 拒签；selectionSnapshot/selectFromWalk 选路不查 answerAnchor。",
+    "evidence": "README.md Honest limits v0.25『The anchor's rewind answer can be silenced by a transplanted checkpoint copy』；src/core/evidence.ts answerAnchor"
+  },
+  {
+    "id": "U3-F2",
+    "title": "the MCP face forwards drift and vanished warnings but no test pins the forwarding",
+    "boundary": "已修未钉：mcp-server 三处 toVerifyValue 调用点已转发 scriptDrift/vanished（U3-M2，v0.25.1 代码在位、注释在案），但 test/23 无对应断言——防回归无保护，属契约缺口而非产品缺口。",
+    "backstop": "转发代码与注释在位（mcp-server.ts:849-853/963/977）；DSH 面对应行为有钉（test/08 H5① 族）；本登记迫使补钉前可见。",
+    "evidence": "README.md Honest limits v0.26『the MCP face forwards drift and vanished warnings (v0.25.1) but no test pins the forwarding yet』；src/app/mcp-server.ts:849"
+  },
+  {
+    "id": "U3-F3",
+    "title": "floor-withheld testimony is visible on the chain marker, not always in the tool reply",
+    "boundary": "可见性缺口（自愈型）：aboveFloorAttestations 只落在 claim/jury 边界 marker 上，toClaimValue/toVerifyValue 与义务详情不告知模型其刚宣誓的证词在地板之上——jury-delivered 会以『无记录』失败并指示重做刚做过的事。",
+    "backstop": "自愈：重交即触发检查点、落在地板之下可定价；引擎侧计数诚实（aboveFloor* 上链）；纯可见性、无信任影响。",
+    "evidence": "README.md Honest limits v0.26『Floor-withheld testimony is visible on the chain, not always in the tool reply』；src/dsh/tools.ts toClaimValue/toVerifyValue"
+  },
+  {
+    "id": "U3-F4",
+    "title": "the LSP cumulative budget is wall-clock, not injectable, and pays a stat before refusing",
+    "boundary": "测试纪律 + 死 I/O：totalBudgetMs 用 Date.now() 累计、无注入接缝（queryTimeoutMs 有）——钉预算耗尽的测试必须烧真实墙钟；预算耗尽的 resolveDefinition 仍按导入站点各付一次 stat。",
+    "backstop": "降级诚实：null 答案从不收窄选择（impactPrecision 无边确认时如实 'approximate'）；单次查询超时可注入（H-34 钉）。",
+    "evidence": "README.md Honest limits v0.25『The LSP cumulative budget is wall-clock, not injectable』；src/dsh/lsp-impact.ts:139-148"
+  },
+  {
+    "id": "U3-F6",
+    "title": "the post-testimony checkpoint failure path is a warning without a pin",
+    "boundary": "已修未钉：checkpoint() 在证词落链后抛出时，tools.ts 已把失败降级为返回注记里的 WARNING（不再把已成功的 endorse/submit 报成失败）——但该失败路径的文案与降级行为无测试断言。",
+    "backstop": "重批落在 gen+1 且取代旧证词（语义正确）；证词本身已在链上；markBestEffort 纪律注释在案（agent-team.ts 同款）。",
+    "evidence": "README.md Honest limits v0.26（failure path has no test pin）；src/dsh/tools.ts:1221/1345"
+  },
+  {
+    "id": "U3-F7",
+    "title": "agent-team mapping recovery reads the suspect-filtered store, not the vouched floor",
+    "boundary": "实验缝隙：重启桥的 hostId→engineId 映射回灌走 store.markersWith(excludeSuspect)（v0.25.1 已从裸 _readMarkers 迁入 store 公共读），但不设地板——头部算对 headRef 的伪造 agent-team/delegated 理论上可重挂 DAG 父边。桥默认关闭、显式选择启用。",
+    "backstop": "agentTeamBridge=false 默认（README v0.19 条目：seam 不稳定、opt-in）；该标签已入受保护名单（claim 6）+ 预签名作者名册（U1-F1）拒公证；映射只影响桥接 DAG、不影响引擎面义务。",
+    "evidence": "README.md Honest limits v0.23『Hook wiring is host-configured』尾句与 v0.19 agent-team 条目；src/index.ts mappings"
+  },
+  {
+    "id": "U3-F9",
+    "title": "MemoryFs keeps mtimes under removeDir and hides empty subdirectories from readDir",
+    "boundary": "测试替身保真度（M-84/Y-L-36 家族延续）：removeDir 删 files/dirs 不删 mtimes——重建同路径文件 stat 报旧 mtime，依赖 mtime 世代的缓存测试可能在陈旧状态上假绿。",
+    "backstop": "相关缓存测试（W13-L12）以构造避开陈旧状态依赖而非依赖替身检测；替身语义注释在案；生产端口行为有独立钉。",
+    "evidence": "README.md Honest limits v0.26『The test doubles are approximations』；test/helpers.ts removeDir"
+  },
+  {
+    "id": "U3-F11",
+    "title": "string caps differ across faces — the MCP claim forwards whole past the DSH cap",
+    "boundary": "跨面上界口径：DSH 面 capToolString 截 4096，MCP 面整文转发 claim（仅 200 处截断警告）——超 4096 的 claim 两面铸不同 claimIdOf/canonical value。链上 marker 本就截 200，影响限于两面 id 分叉。",
+    "backstop": "链上记录与警告以 200 为界（W8-L7 v0.23 已警告）；分叉仅影响超长 claim 的跨面对账，不产生信任提升。",
+    "evidence": "README.md Honest limits v0.26『String caps differ across faces』；src/app/mcp-server.ts vs src/dsh/tools.ts STRING_ARG_CAP"
+  },
+  {
+    "id": "U4-M2",
+    "title": "engine publish leaf identity is pinned weaker than the CLI face twin",
+    "boundary": "测试强度残留：engine 面 V4-M6 孪生测试对发布叶子的身份断言弱于 CLI 面（test/28 钉 published.keyId/sig 格式；engine 面依赖旁路 marker 区分），断言补齐（entry.sig === honest.sig）未落。",
+    "backstop": "发布谓词完整性与拒发行为由 test/32 claim 7（行为半边）+ test/05 V4-M6 第二钉（全候选伪造→点名拒发）覆盖；身份过滤本体在代码并经 U1-F2 修复。",
+    "evidence": "README.md Honest limits v0.26『the engine publish leaf identity is pinned weaker than the CLI face twin』；test/05 V4-M6 段"
+  },
+  {
+    "id": "U4-M3",
+    "title": "differential tests compare clean against attacked without absolute anchors on the clean side",
+    "boundary": "测试强度残留：K1c 与 K1/export 两条差分测试只比较 clean===attacked，无 clean 侧绝对断言——地板若向『连诚实标记也饿死』方向同向退化，差分仍绿。",
+    "backstop": "K1a（attacked 绝对 proven + aboveFloor===1）与 K1b（诚实 task-1 在 DAG）有绝对锚；test/32 行为半边补充覆盖。",
+    "evidence": "README.md Honest limits v0.26『two differential tests compare clean against attacked without absolute anchors on the clean side』；test/05 K1c 段"
+  },
+  {
+    "id": "U4-M5",
+    "title": "the refusal-amnesty loop runs one round — a latched amnesty would still pass",
+    "boundary": "契约强度残留：claim 8 的拒签赦免循环只跑一轮——若实现改成一次性布尔闩锁（第二次拒签不再赦免），契约不红；『拒签留痕』半句只在失败文案里，无 refusedToSign 仍可见断言（test/09 X-H-08 钉承担）。",
+    "backstop": "test/09（refusedToSign.length 不变钉）+ Y-H-02 代际计费行为钉承担实际防线；claim 8 自身为辅。",
+    "evidence": "README.md Honest limits v0.26『the refusal-amnesty loop runs one round (a latched amnesty would still pass)』；test/32 claim 8"
+  },
+  {
+    "id": "U4-L1",
+    "title": "MemoryFs readDir answers undefined for a parent holding only empty subdirectories",
+    "boundary": "替身保真度：mkdirp('/a/b') 后 readDir('/a') 得 undefined（生产 readdir 返回 ['b']）——只影响全部子目录皆空的目录形状；removeDir 对『路径本身是文件』不删该文件（边角）。",
+    "backstop": "V8-L3 钉（empty-dir/never-made/满目录）覆盖主要形状；测试以构造避开该形状。",
+    "evidence": "README.md Honest limits v0.26『The test doubles are approximations』；test/helpers.ts readDir"
+  },
+  {
+    "id": "U4-L2",
+    "title": "FakeCommands rules can collide when an argv merely carries node",
+    "boundary": "替身卫生：claim 9 的 argv.includes('node') 规则同时命中 conjure 的 node 分发与任何含 'node' 的 argv——规则全表最新优先，后续在此文件加钉可能被抢答。",
+    "backstop": "当前 fixture 无冲突；规则表局部于单个测试文件，影响限于测试可维护性。",
+    "evidence": "README.md Honest limits v0.26『FakeCommands rules scan the whole table latest-first』；test/32 claim 9 fixture"
+  },
+  {
+    "id": "U4-L3",
+    "title": "the protected roster assertion is a snapshot list rather than the prefix family",
+    "boundary": "契约盲区：claim 6 逐个断言 8 个标签，但 src 实际是前缀规则（attest/、baseline/、delegation/）——把前缀族成员（如 delegation/verdict、attest/jury-requested）逐出前缀规则不会假红。",
+    "backstop": "名单扩张方向有钉（新增受保护标签不需改测试）；claim 6 superset 语义注释在案；消费点-名单单一来源对照是既定纪律。",
+    "evidence": "README.md Honest limits v0.26『the protected roster assertion is a snapshot list rather than the prefix family itself』；test/32 claim 6"
+  }
+]

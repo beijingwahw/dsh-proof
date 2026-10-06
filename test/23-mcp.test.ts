@@ -237,7 +237,7 @@ test('initialize handshake answers with the server identity and a supported prot
   // V6-L10 (v0.24): MCP_DEFAULT_VERSION tracks the package version — a
   // v0.23 build answering "0.22.0" misjudged every version-negotiating
   // client. DSH_PROOF_SERVER_VERSION still overrides on purpose.
-  assert.equal(result.serverInfo.version, '0.26.0')
+  assert.equal(result.serverInfo.version, '0.27.0')
   assert.equal(result.protocolVersion, '2025-06-18', 'a requested supported version is echoed back')
   assert.equal(result.capabilities.tools.listChanged, false)
 })
