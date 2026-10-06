@@ -8,13 +8,14 @@
  * directly unit-testable) and `runMcpServer` is the thin newline-delimited
  * stdio loop around it.
  *
- * APP/1.2 cross-agent contract: exactly ten tools — `MCP_TOOLS` below is
+ * APP/1.3 cross-agent contract: exactly eleven tools — `MCP_TOOLS` below is
  * the frozen list every consumer agrees on. (APP/1.0 spoke five; the §6
  * transparency-log expansion took it to seven with `proof_publish` and
  * `proof_log_verify`; the v0.19 responsibility-DAG expansion took it to ten
- * with `proof_delegate`, `proof_delegate_submit` and `proof_task`. Each bump
- * is what lets an older consumer refuse the wider dialect instead of
- * guessing at it.)
+ * with `proof_delegate`, `proof_delegate_submit` and `proof_task`; the v0.20
+ * training-export expansion took it to eleven with `proof_training_export`.
+ * Each bump is what lets an older consumer refuse the wider dialect instead
+ * of guessing at it.)
  *
  * Transport note: MCP stdio is newline-delimited JSON (one JSON-RPC 2.0
  * message per line), NOT LSP-style Content-Length framing. Protocol-level
@@ -44,7 +45,7 @@ import { buildBundle } from './bundle.ts'
 import { GRADE_VALUES } from './protocol.ts'
 
 // ---------------------------------------------------------------------------
-// The APP/1.2 contract — frozen with the other agents. Exactly ten tools.
+// The APP/1.3 contract — frozen with the other agents. Exactly eleven tools.
 // ---------------------------------------------------------------------------
 
 export const MCP_TOOLS = [
@@ -54,6 +55,10 @@ export const MCP_TOOLS = [
   // task verdicts. Appended in order so an APP/1.1 consumer reading a list
   // positionally still finds its seven tools where it left them.
   'proof_delegate', 'proof_delegate_submit', 'proof_task',
+  // v0.20: the training-data exhaust valve — the deployer's labeled agent
+  // behavior dataset, distilled off the chain. Appended so the APP/1.2 prefix
+  // is unchanged for a positional reader.
+  'proof_training_export',
 ] as const
 
 /** ζ: the five contract kinds `proof_claim` accepts — mirrors dsh/tools.ts's private list. */
@@ -102,7 +107,7 @@ export interface McpServerOptions extends McpEngineDeps {
 // ---------------------------------------------------------------------------
 
 export const MCP_SERVER_NAME = 'agent-proof-protocol'
-export const MCP_DEFAULT_VERSION = '0.19.0'
+export const MCP_DEFAULT_VERSION = '0.20.0'
 
 /**
  * Protocol versions this server speaks, newest first. A client asking for a
@@ -231,6 +236,20 @@ const TASK_DESCRIPTION =
   + 'workspace\'s own local verdict into the composition. Roles in one line: the orchestrator speaks '
   + 'proof_delegate and proof_task; the worker speaks proof_verify, proof_bundle and proof_delegate_submit; a '
   + 'third-party auditor verifies the published log with proof_log_verify.'
+
+const TRAINING_EXPORT_DESCRIPTION =
+  'Export this workspace\'s accumulated agent behavior data as a training dataset — the deployer\'s exhaust valve '
+  + 'for the labeled behavior traces the proof chain has been recording all along. Every sample\'s label is a '
+  + 'MACHINE-VERIFIED verdict the hash chain protects: credit and blame come from re-running objective checks '
+  + 'against the baseline, never from an agent\'s self-report, so the label is ground truth by construction. The '
+  + 'manifest carries the reward table, the provenance filter and a chain anchor ({count, head, keyId}) — the '
+  + 'anchor makes the whole dataset auditable against the very evidence chain it was distilled from. PRIVACY: '
+  + '`fidelity` defaults to `private`, which emits ZERO output text (structure and labels only); `full` emits the '
+  + 'raw recorded text and must be a deliberate, license-carrying choice. THE SAMPLES THEMSELVES NEVER RIDE THIS '
+  + 'RESPONSE (a dataset can be huge): the value carries the full manifest, the anchor and `sampleCount`; pass '
+  + '`path` to have the engine write the samples to disk as JSONL (the value then carries `writtenTo`), or read '
+  + 'the samples through the engine API. Requires a baseline and at least one verification on the chain (run '
+  + 'proof_baseline, then work and proof_verify — the evidence IS the dataset).'
 
 const MCP_TOOL_LIST: ToolDescriptor[] = [
   {
@@ -405,6 +424,40 @@ const MCP_TOOL_LIST: ToolDescriptor[] = [
           enum: ['proven', 'regressed', 'stale', 'unproven', 'no-baseline'],
           description: 'Optional: fold this workspace\'s own local grade into the composed verdict. One of the '
             + 'five grades — anything else is refused loudly, never silently dropped.',
+        },
+      },
+    },
+  },
+  {
+    name: 'proof_training_export',
+    description: TRAINING_EXPORT_DESCRIPTION,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fidelity: {
+          type: 'string',
+          enum: ['full', 'private'],
+          default: 'private',
+          description: 'Privacy tier of the export. DEFAULTS TO `private` when omitted: sample text is reduced '
+            + 'to zero output — only structure and labels ride out. `full`: the raw recorded text is included; '
+            + 'an unintelligible value is refused loudly, never silently defaulted.',
+        },
+        provenanceFilter: {
+          type: 'string',
+          enum: ['agent-only', 'all'],
+          description: 'Which sessions the dataset is distilled from: `agent-only` keeps agent-authored work, '
+            + '`all` includes every recorded session regardless of provenance.',
+        },
+        license: {
+          type: 'string',
+          description: 'Optional license identifier stamped on the manifest (e.g. "CC-BY-4.0") — the deployer\'s '
+            + 'terms for the exported dataset, recorded with it.',
+        },
+        path: {
+          type: 'string',
+          description: 'Write the samples to this path as JSONL instead of holding them in memory only. When '
+            + 'given, the engine writes the file and the response carries `writtenTo` — the samples still never '
+            + 'ride the response itself.',
         },
       },
     },
@@ -1079,6 +1132,131 @@ async function callTaskTool(deps: McpEngineDeps, args: Record<string, unknown>):
   return toolResult({ taskId, composed: verdict.composed, nodes: verdict.nodes, cycles: verdict.cycles })
 }
 
+// ---------------------------------------------------------------------------
+// v0.20: the training-export tool (APP/1.3's 10 → 11 expansion)
+//
+// The verb itself lives in the engine (exportTrainingData — distilling the
+// chain's recorded agent behavior into a labeled dataset). This face only
+// adjudicates untrusted ARGUMENTS (the fidelity/provenance enums are refused
+// loudly, never silently defaulted) and projects the outcome onto the wire:
+// the manifest, the anchor and sampleCount — the SAMPLES themselves never
+// ride an MCP response (a dataset can be huge; `path` writes them to disk as
+// JSONL and the response then carries `writtenTo` instead).
+// ---------------------------------------------------------------------------
+
+/**
+ * The engine-side training-export contract, as frozen with the engine
+ * workstream (F2). Declared HERE (not imported) for the same reason as
+ * `DelegationVerbs` above: the engine grows into it in parallel, and
+ * `trainingExportVerbs` narrows the live engine against it at runtime, so
+ * this server degrades to a clean capability error — never a crash — on a
+ * build whose engine has not landed the export yet.
+ */
+interface TrainingExportVerbs {
+  exportTrainingData(input: {
+    fidelity?: 'full' | 'private'
+    provenanceFilter?: 'agent-only' | 'all'
+    changedPaths?: string[]
+    license?: string
+    path?: string
+  }): Promise<{
+    manifest: {
+      schema: 'dsh-training/1'
+      fidelity: 'full' | 'private'
+      workspaceKey: string
+      generatedAt: string
+      counts: Record<string, number>
+      rewardTable: unknown
+      license?: string
+      provenanceFilter: 'agent-only' | 'all'
+      root: string
+    }
+    samples: unknown[]
+    anchor: { count: number; head: string; keyId?: string }
+  }>
+}
+
+/**
+ * The live engine's training-export verb, or undefined when this build's
+ * engine does not implement the export yet. Same per-call existence check as
+ * the delegation seam — the one place the engine's newer surface is reached
+ * through a cast.
+ */
+function trainingExportVerbs(engine: ProofEngine): TrainingExportVerbs | undefined {
+  const candidate = engine as unknown as Partial<Record<keyof TrainingExportVerbs, unknown>>
+  return typeof candidate.exportTrainingData === 'function'
+    ? (candidate as TrainingExportVerbs)
+    : undefined
+}
+
+function trainingExportUnavailable(): McpToolResult {
+  return toolError({
+    error: 'proof_training_export: this engine build does not implement the training-export verb '
+      + '(exportTrainingData) — the dataset cannot be distilled on this build',
+  })
+}
+
+/** The two privacy tiers `proof_training_export` accepts — F2's fidelity scale. */
+const FIDELITY_TIERS: readonly string[] = ['full', 'private']
+
+/** The two provenance scopes `proof_training_export` accepts. */
+const PROVENANCE_FILTERS: readonly string[] = ['agent-only', 'all']
+
+function isFidelityTier(value: unknown): value is 'full' | 'private' {
+  return typeof value === 'string' && FIDELITY_TIERS.includes(value)
+}
+
+function isProvenanceFilter(value: unknown): value is 'agent-only' | 'all' {
+  return typeof value === 'string' && PROVENANCE_FILTERS.includes(value)
+}
+
+async function callTrainingExportTool(deps: McpEngineDeps, args: Record<string, unknown>): Promise<McpToolResult> {
+  // Same loud-argument discipline as proof_claim's kind guard: an optional
+  // enum that arrived with a value the scale does not name is an ERROR — a
+  // foreign agent asking for a privacy tier that does not exist must be told,
+  // never silently handed the default (which is `private`, the safe side).
+  if (args.fidelity !== undefined && !isFidelityTier(args.fidelity)) {
+    return toolError({
+      error: `proof_training_export: fidelity must be one of ${FIDELITY_TIERS.join(' | ')} `
+        + `(got ${typeof args.fidelity === 'string' ? JSON.stringify(args.fidelity) : 'a non-string value'}); `
+        + 'omitted fidelity exports the private tier — zero output text — by default',
+    })
+  }
+  if (args.provenanceFilter !== undefined && !isProvenanceFilter(args.provenanceFilter)) {
+    return toolError({
+      error: `proof_training_export: provenanceFilter must be one of ${PROVENANCE_FILTERS.join(' | ')} `
+        + `(got ${typeof args.provenanceFilter === 'string' ? JSON.stringify(args.provenanceFilter) : 'a non-string value'})`,
+    })
+  }
+  if (args.license !== undefined && typeof args.license !== 'string') {
+    return toolError({ error: `proof_training_export: license must be a string (got ${JSON.stringify(args.license)})` })
+  }
+  if (args.path !== undefined && typeof args.path !== 'string') {
+    return toolError({ error: `proof_training_export: path must be a string (got ${JSON.stringify(args.path)})` })
+  }
+  const verbs = trainingExportVerbs(deps.engine)
+  if (verbs === undefined) return trainingExportUnavailable()
+  const fidelity = args.fidelity as 'full' | 'private' | undefined
+  const provenanceFilter = args.provenanceFilter as 'agent-only' | 'all' | undefined
+  // Semantic preconditions (an empty chain, an unwritable path, …) are the
+  // ENGINE's to enforce; a clean throw rides the dispatcher's isError path.
+  const outcome = await verbs.exportTrainingData({
+    ...(fidelity !== undefined ? { fidelity } : {}),
+    ...(provenanceFilter !== undefined ? { provenanceFilter } : {}),
+    ...(typeof args.license === 'string' ? { license: args.license } : {}),
+    ...(typeof args.path === 'string' ? { path: args.path } : {}),
+  })
+  // The samples NEVER ride the response — manifest, anchor and count only.
+  // A caller that wants the dataset itself passes `path` (the engine wrote
+  // the JSONL; writtenTo says where) or reads the engine API directly.
+  return toolResult({
+    manifest: outcome.manifest,
+    anchor: outcome.anchor,
+    sampleCount: outcome.samples.length,
+    ...(typeof args.path === 'string' ? { writtenTo: args.path } : {}),
+  })
+}
+
 async function callTool(deps: McpEngineDeps, params: unknown): Promise<McpToolResult> {
   const name = typeof params === 'object' && params !== null
     ? (params as { name?: unknown }).name
@@ -1096,6 +1274,7 @@ async function callTool(deps: McpEngineDeps, params: unknown): Promise<McpToolRe
       case 'proof_delegate': return await callDelegateTool(deps, args)
       case 'proof_delegate_submit': return await callDelegateSubmitTool(deps, args)
       case 'proof_task': return await callTaskTool(deps, args)
+      case 'proof_training_export': return await callTrainingExportTool(deps, args)
       default:
         // Unknown tool: MCP tool-error semantics (isError result), with the
         // name spelled out so a foreign agent can self-correct.

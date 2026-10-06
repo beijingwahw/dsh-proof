@@ -1,4 +1,4 @@
-# Agent Proof Protocol (APP) 1.2
+# Agent Proof Protocol (APP) 1.3
 
 **An open standard for machine-verifiable completion claims.**
 
@@ -6,9 +6,9 @@
 |---|---|
 | Status | Draft |
 | Protocol name | `agent-proof-protocol` |
-| Version | `APP/1.2` |
-| Reference implementation | dsh-proof v0.19.0 |
-| Supersedes | `APP/1.1` (dsh-proof v0.18.0) — tool-surface expansion only, see §6/§8 |
+| Version | `APP/1.3` |
+| Reference implementation | dsh-proof v0.20.0 |
+| Supersedes | `APP/1.2` (dsh-proof v0.19.0) — tool-surface expansion only, see §6/§8/§11 |
 | Proof media type | `application/vnd.app.proof+json` |
 | Bundle media type | `application/vnd.app.proof-bundle+json` |
 | Constants module | `src/app/protocol.ts` (this repository) |
@@ -107,7 +107,7 @@ A **proof bundle** (media type `application/vnd.app.proof-bundle+json`) moves a 
 
 ```json
 {
-  "protocol": "APP/1.2",
+  "protocol": "APP/1.3",
   "appFingerprint": "<sha256 hex>",
   "workspaceKey": "<stable workspace identity>",
   "createdAt": "<ISO timestamp>",
@@ -125,7 +125,7 @@ A **proof bundle** (media type `application/vnd.app.proof-bundle+json`) moves a 
 
 ## §6 Verification API
 
-APP/1.2's conformance surface is ten model-facing tools (reference: `src/app/mcp-server.ts`):
+APP/1.3's conformance surface is eleven model-facing tools (reference: `src/app/mcp-server.ts`):
 
 | tool | input (essentials) | output (essentials) |
 |---|---|---|
@@ -139,12 +139,15 @@ APP/1.2's conformance surface is ten model-facing tools (reference: `src/app/mcp
 | `proof_delegate` | `claim`, optional `acceptance` (verifiable acceptance criteria), `parentTaskId?` (nest under an existing task) | mints the child's **proof obligation** — the claim that must become true — as a chain record with a content-addressed identity (`obligationId`), guards the graph's acyclicity (a parent must already exist; `detectCycles` as defense in depth), and returns `{taskId, obligationId, obligation}` plus a ready-to-paste `instruction`: the worker handoff text naming the claim, the acceptance criteria, and the worker's half of the protocol (§10) |
 | `proof_delegate_submit` | `taskId`, `bundle` (a §5 export), optional `claimedGrade` (one of the five grades), `byWorkspace?` | adjudicates the bundle from its own bytes — the §5 verifier obligations, zero trust in the submitter — records `artifactVerified` plus the `bundleFingerprint` that anchors what was turned in, derives the default `claimedGrade` two-valued (verified bundle carrying a baseline → `proven`; anything else → `no-baseline` — finer grades MUST be declared explicitly), and returns the `composed` verdict over the rebuilt DAG; a claimed `proven` the artifact cannot back is booked as **forgery** (§10) |
 | `proof_task` | `taskId?`, optional `ownGrade` (one of the five grades) | without `taskId`, the whole-graph overview (every task, its parent, claim summary, submission state); with it, the recursive composed verdict of that task's subtree — grade, forged/regressed/unproven children, waivers, blockers, cycles (§10). `ownGrade` folds this workspace's own locally-earned grade into the composition |
+| `proof_training_export` | optional `fidelity` (`full` \| `private`), `provenanceFilter` (`agent-only` \| `all`), `license`, `path` | distills the evidence chain into a labeled training dataset (`dsh-training/1`, §11) and returns the manifest (reward-table snapshot, sample-counts, Merkle `root`, `provenanceFilter`), the chain `anchor` `{count, head, keyId?}` of the export moment, and `sampleCount`. **The samples themselves never ride the response** — a caller that wants the dataset passes `path` and the engine writes the JSONL samples plus the manifest document to disk (`writtenTo` names where); unknown enum values are refused loudly, never silently defaulted (omitted `fidelity` exports the `private` tier — zero output text — by default) |
 
 **APP/1.0 → APP/1.1 is a tool-surface expansion, nothing else.** The two transparency tools joined the conformance face; the vocabularies (§2), the content addressing (§3), the chain and checkpoint formats (§4) and the bundle format (§5) are byte-for-byte what APP/1.0 defined — an old bundle remains exactly as verifiable as the day it was minted. What did move is the dialect marking: `PROTOCOL_VERSION` is fingerprint material (§8), so every APP/1.1 manifest self-identifies as mutually unintelligible with every APP/1.0 one, and each side refuses the other instead of guessing. A deployment that runs no transparency log keeps a conforming APP/1.1 face: `proof_publish` / `proof_log_verify` answer a clean configuration error when no log is configured, and bundles without a `transparency` record verify as they always have.
 
 **APP/1.1 → APP/1.2 repeats the same move on the same terms.** The three delegation tools joined the conformance face (7 → 10); the vocabularies (§2), the content addressing (§3), the chain and checkpoint formats (§4) and the bundle format (§5) are untouched, and the fingerprint moved by construction — an APP/1.1 consumer refuses an APP/1.2 manifest instead of guessing at delegation semantics it never agreed to. The three tools carry a three-party role split, one line each: the **orchestrator** speaks `proof_delegate` and `proof_task`; the **worker** proves the obligation in its own workspace with `proof_baseline` / `proof_verify` (or `proof_claim`) / `proof_bundle` and hands the export back through `proof_delegate_submit`; a third-party **auditor** verifies the published checkpoint history with `proof_log_verify` (§9) and the submitted bundles from their own bytes (§5). The delegation semantics themselves — obligations, the composition lattice, forgery — are specified in §10.
 
-**Out of scope for v1:** `proof_jury`, `proof_jury_submit`, `proof_endorse`, `proof_conjure` and `proof_conjure_run` exist in the reference implementation but are NOT part of APP/1.2 conformance. They depend on host-held seams an open protocol cannot assume — an isolated deliberation model (Class B testimony), a human approval gate (Class C endorsement), and a sandbox plus session context for conjured tests. Hosts MAY expose them as extensions.
+**APP/1.2 → APP/1.3 repeats it a third time (10 → 11).** The training-export tool joined the conformance face; the vocabularies (§2), the content addressing (§3), the chain and checkpoint formats (§4), the bundle format (§5) and the delegation semantics (§10) are byte-for-byte untouched, and the version-only fingerprint shift makes every APP/1.3 manifest mutually unintelligible with every APP/1.2 one — a consumer never silently accepts a dialect whose training-export semantics it has not implemented. The dataset itself — sample kinds, the reward table, privacy tiers, the provenance filter, content addressing and the chain anchor — is specified in §11.
+
+**Out of scope for v1:** `proof_jury`, `proof_jury_submit`, `proof_endorse`, `proof_conjure` and `proof_conjure_run` exist in the reference implementation but are NOT part of APP/1.3 conformance. They depend on host-held seams an open protocol cannot assume — an isolated deliberation model (Class B testimony), a human approval gate (Class C endorsement), and a sandbox plus session context for conjured tests. Hosts MAY expose them as extensions.
 
 ## §7 Security considerations
 
@@ -163,9 +166,9 @@ APP/1.2's conformance surface is ten model-facing tools (reference: `src/app/mcp
 
 ## §8 Conformance
 
-An APP/1.2 implementation MUST implement content addressing (§3), tamper evidence (§4) and the exchange format (§5) exactly as specified, and MUST expose the ten tools of §6. A transparency log (§9) is an optional deployment: the two transparency tools presuppose an operator-run log and MAY answer a clean configuration error when none is configured. The three delegation tools of §10 are part of the conformance face; an implementation that mints obligations MUST compose verdicts by the §10 lattice exactly.
+An APP/1.3 implementation MUST implement content addressing (§3), tamper evidence (§4) and the exchange format (§5) exactly as specified, and MUST expose the eleven tools of §6. A transparency log (§9) is an optional deployment: the two transparency tools presuppose an operator-run log and MAY answer a clean configuration error when none is configured. The three delegation tools of §10 are part of the conformance face; an implementation that mints obligations MUST compose verdicts by the §10 lattice exactly. The training-export tool of §11 is likewise part of the conformance face; an implementation that mints datasets MUST follow the §11 reward table and honesty rules exactly.
 
-**Implementation fingerprint.** `appFingerprint()` (`src/app/protocol.ts`) is `sha256(canonicalJson(...))` over the five vocabularies plus one string per load-bearing rule — `addressing: 'sha256(canonicalJson(v))'`, `chain: 'prev=sha256(prevLine)'`, `signature: 'ed25519(canonicalJson(checkpointPayload))'`. It is the dialect's digest: any change to a vocabulary value or to one of these rules MUST produce a different fingerprint. Producers stamp it into every manifest; consumers MUST refuse to interpret a bundle whose fingerprint they cannot reproduce against their own constants, rather than guess at the dialect. The APP/1.0 → APP/1.1 bump is this rule applied honestly to the tool surface: the vocabularies and rule strings are untouched, but `PROTOCOL_VERSION` is itself fingerprint material, so the seven-tool expansion moved the fingerprint by construction — a consumer that could silently read a 1.1 manifest while believing it spoke 1.0 would never learn that two tools' semantics exist; the moved fingerprint makes the dialects refuse each other loudly instead. The APP/1.1 → APP/1.2 bump applies the same rule for the same reason: nothing but the three delegation tools moved, and the version-only fingerprint shift makes every APP/1.2 manifest mutually unintelligible with every APP/1.1 one — a consumer never silently accepts a dialect whose delegation semantics it has not implemented.
+**Implementation fingerprint.** `appFingerprint()` (`src/app/protocol.ts`) is `sha256(canonicalJson(...))` over the five vocabularies plus one string per load-bearing rule — `addressing: 'sha256(canonicalJson(v))'`, `chain: 'prev=sha256(prevLine)'`, `signature: 'ed25519(canonicalJson(checkpointPayload))'`. It is the dialect's digest: any change to a vocabulary value or to one of these rules MUST produce a different fingerprint. Producers stamp it into every manifest; consumers MUST refuse to interpret a bundle whose fingerprint they cannot reproduce against their own constants, rather than guess at the dialect. The APP/1.0 → APP/1.1 bump is this rule applied honestly to the tool surface: the vocabularies and rule strings are untouched, but `PROTOCOL_VERSION` is itself fingerprint material, so the seven-tool expansion moved the fingerprint by construction — a consumer that could silently read a 1.1 manifest while believing it spoke 1.0 would never learn that two tools' semantics exist; the moved fingerprint makes the dialects refuse each other loudly instead. The APP/1.1 → APP/1.2 bump applies the same rule for the same reason: nothing but the three delegation tools moved, and the version-only fingerprint shift makes every APP/1.2 manifest mutually unintelligible with every APP/1.1 one — a consumer never silently accepts a dialect whose delegation semantics it has not implemented. The APP/1.2 → APP/1.3 bump repeats it a third time: the single training-export tool moved nothing else, and the version-only shift keeps every APP/1.3 manifest mutually unintelligible with every earlier dialect — a consumer never silently accepts a dialect whose training-export semantics (§11) it has not implemented.
 
 **Backward compatibility.** Evolution of the canonical addressing rules MUST NOT change the address of any existing value. The sanctioned mechanism is additive optional fields that are *omitted* (never `null`) when absent — canonical JSON drops them, so historical records keep their digests, and old artifacts that predate a field skip (rather than fail) its checks. This is the standing precedent of the reference implementation: `Evidence.source`, `synthetic` and `coverage`, `WorkspaceSnapshot.dirtyDigests`, and the anchor's `workspaceKey` were all added this way, without moving a single existing address.
 
@@ -239,3 +242,42 @@ Composition is recursive over the whole subtree, memoised (a grandchild shared b
 **Honest limits.** The composed verdict names forged children, regressed children, unproven children and waivers — descriptive lists in a fixed order, the same story for every reader. What the engine cannot do is substitute for the child's workspace: the artifact verdict is bundle verification (structure, digests, chain), not a re-execution of the child's checks; the fine grade rests on the submitter's explicit declaration, priced honestly by the forgery rule.
 
 Reference implementation: `src/core/obligations.ts` (pure domain — obligations, submissions, the composition lattice, cycle detection; deterministic, no clock, no I/O) and the four engine verbs `delegateTask` / `submitDelegation` / `taskVerdict` / `waiveDelegation` (`src/engine.ts`), with the three MCP tools (`src/app/mcp-server.ts`) as the protocol face.
+
+## §11 Training export
+
+Everything before §11 proves work *as it happens*. §11 reads the same log afterwards and answers a different question: what did proving it **teach**? An evidence log is, among other things, a chronicle of agent behaviour with machine-verified outcomes attached — every record says what ran, what it printed, how long it took, and (read against the baseline, §1) what that run *meant*. Those labels are not the model's opinion of itself: they are differential facts under hash-chain protection (§4). Distilled into a dataset they become RL/DPO training pairs whose labels no annotator graded and no model self-reported — ground truth an agent-behaviour dataset normally spends a human label budget to approximate, available as a by-product of doing the work honestly. APP/1.3 standardizes that distillation (`dsh-training/1`) so a dataset is exportable, verifiable and aggregable across workspaces instead of trapped in one deployment's log.
+
+**Two sample kinds ride in one schema.**
+
+- **`verification`** — one per decisive observation (§2: `pass` / `fail` only): the context (checkId, check kind, discovery source, the session's changed paths) plus the verdict and the scalar `reward` that verdict earns under the reward table below. RL-shaped.
+- **`flip-pair`** — one per adjacent disagreement in a check's decisive subsequence (chain order; non-decisive records neither break adjacency nor mint a pair), in DPO's fixed direction: `rejected` is **always** the fail side, `chosen` **always** the pass side. Which way the flip ran in time is not lost — it lives in the two `recordedAt` stamps — but the preference statement itself never points anywhere but away from red.
+
+**The reward table — a written convention, snapshotted into every manifest.**
+
+| verdict | reward | rationale |
+|---|---|---|
+| `still-passing` | 1.0 | the session's work left a green assertion green |
+| `fixed` | 1.0 | the session repaired what was broken |
+| `new-check` | 0.5 | a pass with no baseline to compare against — neutral |
+| `still-failing` | 0.5 | pre-existing is not the agent's fault; charging 0 would be as dishonest as crediting 1 |
+| `regression` | 0.0 | the session broke what held |
+| `new-failure` | 0.0 | the session shipped a check that never held |
+| `not-run` | 0.0 | unreachable in samples by construction; present so the table is exhaustive law |
+| `indeterminate` | *excluded* | **unknown is not zero** — a decisive run whose baseline produced no decisive answer is EXCLUDED from the dataset rather than labeled 0; a real pass punished like a regression is worse data than no data |
+
+The table is pinned by tests, deliberately not a knob (a reward table that varies per export is a dataset whose labels cannot be compared), and **snapshotted into every manifest** — a dataset always states the law its numbers were minted under, even if the law later changes.
+
+**Privacy tiers — `private` is the default.** Output prose can carry secrets; digests cannot (they are one-way content addresses). A `private` export carries **zero output characters** — structure, labels and digests only — so a dataset can leave the machine before anyone has read every line of it. `full` adds each record's normalized excerpt (§3), truncated to 200 characters. Any degradation runs toward silence, never leakage.
+
+**Provenance filter — `agent-only` is the default.** A reward of 1.0 asserts *"the agent's edit kept the suite green"* — a causal claim. When the change set contains a path attributed `external` (a human was also editing the workspace — attribution is the deployer's change-set provenance, not a protocol construct), that sentence is false, so under `agent-only` **one external path voids the whole session's verification labels** — better an empty dataset than a mislabeled one. Flip-pairs survive the void: pass-then-fail within one chain is a temporal fact about the check, whatever hand moved the files. The manifest records the requested filter honestly, even — especially — when the filter emptied the dataset.
+
+**Content addressing and the chain anchor.** Each sample's address is `sampleHash = sha256(canonicalJson(sample))[:16]`, and the manifest's `root` is the order-independent Merkle root (§3) over the samples' addresses — the same discipline as a baseline's root, so editing **one character of one sample** moves the root: a dataset cannot be quietly re-labeled after the fact, and two exports can be compared without trusting either exporter. The manifest (`schema`, `fidelity`, `workspaceKey`, `generatedAt`, `counts`, `rewardTable`, optional `license`, `provenanceFilter`, `root`) makes the dataset self-describing. Every export is additionally pinned to the chain state at the export moment by an **anchor** `{count, head, keyId?}` — the last signed checkpoint (§4), or the last well-formed checkpoint of an unsigned chain — so a consumer holding the log can re-derive the dataset and check it against the anchor, or know they are looking at a different chain. The samples themselves never ride a tool response (§6): a dataset can be huge, and the response carries the manifest, anchor and count, with `path` writing the JSONL to disk.
+
+**Honest limits**, stated rather than hidden:
+
+- The verdicts underneath the labels are machine-verified differentials, but the 1.0 / 0.5 / 0.0 **pricing is a declared convention, not ground truth** — a dataset consumer who disagrees with `still-failing = 0.5` must re-price, and the reward-table snapshot in the manifest tells them exactly what they are re-pricing.
+- **Flip pairing is an adjacency heuristic**: "adjacent" means adjacent in the exported log's decisive subsequence, not a claim that nothing intervened in the world between the two observations.
+- The **`private` tier removes output text, not context**: samples still carry workspace paths and output digests — a path can itself be sensitive, and a digest can confirm a guess. Dataset consumers owe the data care even at private fidelity.
+- **Cross-deployment aggregation trust is unsolved**: merging datasets from multiple exporters raises "whose data is this, and was it poisoned?" — questions this version does not answer. Anchoring dataset provenance in the transparency log (§9) — anti data-laundering for training sets — is the future direction, not a property of APP/1.3.
+
+Reference implementation: `src/core/training.ts` (pure domain — the schema, reward law, sample shapes, distillation; deterministic, no clock, no I/O) and the engine verb `exportTrainingData` (`src/engine.ts` — chain state in, `DistillInput` assembled, dataset and anchor out), with `proof_training_export` (`src/app/mcp-server.ts`) as the protocol face.

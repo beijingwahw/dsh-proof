@@ -3,14 +3,16 @@
  *
  * Spawns `node --experimental-strip-types src/app/mcp-entry.ts` against a
  * minimal real npm project and drives it over newline-delimited JSON-RPC 2.0
- * on stdio: the handshake, the ten-tool APP/1.2 contract, a real baseline →
+ * on stdio: the handshake, the eleven-tool APP/1.3 contract, a real baseline →
  * verify → status → bundle → publish → log-verify chain, then the v0.19
  * responsibility DAG end to end (delegate → task overview/detail → honest
- * bundle submit → forged bundle refusal) — real `npm test`, real evidence,
- * real Ed25519 chain, real transparency log — and the error paths (unknown
- * tool, bogus claim kind, malformed JSON line). Nothing is stubbed — this is
- * the test that proves any foreign harness can drive the proof protocol end
- * to end.
+ * bundle submit → forged bundle refusal), then the v0.20 training-export
+ * valve (private default with no samples on the wire, full + path writing the
+ * JSONL dataset to disk, the loud enum refusal) — real `npm test`, real
+ * evidence, real Ed25519 chain, real transparency log — and the error paths
+ * (unknown tool, bogus claim kind, malformed JSON line). Nothing is stubbed —
+ * this is the test that proves any foreign harness can drive the proof
+ * protocol end to end.
  */
 
 import { test, before, after } from 'node:test'
@@ -32,12 +34,14 @@ const ENTRY = fileURLToPath(new URL('../src/app/mcp-entry.ts', import.meta.url))
 const WORKSPACE = join(fileURLToPath(new URL('../../../.openclaw/tmp', import.meta.url)), `mcp-it-${process.pid}`)
 
 // v0.18 (APP/1.1): the transparency-log tools joined the frozen contract;
-// v0.19 (APP/1.2): the responsibility-DAG tools take it to ten, appended in
-// order so the APP/1.1 prefix is unchanged.
+// v0.19 (APP/1.2): the responsibility-DAG tools took it to ten; v0.20
+// (APP/1.3): the training-export tool takes it to eleven — appended in order
+// so every earlier dialect's prefix is unchanged.
 const MCP_TOOLS = [
   'proof_status', 'proof_baseline', 'proof_verify', 'proof_claim', 'proof_bundle',
   'proof_publish', 'proof_log_verify',
   'proof_delegate', 'proof_delegate_submit', 'proof_task',
+  'proof_training_export',
 ] as const
 
 const CHECK_SCRIPT = [
@@ -203,7 +207,7 @@ test('initialize handshake answers with the server identity and a supported prot
     serverInfo: { name: string; version: string }
   }
   assert.equal(result.serverInfo.name, 'agent-proof-protocol')
-  assert.equal(result.serverInfo.version, '0.19.0')
+  assert.equal(result.serverInfo.version, '0.20.0')
   assert.equal(result.protocolVersion, '2025-06-18', 'a requested supported version is echoed back')
   assert.equal(result.capabilities.tools.listChanged, false)
 })
@@ -229,7 +233,7 @@ test('notifications/initialized produces no reply and ping answers an empty resu
   assert.deepEqual(pong.result, {})
 })
 
-test('tools/list exposes exactly the ten APP/1.2 contract tools', async () => {
+test('tools/list exposes exactly the eleven APP/1.3 contract tools', async () => {
   const response = await client.request('tools/list', {})
   assert.equal(response.error, undefined)
   const tools = (response.result as {
@@ -238,7 +242,7 @@ test('tools/list exposes exactly the ten APP/1.2 contract tools', async () => {
   assert.deepEqual(
     tools.map(t => t.name).sort(),
     [...MCP_TOOLS].sort(),
-    'the cross-agent contract is exactly ten tools',
+    'the cross-agent contract is exactly eleven tools',
   )
   for (const tool of tools) {
     assert.equal(tool.inputSchema.type, 'object', `${tool.name} inputSchema must be an object schema`)
@@ -262,6 +266,22 @@ test('tools/list exposes exactly the ten APP/1.2 contract tools', async () => {
   assert.equal((task.inputSchema as { required?: string[] }).required, undefined, 'proof_task takes no required argument')
   const ownGrade = (task.inputSchema as { properties?: Record<string, { enum?: string[] }> }).properties?.ownGrade?.enum
   assert.deepEqual(ownGrade, ['proven', 'regressed', 'stale', 'unproven', 'no-baseline'])
+  // v0.20: the training-export tool's parameter face — the two-tier fidelity
+  // scale with its private DEFAULT pinned in the schema, the provenance
+  // filter's two scopes, and no required argument (privacy is the default,
+  // not something a caller must remember to ask for).
+  const training = tools.find(t => t.name === 'proof_training_export')!
+  assert.equal(
+    (training.inputSchema as { required?: string[] }).required,
+    undefined,
+    'proof_training_export takes no required argument — private is the default tier',
+  )
+  const trainingProps = (training.inputSchema as {
+    properties?: Record<string, { enum?: string[]; default?: string }>
+  }).properties
+  assert.deepEqual(trainingProps?.fidelity?.enum, ['full', 'private'])
+  assert.equal(trainingProps?.fidelity?.default, 'private', 'the privacy default is pinned in the schema itself')
+  assert.deepEqual(trainingProps?.provenanceFilter?.enum, ['agent-only', 'all'])
 })
 
 test('an unknown method is a JSON-RPC -32601 error', async () => {
@@ -337,7 +357,7 @@ test('proof_bundle exports a manifest that digests the evidence log', async () =
     }
   }
   assert.ok(value.bundle !== undefined, 'a small bundle rides the response in full')
-  assert.equal(value.bundle.manifest.protocol, 'APP/1.2')
+  assert.equal(value.bundle.manifest.protocol, 'APP/1.3')
   const entry = value.bundle.manifest.files.find(f => f.path === 'evidence.jsonl')
   assert.ok(entry !== undefined, 'the manifest digests evidence.jsonl')
   assert.match(entry.sha256, /^[0-9a-f]{64}$/)
@@ -573,7 +593,7 @@ test('proof_task before any submission: the overview lists the DAG, the parent c
 
 test('proof_delegate_submit with an honestly minted worker bundle composes the obligation proven', async () => {
   const bundle = await mintWorkerBundle()
-  assert.equal(bundle.manifest.protocol, 'APP/1.2', 'the worker exports the current dialect')
+  assert.equal(bundle.manifest.protocol, 'APP/1.3', 'the worker exports the current dialect')
 
   // The child submits: a green baseline+verify chain minted into a bundle,
   // with no grade claimed — the derivation must earn 'proven' on its own.
@@ -643,6 +663,89 @@ test('a forged worker bundle is attributed, not absorbed — composed regressed 
     `forgedChildren attributes the forgery to ${secondTaskId}`)
   assert.ok(!parentValue.composed.forgedChildren?.includes('task-2'),
     'the honest sibling is not smeared by the forged one')
+})
+
+// ---------------------------------------------------------------------------
+// v0.20 (APP/1.3): the training-export valve over the real subprocess — the
+// chain's recorded agent behavior (a real baseline + verifications by this
+// point in the file) distilled into a labeled dataset: the private default
+// with zero samples on the wire, the full tier writing the JSONL dataset to
+// disk via `path`, and the loud enum refusal.
+// ---------------------------------------------------------------------------
+
+test('proof_training_export defaults to the private tier and never ships samples on the wire', async () => {
+  // No arguments at all: fidelity defaults to private, the whole response is
+  // manifest + anchor + sampleCount — the samples themselves never ride it.
+  const result = await callTool('proof_training_export', {}, 60_000)
+  assert.equal(result.isError, undefined, `training export errored: ${result.content[0]?.text}`)
+  const value = result.structuredContent as {
+    manifest: {
+      schema: string
+      fidelity: string
+      provenanceFilter: string
+      counts: Record<string, number> | number
+    }
+    anchor: { count: number; head: unknown }
+    sampleCount: number
+  }
+  assert.equal(value.manifest.schema, 'dsh-training/1', 'the dataset names its own schema version')
+  assert.equal(value.manifest.fidelity, 'private', 'an omitted fidelity exports the private tier — zero output text')
+  // The baseline + verifications that ran earlier in this file ARE the
+  // dataset: the manifest must count at least one distilled sample.
+  const counts = value.manifest.counts
+  const total = typeof counts === 'number'
+    ? counts
+    : Object.values(counts ?? {}).reduce((sum, entry) => sum + (typeof entry === 'number' ? entry : 0), 0)
+  assert.ok(total >= 1, `the manifest counts the distilled samples: ${JSON.stringify(counts)}`)
+  assert.ok(value.anchor.count > 0, 'the anchor commits to a non-empty chain prefix — the dataset is auditable against the chain')
+  assert.equal(typeof value.anchor.head, 'string', 'the anchor names the chain head it was distilled at')
+  assert.ok((value.anchor.head as string).length > 0)
+  assert.ok(typeof value.sampleCount === 'number' && value.sampleCount >= 1, 'sampleCount is reported even though the samples are not shipped')
+  assert.equal(
+    Object.keys(value).includes('samples'),
+    false,
+    'the samples never ride the response — manifest, anchor and count only; use path or the engine API for the dataset',
+  )
+  assert.equal('writtenTo' in value, false, 'no path was given — nothing was written to disk')
+})
+
+test('proof_training_export fidelity full with path writes the JSONL dataset to disk', async () => {
+  const target = join(WORKSPACE, 'training-full.jsonl')
+  const result = await callTool('proof_training_export', { fidelity: 'full', path: target }, 60_000)
+  assert.equal(result.isError, undefined, `training export errored: ${result.content[0]?.text}`)
+  const value = result.structuredContent as {
+    manifest: { schema: string; fidelity: string }
+    sampleCount: number
+    writtenTo?: string
+  }
+  assert.equal(value.manifest.schema, 'dsh-training/1')
+  assert.equal(value.manifest.fidelity, 'full', 'the explicit full tier is honored, not second-guessed')
+  assert.ok(value.sampleCount >= 1)
+  assert.equal(value.writtenTo, target, 'the response names where the engine wrote the dataset')
+  // The disk is the channel for the samples: exactly sampleCount JSONL lines,
+  // every one of them a JSON object (JSONL discipline).
+  const onDisk = await fsp.readFile(value.writtenTo!, 'utf8')
+  const lines = onDisk.split('\n').filter(line => line.trim().length > 0)
+  assert.equal(lines.length, value.sampleCount, 'the JSONL on disk carries exactly sampleCount samples')
+  for (const line of lines) {
+    const parsed: unknown = JSON.parse(line)
+    assert.equal(typeof parsed, 'object', 'each JSONL line is a JSON object — one sample per line')
+    assert.ok(parsed !== null && !Array.isArray(parsed))
+  }
+  assert.equal(
+    Object.keys(value).includes('samples'),
+    false,
+    'even the full tier with a path ships no samples on the wire — the file is the payload',
+  )
+})
+
+test('proof_training_export refuses an unintelligible fidelity loudly, never silently defaulting', async () => {
+  const result = await callTool('proof_training_export', { fidelity: 'loud' })
+  assert.equal(result.isError, true, 'a fidelity the two-tier scale does not name is a tool error')
+  const text = result.content[0]!.text
+  assert.match(text, /fidelity/, 'the error names the offending argument')
+  assert.match(text, /loud/, 'the error echoes the offending value')
+  assert.ok(text.includes('full') && text.includes('private'), 'the error names the two legal tiers')
 })
 
 // ---------------------------------------------------------------------------

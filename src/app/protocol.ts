@@ -1,5 +1,5 @@
 /**
- * Agent Proof Protocol (APP/1.2) — the protocol constants layer.
+ * Agent Proof Protocol (APP/1.3) — the protocol constants layer.
  *
  * Everything a producer emits and a consumer interprets is named here: the
  * wire vocabularies (verdicts, grades, check statuses, chain modes, claim
@@ -47,8 +47,19 @@ export const PROTOCOL_NAME = 'agent-proof-protocol' as const
  * a dialect that does — and because the version is fingerprint material, the
  * refusal is automatic: every APP/1.2 manifest is unintelligible to every
  * APP/1.1 verifier, in both directions, by construction.
+ *
+ * v0.20: APP/1.2 → APP/1.3 — the third tool-surface expansion (10 → 11): the
+ * training-data exhaust valve (`proof_training_export` — the deployer's
+ * labeled agent-behavior dataset distilled off the chain, anchor and all).
+ * The vocabularies, the content addressing, the chain/checkpoint formats, the
+ * bundle format and the responsibility DAG are all byte-for-byte unchanged;
+ * what grew is WHAT THE TOOLS CAN SAY again. Same honest mechanics as the two
+ * prior bumps: the version is fingerprint material, so every APP/1.3 manifest
+ * is unintelligible to every APP/1.2 verifier — and to every earlier one — in
+ * both directions, by construction. Downgrading this constant back is a
+ * wire-compatibility break, not a cosmetic edit.
  */
-export const PROTOCOL_VERSION = 'APP/1.2' as const
+export const PROTOCOL_VERSION = 'APP/1.3' as const
 
 /** Media type of a single proof document (a `ProofReport`-shaped value). */
 export const PROOF_MEDIA_TYPE = 'application/vnd.app.proof+json' as const
@@ -119,7 +130,7 @@ export const CHECK_STATUSES = ['pass', 'fail', 'error', 'timeout', 'aborted', 's
  * `protocolHeader` returns the empty skeleton.
  */
 export interface BundleManifest {
-  /** The protocol dialect, always `APP/1.2` for this module. */
+  /** The protocol dialect, always `APP/1.3` for this module. */
   protocol: typeof PROTOCOL_VERSION
   /** The producing implementation's vocabulary fingerprint (`appFingerprint()`). */
   appFingerprint: string

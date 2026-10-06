@@ -15,16 +15,16 @@
  */
 
 import type {
-  Baseline, ChangeProvenance, ChangeSetResolution, CheckSpec, CheckStatus, Clock, CommandPort,
-  DefinitionResolverPort, DependencyGraph, Evidence, FsPort, ProofGrade, RelPath,
+  Baseline, ChangeProvenance, ChangeSetResolution, CheckSpec, CheckStatus, CheckVerdict, Clock,
+  CommandPort, DefinitionResolverPort, DependencyGraph, Evidence, FsPort, ProofGrade, RelPath,
   SelectionResult, SignerPort, WorkspacePort, WorkspaceSnapshot,
 } from './core/index.ts'
 import {
   DEFAULT_IGNORE_DIRS, EvidenceStore, VerificationRunner, addressOf, assembleBaseline,
-  assembleProof, buildDependencyGraph, discoverChecks, isDecisiveStatus,
+  assembleProof, buildDependencyGraph, canonicalJson, discoverChecks, isDecisiveStatus,
   resolveChangeSet, selectAffectedChecks, sha256, snapshotWorkspace,
   claimProbability, computePriors, posteriorHealthy, rankByInformationGain,
-  summarizeHistory,
+  summarizeHistory, verdictOf, walkChain,
 } from './core/index.ts'
 import type {
   CheckPrior, ClaimModel, ConfidenceBasis, ConfidenceInput, GradedProofReport,
@@ -85,6 +85,13 @@ import {
   bundleFingerprint, composeTaskVerdict, detectCycles, obligationIdOf,
 } from './core/obligations.ts'
 import type { ComposedVerdict, DagNode, DelegationSubmission, TaskObligation } from './core/obligations.ts'
+// v0.20: the training-distillation domain (core/training.ts). The engine owns
+// the export SEAM — chain state in, DistillInput assembled, TrainingSet out to
+// files — while the core owns the distillation itself. Consumed straight from
+// the module, the same discipline as the contract/attest/synthetic/coverage
+// imports above: the core barrel is not this batch's to edit.
+import { distillTrainingSet } from './core/training.ts'
+import type { SampleFidelity, TrainingManifest, TrainingSample } from './core/training.ts'
 // v0.19: the ONE engine→app edge, deliberate. `verifyBundle` is the
 // authoritative implementation of the APP bundle exchange format (manifest
 // digests, chain walk, anchor adjudication), and `submitDelegation` must
@@ -448,6 +455,69 @@ export interface TaskVerdictResult {
 }
 
 /**
+ * v0.20: knobs for `exportTrainingData`. Both behavioural defaults are the
+ * conservative ones — the export would rather withhold than over-share:
+ * `fidelity` defaults to `'private'` (no output text in samples; digests only)
+ * and `provenanceFilter` defaults to `'agent-only'` (behaviour labels stay
+ * pure; records the agent cannot be attributed stay out).
+ */
+export interface TrainingExportOptions {
+  /**
+   * How much output text the samples carry. `'private'` (default) strips the
+   * excerpt and keeps only the digest; `'full'` keeps `outputExcerpt`.
+   */
+  readonly fidelity?: SampleFidelity
+  /**
+   * Behaviour-label purity filter handed to distillation. `'agent-only'`
+   * (default) keeps only agent-attributable verification behaviour; `'all'
+   * keeps everything. When the chain carries no provenance to filter by, the
+   * filter cannot fire — distillation runs unfiltered and the manifest still
+   * records the requested value (an honest downgrade, not a silent lie).
+   */
+  readonly provenanceFilter?: 'agent-only' | 'all'
+  /**
+   * The change set the samples are contextualised against. Default: the
+   * changed-path list recorded on the latest `proof/verified` marker — which
+   * today's markers do not carry (they record the count), so the honest
+   * default for our own chains is no change-set context.
+   */
+  readonly changedPaths?: readonly string[]
+  /** Dataset license, recorded on the manifest verbatim when given. */
+  readonly license?: string
+  /**
+   * When given, the export also lands on disk as two files: `<path>` (one
+   * canonical-JSON sample per line, JSONL) and `<path>.manifest.json` (the
+   * single manifest document). Both go through the fs port's atomic
+   * `writeFile`; the parent directory is created first.
+   */
+  readonly path?: string
+}
+
+/**
+ * v0.20: the chain state an export is pinned to — what a dataset consumer
+ * checks a re-derived merkle root against. `count`/`head` are the last
+ * checkpoint's self-attestation ({@link EvidenceStore.latestSignedCheckpoint}
+ * semantics: the latest signed checkpoint when one exists, otherwise the last
+ * well-formed checkpoint of an unsigned chain); `keyId` names the signing key
+ * and is absent when no signed checkpoint backs the anchor.
+ */
+export interface TrainingAnchor {
+  /** Evidence + marker records the checkpoint commits to. */
+  readonly count: number
+  /** Chain head digest at the checkpoint. */
+  readonly head: string
+  /** The signing key's identity, when the anchor is a signed checkpoint. */
+  readonly keyId?: string
+}
+
+/** v0.20: what `exportTrainingData` produced. */
+export interface TrainingExportResult {
+  readonly manifest: TrainingManifest
+  readonly samples: readonly TrainingSample[]
+  readonly anchor: TrainingAnchor
+}
+
+/**
  * π: narrow one `synthetic/requested` marker payload back into a
  * `SyntheticRequest`. Malformed payloads (older chains, foreign writes)
  * return `undefined` and are skipped by every consumer — a marker that
@@ -561,6 +631,50 @@ function delegationBundleOf(value: unknown): ProofBundle {
     if (typeof contents !== 'string') throw new Error(failure)
   }
   return value as ProofBundle
+}
+
+/** Directory part of an arbitrary export path ('' when the path is bare). */
+function exportDirOf(path: string): string {
+  const idx = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+  return idx <= 0 ? '' : path.slice(0, idx)
+}
+
+/**
+ * v0.20: the changed-path LIST from the latest `proof/verified` marker — only
+ * when a writer actually recorded the list there. The boundary markers this
+ * engine writes today carry the COUNT (`changed: changed.length`, see
+ * `verify`), so for our own chains this returns `undefined` and the export
+ * degrades honestly to no change-set context rather than inventing one. The
+ * structural read keeps the seam forward-compatible: the day a boundary
+ * marker carries the list itself, the export picks it up unmodified.
+ */
+function markerChangedPaths(payload: Record<string, unknown> | undefined): readonly string[] | undefined {
+  if (payload === undefined) return undefined
+  const changed = payload.changed
+  if (!Array.isArray(changed) || !changed.every(p => typeof p === 'string')) return undefined
+  return [...changed]
+}
+
+/**
+ * v0.20: path→provenance from the latest `proof/verified` marker's
+ * attribution payload — again only when the payload carries per-path
+ * attribution (an object of path → 'agent' | 'external' | 'explicit' |
+ * 'unknown'). This engine's own markers record the resolution METHOD there
+ * (a string), so today the answer is `undefined`: distillation runs
+ * unfiltered while the manifest still records the requested
+ * `provenanceFilter` — the downgrade is visible, not silent.
+ */
+function markerProvenance(payload: Record<string, unknown> | undefined): Map<string, ChangeProvenance> | undefined {
+  if (payload === undefined) return undefined
+  const attribution = payload.attribution
+  if (attribution === null || typeof attribution !== 'object' || Array.isArray(attribution)) return undefined
+  const out = new Map<string, ChangeProvenance>()
+  for (const [path, value] of Object.entries(attribution)) {
+    if (value === 'agent' || value === 'external' || value === 'explicit' || value === 'unknown') {
+      out.set(path, value)
+    }
+  }
+  return out.size > 0 ? out : undefined
 }
 
 /**
@@ -2486,6 +2600,108 @@ export class ProofEngine {
       nodes.set(taskId, { ...node, waiver: { by, reason, at } })
     }
     return [...nodes.values()]
+  }
+
+  // -- training export (v0.20) ----------------------------------------------------
+
+  /**
+   * v0.20: distil the evidence chain into an RL/SFT training dataset
+   * (`dsh-training/1`). The engine owns the seam — everything below is chain
+   * state translated into `DistillInput`; the distillation itself is
+   * `core/training.ts`'s.
+   *
+   * - **records** — the store's full log (`all()`), not just the slice before
+   *   the last checkpoint: the dataset anchors to the chain state at export
+   *   time, and the returned `anchor` names where the strongest commitment
+   *   stood ({count, head} of the last checkpoint, keyId when signed). A
+   *   consumer re-deriving the sample set from the same records reproduces
+   *   the manifest root or holds a different chain — that is the whole point
+   *   of anchoring.
+   * - **baselineVerdicts** — the loaded baseline's checks folded into the
+   *   verdict vocabulary. `Baseline.checks` holds evidence RECORDS (not
+   *   verdicts), so each is narrowed through `verdictOf(record, record)`: the
+   *   self-comparison yields `still-passing` for a decisive pass,
+   *   `still-failing` for a decisive fail and `indeterminate` for anything
+   *   non-decisive — exactly "what the baseline believed about this check".
+   * - **changedPaths** — the caller's explicit set (canonicalised) or, by
+   *   default, the latest `proof/verified` marker's changed list; our markers
+   *   record the count, so the honest default is no context (see
+   *   `markerChangedPaths`).
+   * - **provenance** — per-path attribution from the same marker, when the
+   *   payload carries it; absent → distillation runs unfiltered (see
+   *   `markerProvenance`). The manifest's `provenanceFilter` records the
+   *   REQUESTED value either way.
+   *
+   * `options.path`, when given, writes two files through the fs port's atomic
+   * `writeFile`: the JSONL samples (one `canonicalJson` line each) and the
+   * single manifest document. An empty chain is a legal export: zero counts,
+   * zero samples, anchor `{count: 0, head: ''}`.
+   */
+  async exportTrainingData(options: TrainingExportOptions = {}): Promise<TrainingExportResult> {
+    const fidelity: SampleFidelity = options.fidelity ?? 'private'
+    const provenanceFilter: 'agent-only' | 'all' = options.provenanceFilter ?? 'agent-only'
+    const records = await this.store.all()
+    const baselineVerdicts = new Map<string, CheckVerdict>()
+    for (const record of (await this.store.loadBaseline())?.checks ?? []) {
+      baselineVerdicts.set(record.checkId, verdictOf(record, record))
+    }
+    const markers = await this.markersWith('proof/verified')
+    const latestMarker = markers.length > 0 ? markers[markers.length - 1] : undefined
+    const markerPaths = markerChangedPaths(latestMarker)
+    const changedPaths: readonly string[] = options.changedPaths !== undefined
+      ? this.canonicalChanged(options.changedPaths)
+      : markerPaths !== undefined
+        ? [...new Set(markerPaths)].sort()
+        : []
+    const provenance = markerProvenance(latestMarker)
+    const training = distillTrainingSet({
+      records,
+      baselineVerdicts,
+      changedPaths,
+      workspaceKey: this.workspaceKey,
+      fidelity,
+      // Handed over even when no provenance map could be recovered: F1's own
+      // manifest records this value verbatim, and under 'agent-only' the
+      // filter only fires on an `external` attribution it can actually see —
+      // absent provenance means nothing to void, not a silently broader set.
+      provenanceFilter,
+      ...(provenance !== undefined ? { provenance } : {}),
+      generatedAt: new Date(this.clock.now()).toISOString(),
+      ...(options.license !== undefined ? { license: options.license } : {}),
+    })
+    const manifest: TrainingManifest = training.manifest
+    const anchor = await this.trainingAnchor()
+    if (options.path !== undefined) {
+      const dir = exportDirOf(options.path)
+      if (dir.length > 0) await this.fs.mkdirp(dir)
+      const lines = training.samples.map(sample => canonicalJson(sample))
+      await this.fs.writeFile(options.path, lines.length > 0 ? `${lines.join('\n')}\n` : '')
+      await this.fs.writeFile(`${options.path}.manifest.json`, `${canonicalJson(manifest)}\n`)
+    }
+    return { manifest, samples: training.samples, anchor }
+  }
+
+  /**
+   * v0.20: the export's chain anchor. Primary source is
+   * `latestSignedCheckpoint` — the audit's own "best checkpoint" selection —
+   * which yields {count, head} plus the signing key's id. Unsigned chains
+   * (and signed deployments whose signer failed to load) fall back to a raw
+   * `walkChain` over the log: the LAST well-formed checkpoint's {count, head}
+   * with no keyId — the honest answer for a chain with no signature to name.
+   * No checkpoint at all anchors at {0, ''}: an empty dataset over an empty
+   * log, distinguishable from a checkpointed one by count alone.
+   */
+  private async trainingAnchor(): Promise<TrainingAnchor> {
+    const signed = await this.store.latestSignedCheckpoint()
+    if (signed !== undefined) {
+      return { count: signed.payload.count, head: signed.payload.head, keyId: signed.keyId }
+    }
+    const walk = walkChain(await this.fs.readLines(this.logPath))
+    const malformed = new Set(walk.malformedCheckpoints)
+    const last = walk.checkpoints.findLast(cp => !malformed.has(cp.index))
+    return last === undefined
+      ? { count: 0, head: '' }
+      : { count: last.payload.count, head: last.payload.head }
   }
 
   // -- graded evidence (κ) ----------------------------------------------------

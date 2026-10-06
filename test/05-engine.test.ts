@@ -7,8 +7,12 @@ import { join } from 'node:path'
 import { ProofEngine } from '../src/engine.ts'
 import { assembleProof } from '../src/core/report.ts'
 import { attributeChecks, proofNarrative } from '../src/core/regression.ts'
-import { buildBaseline, EvidenceStore, makeEvidence, snapshotWorkspace } from '../src/core/evidence.ts'
+import { buildBaseline, EvidenceStore, isDecisiveStatus, makeEvidence, snapshotWorkspace } from '../src/core/evidence.ts'
 import type { ProofGrade } from '../src/core/evidence.ts'
+import { merkleRoot } from '../src/core/hash.ts'
+// v0.20: the training-export tests assert against F1's own schema constant
+// and reward law, so the assertions cannot drift from the contract they check.
+import { TRAINING_SCHEMA, VERDICT_REWARD, sampleHash } from '../src/core/training.ts'
 import { VerificationRunner } from '../src/core/runner.ts'
 import { claimIdOf } from '../src/core/attest.ts'
 import { SYNTHETIC_TEMPLATE } from '../src/core/synthetic.ts'
@@ -2574,4 +2578,196 @@ test('v0.19: the delegation markers are chain facts — payloads read back from 
     fs.log.some(l => l.includes('"delegation/waive"') && l.includes('tech-lead') && l.includes('docs shipped by another team')),
     'the waive marker carries by and reason',
   )
+})
+
+// -- v0.20: training-data export --------------------------------------------------
+//
+// Every fixture below builds state with the real verbs (baseline/verify/mark
+// through the real store) and asserts what `exportTrainingData` distilled.
+
+test('v0.20: end-to-end export — flip pair, counts, reward table, root, anchor', async () => {
+  const fs = MemoryFs.of(project())
+  const commands = new FakeCommands()
+  const engine = makeEngine(fs, commands)
+  await engine.establishBaseline()
+  // One deliberate fail, then fixed: the fail→pass sequence is the flip pair
+  // RL training wants to see.
+  commands.on(argv => argv.includes('test'), { exitCode: 1, output: 'FAIL expected 1 to be 2' })
+  await engine.verify({ changed: ['src/a.ts'], all: true })
+  commands.on(argv => argv.includes('test'), { exitCode: 0, output: 'ok' })
+  await engine.verify({ changed: ['src/a.ts'], all: true })
+
+  const exported = await engine.exportTrainingData()
+  assert.equal(exported.manifest.schema, TRAINING_SCHEMA)
+  // One verification sample per DECISIVE record: 2 (baseline) + 2 + 2.
+  const records = await engine.storeView.all()
+  const decisive = records.filter(r => isDecisiveStatus(r.status)).length
+  assert.equal(decisive, 6, `fixture produced 6 decisive records, got ${decisive}`)
+  assert.equal(exported.manifest.counts.verification, decisive,
+    'verification count = decisive records on the chain')
+  assert.ok(exported.manifest.counts['flip-pair'] >= 1, 'the fail→pass sequence yielded a flip pair')
+
+  // The manifest root is re-derivable: the merkle root over the exported
+  // samples' own content addresses — anyone holding the samples recomputes it.
+  assert.equal(exported.manifest.root, merkleRoot(exported.samples.map(sampleHash)))
+  // The reward law rides the manifest as a snapshot.
+  assert.deepEqual(exported.manifest.rewardTable, VERDICT_REWARD)
+
+  // The anchor names the chain state the export pinned to (last checkpoint).
+  assert.ok(exported.anchor.count > 0)
+  assert.ok(exported.anchor.head.length > 0)
+  assert.equal(exported.anchor.keyId, undefined, 'an unsigned fixture chain has no keyId to name')
+
+  // Reward ↔ verdict: same verdict ⇒ same reward (a table lookup), and a
+  // failing status is rewarded below a passing one.
+  const rewardByVerdict = new Map<string, number>()
+  let failReward: number | undefined
+  let passReward: number | undefined
+  for (const sample of exported.samples) {
+    if (sample.kind !== 'verification') continue
+    assert.equal(typeof sample.reward, 'number', 'verification samples carry a numeric reward')
+    const seen = rewardByVerdict.get(sample.verdict)
+    assert.ok(seen === undefined || seen === sample.reward,
+      `reward is a per-verdict table lookup (${sample.verdict}: ${seen} vs ${sample.reward})`)
+    rewardByVerdict.set(sample.verdict, sample.reward)
+    if (sample.status === 'fail') failReward = sample.reward
+    if (sample.status === 'pass') passReward = sample.reward
+  }
+  assert.ok(failReward !== undefined && passReward !== undefined, 'the fixture produced both outcomes')
+  assert.ok(failReward < passReward, 'blame is rewarded below credit')
+})
+
+test('v0.20: private is the default fidelity — no output text leaks; full carries excerpts', async () => {
+  const fs = MemoryFs.of(project())
+  const commands = new FakeCommands()
+    .on(argv => argv.includes('test'), { exitCode: 1, output: 'SECRET-FAILURE-TOKEN unique to this run' })
+  const engine = makeEngine(fs, commands)
+  await engine.establishBaseline()
+  commands.on(argv => argv.includes('test'), { exitCode: 0, output: 'fixed now' })
+  await engine.verify({ changed: ['src/a.ts'], all: true })
+
+  const priv = await engine.exportTrainingData()
+  assert.equal(priv.manifest.fidelity, 'private')
+  assert.ok(!JSON.stringify(priv.samples).includes('SECRET-FAILURE-TOKEN'),
+    'the privacy-conservative default carries no output text')
+
+  const full = await engine.exportTrainingData({ fidelity: 'full' })
+  assert.equal(full.manifest.fidelity, 'full')
+  assert.ok(JSON.stringify(full.samples).includes('SECRET-FAILURE-TOKEN'),
+    'full fidelity carries the output excerpt')
+})
+
+test('v0.20: agent-only is the default filter — external attribution is skipped; no provenance degrades honestly', async () => {
+  // (a) Degradation: our own markers record the attribution METHOD, not a
+  // per-path map, so the filter has nothing to enforce — distillation runs
+  // unfiltered and the manifest still records what was requested.
+  const plain = makeEngine(MemoryFs.of(project()), new FakeCommands())
+  await plain.establishBaseline()
+  await plain.verify({ changed: ['src/a.ts'], all: true })
+  const plainDefault = await plain.exportTrainingData()
+  const plainAll = await plain.exportTrainingData({ provenanceFilter: 'all' })
+  assert.equal(plainDefault.manifest.provenanceFilter, 'agent-only')
+  assert.equal(plainDefault.manifest.counts.verification, plainAll.manifest.counts.verification,
+    'no provenance on chain → nothing to filter, both policies agree')
+
+  // (b) External attribution: a boundary marker whose attribution payload is
+  // the per-path map (written through the REAL store — the same channel
+  // verify() itself uses) says the change came from outside the agent.
+  const fs = MemoryFs.of(project())
+  const engine = makeEngine(fs, new FakeCommands())
+  await engine.establishBaseline()
+  await engine.verify({ changed: ['src/a.ts'], all: true })
+  await engine.storeView.mark('proof/verified', {
+    grade: 'proven',
+    root: 're-attributed',
+    changed: ['src/a.ts'],
+    attribution: { 'src/a.ts': 'external' },
+  })
+
+  const all = await engine.exportTrainingData({ provenanceFilter: 'all' })
+  assert.ok(all.manifest.counts.verification > 0)
+  const agentOnly = await engine.exportTrainingData()
+  assert.equal(agentOnly.manifest.provenanceFilter, 'agent-only')
+  assert.ok(agentOnly.manifest.counts.verification < all.manifest.counts.verification,
+    `agent-only skips external-attributed verification behaviour (${agentOnly.manifest.counts.verification} < ${all.manifest.counts.verification})`)
+  // The changed-path default also recovered from the marker payload.
+  const samplePaths = [...new Set(all.samples.flatMap(s => s.kind === 'verification' ? s.changedPaths : []))].sort()
+  assert.deepEqual(samplePaths, ['src/a.ts'])
+})
+
+test('v0.20: path writes the two files — JSONL lines match samples, manifest parses and agrees', async () => {
+  const root = join(CONJURE_ROOT, 'training-export')
+  await fsp.rm(root, { recursive: true, force: true })
+  await fsp.mkdir(join(root, 'src'), { recursive: true })
+  await fsp.writeFile(join(root, 'package.json'), JSON.stringify({ name: 'export-fixture', private: true }))
+  await fsp.writeFile(join(root, 'src', 'feature.ts'), 'export const feature = 2\n')
+  // Real fs store (the evidence log AND the export land on disk); fake
+  // commands/workspace keep the run itself hermetic.
+  const engine = new ProofEngine({
+    root,
+    fs: new NodeFsPort(),
+    commands: new FakeCommands(),
+    workspace: new FakeWorkspace(root),
+    clock: new FakeClock(),
+    autoDiscover: false,
+    checks: [{ label: 'unit', command: ['node', '-e', 'process.exit(0)'], kind: 'test', paths: ['src/**'] }],
+  })
+  try {
+    await engine.establishBaseline()
+    await engine.verify({ changed: ['src/feature.ts'], all: true })
+    const exported = await engine.exportTrainingData({
+      path: join(root, 'out', 'train.jsonl'),
+      license: 'CC-BY-4.0',
+    })
+    const jsonl = await fsp.readFile(join(root, 'out', 'train.jsonl'), 'utf8')
+    const lines = jsonl.split('\n').filter(l => l.trim().length > 0)
+    assert.equal(lines.length, exported.samples.length, 'one JSONL line per sample')
+    for (const [i, line] of lines.entries()) {
+      assert.deepEqual(JSON.parse(line), exported.samples[i], `line ${i} round-trips its sample`)
+    }
+    const manifest = JSON.parse(await fsp.readFile(join(root, 'out', 'train.jsonl.manifest.json'), 'utf8'))
+    assert.equal(manifest.root, exported.manifest.root)
+    assert.equal(manifest.license, 'CC-BY-4.0')
+    assert.equal(manifest.counts.verification, exported.manifest.counts.verification)
+    assert.equal(manifest.root.length, 64, 'the manifest carries a sha-256 root')
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true })
+  }
+})
+
+/** A clock that never moves — two exports over identical state must agree exactly. */
+class StaticClock {
+  now(): number { return 1_700_000_000_000 }
+}
+
+test('v0.20: identical chain state exports deepEqual — generatedAt rides the injected clock', async () => {
+  const fs = MemoryFs.of(project())
+  const engine = makeEngine(fs, new FakeCommands())
+  await engine.establishBaseline()
+  await engine.verify({ changed: ['src/a.ts'], all: true })
+  // A second engine over the SAME log, holding a frozen clock: the only
+  // legitimate difference between two exports would be the clock.
+  const frozen = new ProofEngine({
+    root: ROOT,
+    fs,
+    commands: new FakeCommands(),
+    workspace: new FakeWorkspace(ROOT),
+    clock: new StaticClock(),
+  })
+  const first = await frozen.exportTrainingData()
+  const second = await frozen.exportTrainingData()
+  assert.deepEqual(second, first)
+  assert.equal(first.manifest.generatedAt, new Date(1_700_000_000_000).toISOString())
+})
+
+test('v0.20: an empty chain exports an honest empty dataset — no throw, zero counts', async () => {
+  const engine = makeEngine(MemoryFs.of(project()), new FakeCommands())
+  const exported = await engine.exportTrainingData()
+  assert.equal(exported.samples.length, 0)
+  assert.equal(exported.manifest.counts.verification, 0)
+  assert.equal(exported.manifest.counts['flip-pair'], 0)
+  assert.equal(exported.manifest.root, merkleRoot([]), 'the empty dataset commits to the empty merkle root')
+  assert.deepEqual(exported.anchor, { count: 0, head: '' })
+  assert.equal(exported.manifest.fidelity, 'private')
+  assert.equal(exported.manifest.provenanceFilter, 'agent-only')
 })

@@ -20,7 +20,7 @@ dsh plugin --profile web add dsh-proof
 dsh plugin --profile web add ./dsh-proof
 ```
 
-v0.15 起，核心不再只是一个插件：它是一个开放标准、一台独立服务器，加上宿主适配器——**所有 agent 的公共基础设施**。**Agent Proof Protocol（APP/1.2）**（见 **[PROTOCOL.md](./PROTOCOL.md)**）把词表、内容寻址、签名链与可携带的 bundle 交换格式固化为任何实现都能说的规范；包内随附 **Proof MCP Server**——任何 harness 上的任何 agent（Claude Desktop、Cursor、一切会说 MCP 的宿主）都能对着一个从未装过 DSH 的工作区调 `proof_verify`；v0.15 起另有 **Claude Code 与 OpenCode 宿主适配器**，在工具调用的缝隙上执行一台服务器永远做不到的强制。v0.18 起另有 **Proof Transparency Log**：已发布的检查点历史从此可被公开核验——任何人都能证明某次交付的检查点确实在日志里，且日志从未回写自身。v0.19 起另有**跨代理责任 DAG**：委派出去的任务携带证明义务，父任务的 `proven` 以全部子任务 `proven` 为前提，DAG 的每条边都是任何人都能从字节重验的 proof bundle——多智能体系统第一次有了可追责的信任拓扑。
+v0.15 起，核心不再只是一个插件：它是一个开放标准、一台独立服务器，加上宿主适配器——**所有 agent 的公共基础设施**。**Agent Proof Protocol（APP/1.3）**（见 **[PROTOCOL.md](./PROTOCOL.md)**）把词表、内容寻址、签名链与可携带的 bundle 交换格式固化为任何实现都能说的规范；包内随附 **Proof MCP Server**——任何 harness 上的任何 agent（Claude Desktop、Cursor、一切会说 MCP 的宿主）都能对着一个从未装过 DSH 的工作区调 `proof_verify`；v0.15 起另有 **Claude Code 与 OpenCode 宿主适配器**，在工具调用的缝隙上执行一台服务器永远做不到的强制。v0.18 起另有 **Proof Transparency Log**：已发布的检查点历史从此可被公开核验——任何人都能证明某次交付的检查点确实在日志里，且日志从未回写自身。v0.19 起另有**跨代理责任 DAG**：委派出去的任务携带证明义务，父任务的 `proven` 以全部子任务 `proven` 为前提，DAG 的每条边都是任何人都能从字节重验的 proof bundle——多智能体系统第一次有了可追责的信任拓扑。v0.20 起**训练数据飞轮**装上排气阀：证据日志里机器验证的判定蒸馏为可导出、内容寻址、链上锚定的带标签数据集——诚实工作本身在积累部署方的数据资产。
 
 ---
 
@@ -499,7 +499,7 @@ DSH_PROOF_ROOT=/path/to/project dsh-proof-mcp
 node --experimental-strip-types src/app/mcp-entry.ts
 ```
 
-服务器**不读 `cordis.yml`**——每个旋钮都是环境变量：`DSH_PROOF_ROOT`（它验证的工作区根，默认 cwd）、`DSH_PROOF_TRUST_DIR`（密钥与锚点，默认 `$DSH_HOME/proof`）、`DSH_PROOF_EVIDENCE_STORE`（`host` | `workspace`，默认 `host`）、`DSH_PROOF_PTL_DIR`（v0.18 起的透明日志目录，供 `proof_publish` / `proof_log_verify`，默认 `<信任根>/ptl`）。协议版本协商接受 `2025-06-18` / `2025-03-26` / `2024-11-05`。MCP 侧全部走环境变量，不增减配置表（§八，v0.19 起 33 项）。
+服务器**不读 `cordis.yml`**——每个旋钮都是环境变量：`DSH_PROOF_ROOT`（它验证的工作区根，默认 cwd）、`DSH_PROOF_TRUST_DIR`（密钥与锚点，默认 `$DSH_HOME/proof`）、`DSH_PROOF_EVIDENCE_STORE`（`host` | `workspace`，默认 `host`）、`DSH_PROOF_PTL_DIR`（v0.18 起的透明日志目录，供 `proof_publish` / `proof_log_verify`，默认 `<信任根>/ptl`）。协议版本协商接受 `2025-06-18` / `2025-03-26` / `2024-11-05`。MCP 侧全部走环境变量，不增减配置表（§八，v0.19 起 33 项，v0.20 维持不变）。
 
 **第三步 · 首跑**。打开任意项目目录，让 agent 调 `proof_baseline`——发现的检查全部真跑一遍，签名链与锚点就此建立；再调 `proof_verify` 拿到带回归归因的分级裁决。`proof_claim` 声明完成并证明它；`proof_bundle` 打包 manifest + 日志，交给另一台机器或第三方。
 
@@ -597,9 +597,25 @@ v0.19 之前的一切证明的都是*单个工作区里的单个 agent*。而一
 
 **DAG 的每条边是一个 v0.14 bundle。** worker 在*自己的*工作区里证明义务——`proof_baseline` → 干活 → `proof_verify`/`proof_claim` → `proof_bundle`——把导出物交回来；编排者以零信任 `verifyBundle` 裁决（摘要重算、链重走，提交方说什么都不信），`bundleFingerprint`（manifest 文件摘要列的顺序无关哈希）锚定这次提交到底站在哪些字节后面——v0.14 的交换格式在这里兑现。引擎长出四个动词：`delegateTask`（铸造 `task-<n>`、拒绝不存在的父任务、`detectCycles` 纵深防护、`delegation/created` marker 落链）；`submitDelegation`（`verifyBundle` 的裁决成为 `artifactVerified`；`claimedGrade` 缺省刻意两值——验过且带基线 → `proven`，其余 → `no-baseline`——细等级是提交方必须*显式声明*的工作区本地判断，而声明了 artifact 撑不住的等级按伪造定价）；`taskVerdict`（从 marker 重建全图递归合成；父级自身证据经 `ownGrade` 注入）；`waiveDelegation`（记名的风险接受——`by` 与 `reason` 必填——只记账；豁免抬不抬得动裁决是合成格的事，对伪造与 regressed 由语义拒绝）。
 
-协议升版 **APP/1.1 → APP/1.2**——又是一次纯工具面扩张，7 → 10：`proof_delegate` / `proof_delegate_submit` / `proof_task` 加入 MCP 一致性面；寻址、链与 bundle 格式分毫未动，指纹按构造移动（`test/21` 现在钉死三代指纹——1.0、1.1、1.2 互不相认）。`proof_delegate` 返回 `instruction`——可直接粘进 worker 初始 prompt 的移交文本，写明 claim、验收标准、worker 侧的五步协议，以及那句让拓扑成真的话：*你的 "proven" 是父任务 "proven" 的前提*。角色一行说清：编排者说 `proof_delegate` / `proof_task`；worker 说 `proof_verify` / `proof_bundle` / `proof_delegate_submit`；第三方审计者说 `proof_log_verify` 与 bundle 自己的字节。dsh 侧另有实验性 **agent-team 桥**（`src/dsh/agent-team.ts`，经 `agentTeamBridge` opt-in，默认 false）：dsh 已发布的插件类型尚无 team 接口，桥在运行时对 4 个候选事件 seam 做鸭子类型探测（`agent/team:delegated`、`agent/delegation`、`team/task-created`、`agent/subtask`——每个订阅各自 try/catch），每个事件从 `unknown` 收窄（证明不了自己形状的被跳过，绝不被猜测），探测命中即把委派镜像为链上签名义务、并把 worker 移交 `instruction` 写回宿主能把内容送到子代理的通道。桥内任何路径都不向宿主抛异常——失败降级为一行 stderr，显式工具始终是第一等路径；实验 seam 绝不惊扰没要过它的部署。
+协议升版 **APP/1.1 → APP/1.2**——又是一次纯工具面扩张，7 → 10：`proof_delegate` / `proof_delegate_submit` / `proof_task` 加入 MCP 一致性面；寻址、链与 bundle 格式分毫未动，指纹按构造移动（`test/21` 当时钉死三代指纹——1.0、1.1、1.2 互不相认；v0.20 钉到第四代）。`proof_delegate` 返回 `instruction`——可直接粘进 worker 初始 prompt 的移交文本，写明 claim、验收标准、worker 侧的五步协议，以及那句让拓扑成真的话：*你的 "proven" 是父任务 "proven" 的前提*。角色一行说清：编排者说 `proof_delegate` / `proof_task`；worker 说 `proof_verify` / `proof_bundle` / `proof_delegate_submit`；第三方审计者说 `proof_log_verify` 与 bundle 自己的字节。dsh 侧另有实验性 **agent-team 桥**（`src/dsh/agent-team.ts`，经 `agentTeamBridge` opt-in，默认 false）：dsh 已发布的插件类型尚无 team 接口，桥在运行时对 4 个候选事件 seam 做鸭子类型探测（`agent/team:delegated`、`agent/delegation`、`team/task-created`、`agent/subtask`——每个订阅各自 try/catch），每个事件从 `unknown` 收窄（证明不了自己形状的被跳过，绝不被猜测），探测命中即把委派镜像为链上签名义务、并把 worker 移交 `instruction` 写回宿主能把内容送到子代理的通道。桥内任何路径都不向宿主抛异常——失败降级为一行 stderr，显式工具始终是第一等路径；实验 seam 绝不惊扰没要过它的部署。
 
 测试 632 → 668（+36：`test/29-obligations` 20——全量合成矩阵、递归、菱形、环检测；`05` 引擎六例——诚实/伪造/豁免/参数防御/三层传播/marker 事实；`23` MCP 五例——移交文本、提交前总览、诚实 bundle proven、伪造 bundle 点名归责、畸形用法拒绝；`08` 插件接线五例——agent-team 桥：事件防御性收窄、委派镜像+instruction 注入、seam 探测优雅降级、opt-in 默认不动、移交文本内容）；`src/` 新增 `core/obligations.ts` 与 `dsh/agent-team.ts`。配置 32 → 33 项——唯一的新键是 `agentTeamBridge`（默认 false）：责任 DAG 本身是协议不是旋钮，唯一的旋钮是实验桥的 opt-in。
+
+## 五·二十五、训练数据飞轮（v0.20.0）：部署本身在积累数据资产
+
+到 v0.19 为止，一切价值都在**使用时**兑现：验证过的完成、归因好的回归、可审计的委派。v0.20 把同一份日志一直在悄悄积累的第二份资产捡起来：**诚实工作的副产品——带标签的 agent 行为数据集**。日志里的每一条记录都是 (检查, 变更集, 证据, 判定) 四元组，而判定是哈希链保护下的机器验证基线差分——**客观标签，不是模型对自己的自评**。一个部署只要在证明自己的工作，就无论有意无意都在积累「带真值标签的 agent 轨迹数据」——这类数据通常要花人工标注预算去近似，在这里是诚实工作的免费副产品。
+
+**飞轮的在线一半从 v0.9 就在转**：贝叶斯调度器已经在从日志学每个检查的 flakiness 与成本——部署验证得越多，调度先验越准（用得越多，调度越聪明）。v0.20 装上**排气阀**：积累的数据从此可以离开机器，成为可导出、可验证的数据集（新纯领域模块 `src/core/training.ts`，schema `dsh-training/1`）——这是数据网络效应的**诚实版**：资产是使用的副产品、随使用复利增长、且归**部署方**所有。
+
+**一个 schema 两种样本。** **verification** 样本——一条决定性观测：检查、变更集、判定，加上该判定按成文惯例表挣得的标量 `reward`（`VERDICT_REWARD`，刻意不是旋钮，逐 manifest 快照）：记功 `still-passing`/`fixed` 1.0，中性 `new-check`/`still-failing` 0.5（预置失败不是 agent 的错——记 0 与记 1 同样不诚实），记账 `regression`/`new-failure` 0.0——而 `indeterminate` **根本不进数据集**：未知不是零，一次真实的 pass 被当成回归惩罚，比没有数据更糟。**flip-pair** 样本——同一检查决定性子序列里的一次相邻 fail↔pass 分歧，按 DPO 固定方向装订（`rejected` 恒为 fail 侧、`chosen` 恒为 pass 侧；时间方向保留在两个 `recordedAt` 里）——日志免费铸造的偏好对。
+
+**隐私与因果纯度是缺省，不是要记得做的功课。** `private` 保真档（缺省）导出**零输出字符**——只有结构、标签与 digest——数据集可以在任何人读完它每一行之前就离开机器（`full` 档补上归一化摘录、截到 200 字符；降级方向永远是沉默，绝不是泄漏）。`agent-only` 溯源过滤（缺省）在变更集里出现**一条**外部归属路径时，**作废整个会话的 verification 标签**——reward 1.0 断言的是「agent 的编辑让套件保持绿」，而人类同时也在改工作区时这句话为假——flip-pair 不受作废影响（同一链内的 pass-then-fail 是关于检查的时间事实，无论哪只手动了文件）。manifest 即使（恰恰）在被过滤成空时也如实记录所用过滤器。
+
+**数据集内容寻址、链上锚定。** 每个样本的 `sampleHash` 是其规范化摘要的前 16 hex；manifest 的 `root` 是全体样本地址的 Merkle root——改一条样本的一个字符，root 即变，数据集无法在事后被悄悄改标；两份导出不信任任何导出方即可比对。reward 表作为**快照**随 manifest 走（没有铸造法则的数字是无标签数据），每次导出再以 **anchor** 锚定——导出时刻最后签名检查点的 `{count, head, keyId}`（无签名链则诚实无 key 地取最后一个良构检查点）——持有日志的消费方重导出 root 对得上，对不上就知道手里是另一条链。引擎动词是 `exportTrainingData`（`path` 选项把 JSONL 样本与 manifest 文档原子落盘）；MCP 面是 `proof_training_export`——这就是 **APP/1.2 → APP/1.3** 升版的全部内容（10 → 11，同一诚实条款下的又一次纯工具面扩张：其余分毫未动、指纹按构造移动、`test/21` 现在四代指纹字面钉死）。样本本体**永不进 MCP 响应**——只有 manifest、anchor 与 `sampleCount`；要样本就传 `path`，`writtenTo` 告诉你 JSONL 落在哪。
+
+诚实边界，本节说一遍、清单里留三条：reward 表是**成文惯例不是客观真理**——标签底下的判定是机器验证的差分，1.0/0.5/0.0 的定价是声明的政策；flip 配对是**相邻启发**（相邻指导出日志决定性子序列里的相邻，不是说两次观测之间世上什么都没发生）；**跨部署合并数据集的信任问题未解**——这是谁的数据？被投过毒吗？把数据集来源锚进透明日志（防 data laundering）是未来方向，不是本版的能力。
+
+测试 668 → 685（+17：`test/30-training` 8——全部判定类别与两个翻转方向的真值排气、reward 表钉死、private/full 保真、外部作废、确定性、样本寻址、空日志；`05` 引擎六例——端到端导出（flip pair/counts/root/anchor）、缺省 private、缺省 agent-only 与无溯源数据的诚实降级、`path` 落两个文件、注入时钟确定性、空链；`23` MCP 四例——private 缺省且样本不上线、full+`path` 写出 JSONL、非法枚举大声拒绝、参数面钉死）；`src/` 新增 `core/training.ts`；配置维持 33 项——飞轮是协议，不是旋钮。
 
 ---
 
@@ -610,7 +626,7 @@ v0.19 之前的一切证明的都是*单个工作区里的单个 agent*。而一
 ```
 dsh-proof/
 ├── src/
-│   ├── core/                 ← 纯领域层，零 @deepseek-ai/* 依赖（19 个模块）
+│   ├── core/                 ← 纯领域层，零 @deepseek-ai/* 依赖（20 个模块）
 │   │   ├── ports.ts          # 唯一的对外接口（Command/Fs/Clock/Workspace/Signer/Resolver）
 │   │   ├── hash.ts           # 规范化 JSON + 内容寻址 + Merkle root + 输出归一
 │   │   ├── checks.ts         # 客观检查发现（多语言 + monorepo 子包 cwd）
@@ -629,6 +645,7 @@ dsh-proof/
 │   │   ├── coverage.ts       # 覆盖感知证明（V8 报告解析、变更集聚合、unproven 门控，纯函数）
 │   │   ├── transparency.ts   # 证明透明日志（RFC 6962 Merkle 树、包含/一致性证明、STH 与验证器镜像，纯函数）
 │   │   ├── obligations.ts    # 跨代理责任 DAG（证明义务、递归合成格、环检测、bundleFingerprint，纯函数）
+│   │   ├── training.ts       # 训练数据飞轮（dsh-training/1：verification/flip-pair 两类样本、VERDICT_REWARD 惯例表、隐私两档、agent-only 过滤、样本寻址与 merkleRoot，纯函数）
 │   │   └── index.ts          # 领域导出
 │   ├── engine.ts             # ProofEngine —— 宿主调用的命令式门面
 │   ├── node-ports.ts         # Node 实现（spawn / fs / git / Ed25519）
@@ -640,10 +657,10 @@ dsh-proof/
 │   │   ├── prompt.ts         # proof:policy 段落
 │   │   ├── lsp-impact.ts     # 宿主 LSP → DefinitionResolverPort 适配
 │   │   └── agent-team.ts     # 实验 agent-team 桥（opt-in：4 候选 seam 鸭子类型探测 + 优雅降级，永不炸宿主）
-│   ├── app/                  ← APP/1.2 开放标准层（零 @deepseek-ai/* 依赖，任何宿主可实现）
-│   │   ├── protocol.ts       # APP/1.2 协议常量：五张词表 + 媒体类型 + 实现指纹 appFingerprint()
+│   ├── app/                  ← APP/1.3 开放标准层（零 @deepseek-ai/* 依赖，任何宿主可实现）
+│   │   ├── protocol.ts       # APP/1.3 协议常量：五张词表 + 媒体类型 + 实现指纹 appFingerprint()
 │   │   ├── bundle.ts         # Proof Bundle 交换格式装配（manifest + 逐文件摘要重算 + transparency 记录）
-│   │   ├── mcp-server.ts     # 手写 MCP JSON-RPC 2.0 服务器（恰好 10 工具，零新增依赖）
+│   │   ├── mcp-server.ts     # 手写 MCP JSON-RPC 2.0 服务器（恰好 11 工具，零新增依赖）
 │   │   ├── mcp-entry.ts      # 独立进程入口：环境变量装配引擎，stdio 收发
 │   │   ├── ptl-entry.ts      # dsh-proof-ptl CLI：透明日志 append | head | verify（非 MCP 审计者路径）
 │   │   └── index.ts          # 桶导出（protocol + bundle + MCP 契约，供 lib 使用方）
@@ -659,8 +676,8 @@ dsh-proof/
 │   │       ├── plugin.ts     # 运行时鸭子类型探测 tool.execute.before/after + chat.params，优雅降级
 │   │       └── vendor.ts     # 宿主 API 形状收窄器（探测不到 = 留空不炸宿主）
 │   └── vendor/dsh-tools.ts   # 契约快照（pinned to dsh v0.2.1-alpha.1）
-├── test/                     # 29 个测试文件（668 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心、类型化断言合约、证据分级 B/C、PTC 证据合成、覆盖感知证明、协议词表钉死、bundle 篡改矩阵、MCP 真子进程集成、适配器共享层字节对齐、Claude Code 真子进程协议、OpenCode 鸭子类型降级、透明日志 RFC 6962、PTL CLI、跨代理责任 DAG、agent-team 桥
-├── PROTOCOL.md               # Agent Proof Protocol (APP/1.2) 开放标准（英文规范，十节）
+├── test/                     # 30 个测试文件（685 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心、类型化断言合约、证据分级 B/C、PTC 证据合成、覆盖感知证明、协议词表钉死、bundle 篡改矩阵、MCP 真子进程集成、适配器共享层字节对齐、Claude Code 真子进程协议、OpenCode 鸭子类型降级、透明日志 RFC 6962、PTL CLI、跨代理责任 DAG、agent-team 桥、训练数据飞轮
+├── PROTOCOL.md               # Agent Proof Protocol (APP/1.3) 开放标准（英文规范，十一节）
 ├── cordis.patch.yml          # bundle 层
 └── examples/
     ├── cordis.yml               # --patch 本地调试
@@ -672,7 +689,7 @@ dsh-proof/
 **为什么领域核心不碰 `@deepseek-ai/*`：**
 
 1. DSH 是开发者预览版，破坏性变更频繁。核心逻辑与 harness 版本解耦 → 升级不重写。
-2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，668 个测试全绿。
+2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，685 个测试全绿。
 3. 同一个核心可以被别的宿主（CLI、CI、其他 harness）复用。
 
 **为什么 `vendor/dsh-tools.ts` 是契约快照而不是活依赖：**
@@ -748,6 +765,8 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 
 **责任 DAG 只占一个配置项（v0.19）。** 上表 32 → 33 项（实测 `src/config.ts` 的 `Config` 接口逐键清点，schema 与接口两侧同为 33）——委派、提交、合成、豁免全是协议动词，不是部署分歧点；唯一的新键 `agentTeamBridge`（默认 false）是实验 agent-team 桥的 opt-in：dsh 已发布的类型没有 team 接口，桥对 4 个候选事件 seam 做运行时鸭子类型探测并优雅降级，实验 seam 绝不惊扰没要过它的部署。
 
+**训练数据飞轮不占配置项（v0.20）。** 上表维持 33 项不变（实测同上）——两类样本、reward 惯例表、隐私两档、agent-only 过滤全是协议语义，不是部署分歧点；保真档与过滤档按调用逐次指定（`proof_training_export` 的 `fidelity` / `provenanceFilter` 参数，缺省即安全侧：private + agent-only），数据集落盘位置由调用时的 `path` 给出。刻意不设全局缺省旋钮的理由写在 `VERDICT_REWARD` 的文档里：逐导出可变的 reward 表是一个标签没法对比的数据集。
+
 **`requireBaseline` 三档**
 
 - `off` —— 不拦，只做记录与报告
@@ -776,7 +795,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit，离线可跑
-npm test              # 668 个测试（node:test）
+npm test              # 685 个测试（node:test）
 npm run build         # 产出 lib/
 npm run bundle:check  # 打包契约自检
 ```
@@ -800,15 +819,16 @@ npm run bundle:check  # 打包契约自检
 - `18` —— **证据分级（B/C 证词）**：量规存在性与结构化输出指令（英文 rubric 逐项核对：三值裁决、主观概率、弃权规则、Class B 落盘与重放警告）、`juryPrompt` 字节级确定性与段落结构（含量规版本覆盖）、`claimIdOf` 稳定 16-hex 身份（改写即新断言）、因子数学（p^w 语义、abstain 中性、w=0/w=1 边界、**[p,1] 网格扫描**、NaN/越界防毒、C 类 endorse 0.95^0.9 与 reject 0.05^0.9）、`activeAttestations` 链读纪律（垃圾载荷防御、gen 申诉解析、同 gen 后写者赢、B/C 独立信道、(claimId, kind) 确定性排序）、llm-jury 义务矩阵全分支、模块级确定性
 - `19` —— **PTC 证据合成（32 例）**：模板协议（末行 PASS/FAIL、文件内链上警告、脚手架自筛干净）、`sandboxEntryFor` 确定性与「seq 防碰撞不携带身份」、沙箱目录钉出发现的字面量同步、筛检双向精度（deny-list 恰为锁定集、静态/裸/动态/require 各拼写、node: 前缀、多行与 re-export、process.env 成员/计算形式、注释内导入照报、名字仅含禁用模块的本地 fixture 放行、findings 去重排序）、β 定价（同历史 0.15 vs 0.02 且别的不动、`syntheticFalsePass` 只覆盖它、闭式后验、端到端折价）、记录（合成元数据上链、**同结果不同 scriptDigest 即不同 evidenceId**、冻结时钟深度相等）、义务 tier ladder 全分支（latest 合成兜底点名折价、无覆盖维持 not met、organic 兜底不被误称 synthetic、混合覆盖逐桶点名、当次 organic 压过一切兜底、pre-ο 记录经 spec 池判 synthetic）、入口点纯函数确定性
 - `20` —— **覆盖感知证明（26 例）**：V8 解析（执行/加载未执行分桶、root 外与 node_modules 段丢弃、盘符大小写与双斜杠形态、百分号解码、垃圾 JSON 与异形防御、空 result 是合法报告、执行压倒加载）、聚合（executedSets 并集、零 executedSets 钉死 basis 'none'、重复坍缩、非源码文件入 notApplicable 不参与门控）、门控三档全分支（observe 无数据不拦 / 有数据 uncovered 拦、require 无数据拦 `no-coverage-data`、off 永不拦）、`applyCoverageGate`（unproven 降级与摘要挂载、grade 保序——regressed/stale 永不被改写、none basis 诚实附挂不拦截）、`makeEvidence`（coverage 附件参与内容寻址、自寻址、同输入同记录）、模块级确定性
-- `21` —— **协议词表（APP/1.2）**：`src/app/protocol.ts` 的五张词表逐字钉死，并与核心实际产出交叉核对——verdict 对 `verdictOf` 全真值表、grade 对五个行为夹具、chain mode 对 `walkChain`、status 对决定性/非决定性划分；常量声称一个核心产不出的值、或核心长出一个常量没钉住的值，都必须在这里失败。v0.18 增补 1.1 升版指纹钉死：`PROTOCOL_VERSION` 是指纹材料，词表与规则未动、仅版本 1.0 → 1.1 也必须移动指纹——APP/1.0 方言被拒绝而非被猜测；v0.19 再钉三代：1.0 / 1.1 / 1.2 三代指纹字面钉死且互不相认
+- `21` —— **协议词表（APP/1.3）**：`src/app/protocol.ts` 的五张词表逐字钉死，并与核心实际产出交叉核对——verdict 对 `verdictOf` 全真值表、grade 对五个行为夹具、chain mode 对 `walkChain`、status 对决定性/非决定性划分；常量声称一个核心产不出的值、或核心长出一个常量没钉住的值，都必须在这里失败。v0.18 增补 1.1 升版指纹钉死：`PROTOCOL_VERSION` 是指纹材料，词表与规则未动、仅版本 1.0 → 1.1 也必须移动指纹——APP/1.0 方言被拒绝而非被猜测；v0.19 再钉三代：1.0 / 1.1 / 1.2 三代指纹字面钉死且互不相认；v0.20 钉到四代——1.3 的指纹字面与前三代同列，四代互不相认是 pin 的属性、不只靠活摘要
 - `22` —— **bundle 篡改矩阵**：用真实 `EvidenceStore`（内存 Fs，`09` 同款 fakes）铸造诚实 bundle，再按伪造者的方式逐个攻击——改日志一字节、调包基线、虚报锚点、改写 manifest 方言（appFingerprint 不匹配即拒）；全程 MemoryFs，不碰真实磁盘
-- `23` —— **MCP 真子进程集成**：spawn `node --experimental-strip-types src/app/mcp-entry.ts`，经 stdio 上的换行分隔 JSON-RPC 2.0 驱动握手与协议版本协商、十工具契约（1.1 增 `proof_publish` / `proof_log_verify` 两工具的发布-审计用例；1.2 增委派三工具五例——移交文本、提交前总览、诚实 bundle 合成 proven、伪造 bundle 点名归责、畸形用法拒绝）、baseline → verify → status → bundle 全链（真实 `npm test`、真实证据、真实 Ed25519 链）与错误路径（未知工具、非法 kind、畸形 JSON 行）——零 stub，证明任何外来 harness 都能端到端驱动证明协议
+- `23` —— **MCP 真子进程集成**：spawn `node --experimental-strip-types src/app/mcp-entry.ts`，经 stdio 上的换行分隔 JSON-RPC 2.0 驱动握手与协议版本协商、十一工具契约（1.1 增 `proof_publish` / `proof_log_verify` 两工具的发布-审计用例；1.2 增委派三工具五例——移交文本、提交前总览、诚实 bundle 合成 proven、伪造 bundle 点名归责、畸形用法拒绝；1.3 增训练导出四例——private 缺省且样本永不进响应、full+`path` 把 JSONL 数据集落盘、非法保真档大声拒绝绝不静默降级、参数面钉死——fidelity/provenanceFilter 枚举与 private 缺省写进 schema 本身）、baseline → verify → status → bundle 全链（真实 `npm test`、真实证据、真实 Ed25519 链）与错误路径（未知工具、非法 kind、畸形 JSON 行）——零 stub，证明任何外来 harness 都能端到端驱动证明协议
 - `24` —— **适配器共享层（27 例）**：推导字节对齐的旗舰纪律——跑一个**真实 ProofEngine**，核对文件落点与 `deriveProofPaths` 所说分毫不差；H10 大小写变体洞（`.PROOF/evidence.jsonl` 守卫必须拦）、会话即值（观察/漂移/窗口推进）、跨进程原子持久化、pre 工具门与回合结束门的优先级矩阵
 - `25` —— **Claude Code 适配器（23 例）**：处理器单测（真实目录上的许可决策/观察落盘/漂移+一次性提醒/SessionStart 上下文）、入口**真子进程**（向 stdin 喂 JSON，断言单行 JSON 应答；post→mutate→stop 全程每步独立进程、只共享会话文件）、坏输入（不可解析的 PreToolUse 答 `ask`；未知事件名静默退出 0）；外加 `examples/claude-code.settings.json` 的纯 JSON 与 matcher 形状钉死
 - `26` —— **OpenCode 适配器（19 例）**：vendor 收窄矩阵、before 门的证据库守卫/ask 基线门/warn 默认放行、**漂移锚点**（无 Stop 钩子——after 观察到的漂移在下一次工具调用持起并点名文件）、after 观察跨三种真实载荷形状持久化、合成上下文上的注册与端到端持起（`{error:{message}}` 形态）、chat.params 注入、无面上下文降级为 no-op、抛异常/返回垃圾的注册器绝不炸宿主
 - `27` —— **透明日志核心（25 例，v0.18）**：叶哈希 `SHA-256(0x00 ‖ canonicalJson)` 逐字节钉死（键序不可移动叶地址）、RFC 6962 §2.1.3 工作例逐字核对（audit path 与 PROOF 两组已知答案）、**差分 Merkle**（独立朴素递归对 n = 0..33 全树形一致）、包含证明全位置全尺寸成立且可对**历史树头**验证、伪造形状全拒且永不 throw、一致性 178 对全验且「旧根可从新树导出」（前缀包含 + 一致性双钉）、STH 签名数据恰为规范化载荷、追加以叶哈希幂等、`loadPtl` 跳过残行且可读前缀幸存、`savePtlHead` 拒绝一切回退（缩树/同树换根/回拨时间戳）、**THE SPLIT-VIEW DETECTOR**（改写中段条目铸出签名头无法调和的第二历史；截断尾部被头守卫与数学双重拒绝）、交换两行条目必动根（有序树而非集合）
 - `28` —— **PTL CLI（12 例，v0.18）**：真实子进程驱动 `dsh-proof-ptl`——append 发布最新签名检查点并签新 STH、重复 append 幂等（duplicate=true 不增树）、自检绿/一字节篡改后失败、带 transparency 记录的 bundle 全链绿、**日志增长后旧 bundle 仍验过**（历史不可回写）、leafHash 翻一位即 leafMatch 失败退出 1、无记录 bundle 干净报错、用法错误退出 2 且永不吐栈、verify 永不凭空铸造操作者密钥
 - `29` —— **跨代理责任 DAG（20 例，v0.19）**：`obligationIdOf` 手工重算钉死（规范化字节 sha256 前 16 hex，键序无关、改一字符即搬家）、`bundleFingerprint` 手工重算且顺序无关、**THE ACCOUNTABLE DELEGATION**（两个验过的 bundle 合成一个诚实的 proven 裁决）、全量合成矩阵（每个子状态 × 豁免与否 × 每档自身 grade）、优先序（regressed 压缺工作压自身 grade，账目列表诚实）、无子任务即自身证据（undefined 读作 proven）、**FORGERY**（声称 proven 但 artifact 验不过 = regressed，措辞逐字钉死，豁免救不了）、递归四例（regressed 孙辈层层上传、未提交孙辈拖 stale、伪造中间层在顶层浮出为伪造、纯组织者子树全绿仍 unsubmitted）、菱形（共享孙任务只合成一次、对两父答案一致）、`detectCycles`（委派方向路径规范化、自环/不相交环/悬空父引用/干净森林）、`composeTaskVerdict`（自裁伪造点名且封顶、环拒绝折叠点名 blocker、未铸造 taskId 报告不抛）、豁免可见性（被豁免子从 blockers 消失、伪造同胞不消失）、`childrenByParent` 分组确定性
+- `30` —— **训练数据飞轮（8 例，v0.20）**：**THE GROUND-TRUTH EXHAUST**（全部判定类别 × 两个翻转方向的样本真值——记功/中性/记账各就各位、indeterminate 排除在样本之外、flip 的 rejected 恒 fail / chosen 恒 pass）、reward 表是钉死的法（逐 manifest 快照、改表即改数据集身份）、flip 配对只看决定性子序列的相邻（非决定性记录不断邻也不造对）、保真两档（private 零输出文本、full 摘录恰 200 字符）、溯源过滤（一条外部编辑作废全部 verification 标签、绝不动 flip）、确定性（同输入两次逐字节相同、日志乱序蒸馏出同一数据集）、内容寻址（`sampleHash` 为规范化摘要前 16 hex、root 改一字符即动）、空日志是合法数据集
 
 本地调试：
 
@@ -858,6 +878,9 @@ pnpm dsh web --patch /absolute/path/to/dsh-proof/examples/cordis.yml
 - **透明日志不验证工作区签名（v0.18）。** 日志按设计是哑公证——逐字托管检查点的 `{count, head, at, sig, keyId}`，从不裁定 `sig`。拿工作区公钥裁定工作区签名始终是审计者的独立工作；一条已发布的条目证明的是**发布**这一事实有序且未被回写，从不证明被发布的字节是诚实的。
 - **引擎不能重跑子工作区的检查（v0.19）。** 子代理的检查跑在另一个工作区、对着另一份基线，引擎重演不了。`artifactVerified` 是 bundle 验证——结构、摘要、链——不是重新执行；`claimedGrade` 缺省因此刻意两值（验过且带基线 → `proven`，其余 → `no-baseline`），细等级（`unproven`/`stale`/`regressed`）全靠提交方**显式声明**。谎报的定价是伪造规则：声明了 artifact 撑不住的等级——尤其虚报 `proven`——一律记 `regressed`、豁免免疫；声明买不来字节撑不住的任何东西。
 - **dsh 的 agent-team seam 未稳定（v0.19）。** dsh 已发布的插件类型没有 team 接口，实验桥（`agentTeamBridge`，默认 false，opt-in）因此对 4 个候选事件 seam 做运行时鸭子类型探测并优雅降级——每个事件从 `unknown` 收窄、每个订阅各自 try/catch、任何路径不向宿主抛异常。dsh 构建若不发出任何被探测的事件，桥就保持静默（至多一行 stderr）；显式驱动（MCP 或引擎的委派三工具）始终是第一等路径，与桥无关。
+- **训练 reward 表是成文惯例，不是客观真理（v0.20）。** 标签底下的判定是机器验证的基线差分，但 1.0 / 0.5 / 0.0 的定价（`VERDICT_REWARD`）是声明的政策，逐 manifest 快照——不同意 `still-failing = 0.5` 的消费方必须自行重定价，而快照恰好告诉他重定价的对象是什么。flip 配对同样是相邻启发：「相邻」是导出日志决定性子序列里的相邻，不是「两次观测之间世上什么都没发生」的断言。
+- **`private` 档去掉的是输出文本，不是上下文（v0.20）。** private 导出零输出字符，但仍携带工作区路径与输出 digest——路径本身可能敏感，digest 可以印证一个猜测。数据集消费方即使拿到 private 档也欠这份数据一份小心。
+- **跨部署合并数据集的信任问题未解（v0.20）。** 把多个导出方的数据集并到一起，就要回答「这是谁的数据？被投过毒吗？」——本版不回答。把数据集来源锚进透明日志（防 data laundering）是未来方向，不是 v0.20 的属性。
 - **`proven` 允许存在预置红灯。** 一个本来就红的仓库不该让 Agent 无法工作。预置失败会在报告里显著列出，但不计入本次会话的责任。这是刻意设计，不是漏洞。
 - **它不替代测试本身。** `dsh-proof` 编排并归因你已有的客观检查。v0.12 的证据合成也不改变这条边界：断言由 agent 起草，插件只冻结脚手架、筛检、执行，并把结果折价记账为弱于任何独立检查的证据。
 - **DSH 是 v0.1/0.2 开发者预览版。** 插件契约会变。本插件已把依赖面最小化并钉死契约快照（`src/vendor/dsh-tools.ts`），但上游变更时仍需重新对齐。
