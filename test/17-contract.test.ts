@@ -159,6 +159,74 @@ test('extractApiSurface: string aliases are kept verbatim', () => {
 })
 
 // ---------------------------------------------------------------------------
+// extractApiSurface — typed exports (H4)
+//
+// The un-annotated samples above must stay byte-identical forever (they are
+// the compat red line); the samples below are the blind spot those left: a
+// capture that required `identifier =` silently dropped every annotated
+// declarator, so `behavior-preserving` claims over idiomatic TypeScript saw a
+// permanently empty surface diff — vacuously met. The phantom side of the same
+// coin: a destructuring declaration's TYPE read as a name (`Foo` below).
+// ---------------------------------------------------------------------------
+
+test('extractApiSurface: THE TYPED EXPORT — a type annotation must not hide a name', () => {
+  const surface = extractApiSurface([{ rel: 'tx.ts', content: [
+    'export const x: number = 1',
+    'export let y: string = "s"',
+    'export declare const d: number',
+    'export var flag: boolean',
+    'export const bare: number',
+  ].join('\n') }])
+  assert.deepEqual(surface, ['tx.ts#bare', 'tx.ts#d', 'tx.ts#flag', 'tx.ts#x', 'tx.ts#y'])
+})
+
+test('extractApiSurface: THE TYPED DESTRUCTURING — pattern names in, annotation phantom out', () => {
+  const surface = extractApiSurface([{ rel: 'ph.ts', content: 'export const { a, b }: Foo = obj' }])
+  // `Foo` is the type of the whole pattern, not an export; before the fix it
+  // surfaced as a phantom symbol while the real names rode along by accident.
+  assert.deepEqual(surface, ['ph.ts#a', 'ph.ts#b'])
+  assert.ok(!surface.some(n => n.includes('Foo')))
+})
+
+test('extractApiSurface: a typed array pattern keeps its elements and drops its annotation', () => {
+  const surface = extractApiSurface([{ rel: 'ta.ts', content: 'export const [p, q]: [number, string] = pair' }])
+  // The annotation's own `[number, string]` commas must not shatter the
+  // declarator, and `number`/`string` must not surface as names.
+  assert.deepEqual(surface, ['ta.ts#p', 'ta.ts#q'])
+})
+
+test('extractApiSurface: a mixed declarator list reports annotated and plain names alike', () => {
+  const surface = extractApiSurface([{ rel: 'mx.ts', content: 'export const p = 1, q: number = 2' }])
+  assert.deepEqual(surface, ['mx.ts#p', 'mx.ts#q'])
+})
+
+test('extractApiSurface: typed and untyped destructuring agree on the pattern names', () => {
+  const untyped = extractApiSurface([{ rel: 'u.ts', content: 'export const { a, b: x } = obj' }])
+  const typed = extractApiSurface([{ rel: 'v.ts', content: 'export const { a, b: x }: Shape = obj' }])
+  assert.deepEqual(untyped, ['u.ts#a', 'u.ts#b', 'u.ts#x'])
+  assert.deepEqual(typed, ['v.ts#a', 'v.ts#b', 'v.ts#x'])
+  assert.ok(!typed.some(n => n.includes('Shape')))
+})
+
+test('extractApiSurface: nested patterns report their inner names, annotation aside', () => {
+  const surface = extractApiSurface([{ rel: 'n.ts', content: 'export const { a: { b }, c: [d] }: Shape = shape' }])
+  assert.deepEqual(surface, ['n.ts#a', 'n.ts#b', 'n.ts#c', 'n.ts#d'])
+})
+
+test('extractApiSurface: annotated arrow parameters still stay inside the initializer', () => {
+  // The annotation-tolerant capture could have made `b` (a typed parameter)
+  // look like a declarator head; segment-level comma splitting keeps it — and
+  // every other initializer comma — out of the surface.
+  const surface = extractApiSurface([{ rel: 'tp.ts', content: 'export const cb = (a: number, b: string) => a + b' }])
+  assert.deepEqual(surface, ['tp.ts#cb'])
+})
+
+test('extractApiSurface: an annotated declarator after a plain one in the same list', () => {
+  const surface = extractApiSurface([{ rel: 'ml.ts', content: 'export const x: number = 1, y = 2' }])
+  assert.deepEqual(surface, ['ml.ts#x', 'ml.ts#y'])
+})
+
+// ---------------------------------------------------------------------------
 // diffApiSurface
 // ---------------------------------------------------------------------------
 

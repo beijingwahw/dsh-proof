@@ -85,10 +85,16 @@ else
 fi
 
 set +e
+# The empty `credential.helper=` RESETS the helper list first: without it, git
+# appends our inline helper AFTER any system/global helper (e.g. Git Credential
+# Manager). That has two failure modes: the stored credential wins and the
+# typed token is silently unused, or a successful auth "approves" the token
+# into GCM — writing it to disk, violating the zero-persistence promise above.
 GH_TOKEN="$GH_TOKEN" git \
+  -c credential.helper= \
   -c 'credential.helper=!f() { echo "username=x-access-token"; echo "password=$GH_TOKEN"; }; f' \
   -c credential.useHttpPath=true \
-  push "${PUSH_ARGS[@]}"
+  push "${PUSH_ARGS[@]}" --follow-tags
 STATUS=$?
 set -e
 

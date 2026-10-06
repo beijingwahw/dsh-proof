@@ -127,6 +127,11 @@ export async function discoverChecks(fs: FsPort, root: string, options: Discover
           kind,
           source: 'package.json',
           paths: workspacePaths(root, workspaces),
+          // The argv pins *how npm is told to run*; the digest pins *what
+          // actually runs*. It rides the spec (never the id, never the
+          // evidence payload) so a baseline can later prove the same script
+          // body answered — see CheckSpec.scriptDigest.
+          scriptDigest: sha256(value),
         })
       }
       // Recursive discovery for pnpm/npm workspace members. The argv is
@@ -151,6 +156,7 @@ export async function discoverChecks(fs: FsPort, root: string, options: Discover
             source: 'package.json',
             paths: [`${dir}/**`],
             cwd: dir,
+            scriptDigest: sha256(value),
           })
         }
       }

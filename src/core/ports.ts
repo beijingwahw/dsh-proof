@@ -29,10 +29,22 @@ export interface CommandResult {
    * external signal — one that did not come from this port's own abort or
    * timeout handling. `exitCode === null` with `aborted === false` alone
    * cannot distinguish an external kill from a timeout; this field can.
-   * Platforms that do not propagate signals across processes (Windows) leave
-   * it unset rather than inventing one.
+   * Since libuv 1.44 a kill issued by THIS process (abort/timeout) does
+   * propagate `exit_signal` even on Windows; what stays indistinguishable
+   * there is only a third party's TerminateProcess (exit code 1, no signal),
+   * and ports leave the field unset rather than inventing a signal for it.
    */
   readonly killedBySignal?: string
+  /**
+   * True when this port itself killed the process for exceeding its
+   * `timeoutMs` budget — "we killed it because it ran too slow", as opposed
+   * to the outside world killing it (`killedBySignal`) or the caller
+   * cancelling (`aborted`). The three are orthogonal facts: a timeout kill
+   * still reports `exitCode: null` and (for consumers predating this field)
+   * a `spawnError` of the form `timed out after Nms`, but the honest death
+   * cause lives here.
+   */
+  readonly timedOut?: boolean
 }
 
 /** Runs an argv vector to completion. Implementations must honour `signal`. */
@@ -148,15 +160,25 @@ export interface WorkspacePort {
   readonly root: string
   /** `git rev-parse HEAD`, or `null` outside a git work tree. */
   gitHead(): Promise<string | null>
-  /** Files differing from `HEAD`, relative to root. */
+  /**
+   * Files differing from `HEAD`, relative to root. FAILURE CONTRACT: a query
+   * that fails (git error, lock contention, timeout) must REJECT — a failed
+   * query is not an empty answer; throw so callers can degrade loudly. An
+   * empty array is reserved for the positive finding "nothing is dirty".
+   */
   gitDirty(): Promise<string[]>
   /**
    * Files differing from `ref` (tracked, worktree + index), relative to root.
    * Optional capability: hosts without git history support omit it and the
-   * change-set resolution degrades to the dirty-set union.
+   * change-set resolution degrades to the dirty-set union. FAILURE CONTRACT:
+   * as with `gitDirty` — a failed query must reject, never resolve `[]`.
    */
   changedSince?(ref: string): Promise<string[]>
-  /** Untracked files (honouring .gitignore), relative to root. Optional. */
+  /**
+   * Untracked files (honouring .gitignore), relative to root. Optional.
+   * FAILURE CONTRACT: as with `gitDirty` — a failed query must reject, never
+   * resolve `[]`; "no untracked files" is a positive finding, not a default.
+   */
   untracked?(): Promise<string[]>
   /**
    * Whether git is usable in this workspace at all (binary present, inside a
@@ -199,6 +221,21 @@ export interface CheckSpec {
   readonly cwd?: string
   /** Cooperative budget for one run. */
   readonly timeoutMs: number
+  /**
+   * sha256 (hex) of the script *body* that defines this check — discovery's
+   * answer to "the id says `npm run test`, but WHAT did `test` say?". Only the
+   * package.json discovery path fills it (the npm script's verbatim text);
+   * explicit config entries and the other ecosystems (make/py/go targets)
+   * leave it `undefined` because their "script body" is not enumerable from
+   * build metadata — a documented limitation, not an oversight. It is
+   * deliberately NOT part of the `checkId` material (ids must stay
+   * byte-compatible with already-minted baselines) and never enters the
+   * evidence payload; it exists so a baseline can record, and the engine can
+   * later compare, *which body* answered under a given id — an agent
+   * rewriting `"test": "vitest run"` into `"exit 0"` keeps the id but cannot
+   * keep the digest.
+   */
+  readonly scriptDigest?: string
 }
 
 // 'benchmark' (ε) is additive: perf-measuring checks get their own kind so a

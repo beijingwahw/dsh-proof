@@ -233,7 +233,12 @@ export class NodeCommandPort implements CommandPort {
         return
       }
 
-      const finish = (exitCode: number | null, spawnError?: string, killedBySignal?: string) => {
+      const finish = (
+        exitCode: number | null,
+        spawnError?: string,
+        killedBySignal?: string,
+        timedOut?: boolean,
+      ) => {
         if (settled) return
         settled = true
         clearTimeout(timer)
@@ -249,8 +254,14 @@ export class NodeCommandPort implements CommandPort {
           ...(spawnError !== undefined ? { spawnError } : {}),
           // Signal deaths NOT caused by this port's own abort/timeout — the
           // fact that separates an external kill from a timeout at the port
-          // boundary. Windows never propagates signals; there it stays unset.
+          // boundary. Since libuv 1.44 this port's own kills propagate the
+          // signal on Windows too; only a third party's TerminateProcess
+          // (exit code, no signal) stays unattributable, and there it stays
+          // unset rather than inventing one.
           ...(!aborted && killedBySignal !== undefined ? { killedBySignal } : {}),
+          // "We killed it for exceeding the budget" — the honest death
+          // cause, kept orthogonal to the legacy spawnError text above.
+          ...(timedOut === true ? { timedOut: true } : {}),
         })
       }
 
@@ -277,7 +288,9 @@ export class NodeCommandPort implements CommandPort {
       })
       child.on('close', (code: number | null, signal: string | null) => {
         if (timedOut && code === null) {
-          finish(null, `timed out after ${options.timeoutMs}ms`)
+          // The spawnError text stays (consumers match on it), but the
+          // first-class `timedOut` fact is what the runner reads now.
+          finish(null, `timed out after ${options.timeoutMs}ms`, undefined, true)
           return
         }
         // `signal` is the child's own signalCode at exit time, surfaced
@@ -463,7 +476,15 @@ export class NodeEd25519Signer implements SignerPort {
     let privatePem: string
     try {
       privatePem = await fsp.readFile(privateKeyPath, 'utf8')
-    } catch {
+    } catch (error) {
+      // H11: only a key that provably does not exist may be created. Any
+      // other read failure (EPERM/EBUSY from an AV scan or indexer lock,
+      // EISDIR, a transient network blip) must REJECT: generating a fresh
+      // pair here would silently rotate the key — every existing checkpoint
+      // signature stops verifying and nothing on record says why. Callers
+      // already have a loud degradation path for a load that throws (the
+      // chain continues unsigned, marked signer-unavailable).
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
       const { privateKey, publicKey } = generateKeyPairSync('ed25519')
       privatePem = privateKey.export({ type: 'pkcs8', format: 'pem' }) as string
       const publicPem = publicKey.export({ type: 'spki', format: 'pem' }) as string
@@ -578,11 +599,39 @@ export class GitWorkspace implements WorkspacePort {
     return result.exitCode === 0 ? result.output.trim() || null : null
   }
 
+  /**
+   * H6: a failed git query is not an empty answer. `git status` returning
+   * 128 (index.lock contention, a mid-crash repository) and a query killed
+   * by its own timeout used to coerce into `[]` — indistinguishable from
+   * "clean", which let committed changes vanish from change sets and old
+   * evidence pass as fresh. Now the failure THROWS, naming the subcommand
+   * and the exit code, and callers degrade loudly (the change-set resolution
+   * marks itself degraded and forces a full run). `gitHead` keeps its
+   * `string | null` contract — "no commit" is a legitimate answer there —
+   * and `gitAvailable` keeps probing softly: "no git installed" is an
+   * environment fact, not a query failure.
+   */
+  private requireGitOk(result: CommandResult, subcommand: string): void {
+    if (result.exitCode === null || result.spawnError !== undefined) {
+      // Killed by the query's own timeout, aborted by the caller, or never
+      // spawned — none of these is an answer, let alone "clean".
+      const detail = result.spawnError !== undefined
+        ? result.spawnError
+        : `killed or timed out${result.aborted ? ' (aborted by the caller)' : ''}`
+      throw new Error(`git ${subcommand} produced no answer (${detail})`)
+    }
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `git ${subcommand} failed with exit code ${result.exitCode}: ${result.output.trim().slice(0, 200)}`,
+      )
+    }
+  }
+
   async gitDirty(): Promise<string[]> {
     const result = await this.commands.run(['git', 'status', '--porcelain', '-z'], {
       cwd: this.root, timeoutMs: 10_000, signal: AbortSignal.timeout(10_000),
     })
-    if (result.exitCode !== 0) return []
+    this.requireGitOk(result, 'status --porcelain -z')
     // Both ends of a rename/copy are workspace facts — see parsePorcelainZ.
     return parsePorcelainZ(result.output)
   }
@@ -593,12 +642,13 @@ export class GitWorkspace implements WorkspacePort {
    * `git diff --name-only -z` emits a plain NUL-separated path list: every
    * path terminated by NUL, no status prefixes, no rename pairing, no
    * quoting — so `split('\0')` + dropping empty strings is the exact inverse.
+   * A failed query rejects (see `requireGitOk`): never a silent empty set.
    */
   async changedSince(ref: string): Promise<string[]> {
     const result = await this.commands.run(['git', 'diff', '--name-only', '-z', ref], {
       cwd: this.root, timeoutMs: 15_000, signal: AbortSignal.timeout(15_000),
     })
-    if (result.exitCode !== 0) return []
+    this.requireGitOk(result, `diff --name-only -z ${ref}`)
     return result.output.split('\0').filter(Boolean).sort()
   }
 
@@ -607,13 +657,14 @@ export class GitWorkspace implements WorkspacePort {
    *
    * `git ls-files --others --exclude-standard -z` also emits a plain
    * NUL-separated path list (no prefixes, no quoting), so `split('\0')` +
-   * dropping empty strings parses it exactly.
+   * dropping empty strings parses it exactly. A failed query rejects (see
+   * `requireGitOk`): never a silent empty set.
    */
   async untracked(): Promise<string[]> {
     const result = await this.commands.run(['git', 'ls-files', '--others', '--exclude-standard', '-z'], {
       cwd: this.root, timeoutMs: 15_000, signal: AbortSignal.timeout(15_000),
     })
-    if (result.exitCode !== 0) return []
+    this.requireGitOk(result, 'ls-files --others --exclude-standard -z')
     return result.output.split('\0').filter(Boolean).sort()
   }
 }

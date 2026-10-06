@@ -86,6 +86,12 @@ export class WorkspaceWatch {
   /**
    * Extract every path named by a tool call's arguments.
    *
+   * Only keys name paths: a string counts when it sits under a path key
+   * (`path`, `files`, …), and an array's string items count only when the
+   * array itself sits under one (H9a) — a bare array anywhere else is argv
+   * or content, not a path list. Nested objects still contribute their own
+   * path keys.
+   *
    * `contentKeys: true` re-admits the `source` key (and its array form) for
    * callers that prefer over-detection to precision — the evidence-store
    * guard in index.ts. A false positive there costs one user approval prompt;
@@ -102,29 +108,55 @@ export class WorkspaceWatch {
       ? [...PATH_ARRAY_KEYS, 'sources']
       : PATH_ARRAY_KEYS
     const out = new Set<string>()
-    const visit = (value: unknown, depth: number): void => {
+    // `underPathKey`: this value sits directly beneath a key that names paths.
+    // Only there may an array's bare strings be read as paths (H9a): a bare
+    // array under any other key is overwhelmingly argv (`command: ['node',
+    // 'scripts/build.ts']`), patch lines, or content — collecting its strings
+    // wholesale let content sail around the very key whitelist this extractor
+    // exists to enforce (`{source: [...]}` used to leak the snippet as a
+    // path). Nested objects still recurse: a legal path key inside an element
+    // (`patches: [{file: 'x.ts'}]`) remains reachable, depth-capped as before.
+    const visit = (value: unknown, depth: number, underPathKey: boolean): void => {
       if (depth > 4 || value === null || typeof value !== 'object') return
       if (Array.isArray(value)) {
         for (const item of value) {
-          if (typeof item === 'string') out.add(item)
-          else visit(item, depth + 1)
+          if (typeof item === 'string') {
+            if (underPathKey) out.add(item)
+          } else {
+            visit(item, depth + 1, false)
+          }
         }
         return
       }
       for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
-        if (typeof val === 'string' && (keys.includes(key) || arrayKeys.includes(key))) {
-          out.add(val)
+        const isPathKey = keys.includes(key) || arrayKeys.includes(key)
+        if (typeof val === 'string') {
+          if (isPathKey) out.add(val)
         } else {
-          visit(val, depth + 1)
+          visit(val, depth + 1, isPathKey)
         }
       }
     }
-    visit(args, 0)
+    visit(args, 0, false)
     return [...out].filter(p => looksLikePath(p))
   }
 
+  /**
+   * True once this session has run any shell-class tool (`SHELL_TOOL_RE`) —
+   * a session-level fact, deliberately NOT cleared by `windowStart`: once the
+   * agent has had a shell, "file X is not in the touched set" no longer
+   * proves "file X was changed outside the agent" — the shell's edits are
+   * invisible to path extraction by construction (the command string is not
+   * parsed). Consumers (drift attribution, change classification) must use
+   * this to demote `external` to `unknown` rather than report a false
+   * "edited behind your back". This observer states the fact; it does not
+   * guess which paths the shell moved.
+   */
+  private shellUsed = false
+
   /** Record one completed tool call. */
   async observe(exec: Readonly<ToolExecution>, _result: Readonly<ToolExecutionResult>): Promise<void> {
+    if (SHELL_TOOL_RE.test(exec.name)) this.shellUsed = true
     const paths = WorkspaceWatch.pathsIn(exec.arguments)
     // Classification precedence, one source of truth (`isMutationToolName`):
     //   1. the name matches a mutation/shell pattern -> mutation
@@ -161,6 +193,16 @@ export class WorkspaceWatch {
    */
   sessionTouchedPaths(): string[] {
     return [...this.sessionTouched].sort()
+  }
+
+  /**
+   * Whether any shell-class tool ran this session (H9b). Session-scoped like
+   * `sessionTouchedPaths`: windows do not reset it, because the epistemic
+   * fact it encodes ("a shell ran; path extraction has a blind spot") does
+   * not age out.
+   */
+  sessionShellUsed(): boolean {
+    return this.shellUsed
   }
 
   /** Clear the touched window (called at turn boundaries). */

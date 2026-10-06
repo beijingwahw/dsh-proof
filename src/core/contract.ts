@@ -79,6 +79,9 @@ export interface SurfaceEntry { readonly rel: string; readonly content: string }
  * 1. `export` named declarations (`const`/`let`/`var`/`function`/`class`/
  *    `abstract class`/`interface`/`type`/`enum`, plus `async`/`declare`/
  *    `function*`/`const enum` variants and multi-declarator `const a = 1, b = 2`);
+ *    type annotations are tolerated — `export const x: number = 1` reports
+ *    `x`, and a destructuring declarator reports the pattern's names but never
+ *    its annotation (`export const { a }: Foo = o` reports `a`, not `Foo`);
  * 2. `export { a, b as c }` (single- or multi-line, `export type { … }` included);
  * 3. `export default …` → recorded as `#default`;
  * 4. `export * from …` → recorded as `#*` (a changed re-export face is a face
@@ -205,29 +208,128 @@ function braceListNames(text: string): string[] {
 }
 
 /**
- * Declarator names for `const/let/var`. A declarator list (`x = 1, y = 2`) is
- * split on commas and only segments that *start* with `identifier =` (or end
- * after the bare identifier) count — `export const cb = (a, b) => …` must not
- * report the arrow-function parameter `b` as an export, while `x = f(1, 2), y`
- * must still report both `x` and `y`. Destructuring exports report every
- * identifier in the pattern: over-inclusive, never blind.
+ * Declarator names for `const/let/var`, annotation-tolerant. The declarator
+ * list (`x = 1, y: T = 2`) is split on commas that sit *outside* every bracket
+ * pair (paren/brace/bracket, string-literal aware), so an initializer's own
+ * commas — arrow parameters, call arguments, object literals — never shatter a
+ * declarator. Each segment is then read one of two ways:
+ *
+ * - a **plain declarator** counts when it *starts* with `identifier =`,
+ *   `identifier: Type`, or ends after the bare identifier. The `:` arm is the
+ *   point of the tolerance: a capture requiring `identifier =` silently
+ *   dropped `export const x: number = 1` — the name vanished, the surface diff
+ *   came back empty, and the api-surface-unchanged obligation was vacuously
+ *   met for the most idiomatic TypeScript there is. The segment (not the raw
+ *   line) is what the regex anchors on, which is also what keeps annotated
+ *   arrow parameters (`(a: number, b: string) => …`) from leaking as phantom
+ *   exports: they are inside the segment's parens, not at its head.
+ * - a **destructuring declarator** (`{…}` / `[…]`) reports every pattern
+ *   identifier *inside the group* — aliases, defaults, rest elements and
+ *   nested patterns all report (over-inclusive, never blind) — and nothing
+ *   after the group: the type annotation (`: Foo`) and initializer (`= obj`)
+ *   that follow the closing bracket are not names, and reading them as such
+ *   minted phantom exports.
  */
 function declaratorNames(rest: string): string[] {
   const out: string[] = []
-  if (/^[{[]/.test(rest)) {
-    const eq = rest.indexOf('=')
-    const pattern = eq < 0 ? rest : rest.slice(0, eq)
-    for (const token of pattern.split(/[^\w$]+/)) {
-      if (IDENTIFIER.test(token)) out.push(token)
-    }
-    return out
-  }
-  for (const raw of rest.split(',')) {
+  for (const raw of splitDeclarators(rest)) {
     const segment = raw.trim()
-    const name = /^([A-Za-z_$][\w$]*)\s*(?:=|$)/.exec(segment)?.[1]
-    if (name !== undefined) out.push(name)
+    if (segment.length === 0) continue
+    const head = segment[0] as string
+    if (head === '{' || head === '[') {
+      out.push(...patternNames(segment))
+    } else {
+      const name = /^([A-Za-z_$][\w$]*)\s*(?:[:=]|$)/.exec(segment)?.[1]
+      if (name !== undefined) out.push(name)
+    }
   }
   return out
+}
+
+/**
+ * Split a declarator list on top-level commas only. Depth counts `(`/`[`/`{`
+ * pairs; quoted spans (single, double, backtick) are skipped whole so a comma
+ * or bracket inside a string alias or default value cannot fool the boundary
+ * scan. Depth is clamped at zero so a stray closer degrades to "no more
+ * splits" — the first declarator still reports — instead of desynchronising
+ * every later boundary.
+ */
+function splitDeclarators(text: string): string[] {
+  const segments: string[] = []
+  let depth = 0
+  let start = 0
+  let i = 0
+  while (i < text.length) {
+    const ch = text[i] as string
+    if (ch === '\'' || ch === '"' || ch === '`') { i = skipQuoted(text, i); continue }
+    if (ch === '(' || ch === '[' || ch === '{') depth += 1
+    else if (ch === ')' || ch === ']' || ch === '}') depth = Math.max(0, depth - 1)
+    else if (ch === ',' && depth === 0) {
+      segments.push(text.slice(start, i))
+      start = i + 1
+    }
+    i += 1
+  }
+  segments.push(text.slice(start))
+  return segments
+}
+
+/**
+ * Index just past the quoted span starting at `start` (escapes honoured; an
+ * unterminated quote swallows the rest of the text rather than resuming the
+ * scan mid-string).
+ */
+function skipQuoted(text: string, start: number): number {
+  const quote = text[start] as string
+  let i = start + 1
+  while (i < text.length) {
+    const ch = text[i] as string
+    if (ch === '\\') { i += 2; continue }
+    if (ch === quote) return i + 1
+    i += 1
+  }
+  return i
+}
+
+/**
+ * Pattern identifiers of a destructuring declarator: every identifier token
+ * between the opening `{`/`[` and its matching close (aliases `b: x` report
+ * both sides, nested `{ a: { b } }` reports the inner names too), and nothing
+ * beyond the close — the annotation and initializer that follow are not part
+ * of the pattern.
+ */
+function patternNames(segment: string): string[] {
+  const close = matchingClose(segment)
+  const group = close < 0 ? segment : segment.slice(0, close)
+  const out: string[] = []
+  for (const token of group.split(/[^\w$]+/)) {
+    if (IDENTIFIER.test(token)) out.push(token)
+  }
+  return out
+}
+
+/**
+ * Index just past the bracket matching `segment[0]`, or `-1` when the group
+ * never closes cleanly (malformed line): the caller then treats the whole
+ * segment as pattern, which keeps the over-report bias on the side of naming
+ * too much rather than going blind.
+ */
+function matchingClose(segment: string): number {
+  const want = segment[0] === '{' ? '}' : ']'
+  let depth = 0
+  let i = 0
+  while (i < segment.length) {
+    const ch = segment[i] as string
+    if (ch === '\'' || ch === '"' || ch === '`') { i = skipQuoted(segment, i); continue }
+    if (ch === '(' || ch === '[' || ch === '{') depth += 1
+    else if (ch === ')' || ch === ']' || ch === '}') {
+      depth -= 1
+      if (depth === 0) return ch === want ? i + 1 : -1
+      if (depth < 0) return -1
+    }
+    i += 1
+  }
+  return -1
 }
 
 // ---------------------------------------------------------------------------

@@ -5,6 +5,10 @@
  * dirt that predates the baseline, and edits the *user* made in their IDE.
  * v0.3 anchors the change set to the baseline's working-tree snapshot (with
  * per-file content digests) and classifies every change by who made it.
+ *
+ * v0.16 (H6): a git query that FAILS must not masquerade as an empty answer —
+ * each failing source degrades the resolution (`degraded: true` → the engine
+ * forces the full check set) while the surviving sources keep contributing.
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -239,4 +243,126 @@ test('ENGINE: the same file broken by the agent is still charged normally', asyn
   assert.deepEqual(build?.attributedTo, ['src/b.ts'], 'agent-touched files keep their charge')
   assert.equal(build?.externalSuspects, undefined)
   assert.match(build?.rationale ?? '', /charged to this session/)
+})
+
+// -- H6 (v0.16): a git query that FAILS is not an empty answer -------------------
+// FakeWorkspace never throws, so these cases subclass it locally to simulate
+// the port contract GitWorkspace now honours: a failed query rejects, and the
+// resolution must degrade loudly instead of reading the silence as "clean".
+
+class FlakyWorkspace extends FakeWorkspace {
+  failDiff = false
+  failDirty = false
+  failUntracked = false
+
+  async changedSince(ref: string): Promise<string[]> {
+    if (this.failDiff) throw new Error('git diff --name-only -z HEAD failed with exit code 128')
+    return super.changedSince(ref)
+  }
+
+  async untracked(): Promise<string[]> {
+    if (this.failUntracked) throw new Error('git ls-files --others produced no answer (timed out after 15000ms)')
+    return super.untracked()
+  }
+
+  async gitDirty(): Promise<string[]> {
+    if (this.failDirty) throw new Error('git status --porcelain -z failed with exit code 128: index.lock')
+    return super.gitDirty()
+  }
+}
+
+test('H6: a rejected changedSince degrades the resolution but the surviving sources still contribute', async () => {
+  const fs = MemoryFs.of(project())
+  const ws = new FlakyWorkspace('/ws')
+  ws.failDiff = true
+  const baseline = { head: 'abc123', dirty: [], dirtyDigests: {} }
+  ws.untrackedFiles = ['generated.ts']
+  ws.dirty = ['src/a.ts']
+  fs.mutate('/ws/src/a.ts', 'export const a = 2\n')
+
+  const resolution = await resolveChangeSet({ fs, workspace: ws, baseline, touched: ['src/a.ts'] })
+  assert.equal(resolution.degraded, true, 'the failed diff must be part of the answer, not swallowed')
+  assert.deepEqual(resolution.changed, ['generated.ts', 'src/a.ts'],
+    'the untracked and dirty sources keep building the candidate set')
+})
+
+test('H6: every git query failing leaves content anchoring intact and the resolution degraded', async () => {
+  // The conservative direction: with all three git dimensions blind, the
+  // baseline's own dirty set still supplies candidates and digests still
+  // adjudicate them — what is lost is sight of files CLEAN at baseline, and
+  // `degraded` is the marker that must force a full run downstream.
+  const fs = MemoryFs.of(project({
+    '/ws/src/legacy.ts': 'old but stable\n',
+    '/ws/src/edited.ts': 'changed after baseline\n',
+  }))
+  const ws = new FlakyWorkspace('/ws')
+  ws.failDiff = true
+  ws.failDirty = true
+  ws.failUntracked = true
+  const baseline = {
+    head: 'abc123',
+    dirty: ['src/legacy.ts', 'src/edited.ts'],
+    dirtyDigests: {
+      'src/legacy.ts': sha256('old but stable\n'),
+      'src/edited.ts': sha256('original\n'),
+    },
+  }
+  const resolution = await resolveChangeSet({ fs, workspace: ws, baseline })
+  assert.equal(resolution.degraded, true)
+  assert.deepEqual(resolution.preExistingExcluded, ['src/legacy.ts'], 'digests need no git — stale dirt is still excluded')
+  assert.deepEqual(resolution.changed, ['src/edited.ts'], 'moved dirty-at-baseline content is still caught')
+})
+
+test('H6: no baseline + a failing dirty query yields an empty set that SAYS it is blind', async () => {
+  const fs = MemoryFs.of(project())
+  const ws = new FlakyWorkspace('/ws')
+  ws.failDirty = true
+  ws.dirty = ['src/a.ts'] // what git would have said, had the query answered
+  const resolution = await resolveChangeSet({ fs, workspace: ws })
+  assert.equal(resolution.method, 'dirty-fallback')
+  assert.deepEqual(resolution.changed, [], 'nothing observable — but as blindness, not as cleanliness')
+  assert.equal(resolution.degraded, true, 'the degradation marker is the whole difference vs a fake clean answer')
+})
+
+test('H6: a healthy query set stays un-degraded (failures alone trigger the marker)', async () => {
+  const fs = MemoryFs.of(project())
+  const ws = new FlakyWorkspace('/ws')
+  ws.dirty = ['src/a.ts']
+  const resolution = await resolveChangeSet({
+    fs, workspace: ws, baseline: { head: 'abc123', dirty: [], dirtyDigests: {} },
+  })
+  assert.equal(resolution.degraded, undefined, 'no failure, no marker — degradation must stay informative')
+  assert.deepEqual(resolution.changed, ['src/a.ts'])
+})
+
+test('ENGINE (H6): a committed change hidden by a failed diff still forces the full check set', async () => {
+  // The headline scenario: the agent commits its work, `git diff` then fails
+  // (index.lock contention), and the dirty/untracked dimensions see nothing.
+  // Pre-H6 the resolution answered "clean" and stale baseline evidence passed
+  // as fresh — a fake proven. The `degraded` marker must force every check
+  // back through the machine.
+  const fs = MemoryFs.of(project())
+  const ws = new FlakyWorkspace('/ws')
+  const commands = new FakeCommands()
+  const engine = new ProofEngine({
+    root: '/ws', fs, commands, workspace: ws,
+    clock: new FakeClock(), impactGraphLimit: 1_000,
+  })
+  await engine.establishBaseline()
+
+  // The committed change exists on disk and breaks the build; every git
+  // dimension that could see it goes blind at once.
+  fs.mutate('/ws/src/a.ts', 'export const a = 2\n')
+  commands.on(argv => argv.includes('build'), { exitCode: 2, output: 'src/a.ts(1,1): error' })
+  ws.failDiff = true
+  ws.dirty = []
+  ws.changedSinceFiles = []
+  ws.untrackedFiles = []
+
+  const outcome = await engine.verify({ touched: [] })
+  assert.equal(outcome.degraded, true, 'the failed diff reaches the outcome')
+  assert.equal(outcome.selection.forcedAll, true, 'the lost dimension forces the full check set')
+  assert.deepEqual(outcome.selection.untouched, [], 'nothing is trusted to be untouched')
+  const build = outcome.checks.find(c => c.kind === 'build')
+  assert.equal(build?.verdict, 'regression', 'fresh evidence despite the silent diff — no fake proven')
 })

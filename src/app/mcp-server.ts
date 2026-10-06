@@ -75,7 +75,7 @@ export interface McpServerOptions extends McpEngineDeps {
 // ---------------------------------------------------------------------------
 
 export const MCP_SERVER_NAME = 'agent-proof-protocol'
-export const MCP_DEFAULT_VERSION = '0.15.0'
+export const MCP_DEFAULT_VERSION = '0.16.0'
 
 /**
  * Protocol versions this server speaks, newest first. A client asking for a

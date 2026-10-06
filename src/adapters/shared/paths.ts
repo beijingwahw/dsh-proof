@@ -10,9 +10,11 @@
  * (app/mcp-entry.ts) so a hook process and a server process land on the same
  * bytes without either being able to ask the other.
  *
- * One deliberate widening versus src/index.ts: the evidence-store guard here
- * compares paths case-insensitively (see `touchesEvidencePath`) — the adapter
- * layer does not inherit the DSH adapter's case-sensitivity hole (H10).
+ * The evidence-store guard here (`touchesEvidencePath`) compares paths
+ * case-insensitively and slash-insensitively on both sides — the same H10
+ * fold src/index.ts's guard applies, so adapter hooks and the DSH plugin
+ * agree on what "inside the evidence store" means (see the guard's own
+ * comment for the lockstep rule).
  *
  * @module dsh-proof/adapters/shared/paths
  */
@@ -159,19 +161,25 @@ function collapseSegments(rel: string): string {
  * Does a candidate tool-call path land inside the evidence store this
  * workspace is configured to protect?
  *
- * Semantics mirror index.ts:169-179: project the candidate onto the
- * workspace's relative space (absolute host paths, either slash flavour,
- * `.`/`..` detours collapsed; a path escaping the root keeps its leading `..`
- * and therefore never matches). One deliberate difference — the fix the DSH
- * adapter (H10) does not have: BOTH sides are compared `toLowerCase()`d.
- * On a Windows host, `.PROOF/evidence.jsonl` names the same file as
- * `.proof/evidence.jsonl`, and a case-sensitive comparison let the agent walk
- * the guard by changing one letter's case. The price is that on a genuinely
- * case-sensitive filesystem a sibling `.PROOF` directory would also match —
- * an over-deny that costs one blocked call, versus an under-deny that costs
- * the evidence log the whole plugin exists to keep honest. Adapters take the
- * safe side; index.ts keeps its historic behaviour and is not this batch's to
- * change.
+ * Semantics mirror index.ts's guard (the H10 fold, both sides): project the
+ * candidate onto the workspace's relative space (absolute host paths, either
+ * slash flavour, `.`/`..` detours collapsed; a path escaping the root keeps
+ * its leading `..` and therefore never matches). Both sides are compared
+ * `toLowerCase()`d. On a Windows host, `.PROOF/evidence.jsonl` names the same
+ * file as `.proof/evidence.jsonl`, and a case-sensitive comparison let the
+ * agent walk the guard by changing one letter's case. The price is that on a
+ * genuinely case-sensitive filesystem a sibling `.PROOF` directory would also
+ * match — an over-deny that costs one blocked call, versus an under-deny that
+ * costs the evidence log the whole plugin exists to keep honest. index.ts
+ * folds the same way (case AND backslashes) since the H10 batch — the two
+ * guards are deliberately in lockstep; if one learns a new normalisation,
+ * the other must learn it in the same batch.
+ *
+ * The `evidenceDir` segment is additionally backslash-folded here even though
+ * `deriveProofPaths` already hands it over POSIX-spelled: a hand-assembled
+ * `ProofPaths` (a host adapter, a future entry point) must not be able to
+ * re-open the `'.\proof'`-vs-`./proof` hole index.ts closed — defence in
+ * depth on the segment that names the store.
  *
  * Host mode never matches: the store lives outside the workspace, so nothing
  * the agent can name relatively is it (and absolute foreign paths already
@@ -182,6 +190,6 @@ export function touchesEvidencePath(candidate: string, paths: ProofPaths): boole
   const rel = toWorkspaceRelative(candidate, paths.root)
   if (rel === undefined) return false
   const target = collapseSegments(rel).toLowerCase()
-  const evidence = collapseSegments(paths.evidenceDir).toLowerCase()
+  const evidence = collapseSegments(paths.evidenceDir.replace(/\\/g, '/')).toLowerCase()
   return target === evidence || target.startsWith(`${evidence}/`)
 }

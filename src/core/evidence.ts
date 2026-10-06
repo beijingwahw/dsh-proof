@@ -152,6 +152,12 @@ export interface ProofReport {
   readonly discovered: number
   /** Checks whose evidence is missing after an incremental run. */
   readonly unverified: readonly string[]
+  /**
+   * H5②: baseline checks whose definitions vanished from discovery (the
+   * pool was edited). Optional so pre-v0.16 reports and the jury assemblers
+   * stay byte-compatible; `assembleProof` always emits it.
+   */
+  readonly vanished?: readonly string[]
   readonly summary: {
     readonly passing: number
     readonly failing: number

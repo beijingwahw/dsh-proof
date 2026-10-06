@@ -106,7 +106,15 @@ export interface ConfidenceInput {
    * everything still undecided (never run, timed out, skipped...).
    */
   readonly factors: ReadonlyMap<string, number>
-  /** Checks this verification actually dispatched (records exist for them). */
+  /**
+   * Checks this verification actually dispatched (records exist for them).
+   *
+   * H2: this field is the prior-only-certification guard's material — only a
+   * decisive record for a check *this run dispatched* counts as an
+   * observation, so a factors map that is all priors (zero dispatches, or
+   * every dispatch landing timeout/error/skipped) can never certify, no
+   * matter how green the history behind those priors is.
+   */
   readonly runCheckIds: ReadonlySet<string>
   /** Checks the wave plan deliberately never dispatched, with their priors. */
   readonly skippedByPlan: ReadonlyArray<{ checkId: string; priorHealthy: number }>
@@ -126,6 +134,13 @@ export interface AssembleInput {
   readonly requireFullCoverage?: boolean
   /** When true, impact analysis is bypassed and every check counts as affected. */
   readonly forceAll?: boolean
+  /**
+   * H5②: checkIds the baseline anchored but discovery can no longer find.
+   * A vanished definition is a hole in the pool, not a smaller, greener
+   * report — it must surface and block `proven` until the baseline is
+   * rebuilt against the edited pool.
+   */
+  readonly vanished?: readonly string[]
   /**
    * Graded trust (β): when present (and `requireFullCoverage` is false), the
    * binary coverage gate is replaced by the certify target — confidence ≥
@@ -166,6 +181,22 @@ export function assembleProof(input: AssembleInput): AssembleResult {
     return !isDecisiveStatus(record?.status)
   }).sort()
 
+  // H5②: reconciliation against the baseline's anchored check set. The ids
+  // below have no spec, so they can never be attributed, run, or counted as
+  // unverified — without this line, deleting a check's definition would
+  // simply shrink the report and keep it green.
+  const vanished = [...(input.vanished ?? [])].sort()
+
+  // H2: how many decisive observations THIS run actually produced — counted
+  // over `runCheckIds`, the checks this verification dispatched, so a
+  // decisive record from anywhere else (another run's log, a caller's stray
+  // input) cannot stand in for this run's own work. Zero means every factor
+  // is a prior: nothing was measured, so nothing was certified.
+  const runIds = input.confidence?.runCheckIds
+  const observedDecisive = input.records
+    .filter(r => isDecisiveStatus(r.status) && (runIds === undefined || runIds.has(r.checkId)))
+    .length
+
   const grade = decideGrade({
     hasBaseline: input.baseline !== undefined,
     changed: input.changed,
@@ -175,6 +206,8 @@ export function assembleProof(input: AssembleInput): AssembleResult {
     records: input.records,
     attributed,
     requireFullCoverage: input.requireFullCoverage ?? true,
+    observedDecisive,
+    vanishedCount: vanished.length,
     ...(input.confidence !== undefined
       ? { confidence: { value: productOf(input.confidence.factors), target: input.confidence.target } }
       : {}),
@@ -195,7 +228,7 @@ export function assembleProof(input: AssembleInput): AssembleResult {
   // cannot place in a regime.
   const confidence = input.confidence !== undefined ? productOf(input.confidence.factors) : undefined
   let confidenceBasis = input.confidence !== undefined && confidence !== undefined
-    ? basisFor(confidence, input.confidence.target, unverified, new Set(input.confidence.skippedByPlan.map(s => s.checkId)))
+    ? basisFor(confidence, input.confidence.target, unverified, new Set(input.confidence.skippedByPlan.map(s => s.checkId)), observedDecisive)
     : undefined
   // π: conjured-test-only coverage renames the regime. When every decisive
   // record this run addressed a synthetic-source spec (and at least one
@@ -221,6 +254,7 @@ export function assembleProof(input: AssembleInput): AssembleResult {
     checks: attributed.map(toCheckReport),
     discovered: input.specs.length,
     unverified,
+    vanished,
     summary,
     regressions: attributed
       .filter(c => c.verdict === 'regression' || c.verdict === 'new-failure')
@@ -346,6 +380,15 @@ interface GradeInput {
    * when `requireFullCoverage` is false (the bayesian regime).
    */
   confidence?: { value: number; target: number }
+  /**
+   * H2: decisive observations this run produced (decisive records over the
+   * dispatched set — see `assembleProof`). The bayesian grade gate refuses to
+   * certify without at least one: priors are what checks brought to the
+   * table, not what this run measured.
+   */
+  observedDecisive: number
+  /** H5②: baseline checks whose definitions vanished from discovery. */
+  vanishedCount: number
 }
 
 /** Statuses that actually answer the question — single source: `evidence.ts`. */
@@ -369,9 +412,20 @@ function decideGrade(input: GradeInput): ProofGrade {
     // checks, or the change set touches none of them. Honest answer stays
     // "unproven" — an empty product is vacuous certainty, not proof.
     if (input.discoveredCount === 0 || input.affectedCount === 0) return 'unproven'
+    // H2: prior-only certification guard. Zero decisive observations means
+    // the verification never finished — every factor is a prior, and however
+    // high the prior product sits, it is history's number, not this run's
+    // measurement. An unobserved run lands in the same bucket as any other
+    // unfinished verification: stale.
+    if (input.observedDecisive === 0) return 'stale'
+    // H5②: a vanished definition is a hole in the pool — however high the
+    // posterior, the baseline's own checks did not all answer. Rebuild.
+    if (input.vanishedCount > 0) return 'stale'
     return input.confidence.value >= input.confidence.target ? 'proven' : 'stale'
   }
   if (input.unverifiedCount > 0 && input.requireFullCoverage) return 'stale'
+  // H5②: same rule on the full-coverage path — missing work is missing work.
+  if (input.vanishedCount > 0) return 'stale'
   // Nothing objective speaks for the claim: the workspace declares no checks,
   // or the change set touches none of them. Honest answer is "unproven".
   if (input.discoveredCount === 0 || input.affectedCount === 0) return 'unproven'
@@ -413,14 +467,26 @@ function onlySyntheticDecisive(records: readonly Evidence[], specs: readonly Che
  * target is a certified subset; a fully decisive run is full coverage (still
  * below 1 — flake residual); anything else — unplanned gaps, or stops below
  * target — is degraded.
+ *
+ * H2: a certified subset is a subset that was *certified* — at least one
+ * decisive observation landed this run. Priors alone crossing the target (a
+ * mature history behind a run that never observed anything) is the degraded
+ * regime wearing a certified label; the number may still display, the basis
+ * may not claim certification it did not earn. (The grade agrees by
+ * construction: `decideGrade` returns `stale` on the same zero-observation
+ * fact, so the two statements can never contradict each other again.)
  */
 function basisFor(
   confidence: number,
   target: number,
   unverified: readonly string[],
   plannedSkips: ReadonlySet<string>,
+  observedDecisive: number,
 ): ConfidenceBasis {
-  if (plannedSkips.size > 0 && confidence >= target && unverified.every(id => plannedSkips.has(id))) {
+  if (observedDecisive > 0
+    && plannedSkips.size > 0
+    && confidence >= target
+    && unverified.every(id => plannedSkips.has(id))) {
     return 'certified-subset'
   }
   if (unverified.length === 0) return 'full-coverage'

@@ -185,22 +185,29 @@ export class VerificationRunner {
       // via `killedBySignal`; that is a different fact from a timeout — the
       // model reading the evidence must be able to distinguish "ran too slow,
       // we killed it" from "killed by the outside world" — so it maps to
-      // `error`, with the signal named on the first output line. Both
-      // `aborted` (we chose to stop) and `spawnError` (it never ran) outrank
-      // the signal reading, matching the port contract that leaves
-      // `killedBySignal` unset in exactly those cases.
+      // `error`, with the signal named on the first output line. A port that
+      // killed the process for exceeding its budget says so with
+      // `timedOut: true`; that outranks the `spawnError` the same result
+      // carries for legacy consumers (real ports describe timeouts through
+      // that channel), so 'timeout' is reachable from the real port, not
+      // only from fakes. Both `aborted` (we chose to stop) and a
+      // non-timeout `spawnError` (it never ran) outrank the signal reading,
+      // matching the port contract that leaves `killedBySignal` unset in
+      // exactly those cases.
       const externalSignal = result.aborted || result.spawnError !== undefined
         ? undefined
         : result.killedBySignal
       const status: CheckStatus = result.aborted
         ? 'aborted'
-        : result.spawnError !== undefined || externalSignal !== undefined
-          ? 'error'
-          : result.exitCode === 0
-            ? 'pass'
-            : result.exitCode === null
-              ? 'timeout'
-              : 'fail'
+        : result.timedOut === true
+          ? 'timeout'
+          : result.spawnError !== undefined || externalSignal !== undefined
+            ? 'error'
+            : result.exitCode === 0
+              ? 'pass'
+              : result.exitCode === null
+                ? 'timeout'
+                : 'fail'
       return {
         status,
         exitCode: result.exitCode,

@@ -174,6 +174,13 @@ export interface VerifyOptions {
   readonly changed?: readonly RelPath[]
   /** Paths the agent's tool stream touched, for provenance classification. */
   readonly touched?: readonly RelPath[]
+  /**
+   * H9b: a shell-class tool ran this session (`WorkspaceWatch.sessionShellUsed`).
+   * Path extraction cannot see through a command string, so "not in `touched`"
+   * no longer proves "changed outside the agent" — those changes classify as
+   * `'unknown'` instead of `'external'` (see `ChangeSetInput.uncertainExternal`).
+   */
+  readonly shellUsedSince?: boolean
   readonly signal?: AbortSignal
   /** Force the full check set regardless of impact analysis. */
   readonly all?: boolean
@@ -204,7 +211,13 @@ export interface VerifyOutcome {
     readonly waves: number
     /** Why the plan ended before every affected check ran; null when it ran to completion. */
     readonly stoppedEarly: 'certified' | 'failed' | 'budget' | null
-    /** Checks the plan deliberately never dispatched, each with the prior it rests on. */
+    /**
+     * Checks the plan left resting on their priors, each with that prior:
+     * deliberately never dispatched, or (H2) dispatched without producing a
+     * decisive answer — both are "no verdict from this run", which is exactly
+     * what the report's `unverified` list and `basisFor`'s planned-skip
+     * accounting consume them for.
+     */
     readonly skippedByPlan: ReadonlyArray<{ checkId: string; priorHealthy: number }>
   }
   /**
@@ -222,6 +235,18 @@ export interface VerifyOutcome {
     /** How many changed files were observed executing. */
     readonly executedCount: number
   }
+  /**
+   * H5: check definitions whose script body changed since the baseline
+   * (package.json scripts — the id says `npm run test`, the digest says what
+   * `test` said). Each one was force-re-run regardless of impact analysis and
+   * priced at the synthetic false-pass tier: the baseline's green under that
+   * id was earned by a *different body*, and an interested party rewriting
+   * `"test": "vitest run"` into a no-op carries at least the false-pass risk
+   * of a self-authored test. Present only when at least one check drifted.
+   */
+  readonly scriptDrift?: readonly string[]
+  /** H5②: baseline checks whose definitions vanished from discovery. */
+  readonly vanished?: readonly string[]
 }
 
 /**
@@ -240,6 +265,24 @@ export interface VerifyOutcome {
  */
 export type EngineBaseline = Baseline & {
   readonly apiSurface?: readonly string[]
+  /**
+   * H5: the script *bodies* that answered at baseline time — checkId →
+   * sha256(script body) for every discovered spec that carries a digest (the
+   * package.json discovery path). Same non-addressing discipline as
+   * `apiSurface`: `baselineId` hashes none of it, the field round-trips
+   * through save/load, and a pre-H5 baseline file reads back `undefined` —
+   * comparison then honestly degrades to "drift undetectable" rather than
+   * guessing (see `detectScriptDrift`).
+   */
+  readonly scriptDigests?: Readonly<Record<string, string>>
+  /**
+   * H6: this baseline's dirty-file snapshot was built with a FAILED git query
+   * — the dirty list is empty because it was unobservable, not because the
+   * tree was clean. Kept beside the baseline (never inside `WorkspaceSnapshot`,
+   * which is hash material for `baselineId`); verify folds it into its
+   * degraded synthesis, forcing the full check set.
+   */
+  readonly snapshotDegraded?: true
   readonly aborted?: true
 }
 
@@ -395,6 +438,15 @@ function failureText(reason: unknown): string {
  */
 function resolutionDegraded(attribution: ChangeSetResolution): boolean {
   return (attribution as { degraded?: unknown }).degraded === true
+}
+
+/**
+ * H6: read the baseline's non-addressing snapshot-degradation flag — same
+ * structural read as `resolutionDegraded`, for the same reason (the flag may
+ * have been written by an engine a beat older than the reader).
+ */
+function baselineSnapshotDegraded(baseline: Baseline | undefined): boolean {
+  return (baseline as { snapshotDegraded?: unknown } | undefined)?.snapshotDegraded === true
 }
 
 /** Beyond this many dirty files the per-file digest pass is skipped (conservative mode). */
@@ -574,7 +626,18 @@ export class ProofEngine {
 
   // -- discovery ----------------------------------------------------------
 
-  /** Discover (or return cached) objective checks. */
+  /**
+   * Discover (or return cached) objective checks.
+   *
+   * M7 freshness contract: the engine's own verbs (`establishBaseline`,
+   * `verify`, `verifyContract`) always pass `force` — discovery reads a
+   * handful of manifest files (package.json and the like), so re-discovering
+   * per verb costs next to nothing, and a script added to the workspace
+   * mid-session cannot silently stay out of the pool (an un-discovered check
+   * never runs and never blocks a grade — the exact hole the force closes).
+   * Cheap status views keep the instance cache via `cachedChecks()` or a
+   * plain `loadChecks()`.
+   */
   async loadChecks(force = false): Promise<CheckSpec[]> {
     if (this.specs.length > 0 && !force) return this.specs
     const discoverOptions: DiscoverOptions = {
@@ -653,11 +716,19 @@ export class ProofEngine {
    * `no-baseline` instead of silently anchoring on an accident.
    */
   async establishBaseline(options: { signal?: AbortSignal; onProgress?: VerifyOptions['onProgress'] } = {}): Promise<{ baseline: EngineBaseline; records: readonly Evidence[] }> {
-    const specs = await this.loadChecks()
+    // M7: an anchoring run re-discovers — the baseline must reflect the
+    // checks the workspace declares NOW, not whatever an earlier verb cached.
+    const specs = await this.loadChecks(true)
     // The detailed snapshot digests every dirty file's content: baseline checks
     // ran against the working tree as it was, so those bytes — not the commit —
-    // are what later change-set resolution diffs against.
-    const snapshot = await this.snapshotWorkspaceDetailed()
+    // are what later change-set resolution diffs against. H6: a FAILED dirty
+    // query no longer masquerades as "clean" — the rejection travels beside the
+    // snapshot (see snapshotWorkspaceDetailed) and lands on the baseline as the
+    // non-addressing `snapshotDegraded` attachment.
+    const { snapshot, dirtyQueryFailed } = await this.snapshotWorkspaceDetailed()
+    if (dirtyQueryFailed && this.verbose && this.logger !== undefined) {
+      this.logger('[dsh-proof] baseline degraded: the git dirty query failed — the dirty snapshot is empty because it was unobservable, not because the tree was clean')
+    }
     const batch = await this.runner.run(specs, {
       concurrency: this.options.concurrency,
       totalBudgetMs: this.options.verifyBudgetMs,
@@ -681,18 +752,39 @@ export class ProofEngine {
     // a wrong surface would be worse than none, and old readers simply see a
     // baseline without the field.
     const apiSurface = await this.computeApiSurface()
-    const anchored: EngineBaseline = apiSurface === undefined ? baseline : { ...baseline, apiSurface }
-    // Two honest abort signals: the batch-level flag (a cancelled run — some
-    // checks were never even attempted) and any record that came back
-    // `aborted` (a check whose process was killed mid-flight). Either means
-    // the run did not observe everything, so it must not anchor anything.
-    const aborted = batch.aborted === true || batch.records.some(r => r.status === 'aborted')
+    // H5: lock the script bodies that answered under each id. Non-addressing
+    // like `apiSurface` (see EngineBaseline.scriptDigests): only specs that
+    // carry a digest are recorded, so a workspace with no enumerable script
+    // bodies attaches nothing and comparison later honestly degrades.
+    const scriptDigests: Record<string, string> = {}
+    for (const s of specs) {
+      if (s.scriptDigest !== undefined) scriptDigests[s.id] = s.scriptDigest
+    }
+    const anchored: EngineBaseline = {
+      ...baseline,
+      ...(apiSurface !== undefined ? { apiSurface } : {}),
+      ...(Object.keys(scriptDigests).length > 0 ? { scriptDigests } : {}),
+      ...(dirtyQueryFailed ? { snapshotDegraded: true as const } : {}),
+    }
+    // Three honest abort signals, all the same fact — the run did not observe
+    // everything, so it must not anchor anything: the batch-level flag (a
+    // cancelled run — some checks were never even attempted), any record that
+    // came back `aborted` (a check whose process was killed mid-flight), and
+    // (H12) any record that never got its turn or never finished answering —
+    // `skipped` on a drained budget, `timeout` past the per-check clock. A
+    // half-observed baseline would silently become THE truth later judgments
+    // regress against, which is exactly what E1 exists to prevent.
+    const aborted = batch.aborted === true
+      || batch.records.some(r => r.status === 'aborted' || r.status === 'skipped' || r.status === 'timeout')
     if (aborted) {
       await this.store.mark('baseline/aborted', {
         baselineId: baseline.baselineId,
         root: baseline.root,
         ran: batch.records.length,
         discovered: specs.length,
+        // H12: why the anchor was refused — the batch observed fewer checks
+        // than it completed, whatever the cause (cancel, budget, timeout).
+        reason: 'incomplete-observation',
       })
       await this.store.checkpoint()
       return { baseline: { ...anchored, aborted: true }, records: batch.records }
@@ -706,6 +798,11 @@ export class ProofEngine {
       // ζ: whether this baseline carries an API surface is a chain fact —
       // a later `api-surface-unchanged` judgment rests on it.
       apiSurface: apiSurface !== undefined ? apiSurface.length : null,
+      // H5: how many script bodies were locked; H6: whether the snapshot was
+      // built blind. Both are chain facts the same way — drift detection and
+      // degradation synthesis downstream rest on them.
+      scriptDigests: Object.keys(scriptDigests).length,
+      ...(dirtyQueryFailed ? { snapshotDegraded: true as const } : {}),
     })
     await this.store.checkpoint()
     return { baseline: anchored, records: batch.records }
@@ -713,7 +810,10 @@ export class ProofEngine {
 
   /** Re-run the checks this change set made stale, and grade the claim. */
   async verify(options: VerifyOptions = {}): Promise<VerifyOutcome> {
-    const discovered = await this.loadChecks()
+    // M7: verification judges the workspace as it is now — a check added
+    // since the last verb must be in the pool this run, or it would neither
+    // run nor block the grade.
+    const discovered = await this.loadChecks(true)
     const graph = await this.loadGraph()
     // π: conjured tests join the verification pool as ordinary specs — every
     // synthetic request the chain shows was actually executed. A workspace
@@ -722,17 +822,33 @@ export class ProofEngine {
     // re-executed exactly like an organic check (P5).
     const specs = unionChecks(discovered, await this.syntheticSpecs())
     const baseline = await this.store.loadBaseline()
+    // H5: which discovered checks now answer under a DIFFERENT script body than
+    // the one the baseline greened. Independent of the change set on purpose —
+    // the agent's report of what it touched cannot veto what the manifest says.
+    const scriptDrifted = this.detectScriptDrift(discovered, baseline)
+    if (scriptDrifted.size > 0) this.warnScriptDrift(scriptDrifted)
+    const vanished = this.detectVanishedChecks(discovered, baseline)
+    if (vanished.length > 0 && this.verbose && this.logger !== undefined) {
+      this.logger(`dsh-proof: ${vanished.length} baseline check(s) vanished from discovery — definitions were removed; rebuild the baseline`)
+    }
     const attribution = await this.resolveChanges(options, baseline)
     const changed = attribution.changed
     const provenance = new Map<RelPath, ChangeProvenance>(
       attribution.records.map(r => [r.path, r.provenance] as [RelPath, ChangeProvenance]),
     )
-    // E3: when git facts were unavailable, the derived change set cannot be
-    // trusted to narrow the run — an under-reported change set hides breaks.
-    // Force the full check set through the same `forced` path `all` uses, and
-    // surface the degradation on the outcome so the honesty is visible, not
-    // just structural.
-    const degraded = resolutionDegraded(attribution) || await this.gitFactsUnavailable()
+    // E3/H6: when git facts were unavailable (this run, or the run that built
+    // the baseline's snapshot), the derived change set cannot be trusted to
+    // narrow the run — an under-reported change set hides breaks. Force the
+    // full check set through the same `forced` path `all` uses, and surface
+    // the degradation on the outcome so the honesty is visible, not just
+    // structural. The three legs: the resolution's own degraded flag (B1),
+    // the baseline's snapshot-degraded attachment (H6 — anchored blind), and a
+    // lost HEAD with git still claimed available (H6 — `changedSince` is
+    // wholly blind without a ref to diff against).
+    const degraded = resolutionDegraded(attribution)
+      || baselineSnapshotDegraded(baseline)
+      || await this.gitFactsUnavailable()
+      || await this.gitHeadMissing()
     const forceAll = options.all === true || degraded
     // NOTE (E5): assembleProof recomputes its own internal selection from the
     // same inputs — the report owns that projection, and deduplicating would
@@ -744,6 +860,14 @@ export class ProofEngine {
     const selection = forceAll
       ? forcedSelection(specs, changed)
       : selectAffectedChecks(specs, changed, graph)
+
+    // H5: drifted definitions join the run set REGARDLESS of impact analysis —
+    // the same union the perf-budget path applies to benchmark checks: the
+    // baseline's green under that id was earned by a different script body, so
+    // resting on it (or skipping it as "not affected") would let a rewritten
+    // `"test"` script borrow a verdict it never earned.
+    const driftSpecs = specs.filter(s => scriptDrifted.has(s.id))
+    const runSet = driftSpecs.length > 0 ? unionChecks(selection.affected, driftSpecs) : selection.affected
 
     // β: the sanity constitution keeps the whole-batch path mandatory wherever
     // certainty is owed — `all`, degraded git facts, and the 'set' escape
@@ -766,16 +890,16 @@ export class ProofEngine {
     const records: Evidence[] = []
     let schedule: VerifyOutcome['schedule']
     let confidence: ConfidenceInput | undefined
-    if (bayesian && selection.affected.length > 0) {
-      const plan = await this.runBayesianSchedule(selection.affected, changed, graph, snapshot, options, coverageDir)
+    if (bayesian && runSet.length > 0) {
+      const plan = await this.runBayesianSchedule(runSet, changed, graph, snapshot, options, coverageDir, scriptDrifted)
       records.push(...plan.records)
       schedule = plan.schedule
       confidence = plan.confidence
     } else {
       // Priors must snapshot the log BEFORE this run appends to it — history
       // is what the check brought to the table, not what it did just now.
-      const priors = await this.priorsFor(selection.affected, changed, graph)
-      const batch = await this.runner.run(selection.affected, {
+      const priors = await this.priorsFor(runSet, changed, graph, scriptDrifted)
+      const batch = await this.runner.run(runSet, {
         concurrency: this.options.concurrency,
         totalBudgetMs: this.options.verifyBudgetMs,
         workspace: snapshot,
@@ -788,7 +912,7 @@ export class ProofEngine {
       records.push(...batch.records)
       // Even the whole-batch path earns its confidence number — display only:
       // grading on this path stays binary (requireFullCoverage below).
-      confidence = this.updateFactors(priors, batch.records, selection.affected.length > 0)
+      confidence = this.updateFactors(priors, batch.records, runSet.length > 0)
     }
 
     // υ: collect coverage and re-address the records BEFORE the first append —
@@ -811,6 +935,7 @@ export class ProofEngine {
       requireFullCoverage: !bayesian,
       ...(forceAll ? { forceAll: true } : {}),
       ...(confidence !== undefined ? { confidence } : {}),
+      ...(vanished.length > 0 ? { vanished } : {}),
     })
 
     // υ: execution-coverage gating — after the machine grade, before anything
@@ -843,6 +968,11 @@ export class ProofEngine {
       ...(collected.summary !== undefined
         ? { coverage: this.coverageMarkerPayload(collected.summary) }
         : {}),
+      // H5: which definitions drifted, when any did — a chain fact exactly
+      // like the wave plan's footprint above.
+      ...(scriptDrifted.size > 0 ? { scriptDrift: [...scriptDrifted].sort() } : {}),
+      // H5②: which anchored checks lost their definitions — same visibility.
+      ...(vanished.length > 0 ? { vanished } : {}),
     })
     // Every claim-grade boundary closes the checkpoint window.
     await this.store.checkpoint()
@@ -859,6 +989,8 @@ export class ProofEngine {
             },
           }
         : {}),
+      ...(scriptDrifted.size > 0 ? { scriptDrift: [...scriptDrifted].sort() } : {}),
+      ...(vanished.length > 0 ? { vanished } : {}),
     }
   }
 
@@ -897,8 +1029,19 @@ export class ProofEngine {
    */
   async verifyContract(options: ContractVerifyOptions): Promise<ContractVerifyOutcome> {
     const { contract, ...rest } = options
-    const specs = await this.loadChecks()
+    // M7: a claim verdict re-discovers, exactly like plain verify() — the
+    // obligations are judged against the workspace's current check pool.
+    const specs = await this.loadChecks(true)
     const baseline = await this.store.loadBaseline()
+    // H5: drift detection runs for every contract kind (cheap, pure), though
+    // only the machine path below can act on it — the jury paths run no
+    // checks, so there is nothing to re-run and nothing to discount.
+    const scriptDrifted = this.detectScriptDrift(specs, baseline)
+    if (scriptDrifted.size > 0) this.warnScriptDrift(scriptDrifted)
+    const vanished = this.detectVanishedChecks(specs, baseline)
+    if (vanished.length > 0 && this.verbose && this.logger !== undefined) {
+      this.logger(`dsh-proof: ${vanished.length} baseline check(s) vanished from discovery — definitions were removed; rebuild the baseline`)
+    }
 
     // -- docs-only: the jury path -------------------------------------------
     if (contract.kind === 'docs-only') {
@@ -1082,23 +1225,40 @@ export class ProofEngine {
     const provenance = new Map<RelPath, ChangeProvenance>(
       attribution.records.map(r => [r.path, r.provenance] as [RelPath, ChangeProvenance]),
     )
-    const degraded = resolutionDegraded(attribution) || await this.gitFactsUnavailable()
+    const degraded = resolutionDegraded(attribution)
+      || baselineSnapshotDegraded(baseline)
+      || await this.gitFactsUnavailable()
+      || await this.gitHeadMissing()
     const forceAll = rest.all === true || degraded
     const selection = forceAll
       ? forcedSelection(pool, changed)
       : selectAffectedChecks(pool, changed, graph)
 
-    const runSpecs = contract.kind === 'perf-budget'
-      ? unionChecks(selection.affected, pool.filter(s => s.kind === 'benchmark'))
-      : selection.affected
+    // H5: drifted definitions join the run set regardless of impact analysis —
+    // the same rule as verify() (and stacked under the perf-budget benchmark
+    // union the same way). The obligations below are judged against THIS run's
+    // fresh records, so a drifted check's re-executed evidence is what the
+    // contract consumes — the discount rides the confidence number.
+    const driftSpecs = pool.filter(s => scriptDrifted.has(s.id))
+    const runSpecs = driftSpecs.length > 0
+      ? unionChecks(
+        contract.kind === 'perf-budget'
+          ? unionChecks(selection.affected, pool.filter(s => s.kind === 'benchmark'))
+          : selection.affected,
+        driftSpecs,
+      )
+      : contract.kind === 'perf-budget'
+        ? unionChecks(selection.affected, pool.filter(s => s.kind === 'benchmark'))
+        : selection.affected
 
     const snapshot = await this.workspaceSnapshot()
     // υ: same coverage staging as verify() — the machine legs of a contract
     // claim are ordinary checks and earn the same execution-coverage honesty.
     const coverageDir = await this.prepareCoverageDir()
-    // Whole-batch over the (possibly benchmark-extended) run set, with the
-    // same priors/confidence display the 'set' path uses — see method note.
-    const priors = await this.priorsFor(runSpecs, changed, graph)
+    // Whole-batch over the (possibly benchmark-extended, possibly
+    // drift-extended) run set, with the same priors/confidence display the
+    // 'set' path uses — see method note.
+    const priors = await this.priorsFor(runSpecs, changed, graph, scriptDrifted)
     const batch = await this.runner.run(runSpecs, {
       concurrency: this.options.concurrency,
       totalBudgetMs: this.options.verifyBudgetMs,
@@ -1126,6 +1286,7 @@ export class ProofEngine {
       requireFullCoverage: true,
       ...(forceAll ? { forceAll: true } : {}),
       ...(confidence !== undefined ? { confidence } : {}),
+      ...(vanished.length > 0 ? { vanished } : {}),
     })
 
     // υ: execution-coverage gating — pinned order: after the machine grade,
@@ -1138,7 +1299,21 @@ export class ProofEngine {
     // accept). "The change never executed" is not residual risk; it is missing
     // work, and exactly like an unmet obligation, endorsement cannot pay for
     // work. The two locks agree by construction.
-    let graded = this.gateByCoverage(machineReport, collected.summary)
+    //
+    // H3: the gate verdict is kept beside the gated report, because
+    // `applyCoverageGate` expresses "blocked" only as a proven → unproven
+    // demotion — a report that was already `stale` (or capped to it by the
+    // obligations below) shows nothing. The endorsement unlock reads the
+    // verdict itself, so a coverage-blocked claim cannot be endorsed around
+    // the τ gate through the stale door.
+    const coverageSummary = collected.summary
+    let coverageBlocked = false
+    let graded = machineReport
+    if (coverageSummary !== undefined) {
+      const gate = coverageGate(coverageSummary, this.options.coverage)
+      coverageBlocked = gate.blocked
+      graded = applyCoverageGate(machineReport, gate, coverageSummary)
+    }
 
     // The contract is judged against the freshest facts: this run's records,
     // the surface as the workspace has it NOW, and the surface as the
@@ -1196,14 +1371,27 @@ export class ProofEngine {
       for (const att of claimActive) fused = fuseConfidence(fused, att, this.trustWeights)
       const machineDecisive = batch.records.some(r => isDecisiveStatus(r.status))
       const endorsed = claimActive.some(a => a.kind === 'attest/human' && a.decision === 'endorse')
-      // Risk acceptance unlocks ONLY the target gap: every obligation met,
-      // nothing regressed, nothing newly failing — the machine said "0.94 and
-      // I cannot cross 0.97", and the human took the residual. An unmet
-      // obligation or a regression is not residual risk; it is missing work,
-      // and endorsement cannot pay for work.
+      // H3: endorsement accepts RESIDUAL RISK, it never pays for work. The
+      // unlock therefore demands the work be complete on every axis: every
+      // check verified to a decisive outcome (no `unverified` — checks that
+      // were skipped, timed out or never dispatched are unfinished work, not
+      // residual risk), the coverage gate not blocking (an unexecuted change
+      // is missing work too — see the H3 note above), every obligation met,
+      // nothing regressed, nothing newly failing. That leaves exactly the
+      // machine's own words: "0.94, and I cannot cross 0.97" — and the human
+      // took the remainder. Under the current full-coverage contract wiring
+      // (`requireFullCoverage: true` on the machine run above) a stale grade
+      // coincides with `unverified > 0`, so this branch is in fact
+      // unreachable today; it is kept because it is the honest *shape* of
+      // the rule — the day a confidence-tiered contract path lets a fully
+      // completed run land just under the target, this is the seam where a
+      // human may accept it — and as regression armor against ever widening
+      // the unlock again.
       const endorsementUnlock = endorsed
         && graded.grade === 'stale'
         && unmet.length === 0
+        && graded.unverified.length === 0
+        && !coverageBlocked
         && graded.summary.regressions === 0
         && !checks.some(c => c.verdict === 'new-failure')
       graded = {
@@ -1244,6 +1432,8 @@ export class ProofEngine {
       ...(collected.summary !== undefined
         ? { coverage: this.coverageMarkerPayload(collected.summary) }
         : {}),
+      // H5: which definitions drifted, when any did.
+      ...(scriptDrifted.size > 0 ? { scriptDrift: [...scriptDrifted].sort() } : {}),
     })
     await this.store.checkpoint()
     return {
@@ -1262,6 +1452,8 @@ export class ProofEngine {
             },
           }
         : {}),
+      ...(scriptDrifted.size > 0 ? { scriptDrift: [...scriptDrifted].sort() } : {}),
+      ...(vanished.length > 0 ? { vanished } : {}),
       contract: {
         kind: verdict.kind,
         obligations: verdict.obligations,
@@ -1811,7 +2003,13 @@ export class ProofEngine {
    *   (c) the budget drains or the caller aborts.
    *
    * Non-decisive outcomes (timeout/aborted/error/skipped) never update a
-   * factor: the check keeps its prior and stays counted as undecided.
+   * factor: the check keeps its prior and stays counted as undecided — and
+   * (H2) it stays IN the plan, because an unanswered check is unfinished, not
+   * acquitted; a later wave may re-ask it. When everything still pending has
+   * already been asked without getting an answer, the plan ends as
+   * budget-starved, never as certified: a posterior that crossed the target
+   * on priors alone certified nothing. Certification additionally demands
+   * that the stopping wave itself produced at least one decisive record.
    */
   private async runBayesianSchedule(
     affected: readonly CheckSpec[],
@@ -1820,8 +2018,10 @@ export class ProofEngine {
     snapshot: WorkspaceSnapshot,
     options: VerifyOptions,
     coverageDir?: string,
+    /** H5: drifted checks, priced at the synthetic tier inside `priorsFor`. */
+    drifted?: ReadonlySet<string>,
   ): Promise<{ records: Evidence[]; schedule: NonNullable<VerifyOutcome['schedule']>; confidence: ConfidenceInput }> {
-    const priors = await this.priorsFor(affected, changed, graph)
+    const priors = await this.priorsFor(affected, changed, graph, drifted)
     const target = this.options.certifyTarget
     const specById = new Map(affected.map(c => [c.id, c] as const))
     const factors = new Map<string, number>()
@@ -1840,6 +2040,11 @@ export class ProofEngine {
     let waves = 0
     let settled = 0
     let stoppedEarly: 'certified' | 'failed' | 'budget' | null = null
+    // H2: checks dispatched without receiving a decisive answer. They stay in
+    // `pending` (unfinished, not acquitted), so a later wave can retry them;
+    // this set is what keeps the retries from looping forever when every
+    // attempt lands timeout/aborted/error/skipped.
+    const attemptedNonDecisive = new Set<string>()
 
     while (pending.size > 0) {
       // (c) pre-wave: a plan that cannot afford its next wave must not start it.
@@ -1866,6 +2071,7 @@ export class ProofEngine {
       waves += 1
 
       let decisiveFail = false
+      let waveDecisive = 0
       for (const record of batch.records) {
         // υ: no per-wave append anymore — the caller collects coverage and
         // re-addresses every record BEFORE the first append (the attachment
@@ -1876,21 +2082,36 @@ export class ProofEngine {
         // out of the deferred append exactly as it threw out of this one.
         records.push(record)
         runCheckIds.add(record.checkId)
-        pending.delete(record.checkId)
-        const prior = priors.get(record.checkId)
-        if (prior === undefined) continue
-        if (record.status === 'pass' || record.status === 'fail') {
-          factors.set(record.checkId, posteriorHealthy(prior, record.status))
-          if (record.status === 'fail') decisiveFail = true
+        if (isDecisiveStatus(record.status)) {
+          // The check answered: it leaves the plan and its factor becomes
+          // the posterior.
+          waveDecisive += 1
+          pending.delete(record.checkId)
+          const prior = priors.get(record.checkId)
+          if (prior === undefined) continue
+          if (record.status === 'pass' || record.status === 'fail') {
+            factors.set(record.checkId, posteriorHealthy(prior, record.status))
+            if (record.status === 'fail') decisiveFail = true
+          }
+        } else {
+          // H2: no answer (timeout/aborted/error/skipped) — the check stays
+          // in the plan with its prior: undecided, not acquitted and not
+          // condemned. Deleting it here is what let a later "certified" stop
+          // rest on checks this run never actually heard from.
+          attemptedNonDecisive.add(record.checkId)
         }
-        // every other status: the factor keeps its prior — undecided, not
-        // acquitted and not condemned.
       }
       settled += batch.records.length
 
       // Early stops, in the design's priority order: certify, then blame,
       // then resources.
-      if (claimProbability(model) >= target) {
+      //
+      // H2: certification needs at least one decisive observation from THIS
+      // wave. A posterior crossing the target on priors alone (every dispatch
+      // this wave landed timeout/error/skip) certified nothing — the loop
+      // continues, and the all-attempted guard below ends it honestly as
+      // 'budget'.
+      if (claimProbability(model) >= target && waveDecisive > 0) {
         stoppedEarly = 'certified'
         break
       }
@@ -1899,6 +2120,14 @@ export class ProofEngine {
         break
       }
       if (batch.aborted || signalAborted() || this.clock.now() - started >= this.options.verifyBudgetMs) {
+        stoppedEarly = 'budget'
+        break
+      }
+      // H2 dead-loop guard: everything still pending has already been
+      // attempted without producing an answer — another wave would re-ask
+      // the same silent checks and learn nothing. That is a starved run, and
+      // it is reported as one ('budget'), never as a certification.
+      if (pending.size > 0 && [...pending.keys()].every(id => attemptedNonDecisive.has(id))) {
         stoppedEarly = 'budget'
         break
       }
@@ -1919,14 +2148,24 @@ export class ProofEngine {
    * Priors over one affected set: history summarised from the whole evidence
    * log, priced with a quarter of the per-check timeout as the fallback cost
    * of a check that has never been observed.
+   *
+   * H5: drifted checks are re-priced at the synthetic false-pass tier — the
+   * same β `PriorInput.syntheticFalsePass` charges a conjured test. A script
+   * body rewritten after the baseline carries at least the false-pass risk of
+   * a test authored by an interested party: whatever green it now reports, the
+   * body is new, unreviewed, and chosen by the same hand that owns the claim.
+   * The re-price is a map rewrite (core/bayes.ts is not this batch's to edit):
+   * every other parameter — learned failure tendency, flake rate, impact —
+   * keeps what history honestly said about the OLD body's sensor behaviour.
    */
   private async priorsFor(
     affected: readonly CheckSpec[],
     changed: readonly RelPath[],
     graph: DependencyGraph | undefined,
+    drifted?: ReadonlySet<string>,
   ): Promise<Map<string, CheckPrior>> {
     const history = summarizeHistory(await this.store.all())
-    return computePriors({
+    const priors = computePriors({
       specs: affected,
       changed,
       // Required-but-nullable in PriorInput: `undefined` degrades impact
@@ -1939,6 +2178,14 @@ export class ProofEngine {
       // fixed organic β.
       syntheticFalsePass: this.options.syntheticFalsePass,
     })
+    if (drifted === undefined || drifted.size === 0) return priors
+    const out = new Map<string, CheckPrior>()
+    for (const [checkId, prior] of priors) {
+      out.set(checkId, drifted.has(checkId)
+        ? { ...prior, falsePass: this.options.syntheticFalsePass }
+        : prior)
+    }
+    return out
   }
 
   /**
@@ -1980,6 +2227,84 @@ export class ProofEngine {
   }
 
   /**
+   * H6: git claims to be available but the HEAD ref is gone. `changedSince`
+   * has nothing to diff against without a ref — every committed change since
+   * the (now unreachable) baseline commit is invisible — so the run is forced
+   * exactly like any other git-blind path. Only consulted when git is believed
+   * usable: a definitive `gitAvailable() === false` already fired through
+   * `gitFactsUnavailable`, and a probe that throws is conservatively treated
+   * as "not usable" there (this method then adds nothing). A `gitHead()` that
+   * itself rejects is the same blindness and reports `true`.
+   */
+  private async gitHeadMissing(): Promise<boolean> {
+    if (this.workspace.gitAvailable !== undefined) {
+      try {
+        if (await this.workspace.gitAvailable() === false) return false
+      } catch {
+        return false
+      }
+    }
+    try {
+      return await this.workspace.gitHead() === null
+    } catch {
+      return true
+    }
+  }
+
+  /**
+   * H5: which checks now answer under a different script body than the one
+   * the baseline recorded. Drift = the baseline carries a digest for the id
+   * AND the discovered spec carries a different one. Anything less is NOT
+   * drift: a pre-H5 baseline (no `scriptDigests` attachment at all) or a spec
+   * without a digest (config entries, non-npm ecosystems) leaves the
+   * comparison honestly undetectable — no guess, no charge, behaviour
+   * byte-identical to pre-H5. A recorded digest whose check no longer
+   * discovers is the *disappeared check* hole (baseline reconciliation), a
+   * separate defect with separate machinery — deliberately not conflated here.
+   */
+  private detectScriptDrift(specs: readonly CheckSpec[], baseline: Baseline | undefined): Set<string> {
+    const recorded = (baseline as EngineBaseline | undefined)?.scriptDigests
+    if (recorded === undefined) return new Set()
+    const drifted = new Set<string>()
+    for (const spec of specs) {
+      if (spec.scriptDigest === undefined) continue
+      const was = Object.prototype.hasOwnProperty.call(recorded, spec.id)
+        ? recorded[spec.id]
+        : undefined
+      if (was !== undefined && was !== spec.scriptDigest) drifted.add(spec.id)
+    }
+    return drifted
+  }
+
+  /**
+   * H5②: the other half of definition reconciliation — checks the baseline
+   * anchored whose ids discovery no longer produces. Deleting a failing
+   * check's definition must not quietly shrink the report back to green:
+   * the vanished ids surface on the outcome, the boundary marker, and the
+   * grade (`assembleProof` blocks `proven` while any are missing).
+   */
+  private detectVanishedChecks(specs: readonly CheckSpec[], baseline: Baseline | undefined): string[] {
+    if (baseline === undefined) return []
+    const known = new Set(specs.map(s => s.id))
+    return baseline.checks
+      .map(entry => entry.checkId)
+      .filter(id => !known.has(id))
+      .sort()
+  }
+
+  /**
+   * H5: drift is a degradation of trust in a definition, so it follows E2's
+   * visibility rule — a line on the verbose channel (when wired), and the
+   * chain always carries the fact through the `proof/verified` boundary
+   * marker this method's callers extend.
+   */
+  private warnScriptDrift(drifted: ReadonlySet<string>): void {
+    if (this.verbose && this.logger !== undefined) {
+      this.logger(`[dsh-proof] ${drifted.size} check definition(s) changed since baseline (script drift) — re-run and discounted`)
+    }
+  }
+
+  /**
    * Which files moved since the baseline, and who moved them. Explicit sets
    * are honoured as-is; otherwise the resolution is content-anchored to the
    * baseline's working-tree snapshot, with the plain dirty set as the
@@ -2001,20 +2326,38 @@ export class ProofEngine {
           }
         : {}),
       ...(options.touched !== undefined ? { touched: options.touched } : {}),
+      // H9b: a shell ran this session — absence from `touched` is no longer
+      // proof of an external edit, so classification demotes to 'unknown'.
+      ...(options.shellUsedSince === true ? { uncertainExternal: true } : {}),
     })
   }
 
-  /** Snapshot with content digests of the dirty set (capped; skipped when huge). */
-  private async snapshotWorkspaceDetailed(): Promise<WorkspaceSnapshot> {
+  /**
+   * Snapshot with content digests of the dirty set (capped; skipped when huge).
+   *
+   * H6: a rejected dirty query is no longer folded into "clean" (`[]`). The
+   * failure cannot live in the snapshot itself — `WorkspaceSnapshot` is hash
+   * material for `baselineId`, and a flag there would re-identify every
+   * baseline — so it travels beside the snapshot and `establishBaseline`
+   * records it as the non-addressing `snapshotDegraded` attachment. The dirty
+   * list is still empty: content-anchored resolution can only *over*-report
+   * from a blind dirty list, and verify's degraded synthesis forces the full
+   * check set anyway (the conservative direction either way).
+   */
+  private async snapshotWorkspaceDetailed(): Promise<{ snapshot: WorkspaceSnapshot; dirtyQueryFailed: boolean }> {
     const head = await this.workspace.gitHead().catch(() => null)
-    const dirty = [...new Set(await this.workspace.gitDirty().catch(() => []))].sort()
+    let dirtyQueryFailed = false
+    const dirty = [...new Set(await this.workspace.gitDirty().catch(() => {
+      dirtyQueryFailed = true
+      return [] as string[]
+    }))].sort()
     const dirtDigest = sha256(dirty.join('\n'))
-    if (dirty.length > WORKSPACE_DIGEST_CAP) return { head, dirty, dirtDigest }
+    if (dirty.length > WORKSPACE_DIGEST_CAP) return { snapshot: { head, dirty, dirtDigest }, dirtyQueryFailed }
     const dirtyDigests: Record<string, string> = {}
     for (const rel of dirty) {
       const content = await this.fs.readFile(`${this.root}/${rel}`)
       if (content !== undefined) dirtyDigests[rel] = sha256(content)
     }
-    return { head, dirty, dirtDigest, dirtyDigests }
+    return { snapshot: { head, dirty, dirtDigest, dirtyDigests }, dirtyQueryFailed }
   }
 }

@@ -69,9 +69,9 @@ fi
 
 echo "==> pushing $BRANCH"
 if git ls-remote --exit-code origin "$BRANCH" >/dev/null 2>&1; then
-  git push origin "$BRANCH"
+  git push origin "$BRANCH" --follow-tags
 else
-  git push -u origin "$BRANCH"
+  git push -u origin "$BRANCH" --follow-tags
 fi
 
 cat <<'EOF'

@@ -1476,3 +1476,173 @@ test('υ: a claim over an unexecuted change carries an unexecuted-change blocker
     'the no-coverage claim carries exactly its pre-υ blockers',
   )
 })
+
+// ---------------------------------------------------------------------------
+// H10: the evidence-store guard must compare case-folded. `toWorkspaceRelative`
+// preserves the case the tool sent (only the ROOT comparison is
+// case-insensitive), so `.PROOF/evidence.jsonl` used to walk straight past a
+// case-sensitive `=== '.proof'` on Windows — where both spellings name the
+// same file. A backslash-flavoured config (`'.\proof'`) is the same hole on
+// the config side and is normalized here too.
+// ---------------------------------------------------------------------------
+
+test('H10: workspace mode gates case variants of the evidence store path', async () => {
+  const harness = makeHarness()
+  process.env.DSH_PROOF_ROOT = ROOT
+  try {
+    plugin.apply(harness.ctx, config({ evidenceStore: 'workspace', requireBaseline: 'off' }))
+  } finally {
+    delete process.env.DSH_PROOF_ROOT
+  }
+
+  const gate = harness.listeners.get('tools/pre-execute')![0] as (
+    exec: unknown, next: () => Promise<unknown>,
+  ) => Promise<{ kind: string; reason?: string }>
+
+  // On Windows these all name <root>/.proof/evidence.jsonl exactly.
+  const variants = [
+    '.PROOF/evidence.jsonl', // uppercase directory
+    '.Proof/EVIDENCE.jsonl', // mixed-case directory and file
+    `${ROOT.replace(/\\/g, '/')}/.PROOF/evidence.jsonl`, // case variant via host-style absolute
+  ]
+  for (const forged of variants) {
+    const denied = await gate(
+      { name: 'write', arguments: { path: forged, content: 'forged' }, signal: new AbortController().signal },
+      async () => ({ kind: 'allow' }),
+    )
+    assert.equal(denied.kind, 'ask', `a case variant of the evidence path must ask: ${forged}`)
+    assert.match(denied.reason ?? '', /evidence/i)
+  }
+
+  // Folding the comparison does not smear it onto unrelated directories: an
+  // ordinary (non-evidence) path still passes untouched.
+  const allowed = await gate(
+    { name: 'write', arguments: { path: 'src/a.ts', content: 'fine' }, signal: new AbortController().signal },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(allowed.kind, 'allow')
+})
+
+test('H10: a differently-named evidence dir keeps its case-folded guard', async () => {
+  const harness = makeHarness()
+  process.env.DSH_PROOF_ROOT = ROOT
+  try {
+    plugin.apply(harness.ctx, config({ evidenceStore: 'workspace', evidenceDir: 'proof', requireBaseline: 'off' }))
+  } finally {
+    delete process.env.DSH_PROOF_ROOT
+  }
+
+  const gate = harness.listeners.get('tools/pre-execute')![0] as (
+    exec: unknown, next: () => Promise<unknown>,
+  ) => Promise<{ kind: string; reason?: string }>
+
+  for (const forged of ['Proof/EVIDENCE.jsonl', 'PROOF/evidence.jsonl']) {
+    const denied = await gate(
+      { name: 'write', arguments: { path: forged, content: 'forged' }, signal: new AbortController().signal },
+      async () => ({ kind: 'allow' }),
+    )
+    assert.equal(denied.kind, 'ask', `case variant of configured dir 'proof' must ask: ${forged}`)
+  }
+})
+
+test('H10: a backslash-flavoured evidenceDir config still guards the real path', async () => {
+  const harness = makeHarness()
+  process.env.DSH_PROOF_ROOT = ROOT
+  try {
+    plugin.apply(harness.ctx, config({ evidenceStore: 'workspace', evidenceDir: '.\\proof', requireBaseline: 'off' }))
+  } finally {
+    delete process.env.DSH_PROOF_ROOT
+  }
+
+  const gate = harness.listeners.get('tools/pre-execute')![0] as (
+    exec: unknown, next: () => Promise<unknown>,
+  ) => Promise<{ kind: string; reason?: string }>
+
+  // '.\proof' on Windows names <root>/proof — the guard must land there, in
+  // both slash flavours and case variants, not silently never-match.
+  for (const forged of ['proof/evidence.jsonl', '.\\proof\\evidence.jsonl', 'PROOF/EVIDENCE.jsonl']) {
+    const denied = await gate(
+      { name: 'write', arguments: { path: forged, content: 'forged' }, signal: new AbortController().signal },
+      async () => ({ kind: 'allow' }),
+    )
+    assert.equal(denied.kind, 'ask', `a write into the configured store must ask: ${forged}`)
+    assert.match(denied.reason ?? '', /evidence/i)
+  }
+
+  // '.proof' (dotted) is a genuinely different directory than 'proof' — the
+  // fold must not blur distinct names into one gate.
+  const allowed = await gate(
+    { name: 'write', arguments: { path: '.proof/evidence.jsonl', content: 'x' }, signal: new AbortController().signal },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(allowed.kind, 'allow', 'a different directory name is not the configured store')
+})
+
+// ---------------------------------------------------------------------------
+// M5: the approver a proof_endorse will record is agent-declared free text —
+// the human at the approval seam must see the exact name they are about to
+// vouch for, or "named accountability" can be counterfeited (the human
+// approves a claim; the chain logs a name the agent invented).
+// ---------------------------------------------------------------------------
+
+test('M5: the endorsement ask names the agent-declared approver', async () => {
+  const harness = makeHarness()
+  process.env.DSH_PROOF_ROOT = ROOT
+  try {
+    plugin.apply(harness.ctx, config({ requireBaseline: 'off' }))
+  } finally {
+    delete process.env.DSH_PROOF_ROOT
+  }
+  const gate = harness.listeners.get('tools/pre-execute')![0] as (
+    exec: unknown, next: () => Promise<unknown>,
+  ) => Promise<{ kind: string; reason?: string; displayReason?: Record<string, string> }>
+
+  const claim = 'the evidence chain is safe to hand to the customer'
+  const asked = await gate(
+    {
+      name: 'proof_endorse',
+      arguments: { claim, decision: 'endorse', approver: 'Zhang San (tech lead)' },
+      signal: new AbortController().signal,
+    },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(asked.kind, 'ask')
+  assert.ok(asked.reason?.includes(claim), 'the claim stays in the approval reason')
+  assert.match(String(asked.reason), /approver \(as declared by the agent\): Zhang San \(tech lead\)/)
+  assert.match(asked.displayReason?.en ?? '', /approver \(as declared by the agent\): Zhang San/)
+  assert.match(asked.displayReason?.['zh-CN'] ?? '', /审批人（由 agent 自报）：Zhang San/)
+
+  // A whitespace-only approver is no approver: the human must see the default,
+  // not a blank line that reads as "somehow nobody".
+  const blank = await gate(
+    {
+      name: 'proof_endorse',
+      arguments: { claim, decision: 'endorse', approver: '   ' },
+      signal: new AbortController().signal,
+    },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.match(String(blank.reason), /approver \(as declared by the agent\): host-approver \(default\)/)
+})
+
+test('M5: an endorsement without an approver shows the default in the ask', async () => {
+  const harness = makeHarness()
+  process.env.DSH_PROOF_ROOT = ROOT
+  try {
+    plugin.apply(harness.ctx, config({ requireBaseline: 'off' }))
+  } finally {
+    delete process.env.DSH_PROOF_ROOT
+  }
+  const gate = harness.listeners.get('tools/pre-execute')![0] as (
+    exec: unknown, next: () => Promise<unknown>,
+  ) => Promise<{ kind: string; reason?: string; displayReason?: Record<string, string> }>
+
+  const asked = await gate(
+    { name: 'proof_endorse', arguments: { claim: 'ok', decision: 'reject' }, signal: new AbortController().signal },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(asked.kind, 'ask')
+  assert.match(String(asked.reason), /host-approver \(default\)/)
+  assert.match(asked.displayReason?.en ?? '', /host-approver \(default\)/)
+  assert.match(asked.displayReason?.['zh-CN'] ?? '', /host-approver \(default\)/)
+})

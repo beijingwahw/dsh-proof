@@ -11,6 +11,8 @@ import { makeEvidence, snapshotWorkspace } from '../src/core/evidence.ts'
 import { VerificationRunner } from '../src/core/runner.ts'
 import { claimIdOf } from '../src/core/attest.ts'
 import { SYNTHETIC_TEMPLATE } from '../src/core/synthetic.ts'
+import { createProofTools, toVerifyValue } from '../src/dsh/tools.ts'
+import { deriveProofPaths, touchesEvidencePath } from '../src/adapters/shared/paths.ts'
 import { NodeCommandPort, NodeFsPort, SystemClock } from '../src/node-ports.ts'
 import { FakeClock, FakeCommands, FakeWorkspace, MemoryFs, spec } from './helpers.ts'
 
@@ -148,16 +150,25 @@ test('an aborted run refuses to claim PROVEN', async () => {
 })
 
 test('budget exhaustion marks checks skipped and downgrades to STALE', async () => {
-  const engine = new ProofEngine({
+  // H12 tightened the baseline half of this scenario: a budget-starved
+  // baseline is an incomplete observation and no longer anchors (see the
+  // E1-style case in the H12 block below). The baseline here is therefore
+  // established with a healthy budget, and only the VERIFICATION is starved —
+  // which is what this case was always about: skipped checks leave the claim
+  // stale, never proven.
+  const fs = MemoryFs.of(project())
+  const commands = new FakeCommands()
+  const anchoring = makeEngine(fs, commands)
+  await anchoring.establishBaseline()
+  const starved = new ProofEngine({
     root: ROOT,
-    fs: MemoryFs.of(project()),
-    commands: new FakeCommands(),
+    fs,
+    commands,
     workspace: new FakeWorkspace(ROOT),
     clock: new FakeClock(),
     verifyBudgetMs: 1,
   })
-  await engine.establishBaseline()
-  const outcome = await engine.verify({ changed: ['src/a.ts'], all: true })
+  const outcome = await starved.verify({ changed: ['src/a.ts'], all: true })
   assert.equal(outcome.report.grade, 'stale', `got ${outcome.report.grade}`)
   assert.ok(outcome.report.unverified.length > 0)
 })
@@ -174,6 +185,27 @@ test('a global invalidator forces every check to re-run', async () => {
   assert.equal(outcome.selection.forcedAll, true)
   assert.equal(outcome.report.grade, 'proven')
   assert.equal(outcome.report.unverified.length, 0)
+})
+
+test('M7: a script added mid-session joins the next verify — the spec pool cannot silently expire', async () => {
+  // The discovery cache used to live for the whole engine instance: a script
+  // added after the baseline was invisible to every later verify — never run,
+  // never unverified, never blocking a grade. Discovery reads a few manifest
+  // files, so the engine's verbs now force re-discovery.
+  const fs = MemoryFs.of(project())
+  const engine = makeEngine(fs, new FakeCommands())
+  await engine.establishBaseline()
+  assert.equal((await engine.baseline())?.checks.length, 2, 'two checks at baseline time')
+
+  fs.mutate(`${ROOT}/package.json`, JSON.stringify({
+    name: 'demo',
+    scripts: { test: 'vitest run', build: 'tsc -b', lint: 'eslint .' },
+  }))
+  const outcome = await engine.verify({ changed: ['package.json'] })
+  assert.equal(outcome.report.discovered, 3, 'the lint script joined the discovered pool')
+  assert.ok(outcome.checks.some(c => c.label === 'npm script "lint"'),
+    'the new check was selected, run and attributed')
+  assert.equal(outcome.report.grade, 'proven', 'the widened pool runs green')
 })
 
 test('impact analysis runs only what the change set touched', async () => {
@@ -317,6 +349,36 @@ test('E1: an aborted baseline run keeps its evidence but never becomes the ancho
   // diffing against a half-built truth.
   const outcome = await engine.verify({ changed: ['src/a.ts'] })
   assert.equal(outcome.report.grade, 'no-baseline')
+})
+
+test('H12: a budget-starved baseline is an incomplete observation — it anchors nothing', async () => {
+  // E1's own rule, extended to the SILENT truncation shapes: a baseline whose
+  // tail was `skipped` (budget drained) or `timeout` observed fewer checks
+  // than the workspace declares, and a half-observed truth must not become
+  // THE anchor. The FakeClock advances 1ms per read, so verifyBudgetMs:1 is
+  // exhausted before the first spec is ever dispatched — every record lands
+  // `skipped`, the batch flag stays down, and only the record-level guard
+  // catches it.
+  const fs = MemoryFs.of(project())
+  const engine = new ProofEngine({
+    root: ROOT,
+    fs,
+    commands: new FakeCommands(),
+    workspace: new FakeWorkspace(ROOT),
+    clock: new FakeClock(),
+    verifyBudgetMs: 1,
+  })
+
+  const { baseline, records } = await engine.establishBaseline()
+  assert.equal(baseline.aborted, true, 'a starved batch is an abort, not an anchor')
+  assert.ok(records.length === 2 && records.every(r => r.status === 'skipped'),
+    'the budget died before any spec ran')
+  assert.equal(await fs.readFile(`${ROOT}/.proof/baseline.json`), undefined,
+    'an incomplete observation must not write baseline.json')
+  assert.ok(fs.log.some(l => l.includes('baseline/aborted') && l.includes('incomplete-observation')),
+    'the abort marker names the reason')
+  const outcome = await engine.verify({ changed: ['src/a.ts'] })
+  assert.equal(outcome.report.grade, 'no-baseline', 'the next verify honestly reports there is no anchor')
 })
 
 // -- E2: signer degradation must be visible -------------------------------------
@@ -545,6 +607,80 @@ test('β: budget exhaustion degrades below target and grades stale', async () =>
   assert.equal(outcome.report.grade, 'stale')
   assert.equal(outcome.report.confidenceBasis, 'degraded')
   assert.ok((outcome.report.confidence ?? 1) < 0.97, 'the claim never reached the target')
+})
+
+/**
+ * H2: the prior-only certification fixture — ONE check carrying a deep green
+ * history (baseline + 30 seeded passes → 31 observed runs, all pass), so its
+ * prior (≈0.972) clears the default 0.97 certify target on its own. That
+ * number is history's, not this run's; the two cases below pin that it can
+ * never stand in for an observation this run did not make.
+ */
+function priorOnlyEngine(fs: MemoryFs, commands: FakeCommands) {
+  return new ProofEngine({
+    root: ROOT,
+    fs,
+    commands,
+    workspace: new FakeWorkspace(ROOT),
+    clock: new FakeClock(),
+    autoDiscover: false,
+    checks: [{ label: 'a tests', command: ['npm', 'run', '--silent', 'a'], kind: 'test', paths: ['src/a.ts'] }],
+    concurrency: 2,
+    impactGraphLimit: 1_000,
+    checkTimeoutMs: 5_000,
+    verifyBudgetMs: 20_000,
+  })
+}
+
+test('β (H2): a pre-aborted signal observes nothing — a prior product above the target still grades stale', async () => {
+  const fs = MemoryFs.of(waveProject())
+  const engine = priorOnlyEngine(fs, new FakeCommands())
+  await engine.establishBaseline()
+  await seedGreenHistory(engine, 30)
+
+  const controller = new AbortController()
+  controller.abort()
+  const outcome = await engine.verify({ changed: ['src/a.ts'], signal: controller.signal })
+
+  const schedule = outcome.schedule
+  assert.ok(schedule, 'the bayesian path ran and planned')
+  assert.equal(schedule.waves, 0, 'zero waves dispatched')
+  assert.equal(schedule.stoppedEarly, 'budget')
+  // The trap this case pins: zero records, zero observations, every factor a
+  // prior — and the prior product sits ABOVE the certify target. The old
+  // grade rule certified on that number alone; a prior is what the check
+  // brought to the table, not what this run measured.
+  assert.ok(outcome.report.confidence !== undefined && outcome.report.confidence >= 0.97,
+    `prior product ${outcome.report.confidence} crosses the target — and still proves nothing`)
+  assert.equal(outcome.report.grade, 'stale', 'a run that observed nothing is unfinished, never proven')
+  assert.notEqual(outcome.report.confidenceBasis, 'certified-subset')
+  assert.equal(outcome.report.confidenceBasis, 'degraded')
+  assert.deepEqual(outcome.report.unverified, schedule.skippedByPlan.map(s => s.checkId))
+})
+
+test('β (H2): a high-prior check that cannot answer certifies nothing — the plan ends starved, not certified', async () => {
+  const fs = MemoryFs.of(waveProject())
+  const commands = new FakeCommands()
+  const engine = priorOnlyEngine(fs, commands)
+  await engine.establishBaseline()
+  await seedGreenHistory(engine, 30)
+  // The one check now dies at spawn: a non-decisive `error` record — the same
+  // knowledge-lattice bucket as timeout/skipped (no verdict). Its prior would
+  // clear the target on its own; the wave that heard nothing cannot certify.
+  commands.on(() => true, { exitCode: null, spawnError: 'spawn failed: ENOENT' })
+
+  const outcome = await engine.verify({ changed: ['src/a.ts'] })
+
+  const schedule = outcome.schedule
+  assert.ok(schedule)
+  assert.equal(schedule.waves, 1, 'the plan dispatched the check')
+  assert.notEqual(schedule.stoppedEarly, 'certified', 'a wave with zero decisive records cannot certify')
+  assert.equal(schedule.stoppedEarly, 'budget', 'the unanswered check ends the plan as starved')
+  assert.equal(outcome.report.grade, 'stale')
+  assert.ok(outcome.report.confidence !== undefined && outcome.report.confidence >= 0.97,
+    `prior product ${outcome.report.confidence} crosses the target — and still proves nothing`)
+  assert.equal(outcome.report.confidenceBasis, 'degraded')
+  assert.equal(outcome.report.unverified.length, 1, 'the unanswered check is named as unverified')
 })
 
 // -- ζ: typed claim contracts wired into the engine -------------------------------
@@ -990,27 +1126,39 @@ test('κ: a Class C endorsement fuses into a machine certification — and a rej
   assert.equal(rejected.report.grade, 'stale', 'an explicit rejection locks the grade down')
 })
 
-test('κ: endorsement unlocks ONLY the target gap — and never pays for work', async () => {
+test('κ (H3): endorsement cannot pay for unrun checks — the unlock requires completed work', async () => {
   const claim = 'docs and internals tidied, no behaviour change'
-  // Budget-starved machine run: skips land, the bayesian confidence stays
-  // under target, the verdict is honestly stale — with zero regressions and
-  // obligations met. That gap is exactly the residual a human accepts.
+  // The semantics this case pins were REVERSED by the 2026-10-06 deep read:
+  // a budget-starved run skips every check, the machine grade is honestly
+  // stale — and the old unlock lifted that stale to `proven` on one human
+  // endorsement, i.e. the endorsement paid for work that never happened. The
+  // honest rule: an endorsement accepts the residual risk of work that DID
+  // happen (a completed run sitting just under the certify target); six
+  // skipped checks are not residual risk, they are missing work. (H12
+  // additionally keeps a starved baseline from anchoring, so the baseline is
+  // established with a healthy budget first and only the verification is
+  // starved.)
   const fs = MemoryFs.of(endorsementProject())
+  const anchoring = contractEngine(fs, new FakeCommands(), ENDORSEMENT_CHECKS)
+  await anchoring.establishBaseline()
   const starved = new ProofEngine({
     root: ROOT, fs, commands: new FakeCommands(), workspace: new FakeWorkspace(ROOT),
     clock: new FakeClock(), autoDiscover: false, checks: ENDORSEMENT_CHECKS,
     verifyBudgetMs: 1,
   })
-  await starved.establishBaseline()
   const starvedRun = await starved.verifyContract({ changed: ENDORSEMENT_CHANGED, contract: { kind: 'behavior-preserving', claim } })
   assert.equal(starvedRun.report.grade, 'stale', 'budget starvation is stale before any witness speaks')
   assert.equal(starvedRun.report.summary.regressions, 0)
+  assert.equal(starvedRun.report.unverified.length, 6, 'every check is unverified — nothing ran')
 
-  // Seed the SAME claim's endorsement on the same chain and re-verify.
+  // Seed the SAME claim's endorsement on the same chain and re-verify: the
+  // witness is recorded and fused into the number, but the grade does not
+  // move — no unlock without completed work.
   await seedHumanAttestation(starved, claim, { gen: 0, decision: 'endorse' })
-  const unlocked = await starved.verifyContract({ changed: ENDORSEMENT_CHANGED, contract: { kind: 'behavior-preserving', claim } })
-  assert.equal(unlocked.report.grade, 'proven', 'the human took the residual the machines could not cross')
-  assert.equal(unlocked.report.confidenceBasis, 'attested')
+  const endorsed = await starved.verifyContract({ changed: ENDORSEMENT_CHANGED, contract: { kind: 'behavior-preserving', claim } })
+  assert.equal(endorsed.report.grade, 'stale', 'an endorsement buys zero unrun checks')
+  assert.equal(endorsed.report.confidenceBasis, 'attested', 'the witness is still honestly fused into the number')
+  assert.equal(endorsed.report.summary.regressions, 0)
 
   // But an unmet obligation is missing work, not residual risk: endorsement
   // must not pay for it (grow the API surface, keep the endorsement seeded).
@@ -1510,4 +1658,315 @@ test('υ: backward compatibility — default observe over fake ports keeps the p
 
   const offAgain = await runOnce('off')
   assert.equal(offAgain.report.root, off.report.root, 'determinism itself is untouched')
+})
+
+// -- H5: check-definition drift — the script BODY, not the id, must hold ------
+//
+// The id says `npm run test`; the digest says what `test` said. Discovery
+// fills CheckSpec.scriptDigest from the package.json script body; these cases
+// pin the engine half: the baseline locks the bodies that answered, and a
+// later verify compares, force-re-runs and re-prices whatever drifted —
+// regardless of what the change set (or the agent's report of it) says.
+
+/**
+ * Monorepo fixture: member scripts carry member-scoped paths
+ * (`packages/<m>/**`), so a change in one member's source does NOT select the
+ * other member's checks — the shape in which a drifted definition can hide
+ * from impact analysis entirely.
+ */
+function driftProject() {
+  return {
+    [`${ROOT}/package.json`]: JSON.stringify({ name: 'mono', workspaces: ['packages/*'] }),
+    [`${ROOT}/packages/a/package.json`]: JSON.stringify({ name: 'a', scripts: { test: 'vitest run' } }),
+    [`${ROOT}/packages/a/src/a.ts`]: 'export const a = 1\n',
+    [`${ROOT}/packages/b/package.json`]: JSON.stringify({ name: 'b', scripts: { test: 'vitest run' } }),
+    [`${ROOT}/packages/b/src/b.ts`]: 'export const b = 1\n',
+  }
+}
+
+function driftEngine(
+  fs: MemoryFs,
+  commands: FakeCommands,
+  overrides: Partial<ConstructorParameters<typeof ProofEngine>[0]> = {},
+) {
+  return new ProofEngine({
+    root: ROOT,
+    fs,
+    commands,
+    workspace: new FakeWorkspace(ROOT),
+    clock: new FakeClock(),
+    concurrency: 2,
+    impactGraphLimit: 1_000,
+    checkTimeoutMs: 5_000,
+    verifyBudgetMs: 20_000,
+    // 0.99 (not the 0.97 default) so the fixture's arithmetic is unambiguous:
+    // an organic pass prices at ≈0.996 and certifies; the drifted check's
+    // discounted pass prices at ≈0.986 and — multiplied with the organic
+    // factor ≈0.982 — cannot clear the target. The discount prices the risk,
+    // it does not veto the pass; at the default 0.97 a single drifted pass
+    // would still certify, visibly cheaper but certifying.
+    certifyTarget: 0.99,
+    ...overrides,
+  })
+}
+
+test('H5: a tampered script body drifts — detected, force-re-run past selection, synthetic-tier pricing', async () => {
+  // Control: the same verify against an untampered workspace certifies.
+  const controlFs = MemoryFs.of(driftProject())
+  const control = driftEngine(controlFs, new FakeCommands())
+  await control.establishBaseline()
+  const cleanRun = await control.verify({ changed: ['packages/b/src/b.ts'] })
+  assert.equal(cleanRun.report.grade, 'proven', 'control: a b-only change certifies at the 0.99 target')
+  assert.equal(cleanRun.scriptDrift, undefined, 'no drift on an honest workspace')
+
+  // The adversarial half: package a's test script becomes a no-op, and the
+  // session's change report names only b's source — impact analysis would
+  // leave a's check resting on evidence a DIFFERENT script body earned.
+  const fs = MemoryFs.of(driftProject())
+  const commands = new FakeCommands()
+  const engine = driftEngine(fs, commands)
+  const { baseline } = await engine.establishBaseline()
+  const locked = (baseline as { scriptDigests?: Record<string, string> }).scriptDigests
+  assert.ok(locked !== undefined && Object.keys(locked).length === 2,
+    'the baseline locks the script body digest under every discovered id')
+
+  fs.mutate(`${ROOT}/packages/a/package.json`, JSON.stringify({ name: 'a', scripts: { test: 'node -e ""' } }))
+  const specs = await engine.loadChecks(true)
+  const aCheck = specs.find(c => c.cwd === 'packages/a')
+  assert.ok(aCheck !== undefined && aCheck.scriptDigest !== undefined && aCheck.scriptDigest !== locked?.[aCheck.id],
+    'sanity: same id, different body')
+
+  const runsInA = (): number => commands.calls.filter(c => c.cwd === `${ROOT}/packages/a`).length
+  const callsBeforeVerify = runsInA()
+  const outcome = await engine.verify({ changed: ['packages/b/src/b.ts'] })
+
+  // Detected — by digest, not by id.
+  assert.ok(outcome.scriptDrift !== undefined && outcome.scriptDrift.length === 1)
+  assert.equal(outcome.scriptDrift?.[0], aCheck?.id)
+  assert.equal(outcome.scriptDrift?.[0] === specs.find(c => c.cwd === 'packages/b')?.id, false,
+    'the untampered sibling did not drift')
+  // Force-re-run PAST impact analysis: selection left a untouched, yet it ran.
+  assert.ok(outcome.selection.untouched.some(c => c.id === aCheck?.id),
+    'sanity: the change set alone does not select the drifted check')
+  assert.equal(runsInA(), callsBeforeVerify + 1,
+    'the drifted check was re-run regardless of the selection')
+  // Priced at the synthetic tier: the vacuous pass ≈0.9864 (β=0.15) times the
+  // organic sibling ≈0.9960 lands at ≈0.9825 — under the 0.99 target, above
+  // outright failure. The grade follows the number: stale, never proven.
+  assert.ok(outcome.report.confidence !== undefined && outcome.report.confidence < 0.99,
+    `discounted posterior ${outcome.report.confidence} must sit under the target`)
+  assert.ok(outcome.report.confidence !== undefined && outcome.report.confidence >= 0.97,
+    'the number sank through pricing, not through a failure')
+  assert.equal(outcome.report.grade, 'stale', 'a no-op "test" script cannot carry the claim across the target')
+  // The chain and the model-facing narrative both carry the warning.
+  assert.ok(fs.log.some(l => l.includes('proof/verified') && l.includes('"scriptDrift"')),
+    'the boundary marker records which definitions drifted')
+  const value = toVerifyValue(
+    outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
+    outcome.schedule, outcome.coverage, outcome.scriptDrift,
+  )
+  assert.match(value.summary, /1 check definition\(s\) changed since baseline \(script drift\) — re-run and discounted/)
+})
+
+test('H5: a pre-H5 baseline without scriptDigests degrades honestly — no comparison, no drift charge', async () => {
+  const fs = MemoryFs.of(driftProject())
+  const commands = new FakeCommands()
+  const engine = driftEngine(fs, commands)
+  await engine.establishBaseline()
+  // Hand-strip the attachment, exactly like a baseline written before H5.
+  const raw = await fs.readFile(`${ROOT}/.proof/baseline.json`)
+  assert.ok(raw !== undefined)
+  const parsed = JSON.parse(raw) as { scriptDigests?: unknown }
+  assert.ok(parsed.scriptDigests !== undefined, 'sanity: the fresh baseline does carry the digests')
+  delete parsed.scriptDigests
+  fs.mutate(`${ROOT}/.proof/baseline.json`, JSON.stringify(parsed, null, 2))
+
+  fs.mutate(`${ROOT}/packages/a/package.json`, JSON.stringify({ name: 'a', scripts: { test: 'node -e ""' } }))
+  const runsInA = (): number => commands.calls.filter(c => c.cwd === `${ROOT}/packages/a`).length
+  const before = runsInA()
+  const outcome = await engine.verify({ changed: ['packages/b/src/b.ts'] })
+
+  assert.equal(outcome.scriptDrift, undefined, 'nothing recorded to compare against — drift is honestly undetectable')
+  assert.equal(runsInA(), before, 'the drifted check rests on its stale evidence, exactly as pre-H5')
+  assert.ok(!fs.log.some(l => l.includes('"scriptDrift"')), 'no drift marker may exist')
+  // The hole a new baseline closes: this grade is the documented reason to
+  // re-anchor. (Asserted, not hidden — the upgrade path is a fresh baseline.)
+  assert.equal(outcome.report.grade, 'proven', 'the honest statement of the downgrade: pre-H5 baselines cannot see this')
+})
+
+test('H5: verifyContract carries the drift verdict on its machine path — obligations eat the re-run evidence', async () => {
+  const fs = MemoryFs.of(driftProject())
+  const commands = new FakeCommands()
+  const engine = driftEngine(fs, commands)
+  await engine.establishBaseline()
+  fs.mutate(`${ROOT}/packages/a/package.json`, JSON.stringify({ name: 'a', scripts: { test: 'node -e ""' } }))
+  const aCheck = (await engine.loadChecks(true)).find(c => c.cwd === 'packages/a')
+
+  const outcome = await engine.verifyContract({
+    changed: ['packages/b/src/b.ts'],
+    contract: { kind: 'behavior-adding', claim: 'extended package b' },
+  })
+  assert.ok(outcome.scriptDrift !== undefined && outcome.scriptDrift.length === 1)
+  assert.equal(outcome.scriptDrift?.[0], aCheck?.id)
+  // The drifted check re-ran under the contract too, and its fresh (vacuously
+  // green) evidence is exactly what the obligations were judged against.
+  assert.ok(outcome.checks.some(c => c.checkId === aCheck?.id && c.current !== undefined),
+    'the drifted check produced current evidence for the contract')
+  assert.ok(fs.log.some(l => l.includes('proof/verified') && l.includes('"scriptDrift"')),
+    'the contract boundary marker records the drift')
+})
+
+// -- H6: git-blind snapshots — a failed query is not "clean" -------------------
+
+/** A workspace whose dirty query fails while a flag is set (index.lock, …). */
+class FlakyDirtyWorkspace extends FakeWorkspace {
+  broken = true
+  async gitDirty(): Promise<string[]> {
+    if (this.broken) throw new Error('fatal: Unable to create .git/index.lock: File exists')
+    return super.gitDirty()
+  }
+}
+
+test('H6: a baseline built on a failed dirty query is degraded — visibly, and past recovery', async () => {
+  const fs = MemoryFs.of(project())
+  const ws = new FlakyDirtyWorkspace(ROOT)
+  const engine = new ProofEngine({
+    root: ROOT, fs, commands: new FakeCommands(), workspace: ws, clock: new FakeClock(), impactGraphLimit: 1_000,
+  })
+  const { baseline } = await engine.establishBaseline()
+  assert.equal(baseline.checks.length, 2, 'the anchor itself is fine — the blindness rides beside it')
+  assert.equal((baseline as { snapshotDegraded?: true }).snapshotDegraded, true,
+    'the failed dirty query is recorded next to the baseline, not silently as "clean"')
+  assert.equal(baseline.workspace.dirty.length, 0, 'the snapshot shape is untouched (nothing entered its hash material)')
+  assert.ok(fs.log.some(l => l.includes('baseline/established') && l.includes('"snapshotDegraded":true')),
+    'the chain marker carries the fact')
+
+  // The query recovers; the blindness does not age out. Every verify against
+  // this blind anchor is forced full until a fresh baseline re-anchors — even
+  // with git perfectly healthy now (this is the leg B1's resolution-level
+  // degradation cannot see: the failure happened at BASELINE time).
+  ws.broken = false
+  fs.mutate(`${ROOT}/src/a.ts`, 'export const a = 2\n')
+  const outcome = await engine.verify({ changed: ['src/a.ts'] })
+  assert.equal(outcome.degraded, true, 'a blind anchor degrades the run even with git healthy now')
+  assert.equal(outcome.selection.forcedAll, true)
+  assert.equal(outcome.selection.affected.length, 2, 'the full check set ran')
+  assert.equal(outcome.report.grade, 'proven', 'the forced run itself still grades normally (E3 semantics)')
+})
+
+test('H6: git available but HEAD gone — changedSince is wholly blind, the run is forced', async () => {
+  const fs = MemoryFs.of(project())
+  const ws = new FakeWorkspace(ROOT)
+  const engine = new ProofEngine({
+    root: ROOT, fs, commands: new FakeCommands(), workspace: ws, clock: new FakeClock(), impactGraphLimit: 1_000,
+  })
+  await engine.establishBaseline()
+  // Unborn/detached repo: no ref to diff against, so every committed change
+  // since the baseline commit is invisible to changedSince.
+  ws.head = null
+  fs.mutate(`${ROOT}/src/a.ts`, 'export const a = 2\n')
+  const outcome = await engine.verify({ changed: ['src/a.ts'] })
+  assert.equal(outcome.degraded, true, 'a lost HEAD with git claimed available is blindness')
+  assert.equal(outcome.selection.forcedAll, true)
+  assert.equal(outcome.selection.precision, 'forced')
+})
+
+// -- H9b: shell-blind provenance — absence from touched is not proof of external --
+
+test('H9b: a shell this session demotes untouched changes from external to unknown', async () => {
+  const run = async (shellUsedSince: boolean | undefined) => {
+    const fs = MemoryFs.of(project())
+    const ws = new FakeWorkspace(ROOT)
+    const engine = new ProofEngine({
+      root: ROOT, fs, commands: new FakeCommands(), workspace: ws, clock: new FakeClock(), impactGraphLimit: 1_000,
+    })
+    await engine.establishBaseline()
+    // A file moves outside the (declared) touched set — the shape a shell's
+    // invisible edits produce: nothing in the tool stream names it.
+    fs.mutate(`${ROOT}/src/ghost.ts`, 'export const ghost = 1\n')
+    ws.dirty = ['src/ghost.ts']
+    return engine.verify({ touched: ['src/a.ts'], ...(shellUsedSince !== undefined ? { shellUsedSince } : {}) })
+  }
+
+  const blind = await run(true)
+  const record = blind.attribution.records.find(r => r.path === 'src/ghost.ts')
+  assert.ok(record, 'the ghosted file moved')
+  assert.equal(record?.provenance, 'unknown',
+    'a shell ran — absence from the touched set is absence of evidence, not proof of external')
+  assert.ok(blind.report.checks.every(c => !(c.externalSuspects ?? []).includes('src/ghost.ts')),
+    'no check charges the file as an external suspect')
+
+  // The control: the same shape without a shell stays honestly external.
+  const control = await run(false)
+  assert.equal(control.attribution.records.find(r => r.path === 'src/ghost.ts')?.provenance, 'external')
+})
+
+test('H9b: the model-facing tools carry the session shell fact into the engine', async () => {
+  // The plugin entry wires `() => watch.sessionShellUsed()` the same route as
+  // `touched`; this exercises the tools seam itself — the value the tool
+  // reports must move with the session fact, not with the call site.
+  const fs = MemoryFs.of(project())
+  const ws = new FakeWorkspace(ROOT)
+  const engine = new ProofEngine({
+    root: ROOT, fs, commands: new FakeCommands(), workspace: ws, clock: new FakeClock(), impactGraphLimit: 1_000,
+  })
+  await engine.establishBaseline()
+  fs.mutate(`${ROOT}/src/ghost.ts`, 'export const ghost = 1\n')
+  ws.dirty = ['src/ghost.ts']
+  let shellUsed = true
+  const verify = createProofTools(engine, () => ['src/a.ts'], undefined, () => shellUsed)
+    .find(t => t.name === 'proof_verify')
+  assert.ok(verify !== undefined)
+  const execution = {
+    callId: 'call-1', rootCallId: 'call-1', name: 'proof_verify', arguments: {},
+    token: Symbol('token'), signal: new AbortController().signal,
+    deferContext: () => undefined, concludeTurn: () => undefined,
+  }
+  const run = async (): Promise<string[]> => {
+    const value = await verify!.execute({}, execution as Parameters<typeof verify.execute>[1]) as unknown as {
+      externalChanged?: string[]
+    }
+    return value.externalChanged ?? []
+  }
+  assert.deepEqual(await run(), [], 'with a shell in the session, the ghosted file is not reported external')
+  shellUsed = false
+  assert.deepEqual(await run(), ['src/ghost.ts'], 'without one, the same file is honestly external')
+})
+
+// -- B2 follow-up: the adapter evidence-store guard is separator-blind ----------
+
+test('adapters/shared/paths: the evidence-store guard folds a backslashed evidenceDir segment', () => {
+  // deriveProofPaths POSIX-folds the configured segment on its own
+  // (`'.\proof'` ≡ `./proof` ≡ the 'proof' directory, never '.proof'); this
+  // pins the guard itself, so a hand-assembled ProofPaths still carrying a
+  // backslashed segment cannot silently match nothing (an under-deny — the
+  // `'.\proof'` shape index.ts closed in H10). test/24 owns the derive-side
+  // matrix and is not this batch's to edit; the backslash case lives here.
+  const paths = deriveProofPaths({ root: ROOT, trustRoot: '/trust', evidenceStore: 'workspace', evidenceDir: '.\\proof' })
+  assert.equal(paths.evidenceDir, 'proof', 'deriveProofPaths folds the configured segment')
+  assert.equal(touchesEvidencePath('proof/evidence.jsonl', paths), true, 'the derived guard hits the store it derived')
+  const handBuilt: typeof paths = { ...paths, evidenceDir: '.\\proof' }
+  assert.equal(touchesEvidencePath('proof/evidence.jsonl', handBuilt), true,
+    'the guard is separator-blind on the store segment even without deriveProofPaths')
+})
+
+test('H5②: a deleted check definition surfaces as vanished — the report cannot shrink back to green', async () => {
+  // The other half of definition reconciliation: deleting a check's
+  // definition used to make it vanish from specs entirely — never attributed,
+  // never unverified, never blocking `proven`. The baseline's anchored ids
+  // are now reconciled against discovery; a hole in the pool reads as a hole.
+  const fs = MemoryFs.of(project())
+  const engine = makeEngine(fs, new FakeCommands())
+  await engine.establishBaseline()
+  assert.equal((await engine.baseline())?.checks.length, 2, 'two checks at baseline time')
+
+  fs.mutate(`${ROOT}/package.json`, JSON.stringify({
+    name: 'demo',
+    scripts: { build: 'tsc -b' }, // the test script's definition is gone
+  }))
+  const outcome = await engine.verify({ changed: ['package.json'] })
+  assert.equal(outcome.vanished?.length, 1, 'the anchored test check vanished from discovery')
+  assert.equal(outcome.report.vanished?.length, 1, 'the report carries the hole')
+  assert.equal(outcome.report.grade, 'stale', 'a vanished definition blocks proven')
+  assert.ok((outcome.report.vanished?.[0] ?? "").startsWith("package.json:"), "identified by source id")
 })

@@ -187,7 +187,7 @@ test('initialize handshake answers with the server identity and a supported prot
     serverInfo: { name: string; version: string }
   }
   assert.equal(result.serverInfo.name, 'agent-proof-protocol')
-  assert.equal(result.serverInfo.version, '0.15.0')
+  assert.equal(result.serverInfo.version, '0.16.0')
   assert.equal(result.protocolVersion, '2025-06-18', 'a requested supported version is echoed back')
   assert.equal(result.capabilities.tools.listChanged, false)
 })

@@ -565,6 +565,14 @@ claude mcp add proof -- dsh-proof-mcp
 
 **再写一个适配器**——`src/adapters/shared/` 本身就是适配器 cookbook：`paths.ts`（一切工件住在哪，engine 字节对齐保证）、`session.ts`（观察即值，每个会话 id 一份快照）、`gates.ts`（三种判定的纯函数）。宿主特定代码刻意保持薄——翻译你宿主的钩子载荷、调用共享函数、渲染你宿主的应答形状——已随附的两个适配器就是参考实现：哪个宿主长得像你的，就抄哪个。
 
+## 五·二十一、诚实性收口（v0.16.0）：这一轮到底观察到了什么？
+
+v0.16 是一个**诚实性收口版**：对核心发出的每一个判定做一次深读审计，全部高优先问题一次修完。这些问题共享同一个形状：置信度词表早已建起来（grade、basis、先验——v0.9 到 v0.13），但它的两条消费线——grade 与 basis——都从没校验过「实际观察到了什么」。**先验不是观察（H2）**：一波验证零决定性观察，贝叶斯 verify 不再给 `proven`——降为 `stale`；certified-subset 提前停如今要求**本波**产出过决定性记录；非决定性记录留在 `pending`，不再被悄悄挪走；沉睡的 `runCheckIds` 字段激活，confidence 点名真正跑过的检查。**背书不是工作的替身（H3）**：`proof_endorse` 不能再为从未跑过、或被覆盖门拦下的检查付费解锁——风险接受如今以工作完成为前提（`unverified = 0` 且门未拦），对应测试叙事同步反转。
+
+**检查定义本身成为证据（H5）**：基线为发现的每个 npm 脚本体锚定 `scriptDigest`，verify 逐个比对——漂移的检查强制重跑、按 synthetic 档（falsePass 0.15）折价、summary 里点名警告一行，「agent 偷偷改 test 脚本」的攻击面闭合；基线锚定过、发现池里却**消失**的检查如实上报并阻止 `proven`，「删掉失败检查的定义」的攻击面闭合。**失败即闭合（H6）**：git 查询失败从「静默空答案」改为 throw→降级→强制全量验证（假 proven 方向堵死）；基线快照时的 git 失败以 `snapshotDegraded` 附件透传。**超时成为被观察的状态（H7）**：命令端口上报 `timedOut` 标志，真实超时在两个平台上都记 `'timeout'`——此前生产端口报告不了这个死因、真实超时全被记成 `error`；全套件首个真实超时测试就此落钉。
+
+其余清剿同一纪律：API 面提取不再漏掉 `export const x: number = 1`、解构类型注解不再产出幻影名（H4——behavior-preserving 对惯用 TS 重新成立）；观察器的 `pathsIn` 数组分支不再绕过键白名单（patch 行 / argv 数组不再被误当路径），本会话用过 shell 后，touched 集之外的变更归因从 `external` 降为 `unknown`——宁可归因不了，也不误指外部（H9）；`.PROOF` 大小写变体与反斜杠配置不再穿透工作区证据守卫（H10）；签名私钥读失败仅 ENOENT 才生成新钥，杀软瞬时锁不再触发静默轮换（H11）；预算耗尽或超时的基线拒绝锚定、落 `aborted` 标志（H12）——半真基线不再上链；`proof_endorse` 审批提示显示 agent 自报的 approver 名，冒名至少可见（M5）；verify 与 baseline 强制重发现，中途加脚本无法静默逃逸（M7）；config→engine 透传补上最后三个缺口——`lspQueryBudget`、`logger`、`verbose`（M14）。测试 493 → 543（+50），零新增配置键：scriptDigest、vanished、timedOut 都是内部观测字段，不是旋钮。
+
 ---
 
 ## 六、架构：领域核心 + 薄适配层
@@ -619,7 +627,7 @@ dsh-proof/
 │   │       ├── plugin.ts     # 运行时鸭子类型探测 tool.execute.before/after + chat.params，优雅降级
 │   │       └── vendor.ts     # 宿主 API 形状收窄器（探测不到 = 留空不炸宿主）
 │   └── vendor/dsh-tools.ts   # 契约快照（pinned to dsh v0.2.1-alpha.1）
-├── test/                     # 26 个测试文件（493 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心、类型化断言合约、证据分级 B/C、PTC 证据合成、覆盖感知证明、协议词表钉死、bundle 篡改矩阵、MCP 真子进程集成、适配器共享层字节对齐、Claude Code 真子进程协议、OpenCode 鸭子类型降级
+├── test/                     # 26 个测试文件（543 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心、类型化断言合约、证据分级 B/C、PTC 证据合成、覆盖感知证明、协议词表钉死、bundle 篡改矩阵、MCP 真子进程集成、适配器共享层字节对齐、Claude Code 真子进程协议、OpenCode 鸭子类型降级
 ├── PROTOCOL.md               # Agent Proof Protocol (APP/1.0) 开放标准（英文规范，八节）
 ├── cordis.patch.yml          # bundle 层
 └── examples/
@@ -631,7 +639,7 @@ dsh-proof/
 **为什么领域核心不碰 `@deepseek-ai/*`：**
 
 1. DSH 是开发者预览版，破坏性变更频繁。核心逻辑与 harness 版本解耦 → 升级不重写。
-2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，493 个测试全绿。
+2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，543 个测试全绿。
 3. 同一个核心可以被别的宿主（CLI、CI、其他 harness）复用。
 
 **为什么 `vendor/dsh-tools.ts` 是契约快照而不是活依赖：**
@@ -730,7 +738,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit，离线可跑
-npm test              # 493 个测试（node:test）
+npm test              # 543 个测试（node:test）
 npm run build         # 产出 lib/
 npm run bundle:check  # 打包契约自检
 ```
@@ -800,6 +808,9 @@ pnpm dsh web --patch /absolute/path/to/dsh-proof/examples/cordis.yml
 - **检查点 count 自 v0.14 起是规范性的（H1）。** `count` 不是安全整数、或不等于走链实数记录数的检查点，无论谁签，一律进 `malformedCheckpoints`；锚比较只采信锚 keyId 匹配的检查点——伪造检查点（外来 keyId、虚报 count）不再能洗白截断。反面同样对称：一个诚实但数错了 count 的有 bug 生产方会被同样拒绝，没有豁免通道。
 - **shell 命令字符串是所有宿主共有的路径盲区（v0.15）。** Bash/shell 类工具不携带结构化路径——`sed -i … src/a.ts` 这样的命令对溯源什么都提取不出来，DSH、Claude Code、OpenCode 三个宿主同此洞，且是刻意为之（在命令行里挖「长得像路径的词」只会指纹出噪声）。shell 写出的文件没有指纹、没有触达归因；兜底是漂移检测——shell 改动先前观察过的文件仍会被抓到（字节与记录的指纹不再匹配）。逃逸的只有**全新** shell 建立的文件的归因——想要被记账与归因的改动，请用 Write/Edit。
 - **OpenCode 没有回合结束 seam（v0.15）。** 没有 Stop 钩子、事件总线形状不稳，漂移与一次性 baseline/verify 提醒只能锚定在下一次工具调用上——外部改动后的第一个调用被持起并给出漂移叙事，且每个不同漂移集每个插件生命周期至多浮出一次（被无视的消息不能永远扣押后续调用）。`ask` 判定在这个宿主上也走不了用户审批往返：`ask` 与 `deny` 都持起调用，理由说明该改做什么。
+- **超时如今是被观察的状态，不是推断（v0.16）。** 命令端口上报 `timedOut` 标志，真实超时的检查在两个平台上都记 `'timeout'`——此前生产端口报告不了这个死因，真实超时全被记成普通 `error`。边界仍在原处：信号死亡在能报告的平台上仍记 `error` 并注明信号（见 v0.8 条），Windows 上以普通退出码到达的击杀仍读作 `error`——插件只报告端口观察到的，绝不多说。
+- **本会话用过 shell 后，`external` 降级为 `unknown`（v0.16）。** 「不在 touched 集」曾被读作外部改动的肯定证据——可会话一旦用过 shell（其路径任何宿主都提取不了，见 v0.15 条），这个缺失可能只是 agent 自己的 shell 工作没有被归因。归因如今对此说 `unknown`，不说自信但可能错指的 `external`，漂移叙事与外部嫌疑记账都读这个降级；`external` 只在本会话确实没有能产出该改动的手段时保留。
+- **MCP `serverInfo.version` 就是包版本（v0.16）。** `initialize` 应答 `MCP_DEFAULT_VERSION`，随发布纪律与 `package.json` 保持同步，并被 `test/23-mcp` 的握手断言钉死——它是**实现版本**，不是协议能力声明；协议兼容性另行协商（`2025-06-18` 等）。
 - **`proven` 允许存在预置红灯。** 一个本来就红的仓库不该让 Agent 无法工作。预置失败会在报告里显著列出，但不计入本次会话的责任。这是刻意设计，不是漏洞。
 - **它不替代测试本身。** `dsh-proof` 编排并归因你已有的客观检查。v0.12 的证据合成也不改变这条边界：断言由 agent 起草，插件只冻结脚手架、筛检、执行，并把结果折价记账为弱于任何独立检查的证据。
 - **DSH 是 v0.1/0.2 开发者预览版。** 插件契约会变。本插件已把依赖面最小化并钉死契约快照（`src/vendor/dsh-tools.ts`），但上游变更时仍需重新对齐。

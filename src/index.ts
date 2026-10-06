@@ -122,6 +122,10 @@ export function apply(ctx: Context, config: Config): void {
     concurrency: config.concurrency,
     impactGraph: config.impactGraph,
     impactGraphLimit: config.impactGraphLimit,
+    // M14: the LSP round-trip cap was in the config and the engine option but
+    // never travelled between them — a graph build silently ran on the engine
+    // default (400) whatever the deployment asked for.
+    lspQueryBudget: config.lspQueryBudget,
     headChars: config.headChars,
     scheduler: config.scheduler,
     certifyTarget: config.certifyTarget,
@@ -135,6 +139,13 @@ export function apply(ctx: Context, config: Config): void {
     syntheticFalsePass: config.syntheticFalsePass,
     syntheticTimeoutMs: config.syntheticTimeoutMs,
     coverage: config.coverage,
+    // M14: the engine's degradation-warning channel (E2 discipline — trust
+    // downgrades must be visible, not just recorded): verbose mirrors the
+    // plugin's own flag, and the logger lands on the host context's logger
+    // when it has one (the vendor snapshot documents none) and the console
+    // otherwise.
+    verbose: config.verbose,
+    logger: hostLogger(ctx),
   })
 
   const watch = new WorkspaceWatch(engineFs(engine), root)
@@ -156,7 +167,10 @@ export function apply(ctx: Context, config: Config): void {
   const log = (...args: unknown[]) => { if (config.verbose) console.log('[dsh-proof]', ...args) }
 
   // -- model-facing tools -------------------------------------------------
-  for (const tool of createProofTools(engine, () => watch.sessionTouchedPaths(), evidenceLogPath)) {
+  // H9b: `shellUsed` rides the same route as `touched` — the entry closes over
+  // its watch instance, so every verify/claim call the tools make carries the
+  // session's shell fact alongside the session's touched set.
+  for (const tool of createProofTools(engine, () => watch.sessionTouchedPaths(), evidenceLogPath, () => watch.sessionShellUsed())) {
     host.tools.register(tool)
     log(`registered tool ${tool.name}`)
   }
@@ -165,7 +179,20 @@ export function apply(ctx: Context, config: Config): void {
   // tools touching it are routed through user approval. In `host` mode the
   // log is outside the sandboxed workspace and needs no gate.
   if (config.evidenceStore === 'workspace') {
-    const evidenceSegment = collapseSegments(config.evidenceDir.replace(/^\.\/+/, '').replace(/\/+$/, ''))
+    // Both sides of the comparison are lowercased and forward-slashed (H10).
+    // Case: Windows describes one directory as `.proof`, `.PROOF` or `.Proof`
+    // — a case-sensitive compare let the agent write the evidence log by
+    // changing one letter's case (toWorkspaceRelative preserves the case the
+    // tool sent). The price is that on a genuinely case-sensitive filesystem
+    // a sibling `.PROOF` directory also matches — acceptable: it gates at
+    // worst one extra write through user approval. The adapter layer guards
+    // with the same fold (src/adapters/shared/paths.ts `touchesEvidencePath`);
+    // keep the two in lockstep. Backslashes: a Windows config `'.\proof'`
+    // names the same directory as `./proof` — normalize before collapsing,
+    // as the candidate side (toWorkspaceRelative) already does.
+    const evidenceSegment = collapseSegments(
+      config.evidenceDir.replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/\/+$/, ''),
+    ).toLowerCase()
     const touchesEvidence = (candidate: string): boolean => {
       // The guard must reason in one path space. A candidate is first projected
       // onto the workspace's relative space (absolute host-style paths, either
@@ -174,7 +201,7 @@ export function apply(ctx: Context, config: Config): void {
       // string-matching puzzle the agent can simply walk around.
       const rel = toWorkspaceRelative(candidate, root)
       if (rel === undefined) return false
-      const target = collapseSegments(rel)
+      const target = collapseSegments(rel).toLowerCase()
       return target === evidenceSegment || target.startsWith(`${evidenceSegment}/`)
     }
     host.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
@@ -236,15 +263,27 @@ export function apply(ctx: Context, config: Config): void {
   // means hosts (and tests) that index this pipeline keep their reading.
   host.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
     if (exec.name !== 'proof_endorse') return next()
-    const claim = (exec.arguments as { claim?: unknown } | null | undefined)?.claim
+    const parsed = (exec.arguments ?? {}) as { claim?: unknown; approver?: unknown }
+    const claim = parsed.claim
     const head = typeof claim === 'string' ? claim.slice(0, 80) : '(no claim text)'
+    // M5: the approver is agent-declared free text that the chain will record
+    // as the responsible human — the human at the approval seam must SEE the
+    // name they are about to vouch for, or Class C's named accountability can
+    // be counterfeited wholesale (the human approves a claim; the chain logs a
+    // name the agent invented). v0.16 makes it visible; whether to keep
+    // trusting the self-report is a later batch's call.
+    const approver = typeof parsed.approver === 'string' && parsed.approver.trim().length > 0
+      ? parsed.approver
+      : 'host-approver (default)'
     return {
       kind: 'ask',
       reason: `dsh-proof: a human must consciously endorse/reject this claim — approve to record Class C evidence? `
-        + `claim: "${head}"`,
+        + `claim: "${head}" approver (as declared by the agent): ${approver}`,
       displayReason: {
-        en: 'dsh-proof: a human must consciously endorse/reject this claim — approve to record Class C evidence?',
-        'zh-CN': 'dsh-proof：需要人类有意识地背书/否决此主张——批准以记录 Class C 证据？',
+        en: `dsh-proof: a human must consciously endorse/reject this claim — approve to record Class C evidence? `
+          + `approver (as declared by the agent): ${approver}`,
+        'zh-CN': `dsh-proof：需要人类有意识地背书/否决此主张——批准以记录 Class C 证据？`
+          + `审批人（由 agent 自报）：${approver}`,
       },
     }
   })
@@ -388,6 +427,22 @@ function hostWorkspaceRoot(ctx: Context): string {
 /** The engine's FsPort, reused by the watcher so both see the same filesystem. */
 function engineFs(engine: ProofEngine): FsPort {
   return engine.fsView
+}
+
+/**
+ * M14: the engine's line logger for degradation warnings (E2/H5/H6 visibility).
+ * The host-context surface this adapter is written against (see
+ * `src/vendor/dsh-tools.ts`, the pinned snapshot) documents no `logger`
+ * capability, so the console is the default — but if the running context does
+ * expose one, it wins: same rule as every other capability probe here
+ * (`host.lsp`, `host.systemPrompt`), structural read over assumption.
+ */
+function hostLogger(ctx: Context): (message: string) => void {
+  const candidate = (ctx as unknown as { logger?: unknown }).logger
+  if (typeof candidate === 'function') {
+    return (message: string) => { (candidate as (line: string) => void).call(ctx, message) }
+  }
+  return (message: string) => { console.log(message) }
 }
 
 /**

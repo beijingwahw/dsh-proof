@@ -19,6 +19,17 @@
  *   R2  `CommandResult.killedBySignal` carries external signal deaths to the
  *       port boundary (Windows cannot propagate signals — asserted as such).
  *   R3  concurrent writeFile temp names no longer collide within one process.
+ *
+ * Node adapter fidelity round 3 (v0.16 correctness batch):
+ *   H7  a real port timeout sets `timedOut: true` on the CommandResult (the
+ *       spawnError text stays for legacy consumers) — the first real-process
+ *       timeout test in the suite.
+ *   H11 a private-key read failure that is NOT ENOENT (EISDIR/EPERM/EBUSY)
+ *       makes NodeEd25519Signer.load REJECT instead of silently rotating the
+ *       signing key over the old one.
+ *   H6  failed git fact queries (non-zero exit, timeout kill, spawnError)
+ *       REJECT with the subcommand and exit code in the message; a failing
+ *       query must never answer "clean".
  */
 
 import { test, before, after } from 'node:test'
@@ -27,7 +38,7 @@ import { existsSync, promises as fsp } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 
-import { GitWorkspace, NodeCommandPort, NodeFsPort, parsePorcelainZ, resolveCmdShim } from '../src/node-ports.ts'
+import { GitWorkspace, NodeCommandPort, NodeEd25519Signer, NodeFsPort, parsePorcelainZ, resolveCmdShim } from '../src/node-ports.ts'
 import type { CommandPort, CommandResult } from '../src/core/ports.ts'
 
 // <workspace>/.openclaw/tmp/... — the designated scratch area (one level
@@ -267,7 +278,13 @@ test('GIT: untracked parses the plain NUL-separated ls-files list (D7)', async (
   assert.deepEqual(files, ['sub/new.ts', 'untracked.ts'])
 })
 
-test('GIT: non-zero git exits degrade to empty facts, not garbage', async () => {
+test('GIT: gitHead survives non-zero exits as null, the fact queries REJECT (H6)', async () => {
+  // v0.16 tightened behaviour: a failed `git status`/`git diff`/`git
+  // ls-files` used to coerce into `[]` — indistinguishable from "clean",
+  // which is how committed changes vanished from change sets (H6, fake
+  // proven direction). The fact queries must now throw, naming the
+  // subcommand and the exit code; only `gitHead` keeps its `string | null`
+  // contract ("no commit" is a legitimate answer, not a query failure).
   const failing: CommandPort = {
     run: async (): Promise<CommandResult> => ({
       exitCode: 128,
@@ -278,9 +295,9 @@ test('GIT: non-zero git exits degrade to empty facts, not garbage', async () => 
   }
   const ws = new GitWorkspace('C:/definitely/not/a/repo', failing)
   assert.equal(await ws.gitHead(), null)
-  assert.deepEqual(await ws.gitDirty(), [])
-  assert.deepEqual(await ws.changedSince('HEAD'), [])
-  assert.deepEqual(await ws.untracked(), [])
+  await assert.rejects(ws.gitDirty(), /status --porcelain[^]*exit code 128/)
+  await assert.rejects(ws.changedSince('HEAD'), /diff --name-only[^]*exit code 128/)
+  await assert.rejects(ws.untracked(), /ls-files --others[^]*exit code 128/)
 })
 
 // -- gitAvailable (E3) ---------------------------------------------------------
@@ -447,4 +464,95 @@ test('FS: 100 concurrent writeFile calls leave one intact winner and no temp res
     `final content is not any single writer's complete write: ${final?.slice(0, 80)}`)
   const residue = (await fsp.readdir(ATOMIC_DIR)).filter((name) => name.endsWith('.tmp'))
   assert.deepEqual(residue, [])
+})
+
+// -- real-process timeout (H7) ----------------------------------------------------
+
+test('NODE-PORTS: a real port timeout sets timedOut, keeps the legacy spawnError text (H7)', async () => {
+  // The first real timeout in the suite: every previous 'timeout' status was
+  // fed by fakes. The child outlives the 400ms budget by orders of magnitude.
+  const startedAt = Date.now()
+  const result = await commands.run(
+    [process.execPath, '-e', 'setTimeout(() => {}, 10000)'],
+    { cwd: WORKSPACE, timeoutMs: 400, signal: AbortSignal.timeout(30_000) },
+  )
+  const wallMs = Date.now() - startedAt
+  assert.equal(result.timedOut, true, '"we killed it for exceeding the budget" is a first-class fact')
+  assert.equal(result.exitCode, null, 'a killed process has no exit code')
+  assert.equal(result.aborted, false, 'the caller did not cancel — the budget did')
+  assert.ok(result.durationMs >= 350, `durationMs ${result.durationMs} — the budget must actually elapse`)
+  assert.ok(wallMs < 5_000, `run() took ${wallMs}ms — the timeout must not wait on the dead child`)
+  // Legacy compatibility: consumers matching on the text keep working.
+  assert.ok((result.spawnError ?? '').includes('timed out'), `spawnError: ${result.spawnError}`)
+  assert.ok((result.spawnError ?? '').includes('400'), 'the spawnError names the budget that was exceeded')
+})
+
+// -- signer key must not silently rotate (H11) -------------------------------------
+
+test('SIGNER: a non-ENOENT private-key read failure rejects instead of rotating the key (H11)', async () => {
+  const dir = join(SCRATCH, `node-ports-signer-${process.pid}`)
+  await fsp.rm(dir, { recursive: true, force: true })
+  await fsp.mkdir(join(dir, 'proof-signing-key.pem'), { recursive: true }) // EISDIR on read
+  await assert.rejects(
+    NodeEd25519Signer.load(dir),
+    (error: unknown) => {
+      const code = (error as NodeJS.ErrnoException).code
+      assert.ok(code !== 'ENOENT', 'the failure must be the read error itself, rethrown')
+      return true
+    },
+    'EPERM/EBUSY/EISDIR must surface, not trigger key generation',
+  )
+  // No rotation happened: the "key" is still the directory the read tripped
+  // over, and no public half was ever written next to it.
+  assert.ok((await fsp.stat(join(dir, 'proof-signing-key.pem'))).isDirectory(),
+    'a fresh PEM must not have replaced the unreadable path')
+  assert.equal(existsSync(join(dir, 'proof-signing-key.pub.pem')), false,
+    'no public half may appear for a key that was never loaded')
+  await fsp.rm(dir, { recursive: true, force: true })
+})
+
+// -- failed git fact queries reject (H6) -------------------------------------------
+
+test('GIT: a timeout-killed git query (exitCode null) rejects, never answers clean (H6)', async () => {
+  const killed: CommandPort = {
+    run: async (): Promise<CommandResult> => ({
+      exitCode: null, output: '', durationMs: 15_000, aborted: false,
+      spawnError: 'timed out after 15000ms', timedOut: true,
+    }),
+  }
+  const ws = new GitWorkspace(GIT_ROOT, killed)
+  await assert.rejects(ws.gitDirty(), /status --porcelain[^]*produced no answer[^]*timed out/)
+  await assert.rejects(ws.changedSince('HEAD'), /diff --name-only/)
+  await assert.rejects(ws.untracked(), /ls-files --others/)
+})
+
+test('GIT: a spawnError git query rejects with the spawn failure named (H6)', async () => {
+  const broken: CommandPort = {
+    run: async (): Promise<CommandResult> => ({
+      exitCode: null, output: '', durationMs: 0, aborted: false,
+      spawnError: 'spawn failed: ENOENT',
+    }),
+  }
+  const ws = new GitWorkspace(GIT_ROOT, broken)
+  await assert.rejects(ws.gitDirty(), /status --porcelain[^]*produced no answer[^]*spawn failed: ENOENT/)
+})
+
+test('GIT: one failing fact query does not take the others down (H6)', async () => {
+  // index.lock contention hits `git status` while diff/ls-files still answer:
+  // each query fails (or succeeds) on its own merits.
+  const flaky: CommandPort = {
+    run: async (argv): Promise<CommandResult> => {
+      if (argv.includes('status')) {
+        return { exitCode: 128, output: 'fatal: Unable to create index.lock: File exists.\n', durationMs: 1, aborted: false }
+      }
+      if (argv.includes('diff')) {
+        return { exitCode: 0, output: 'keep.ts\0', durationMs: 1, aborted: false }
+      }
+      return { exitCode: 0, output: 'untracked.ts\0', durationMs: 1, aborted: false }
+    },
+  }
+  const ws = new GitWorkspace(GIT_ROOT, flaky)
+  await assert.rejects(ws.gitDirty(), /status --porcelain[^]*exit code 128[^]*index\.lock/)
+  assert.deepEqual(await ws.changedSince('HEAD'), ['keep.ts'])
+  assert.deepEqual(await ws.untracked(), ['untracked.ts'])
 })

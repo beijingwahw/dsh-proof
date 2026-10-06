@@ -429,12 +429,20 @@ export function createProofTools(
   engine: ProofEngine,
   touched?: () => readonly string[],
   evidenceLogPath?: string,
+  /**
+   * H9b: whether a shell-class tool ran this session
+   * (`WorkspaceWatch.sessionShellUsed`), wired the same route as `touched` —
+   * the plugin entry closes over its watch instance and hands both accessors
+   * down. Present only when the host provides one; a bare construction keeps
+   * the pre-H9 classification byte-for-byte.
+   */
+  shellUsed?: () => boolean,
 ): ToolDefinition[] {
   return [
     createStatusTool(engine),
     createBaselineTool(engine),
-    createVerifyTool(engine, touched),
-    createClaimTool(engine, touched),
+    createVerifyTool(engine, touched, shellUsed),
+    createClaimTool(engine, touched, shellUsed),
     createJuryTool(engine),
     createJurySubmitTool(engine, evidenceLogPath),
     createEndorseTool(engine, evidenceLogPath),
@@ -566,7 +574,7 @@ function createBaselineTool(engine: ProofEngine): ToolDefinition {
   }
 }
 
-function createVerifyTool(engine: ProofEngine, touched?: () => readonly string[]): ToolDefinition {
+function createVerifyTool(engine: ProofEngine, touched?: () => readonly string[], shellUsed?: () => boolean): ToolDefinition {
   return {
     name: 'proof_verify',
     description:
@@ -641,17 +649,20 @@ function createVerifyTool(engine: ProofEngine, touched?: () => readonly string[]
         ...(Array.isArray(parsed.changed) ? { changed: parsed.changed } : {}),
         ...(parsed.all === true ? { all: true } : {}),
         ...(touched !== undefined ? { touched: touched() } : {}),
+        // H9b: once a shell ran, "not in the touched set" no longer proves
+        // "changed outside the agent" — the engine demotes those to 'unknown'.
+        ...(shellUsed !== undefined && shellUsed() ? { shellUsedSince: true } : {}),
         signal: exec.signal,
       })
       return toVerifyValue(
         outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
-        outcome.schedule, outcome.coverage,
+        outcome.schedule, outcome.coverage, outcome.scriptDrift, outcome.vanished,
       ) as unknown as JsonValue
     },
   }
 }
 
-function createClaimTool(engine: ProofEngine, touched?: () => readonly string[]): ToolDefinition {
+function createClaimTool(engine: ProofEngine, touched?: () => readonly string[], shellUsed?: () => boolean): ToolDefinition {
   return {
     name: 'proof_claim',
     description:
@@ -748,22 +759,24 @@ function createClaimTool(engine: ProofEngine, touched?: () => readonly string[])
           contract,
           ...(Array.isArray(parsed.changed) ? { changed: parsed.changed } : {}),
           ...(touched !== undefined ? { touched: touched() } : {}),
+          ...(shellUsed !== undefined && shellUsed() ? { shellUsedSince: true } : {}),
           signal: exec.signal,
         })
         const verified = toVerifyValue(
           outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
-          outcome.schedule, outcome.coverage,
+          outcome.schedule, outcome.coverage, outcome.scriptDrift, outcome.vanished,
         )
         return toClaimValue(parsed.claim, outcome.report, verified, outcome.contract) as unknown as JsonValue
       }
       const outcome = await engine.verify({
         ...(Array.isArray(parsed.changed) ? { changed: parsed.changed } : {}),
         ...(touched !== undefined ? { touched: touched() } : {}),
+        ...(shellUsed !== undefined && shellUsed() ? { shellUsedSince: true } : {}),
         signal: exec.signal,
       })
       const verified = toVerifyValue(
         outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
-        outcome.schedule, outcome.coverage,
+        outcome.schedule, outcome.coverage, outcome.scriptDrift, outcome.vanished,
       )
       return toClaimValue(parsed.claim, outcome.report, verified) as unknown as JsonValue
     },
@@ -1485,6 +1498,21 @@ export function toVerifyValue(
     readonly uncovered: readonly string[]
     readonly executedCount: number
   },
+  /**
+   * H5: check definitions whose script body changed since the baseline, as
+   * the outcome reported them. Each was force-re-run and priced at the
+   * synthetic false-pass tier; the summary appends one warning line so the
+   * model cannot read a "proven" posterior as if the baseline's original
+   * definitions had answered. Absent (and the summary line with it) when
+   * nothing drifted, keeping the canonical value byte-stable.
+   */
+  scriptDrift?: readonly string[],
+  /**
+   * H5②: baseline checks whose definitions vanished from discovery. The
+   * summary appends one warning line so a shrunken pool cannot read as a
+   * green report; absent when nothing vanished (canonical value stable).
+   */
+  vanished?: readonly string[],
 ): VerifyValue {
   const externalChanged = attribution?.records.filter(r => r.provenance === 'external').map(r => r.path) ?? []
   // The check list covers every discovered spec (attribution included), so the
@@ -1515,6 +1543,20 @@ export function toVerifyValue(
     ? coverage.uncovered.filter((p): p is string => typeof p === 'string')
     : []
   const coverageExecuted = typeof coverage?.executedCount === 'number' ? coverage.executedCount : 0
+  // H5: one warning line when definitions drifted. The engine re-ran and
+  // re-priced them, but the reader of "PROVEN (p≈0.98)" must also see that the
+  // checks answering are not the bodies the baseline greened — the same
+  // visibility rule the coverage blind spot gets in `proofNarrative`.
+  const drift = Array.isArray(scriptDrift) ? scriptDrift.filter((id): id is string => typeof id === 'string') : []
+  const driftTail = drift.length > 0
+    ? ` — ${drift.length} check definition(s) changed since baseline (script drift) — re-run and discounted`
+    : ''
+  // H5②: same visibility rule for definitions that disappeared entirely —
+  // a shrunken pool must never read as a green report.
+  const gone = Array.isArray(vanished) ? vanished.filter((id): id is string => typeof id === 'string') : []
+  const goneTail = gone.length > 0
+    ? ` — ${gone.length} baseline check(s) vanished from discovery (definitions removed) — rebuild the baseline`
+    : ''
   return {
     grade: report.grade,
     root: report.root,
@@ -1552,7 +1594,7 @@ export function toVerifyValue(
     unverified: [...report.unverified],
     passing: report.summary.passing,
     failing: report.summary.failing,
-    summary: proofNarrative(report),
+    summary: `${proofNarrative(report)}${driftTail}${goneTail}`,
   }
 }
 

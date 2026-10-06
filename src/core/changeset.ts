@@ -67,6 +67,18 @@ export interface ChangeSetInput {
   }
   /** Paths the agent's tool stream touched since the baseline, for provenance. */
   readonly touched?: readonly RelPath[]
+  /**
+   * H9b: a shell-class tool ran this session (`WorkspaceWatch.sessionShellUsed`).
+   * Path extraction cannot see through a command string — `bash -c "prettier -w
+   * src/a.ts"` mutates files no key of the tool call names — so once a shell
+   * has run, "this file is not in `touched`" no longer proves "this file was
+   * changed outside the agent's tool stream". When set, non-touched changes
+   * classify as `'unknown'` instead of `'external'`: attribution would rather
+   * say nothing than misreport an agent edit as an external one (the honest
+   * boundary, externalised — drift narratives and external-suspect charging
+   * both read the demotion).
+   */
+  readonly uncertainExternal?: boolean
 }
 
 /**
@@ -75,7 +87,8 @@ export interface ChangeSetInput {
  * their behaviour. `false` is a definitive "git is unusable here": skip the
  * git queries entirely (they can only fail) and mark the resolution degraded.
  * A probe that *throws* is treated as available: we do not know it is broken,
- * and each git call still carries its own catch.
+ * and each git query still carries its own failure accounting (H6) — a
+ * rejection degrades the resolution rather than answering "clean".
  */
 async function gitUsable(workspace: WorkspacePort): Promise<boolean> {
   if (workspace.gitAvailable === undefined) return true
@@ -104,33 +117,70 @@ export async function resolveChangeSet(input: ChangeSetInput): Promise<ChangeSet
 
   if (input.baseline === undefined) {
     // Without git there is no dirty set to fall back to — the resolution
-    // degrades to "nothing visible", and says so.
-    const dirty = git ? await input.workspace.gitDirty().catch(() => []) : []
+    // degrades to "nothing visible", and says so. A dirty query that FAILS
+    // (H6) lands in the same place by the same reasoning: no observable
+    // change set, but the blindness is surfaced via `degraded` instead of
+    // masquerading as "clean" — downstream, degraded resolutions force a
+    // full run rather than trust a narrowed set.
+    let dirtyQueryFailed = false
+    const dirty: readonly string[] = git
+      ? await input.workspace.gitDirty().catch(() => {
+          dirtyQueryFailed = true
+          return [] as string[]
+        })
+      : []
     const changed = [...new Set(dirty)].sort()
     return {
       changed,
-      records: changed.map(path => ({ path, provenance: classify(path, touchedSet, touchedProvided) })),
+      records: changed.map(path => ({
+        path,
+        provenance: classify(path, touchedSet, touchedProvided, input.uncertainExternal === true),
+      })),
       method: 'dirty-fallback',
       preExistingExcluded: [],
       baselineHead: null,
-      ...(git ? {} : { degraded: true as const }),
+      ...(git && !dirtyQueryFailed ? {} : { degraded: true as const }),
     }
   }
 
   const baselineDirty = new Set(input.baseline.dirty)
   const digests = input.baseline.dirtyDigests
-  // When git is down, every one of these queries is skipped rather than
-  // fired-and-failed: candidates then come from the baseline's own dirty set,
-  // which content digests can still adjudicate without git.
-  const trackedDiff: readonly string[] = git && input.baseline.head !== null
-    ? await input.workspace.changedSince?.(input.baseline.head).catch(() => [] as string[]) ?? []
-    : []
-  const untrackedNow: readonly string[] = git
-    ? await input.workspace.untracked?.().catch(() => [] as string[]) ?? []
-    : []
-  const dirtyNow: readonly string[] = git
-    ? await input.workspace.gitDirty().catch(() => [])
-    : []
+  // When git is down (or the probe is absent-but-unused), every query is
+  // skipped rather than fired-and-failed: candidates then come from the
+  // baseline's own dirty set, which content digests can still adjudicate
+  // without git. When git is up but a query FAILS (H6), that source
+  // contributes nothing while the surviving sources keep building the
+  // candidate set — and the failure is recorded, because an empty answer
+  // from a dead query is not evidence of cleanliness. Conservative by
+  // construction: `degraded` resolutions force a full check run
+  // downstream, which is exactly the net a lost dimension (committed
+  // changes the diff never reported, untracked files ls-files never
+  // listed) falls into.
+  let gitQueryFailed = false
+  let trackedDiff: readonly string[] = []
+  let untrackedNow: readonly string[] = []
+  let dirtyNow: readonly string[] = []
+  if (git && input.baseline.head !== null && input.workspace.changedSince !== undefined) {
+    try {
+      trackedDiff = await input.workspace.changedSince(input.baseline.head)
+    } catch {
+      gitQueryFailed = true
+    }
+  }
+  if (git && input.workspace.untracked !== undefined) {
+    try {
+      untrackedNow = await input.workspace.untracked()
+    } catch {
+      gitQueryFailed = true
+    }
+  }
+  if (git) {
+    try {
+      dirtyNow = await input.workspace.gitDirty()
+    } catch {
+      gitQueryFailed = true
+    }
+  }
 
   // Everything that could possibly have moved: differs from the baseline
   // commit, is untracked now, is dirty now, or was already dirty at baseline
@@ -160,15 +210,31 @@ export async function resolveChangeSet(input: ChangeSetInput): Promise<ChangeSet
 
   return {
     changed,
-    records: changed.map(path => ({ path, provenance: classify(path, touchedSet, touchedProvided) })),
+    records: changed.map(path => ({
+      path,
+      provenance: classify(path, touchedSet, touchedProvided, input.uncertainExternal === true),
+    })),
     method: digests !== undefined ? 'baseline-content' : 'git-head',
     preExistingExcluded: excluded,
     baselineHead: input.baseline.head,
-    ...(git ? {} : { degraded: true as const }),
+    ...(git && !gitQueryFailed ? {} : { degraded: true as const }),
   }
 }
 
-function classify(path: RelPath, touchedSet: ReadonlySet<RelPath>, touchedProvided: boolean): ChangeProvenance {
+/**
+ * Who moved one file. `touched`/`explicit` keep their meaning; the only
+ * H9b change is the negative branch: without a shell this session, absence
+ * from the touched set is affirmative evidence of an external edit, and with
+ * one it is merely an absence of evidence — `'unknown'`, never a false
+ * `'external'`.
+ */
+function classify(
+  path: RelPath,
+  touchedSet: ReadonlySet<RelPath>,
+  touchedProvided: boolean,
+  uncertainExternal = false,
+): ChangeProvenance {
   if (!touchedProvided) return 'unknown'
-  return touchedSet.has(path) ? 'agent' : 'external'
+  if (touchedSet.has(path)) return 'agent'
+  return uncertainExternal ? 'unknown' : 'external'
 }

@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { checkId, discoverChecks } from '../src/core/checks.ts'
+import { sha256 } from '../src/core/hash.ts'
 import { MemoryFs } from './helpers.ts'
 
 test('discovers npm scripts by kind, skipping pre/post hooks', async () => {
@@ -186,4 +187,78 @@ test('checks inherit the configured timeout', async () => {
   const fs = MemoryFs.of({ '/ws/package.json': JSON.stringify({ scripts: { test: 'x' } }) })
   const checks = await discoverChecks(fs, '/ws', { timeoutMs: 777 })
   assert.equal(checks[0]?.timeoutMs, 777)
+})
+
+// ---------------------------------------------------------------------------
+// scriptDigest (H5a) — the discovery half of check-definition drift.
+//
+// A checkId pins source+command+cwd, so `"test": "vitest run"` and
+// `"test": "exit 0"` mint the SAME id: after a baseline, an agent could gut a
+// script and keep its full-confidence identity. The digest on the spec is the
+// discovery layer's answer — same id, provably different body. It must never
+// leak into the id (byte-compat red line above) nor into the evidence payload.
+// ---------------------------------------------------------------------------
+
+test('a discovered npm script carries scriptDigest: the sha256 of its body, recomputed independently', async () => {
+  const body = 'vitest run --coverage'
+  const fs = MemoryFs.of({
+    '/ws/package.json': JSON.stringify({ scripts: { test: body } }),
+  })
+  const checks = await discoverChecks(fs, '/ws')
+  const test = checks.find(c => c.label === 'npm script "test"')
+  assert.equal(test?.scriptDigest, sha256(body), 'the digest is exactly the script text, verbatim')
+})
+
+test('monorepo member scripts digest their own bodies, not the root\u2019s', async () => {
+  const checks = await discoverChecks(MemoryFs.of(MONOREPO), '/ws')
+  const sub = checks.find(c => c.label === 'npm script "test" (packages/a)')
+  const root = checks.find(c => c.label === 'npm script "test"')
+  assert.equal(sub?.scriptDigest, sha256('node test.js'), 'the member digest is the member body')
+  assert.equal(root?.scriptDigest, sha256('vitest run'), 'the root digest is the root body')
+  assert.notEqual(sub?.scriptDigest, root?.scriptDigest)
+})
+
+test('rewriting the script body moves the digest and leaves the id alone — identity theft made visible', async () => {
+  const fixture = (body: string) => MemoryFs.of({
+    '/ws/package.json': JSON.stringify({ scripts: { test: body } }),
+  })
+  const before = (await discoverChecks(fixture('vitest run'), '/ws')).find(c => c.label === 'npm script "test"')
+  const after = (await discoverChecks(fixture('exit 0'), '/ws')).find(c => c.label === 'npm script "test"')
+  // The id is unchanged (same source, argv and cwd — baselines keep
+  // addressing), the digest is not: the drift is now detectable on the spec.
+  assert.equal(after?.id, before?.id, 'checkId material never included the body')
+  assert.equal(after?.scriptDigest, sha256('exit 0'))
+  assert.notEqual(after?.scriptDigest, before?.scriptDigest)
+})
+
+test('config entries and python/make checks leave scriptDigest undefined — those bodies are not enumerable', async () => {
+  const fs = MemoryFs.of({
+    '/ws/package.json': JSON.stringify({ scripts: { test: 'vitest run' } }),
+    '/ws/pyproject.toml': '[tool.pytest.ini_options]\n',
+    '/ws/Makefile': 'test:\n\tnpm test\n',
+  })
+  const checks = await discoverChecks(fs, '/ws', {
+    checks: [{ label: 'custom', command: ['make', 'verify'], kind: 'test' }],
+  })
+  const config = checks.find(c => c.source === 'config')
+  assert.equal(config?.scriptDigest, undefined, 'explicit config has no script body to digest')
+  for (const c of checks.filter(x => x.source !== 'package.json')) {
+    assert.equal(c.scriptDigest, undefined, `${c.source}:${c.label} must stay digest-free`)
+  }
+  const npm = checks.find(c => c.source === 'package.json')
+  assert.equal(npm?.scriptDigest, sha256('vitest run'), 'only the npm script carries its body')
+})
+
+test('a config entry shadowing a discovered script keeps the dedupe: one survivor, no digest', async () => {
+  // Same invocation (command+cwd) still collapses config-first — the digest
+  // must not become a back door to resurrect the displaced discovery as a
+  // second check, and the surviving config spec carries no digest.
+  const fs = MemoryFs.of({ '/ws/package.json': JSON.stringify({ scripts: { test: 'exit 0' } }) })
+  const checks = await discoverChecks(fs, '/ws', {
+    checks: [{ label: 'my tests', command: 'npm run --silent test' }],
+  })
+  const same = checks.filter(c => c.command.join(' ') === 'npm run --silent test')
+  assert.equal(same.length, 1, 'dedupe key is command+cwd, unchanged by the digest')
+  assert.equal(same[0]?.source, 'config')
+  assert.equal(same[0]?.scriptDigest, undefined)
 })

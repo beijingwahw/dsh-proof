@@ -217,3 +217,112 @@ test('driftNarrative names stale reads first and tells the model what to do', ()
   assert.match(text ?? '', /src\/b\.ts/)
   assert.match(text ?? '', /proof_verify/)
 })
+
+// ---------------------------------------------------------------------------
+// H9a: arrays only carry paths when a path key names them. The old generic
+// array branch collected every string in every array — a patch's line list,
+// an argv vector, a `source` content array — which walked straight around the
+// key whitelist this extractor exists to enforce (`{source: ['src/old/text']}`
+// used to leak the snippet as a touched path, charging the agent with an edit
+// it never made).
+// ---------------------------------------------------------------------------
+
+test('H9a: a bare array under a non-path key contributes no paths', () => {
+  // The exact shape that used to bypass the whitelist: content snippets in
+  // array form under `source` sailed through as paths.
+  assert.deepEqual(WorkspaceWatch.pathsIn({ source: ['src/old/text'] }), [])
+  // An argv vector is not a path list, however path-shaped item[1] looks.
+  assert.deepEqual(WorkspaceWatch.pathsIn({ command: ['node', 'scripts/build.ts'] }), [])
+  // A patch body's line array likewise.
+  assert.deepEqual(WorkspaceWatch.pathsIn({ patch: ['--- a/src/x.ts', '+++ b/src/x.ts', '@@ -1 +1 @@'] }), [])
+})
+
+test('H9a: arrays under path keys still contribute their string items', () => {
+  assert.deepEqual(
+    WorkspaceWatch.pathsIn({ files: ['src/a.ts', 'src/b.ts'] }),
+    ['src/a.ts', 'src/b.ts'],
+  )
+  // The single-key form (`paths`) is the shape the adapters' tests pin.
+  assert.deepEqual(
+    WorkspaceWatch.pathsIn({ paths: ['src/gone.ts', 'src/there.ts'] }),
+    ['src/gone.ts', 'src/there.ts'],
+  )
+  // A path key holding a one-element array, and the string-in-array-key form.
+  assert.deepEqual(WorkspaceWatch.pathsIn({ file: ['src/one.ts'] }), ['src/one.ts'])
+})
+
+test('H9a: nested objects inside arrays still expose their path keys', () => {
+  // Legal deep shapes must stay reachable — only bare strings were the leak.
+  assert.deepEqual(
+    WorkspaceWatch.pathsIn({ patches: [{ file: 'src/x.ts' }, { file: 'src/y.ts' }] }),
+    ['src/x.ts', 'src/y.ts'],
+  )
+  // Object elements inside a genuinely path-keyed array keep both routes.
+  assert.deepEqual(
+    WorkspaceWatch.pathsIn({ files: ['src/a.ts', { path: 'src/b.ts' }] }),
+    ['src/a.ts', 'src/b.ts'],
+  )
+})
+
+test('H9a: the guard view (contentKeys) still collects source arrays', () => {
+  // Over-detection is the guard's designed direction: a `move` sourcing the
+  // evidence log as an array must not slip the gate just because arrays got
+  // stricter for everyone else.
+  assert.deepEqual(
+    WorkspaceWatch.pathsIn({ source: ['.proof/x'] }, { contentKeys: true }),
+    ['.proof/x'],
+  )
+  assert.deepEqual(
+    WorkspaceWatch.pathsIn({ sources: ['.proof/x', '.proof/y'] }, { contentKeys: true }),
+    ['.proof/x', '.proof/y'],
+  )
+  // And the precise view stays precise on the same payload.
+  assert.deepEqual(WorkspaceWatch.pathsIn({ source: ['.proof/x'] }), [])
+})
+
+test('H9a end-to-end: an argv array no longer charges the agent with phantom edits', async () => {
+  const fs = MemoryFs.of({ [`${ROOT}/src/a.ts`]: 'v1\n' })
+  const watch = new WorkspaceWatch(fs, ROOT)
+  await watch.observe(exec('run_command', { command: ['node', 'scripts/build.ts'] }), OK)
+  assert.deepEqual(watch.touchedPaths(), [], 'argv items are not files the agent touched')
+  assert.deepEqual(watch.sessionTouchedPaths(), [], 'nor provenance')
+})
+
+// ---------------------------------------------------------------------------
+// H9b: shell visibility. bash/exec-class tools name their paths only inside a
+// command string this observer deliberately does not parse — so once one has
+// run, "not in the touched set" stops proving "external". The watcher records
+// the session-level fact; consumers use it to demote `external` to `unknown`.
+// ---------------------------------------------------------------------------
+
+test('H9b: a shell tool call flips sessionShellUsed for the session', async () => {
+  const fs = MemoryFs.of({ [`${ROOT}/src/a.ts`]: 'v1\n' })
+  const watch = new WorkspaceWatch(fs, ROOT)
+  assert.equal(watch.sessionShellUsed(), false, 'no shell has run yet')
+
+  await watch.observe(exec('bash', { command: 'prettier -w src/a.ts' }), OK)
+  assert.equal(watch.sessionShellUsed(), true, 'the session has used a shell')
+})
+
+test('H9b: sessionShellUsed survives windowStart — it is a session-level fact', async () => {
+  const fs = MemoryFs.of({ [`${ROOT}/src/a.ts`]: 'v1\n' })
+  const watch = new WorkspaceWatch(fs, ROOT)
+  await watch.observe(exec('exec', { command: 'true' }), OK)
+  watch.windowStart()
+  assert.equal(watch.sessionShellUsed(), true, 'windows reset the touched set, not this fact')
+  watch.windowStart()
+  assert.equal(watch.sessionShellUsed(), true)
+})
+
+test('H9b: read-only and non-shell mutation tools do not flip the flag', async () => {
+  const fs = MemoryFs.of({ [`${ROOT}/src/a.ts`]: 'v1\n' })
+  const watch = new WorkspaceWatch(fs, ROOT)
+  await watch.observe(exec('read_file', { path: 'src/a.ts' }), OK)
+  await watch.observe(exec('write', { path: 'src/a.ts', content: 'v2\n' }), OK)
+  await watch.observe(exec('mystery_analyzer', { path: 'src/a.ts' }), OK)
+  assert.equal(watch.sessionShellUsed(), false, 'only SHELL_TOOL_RE names flip it')
+  // The anchored pattern, not a substring sniff: a name merely containing a
+  // shell word never flips the flag.
+  await watch.observe(exec('npm_audit_viewer', { path: 'src/a.ts' }), OK)
+  assert.equal(watch.sessionShellUsed(), false)
+})

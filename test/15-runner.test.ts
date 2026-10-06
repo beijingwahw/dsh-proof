@@ -43,6 +43,16 @@ class ScriptedCommands extends FakeCommands implements CommandPort {
       await super.run(argv, options)
       return { exitCode: null, output: 'running forever', durationMs: 5, aborted: false }
     }
+    if (argv.includes('too-slow')) {
+      // H7: the REAL port's timeout shape — exitCode null, the legacy
+      // spawnError text for pre-v0.16 consumers, and the first-class
+      // timedOut fact. The runner must read the fact, not the channel.
+      await super.run(argv, options)
+      return {
+        exitCode: null, output: 'partial output before the kill', durationMs: 5, aborted: false,
+        spawnError: 'timed out after 1000ms', timedOut: true,
+      }
+    }
     if (argv.includes('enoent')) {
       await super.run(argv, options)
       return { exitCode: null, output: '', durationMs: 0, aborted: false, spawnError: 'spawn failed: ENOENT' }
@@ -202,4 +212,39 @@ test('RUNNER: the excerpt budget constrains outputHead while the digest covers t
   // Content addressing is over the FULL normalised output — the excerpt is a
   // reading aid, never part of the identity.
   assert.equal(record.outputDigest, sha256(big))
+})
+
+// 8. timedOut outranks the legacy spawnError channel (H7) ------------------------
+
+test('RUNNER: timedOut=true maps to timeout even though the result carries a spawnError (H7)', async () => {
+  // The real port reports timeouts through the spawnError channel for
+  // pre-v0.16 consumers; before the timedOut field the runner read that
+  // channel as "never ran" and labelled every real timeout 'error'. The
+  // first-class fact must win, and the death-cause partition must hold on
+  // all three shapes at once:
+  //   timedOut + spawnError -> timeout   (the real port's timeout shape)
+  //   exitCode null, no fields  -> timeout (legacy/fake hang shape)
+  //   spawnError alone         -> error   (genuinely never ran)
+  const commands = new ScriptedCommands()
+  const result = await new VerificationRunner(commands, new FakeWorkspace(ROOT), new FakeClock())
+    .run([
+      spec({ id: 'too-slow', command: ['node', 'too-slow'] }),
+      spec({ id: 'hung', command: ['node', 'hang'] }),
+      spec({ id: 's', command: ['node', 'enoent'] }),
+    ], { concurrency: 3 })
+  const byId = new Map(result.records.map(r => [r.checkId, r]))
+
+  const tooSlow = byId.get('too-slow')
+  assert.equal(tooSlow?.status, 'timeout', 'the real port\'s timeout shape must reach the timeout status')
+  assert.equal(tooSlow?.exitCode, null)
+  // Canonical normalisation scrubs the duration figure to '<duration>' (evidence
+  // identity must not wobble on timing), so match the stable prefix.
+  assert.match(tooSlow?.outputHead ?? '', /^timed out after/, 'the budget text leads the record')
+  assert.ok(tooSlow?.outputHead.includes('partial output before the kill'), 'captured pre-kill output is kept')
+
+  const hung = byId.get('hung')
+  assert.equal(hung?.status, 'timeout', 'the legacy hang shape (exitCode null, nothing else) stays a timeout')
+
+  const enoent = byId.get('s')
+  assert.equal(enoent?.status, 'error', 'a spawnError WITHOUT timedOut is still "never ran" — an error')
 })
