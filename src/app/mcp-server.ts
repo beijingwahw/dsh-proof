@@ -155,7 +155,7 @@ export const MCP_SERVER_NAME = 'agent-proof-protocol'
  * reason. Bump it with package.json (an operator who needs to pin the string
  * still can, via DSH_PROOF_SERVER_VERSION).
  */
-export const MCP_DEFAULT_VERSION = '0.24.0'
+export const MCP_DEFAULT_VERSION = '0.25.0'
 
 /**
  * Protocol versions this server speaks, newest first. A client asking for a

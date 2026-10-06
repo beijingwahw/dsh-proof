@@ -63,12 +63,22 @@ const nodeFs = new NodeFsPort()
  * selection rule verifies with — X-H-11 made verification mandatory, so the
  * happy path must publish under a key the CLI can actually check); the fake
  * remains for the refusal fixtures (an anchored key with no local material).
+ *
+ * Y-M-36 (v0.24): the fake's digest is keyed off module-private material —
+ * `sha256(data)` alone meant the "attacker cannot forge" shape was never
+ * actually exercised (re-hashing the public payload reproduced every
+ * signature). The refusal fixtures keep working verbatim: their signatures
+ * are planted garbage the holder never produced, and now never could.
  */
+const FAKE_SIGNER_SECRET = 'fixture-engine-key-material-never-published'
 class FakeSigner implements SignerPort {
   readonly keyId: string
   constructor(keyId = 'fake-key') { this.keyId = keyId }
-  async sign(data: string): Promise<string> { return `sig:${createHash('sha256').update(data).digest('hex')}` }
-  async verify(data: string, signature: string): Promise<boolean> { return signature === `sig:${createHash('sha256').update(data).digest('hex')}` }
+  private digest(data: string): string {
+    return `sig:${createHash('sha256').update(`${FAKE_SIGNER_SECRET}:${data}`).digest('hex')}`
+  }
+  async sign(data: string): Promise<string> { return this.digest(data) }
+  async verify(data: string, signature: string): Promise<boolean> { return signature === this.digest(data) }
 }
 
 const paths = deriveProofPaths({ root: WS_ROOT, trustRoot: TRUST_DIR, evidenceStore: 'host' })

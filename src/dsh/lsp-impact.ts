@@ -13,6 +13,17 @@
  * server that never answers degrades its position to a null answer (uncached,
  * retried later), never hangs the whole verify.
  *
+ * M-30 (v0.24): the budget is TWO-LAYERED. The invocation count
+ * (`budget`, fed from `lspQueryBudget`) caps round-trips; the cumulative
+ * wall-clock (`totalBudgetMs`) caps the TIME those round-trips spend — a
+ * merely SLOW server (every answer arrives inside the 5s per-query deadline,
+ * but takes seconds each) used to be bounded only by count: 400 × 5s ≈ 33
+ * minutes of graph building with no budget ever firing. Cumulative time is
+ * accounted across the resolver's whole lifetime (it is a plugin-lifetime
+ * singleton), cache hits cost nothing, and once the clock runs dry new
+ * queries degrade to null exactly like count exhaustion — approximate graph,
+ * soundness never narrows.
+ *
  * @module dsh-proof/dsh/lsp-impact
  */
 
@@ -32,6 +43,15 @@ export interface LspResolverOptions {
    * real time.
    */
   readonly queryTimeoutMs?: number
+  /**
+   * M-30: cumulative wall-clock ceiling for ALL round-trips this resolver
+   * ever makes, in ms (default 60s). Unlike the count budget, this one binds
+   * slow-but-answerable servers: each round-trip's full duration — including
+   * a timed-out or rejected one, whose wall time was spent just the same —
+   * accrues to the total; once it runs dry, new positions degrade to null
+   * (uncached, like every degradation here) while cached answers stay free.
+   */
+  readonly totalBudgetMs?: number
 }
 
 /** Build a caching, budgeted resolver over the host's LSP seam, if present. */
@@ -54,6 +74,7 @@ export function createLspResolver(
     lsp, root, fs,
     Math.max(1, Math.floor(finitePositive(options.budget, 400))),
     finitePositive(options.queryTimeoutMs, 5_000),
+    finitePositive(options.totalBudgetMs, 60_000),
   )
 }
 
@@ -72,18 +93,25 @@ class CachingLspResolver implements DefinitionResolverPort {
   private readonly lastStat = new Map<string, string>()
   private readonly generations = new Map<string, number>()
   private queries = 0
+  /** M-30: cumulative wall-clock spent inside round-trips, in ms. */
+  private totalSpentMs = 0
   private readonly lsp: LspLike
   private readonly root: string
   private readonly fs: FsPort
   private readonly budget: number
   private readonly queryTimeoutMs: number
+  private readonly totalBudgetMs: number
 
-  constructor(lsp: LspLike, root: string, fs: FsPort, budget: number, queryTimeoutMs: number) {
+  constructor(
+    lsp: LspLike, root: string, fs: FsPort,
+    budget: number, queryTimeoutMs: number, totalBudgetMs: number,
+  ) {
     this.lsp = lsp
     this.root = root
     this.fs = fs
     this.budget = budget
     this.queryTimeoutMs = queryTimeoutMs
+    this.totalBudgetMs = totalBudgetMs
   }
 
   async resolveDefinition(file: string, line: number, character: number): Promise<string | null> {
@@ -101,16 +129,23 @@ class CachingLspResolver implements DefinitionResolverPort {
       this.entries.set(file, entry)
     }
     const positionKey = `${line}:${character}`
-    // M-30: a cache hit answers for free. The budget gates NEW round-trips
-    // only — this resolver is a plugin-lifetime singleton and the budget a
-    // whole-session allowance, so checking the budget first used to blind
-    // the graph to answers already paid for the moment the counter flipped.
     const cached = entry.results.get(positionKey)
+    // M-30: TWO budget layers gate NEW round-trips only — invocation count
+    // and cumulative wall-clock — so a cache hit stays free under both (this
+    // resolver is a plugin-lifetime singleton and both budgets are
+    // whole-session allowances; checking either first used to blind the graph
+    // to answers already paid for the moment it flipped).
     if (cached !== undefined) return cached
-    if (this.queries >= this.budget) return null
+    if (this.queries >= this.budget || this.totalSpentMs >= this.totalBudgetMs) return null
 
     this.queries += 1
+    // M-30: the round-trip's full wall time — answer, rejection or timeout
+    // alike — accrues to the cumulative budget. A slow-but-answerable server
+    // is exactly the shape the count budget cannot see (400 × 5s ≈ 33min) and
+    // this clock exists to bound.
+    const startedAt = Date.now()
     const outcome = await this.timedQuery(file, line, character)
+    this.totalSpentMs += Math.max(0, Date.now() - startedAt)
     if (outcome.transient) {
       // H-34/M-30: a timeout or a rejection is a fact about the SERVER
       // (cold start, hiccup, hang), not about the code — it must not be

@@ -133,6 +133,15 @@ test('Schemastery fills configuration defaults and rejects bad values', () => {
   assert.equal(defaults.concurrency, 2)
   assert.throws(() => Config({ requireBaseline: 'nonsense' } as never), /invalid|expected|union/i)
   assert.throws(() => Config({ concurrency: 'lots' } as never), /invalid|expected|number/i)
+  // Y-L-18: the per-check timeoutMs override gets checkTimeoutMs's positive
+  // domain — 0/negative used to sail past the schema and become a check that
+  // can only ever time out (constant red), found one run at a time instead
+  // of at config load.
+  assert.throws(
+    () => Config({ checks: [{ command: 'npm test', timeoutMs: 0 }] } as never),
+    /invalid|expected|number|larger|greater/i,
+  )
+  assert.doesNotThrow(() => Config({ checks: [{ command: 'npm test', timeoutMs: 5_000 }] } as never))
 })
 
 test('workspace mode gates writes into the evidence store', async () => {
@@ -625,6 +634,13 @@ test('aborted baselines say so in the canonical value, the render and the card t
   const aborted = toBaselineValue({ baselineId: 'b'.repeat(32), root: 'r'.repeat(64), aborted: true }, records)
   assert.equal(aborted.aborted, true)
   assert.equal(aborted.ok, false, 'an aborted record is not a clean run')
+  // W13-L14 (V6-L residual, v0.24): the aborted record is booked ONCE — in
+  // the skipped/unrun count. It used to ALSO appear in failingLabels, so one
+  // record showed in two failure channels and the render's "failures here
+  // are pre-existing" framing blamed a check that never ran.
+  assert.equal(aborted.failing, 0)
+  assert.equal(aborted.skipped, 1)
+  assert.deepEqual(aborted.failingLabels, [], 'aborted lives in the skipped bucket, never among failing labels')
 
   const baseline = appliedTools().find(t => t.name === 'proof_baseline')!
   const rendered = renderedText(baseline, { summary: 'Baseline bbbbbbbb: 1 passing, 0 failing, 1 skipped/unrun across 2 check(s).', aborted: true, failingLabels: [] })
@@ -2118,7 +2134,14 @@ test('agent-team: createTeamBridge delegates and injects the instruction into a 
   await capBridge.onEvent({ prompt: 'do x' })
   assert.equal(calls[0]!.claim, 'do x')
   await capBridge.onEvent({ claim: 'a'.repeat(600) })
-  assert.equal(String(calls[1]!.claim).length, 500, 'an event prompt is not a spec — the obligation claim is capped')
+  // V6-L13: the cap is LOUD — 500 chars of payload plus a baked-in flag
+  // naming the original length, so a truncated claim is a visible chain fact
+  // instead of an obligation that looks complete while the host said more.
+  assert.match(
+    String(calls[1]!.claim),
+    /^a{500}…\[claim truncated from 600 chars\]$/,
+    'an event prompt is not a spec — the obligation claim is capped, and says so',
+  )
 
   // H-12: a host parent id is NOT cast into the engine's task-N namespace —
   // an unmapped parent (even one that looks like task-1) mints a root, never
@@ -2207,6 +2230,34 @@ test('agent-team: H-12 — host parentTaskId is translated through a mapping, ne
     && m.payload.hostParentTaskId === 'task-1')
   assert.ok(collisionMarker, 'the collision is recorded')
   assert.match(String(collisionMarker?.payload.reason), /coincides with the engine id minted for host task/)
+})
+
+test('agent-team: V6-L13 — a reused hostTaskId rehydrates NEWEST-wins, matching the in-process overwrite', async () => {
+  // A host that REUSES a hostTaskId leaves two agent-team/delegated markers
+  // for it on the chain. The in-process bridge lets every fresh mint
+  // OVERWRITE the map (the host's CURRENT task under that id is the newest
+  // one); rehydration used to apply the chain set-if-absent, so the OLDEST
+  // marker won offline while the NEWEST won in flight — the same chain
+  // translated the same host id to two different obligations depending on
+  // how old the process was. Both faces now agree: last marker wins.
+  const delegated: Record<string, unknown>[] = []
+  let seq = 0
+  const bridge = createTeamBridge({
+    delegate: async input => {
+      delegated.push(input)
+      seq += 1
+      return { taskId: `task-${seq}`, obligationId: `obl-${seq}`, obligation: {} }
+    },
+    instructionOf: () => 'x',
+    mappings: async () => [
+      { hostTaskId: 'host-1', engineTaskId: 'task-1' },
+      { hostTaskId: 'host-1', engineTaskId: 'task-9' },
+    ],
+  })
+  await bridge.onEvent({ claim: 'child of the reused id', parentTaskId: 'host-1' })
+  assert.equal(delegated.length, 1)
+  assert.equal((delegated[0]! as { parentTaskId?: unknown }).parentTaskId, 'task-9',
+    'the LAST chain marker for a reused host id wins — the same answer a fresh process gave in flight')
 })
 
 test('agent-team: attachTeamBridge probes every seam and degrades without a usable on()', () => {
@@ -2490,6 +2541,22 @@ test('H-29/M-49/M-54: proof_claim rejects non-finite budgets, forwards entryPoin
     verifyTool.execute({ changed: ['src/a.ts', null] }, execution('proof_verify', {})),
     /proof_verify: changed\[1\] must be a string path/,
   )
+
+  // V6-L residual (v0.24): a truthy NON-boolean `all` is refused loudly on
+  // the DSH face — the MCP face already refuses it, and `=== true`'s silent
+  // ignore used to hand a caller asking for a full re-run the impact
+  // analysis instead, attributing nothing it did not run.
+  await assert.rejects(
+    verifyTool.execute({ all: 'true' }, execution('proof_verify', {})),
+    /proof_verify: all must be a boolean \(got "true"\)/,
+  )
+  await assert.rejects(
+    verifyTool.execute({ all: 1 }, execution('proof_verify', {})),
+    /proof_verify: all must be a boolean \(got 1\)/,
+  )
+  // The two legal spellings still reach the engine untouched.
+  await verifyTool.execute({ all: false }, execution('proof_verify', {}))
+  await verifyTool.execute({ all: true }, execution('proof_verify', {}))
 })
 
 // ---------------------------------------------------------------------------

@@ -487,6 +487,32 @@ test('H-29: a non-finite or non-positive budgetMs is refused — the budget must
   }
 })
 
+test('Y-M-07: an absurdly large finite budgetMs is refused — the ceiling is 1e12, same as both tool faces', () => {
+  // 1e13 is finite and positive, so the H-29 gate passed it; `durationMs >
+  // 1e13` is false for every benchmark a real process can run, making the
+  // obligation vacuously met — the same disease one magnitude later. The DSH
+  // tool face and the MCP face already cap budgetMs at 1e12 ms (≈ 11.6
+  // days); this pure layer used to accept anything finite, so a contract
+  // reaching it through any other door dodged the ceiling. One budget
+  // domain, three faces, one answer.
+  const bench = spec({ id: 'bench1', kind: 'benchmark' })
+  for (const bad of [1e13, Number.MAX_VALUE]) {
+    const v = evaluateContract(input({
+      contract: contract('perf-budget', { budgetMs: bad }),
+      records: [ev(bench, 'pass', 999_999)],
+    }))
+    const o = byId(v, 'within-budget')
+    assert.equal(o.met, false, `budgetMs ${bad} must not be met`)
+    assert.match(o.detail, /at most 1e12/, `budgetMs ${bad}: ${o.detail}`)
+  }
+  // The ceiling itself is a legal budget — 1e12 must bind, not be refused.
+  const atCeiling = evaluateContract(input({
+    contract: contract('perf-budget', { budgetMs: 1e12 }),
+    records: [ev(bench, 'pass', 5_000)],
+  }))
+  assert.equal(byId(atCeiling, 'within-budget').met, true, 'budgetMs exactly 1e12 is a real budget')
+})
+
 test('H-29: a benchmark record with a NaN duration cannot be "within" any budget', () => {
   // `durationMs > budget` is false for NaN — a broken-clock record slipped
   // through as within-budget. The comparison is now NaN-safe: only a real

@@ -395,6 +395,16 @@ The wiring itself, briefly: the engine now reads every marker and checkpoint thr
 
 Tests 951 → 1036 (+85, including the ten claims). The fourth survey's own PoCs were re-run against this code after a rebuild: the planted-head notarisation, the head-liar publication, the unsubmitted-leaf `proven` and the sweep ladders all die at their seams. The curve this version is built to break: fixes introducing 42% → 50% of the next survey's highs — not because walls got weaker, but because *nobody was checking whether the walls existed*. Now the suite checks. That is the whole trick, and it is the cheapest one in this README.
 
+## The vouched floor (v0.25.0): pattern five, closed at the root
+
+Five audit rounds kept finding the same deepest weakness, always in a new costume: on a writable log, a *properly-shaped* append — correct hash chain, correct headRef, honest-looking bytes — passes every structural test, because shape is all structure can see. v0.24 answered with authorship sets and position tests; the fourth survey's PoC simply computed the position correctly. The shape-forensics arms race has no end, so v0.25 stops running it: **every trust decision now consumes only what lies below the vouched floor — the line index of the latest checkpoint whose signature this host's key has actually verified** — and a fresh append above the floor is structurally inert no matter how well-shaped it is. It cannot enter κ fusion, cannot plant a delegation obligation, cannot re-cut a drift boundary, cannot anchor a quote, cannot compose a verdict. It is *counted* (the boundary markers say how many markers "ride above the last verified checkpoint and price nothing"), never *believed*. Deployment facts stay honest: a chain with no signatures has no floor and reads whole — that is what it means to run unsigned, and the audit mode still says so.
+
+The floor itself had to be DoS-proof: v0.24's derivation picked the newest checkpoint and one garbage-signed twin at the tail could evict it, un-flooding the whole honest prefix. The floor is now a reverse scan — the newest checkpoint of this host's key that *actually verified*, well-formed and not position-lying — and publication inherited the same discipline: the engine's publish path no longer lets one bad candidate veto the tree, it walks candidates newest-first and publishes the first one the operator's key can actually vouch for (the CLI's rule, at last shared). And the last cycle-lag closed: sworn testimony is checkpointed the moment it is sworn, so a witness is priceable immediately, not one boundary later.
+
+The rest of the ledger: `synthetic/run` joined the protected-marker roster (an injected twin can no longer promote an unexecuted offer into the verification pool); LSP queries are budgeted by wall-clock, not query count (a slow server can no longer burn an unbounded evening one fast-failing call at a time); the engine refuses to bootstrap a fresh operator key onto a log whose checkpoints name a different workspace (identity mismatch, said out loud); the remaining round-four mediums fell — abort double-counting, silent non-boolean `all`, claim truncation without a marker, rehydration oldest-wins, contract's budget twin, per-check timeout floors, and a `FakeSigner` that finally keeps a secret. Two new claims joined `test/32`: the floor's consumers (fusion, DAG, drift) must route through the floor-bounded reader, and testimony writes must sit next to their checkpoint — the day someone adds a trust reader that forgets the floor, the suite goes red before the next audit does. Tests 1036 → 1054.
+
+## Architecture
+
 ## Architecture
 
 ## Architecture
@@ -416,7 +426,7 @@ The domain core is framework-free on purpose: it is fully unit-testable offline,
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit
-npm test              # 1036 tests, node:test
+npm test              # 1054 tests, node:test
 npm run build
 npm run bundle:check  # packaging contract self-check
 ```

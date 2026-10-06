@@ -276,3 +276,67 @@ test('M-30: the budget gates NEW round-trips only — cache hits stay free after
     'a NEW position past the budget degrades to null (approximate graph)')
   assert.equal(queries, 1)
 })
+
+test('M-30: the CUMULATIVE wall-clock budget binds slow servers the count budget cannot see', async () => {
+  // Y-M-30's slow-server shape: every round-trip ANSWERS inside its own
+  // deadline, but each costs real seconds. Count-only budgeting allowed
+  // 400 × 5s ≈ 33 minutes of graph building with no budget ever firing; the
+  // cumulative clock (totalBudgetMs) drains on every round-trip — answers,
+  // rejections and timeouts alike — and once dry, new positions degrade to
+  // null while cached answers stay free.
+  const delays = [60, 0, 0]
+  let queries = 0
+  const slow: LspLike = {
+    async query(): Promise<LspQueryResult> {
+      const delay = delays[queries] ?? 0
+      queries += 1
+      if (delay > 0) await new Promise<void>(resolve => { setTimeout(resolve, delay) })
+      return { kind: 'locations', locations: [{ uri: 'file:///ws/lib/t.ts', range: {} }] }
+    },
+  }
+  const fs = MemoryFs.of({ '/ws/src/a.ts': "import { t } from '@lib/t'\n" })
+  const resolver = createLspResolver(slow, '/ws', fs, { budget: 100, totalBudgetMs: 50 })
+  assert.ok(resolver)
+
+  assert.equal(await resolver.resolveDefinition('src/a.ts', 0, 10), 'lib/t.ts',
+    'the first (slow) round-trip answers — the per-query deadline is nowhere near')
+  assert.equal(await resolver.resolveDefinition('src/a.ts', 0, 10), 'lib/t.ts',
+    'its cache hit stays free — neither budget gates cache hits')
+  // One 60ms round-trip against a 50ms cumulative clock: dry. Every NEW
+  // position degrades, and the slow server is not consulted again (the wall
+  // clock, not the count, is what ran dry — queries is 1 of 100).
+  assert.equal(await resolver.resolveDefinition('src/a.ts', 0, 11), null,
+    'a new position past the CUMULATIVE clock degrades to null')
+  assert.equal(await resolver.resolveDefinition('src/a.ts', 1, 4), null,
+    'degradation persists — the clock never refills within one resolver lifetime')
+  assert.equal(queries, 1, 'the server was consulted exactly once — the count budget never fired')
+})
+
+test('M-30: a timed-out round-trip spends the wall clock too — the slow-server tax counts failures', async () => {
+  // The transient discipline is unchanged (a timeout answers null, uncached,
+  // retried later — H-34), but the time a timeout BURNS now accrues to the
+  // cumulative budget: a server that hangs every position until the deadline
+  // is a slow server with extra steps, and must run the clock dry rather
+  // than retrying forever inside the count budget. The bound is
+  // load-robust: every timed-out query accrues AT LEAST queryTimeoutMs of
+  // wall time (the race resolves at the timer, never before), so against a
+  // 100ms clock with 30ms deadlines at most ceil(100/30) = 4 round-trips
+  // can ever happen — scheduler jitter only makes each one longer, i.e.
+  // drains the clock sooner.
+  let queries = 0
+  const hung: LspLike = {
+    query(): Promise<LspQueryResult> {
+      queries += 1
+      return new Promise<LspQueryResult>(() => { /* never settles */ })
+    },
+  }
+  const fs = MemoryFs.of({ '/ws/src/a.ts': "import { t } from '@lib/t'\n" })
+  const resolver = createLspResolver(hung, '/ws', fs, { budget: 100, queryTimeoutMs: 30, totalBudgetMs: 100 })
+  assert.ok(resolver)
+  for (let i = 0; i < 20; i += 1) {
+    assert.equal(await resolver.resolveDefinition('src/a.ts', i, 10), null,
+      `position ${i}: hung server, degraded within the deadline`)
+  }
+  assert.ok(queries >= 1 && queries <= 4,
+    `the count budget (100) never fired; the wall clock did — ${queries} timed-out round-trips drained 100ms`)
+})

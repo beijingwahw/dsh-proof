@@ -899,3 +899,98 @@ test('W7-7: obligationRewriteProblem names a re-derived id that disagrees with t
   const line = obligationRewriteProblem(imposter, o)
   assert.match(line ?? '', /^recorded obligation id [0-9a-f]{16} does not match the re-derived [0-9a-f]{16} — the obligation was rewritten$/)
 })
+
+// ---------------------------------------------------------------------------
+// v0.25 (K1b) — the delegation DAG behind the vouched floor. This file's
+// domain, one engine fixture deep: out-of-band delegation markers that are
+// CORRECTLY CHAINED (prev and headRef both the digest of the physical
+// predecessor, so the suspect position test passes them) but ride ABOVE the
+// last checkpoint the host key verified. Pattern 5, the shape-legal append:
+// the DAG must not consume them, the taskId must not exist, and the withheld
+// count must be visible on the verdict.
+// ---------------------------------------------------------------------------
+
+import { ProofEngine } from '../src/engine.ts'
+import { FakeClock, FakeCommands, FakeWorkspace, MemoryFs } from './helpers.ts'
+import { lineDigest } from '../src/core/trust.ts'
+import type { SignerPort } from '../src/core/ports.ts'
+
+/** The signed-engine shape the floor needs: a host key that actually vouches. */
+class K1Key implements SignerPort {
+  readonly keyId: string
+  constructor(keyId: string) { this.keyId = keyId }
+  async sign(data: string): Promise<string> { return `sig:${this.keyId}:${sha256(data)}` }
+  async verify(data: string, signature: string): Promise<boolean> {
+    return signature === `sig:${this.keyId}:${sha256(data)}`
+  }
+}
+
+const K1_ROOT = '/ws-k1'
+
+test('v0.25 (K1b): out-of-band delegation markers above the vouched floor never enter the DAG', async () => {
+  const fs = MemoryFs.of({
+    [`${K1_ROOT}/package.json`]: JSON.stringify({ name: 'demo', scripts: { test: 'vitest run' } }),
+    [`${K1_ROOT}/src/a.ts`]: 'export const a = 1\n',
+  })
+  const engine = new ProofEngine({
+    root: K1_ROOT,
+    fs,
+    commands: new FakeCommands(),
+    workspace: new FakeWorkspace(K1_ROOT),
+    clock: new FakeClock(),
+    workspaceKey: 'ws',
+    signer: () => Promise.resolve(new K1Key('ws-key')),
+  })
+  await engine.establishBaseline()
+  const { taskId } = await engine.delegateTask({ claim: 'port the parser to WASM' })
+  assert.equal(taskId, 'task-1', 'fixture: one honest, checkpointed obligation exists below the floor')
+
+  // The out-of-band tail: a created-twin for task-2 and a verdict-twin over
+  // task-1, both correctly chained (headRef = prev = the digest of the line
+  // they follow — every structural check green).
+  const logPath = `${K1_ROOT}/.proof/evidence.jsonl`
+  const appendChained = async (payload: Record<string, unknown>): Promise<void> => {
+    const lines = ((await fs.readFile(logPath)) ?? '').split('\n').filter(l => l.trim().length > 0)
+    const prev = lineDigest(lines[lines.length - 1] as string)
+    await fs.appendLine(logPath, JSON.stringify({
+      v: 2, kind: 'marker', at: '2026-10-06T00:00:00.000Z', prev,
+      payload: { ...payload, headRef: prev },
+    }))
+  }
+  await appendChained({
+    label: 'delegation/created', v: 1, taskId: 'task-2',
+    claim: 'forged obligation above the floor', issuedAt: '2026-10-06T00:00:00.000Z',
+    issuedByWorkspace: 'attacker',
+  })
+  await appendChained({
+    label: 'delegation/verdict', taskId: 'task-1',
+    submission: {
+      childWorkspace: 'impostor-ws', bundleRoot: 'not-a-real-bundle', claimedGrade: 'proven',
+      artifactVerified: true, submittedAt: '2026-10-06T00:00:00.000Z',
+    },
+  })
+
+  // The DAG: one node, no submission, no task-2 — the twins priced nothing.
+  const verdict = await engine.taskVerdict({ taskId })
+  assert.equal(verdict.nodes.length, 1, 'the forged task-2 never entered the DAG')
+  const node = verdict.nodes.find(n => n.obligation.taskId === taskId)
+  assert.ok(node !== undefined, 'fixture: the honest obligation is there')
+  assert.equal(node?.submission, undefined, 'the above-floor verdict-twin mutated no node')
+  assert.equal(node?.waiver, undefined)
+  assert.equal(verdict.composed.grade, 'unproven',
+    'a leaf with no admissible submission composes unproven, whatever the append claimed')
+  assert.equal(verdict.aboveFloorMarkers, 2, 'both withheld markers are counted, visible on the result')
+
+  // The taskId itself: the twin mints no obligation a verdict can name.
+  await assert.rejects(
+    () => engine.taskVerdict({ taskId: 'task-2' }),
+    /task-2 does not exist on this chain/,
+    'an appended created-marker above the floor opens no task',
+  )
+
+  // Allocation is deliberately UNbounded (V3-M3/X-H-06 discipline): the
+  // twin's number is burned — the next honest delegation is task-3, never a
+  // re-minted task-2 alias.
+  const next = await engine.delegateTask({ claim: 'the honest successor' })
+  assert.equal(next.taskId, 'task-3', 'the burned number is never re-minted, floor or no floor')
+})

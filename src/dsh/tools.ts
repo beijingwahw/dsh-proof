@@ -719,6 +719,18 @@ function createVerifyTool(engine: ProofEngine, touched?: () => readonly string[]
     async execute(args, exec: ToolRunContext) {
       assertActive(exec)
       const parsed = (args ?? {}) as { changed?: string[]; all?: boolean; claim?: string }
+      // W8-M2 twin (V6-L residual, v0.24): a truthy NON-boolean `all` used to
+      // be silently ignored by the `=== true` spread below — a caller thinking
+      // it asked for a full re-run got the impact analysis instead, and the
+      // un-run checks' regressions went unattributed. The MCP face refuses
+      // this loudly; the DSH face must agree: one spelling, one answer, on
+      // every face the tool has.
+      if (parsed.all !== undefined && typeof parsed.all !== 'boolean') {
+        throw new Error(
+          `proof_verify: all must be a boolean (got ${JSON.stringify(parsed.all)})`
+          + ' — a truthy non-boolean is refused rather than silently ignored: all: "true" once meant "run the impact analysis anyway"',
+        )
+      }
       // M-54: element-level validation — a non-string entry is a parameter
       // error, never a silently narrowed change set. W13-M5: each element is
       // also capped on its way to the engine (an unbounded "path" froze
@@ -1130,6 +1142,10 @@ function createJurySubmitTool(engine: ProofEngine, evidenceLogPath?: string): To
         at: Date.now(),
       }
       await engine.storeView.mark('attest/jury', { ...attestation })
+      // K1 residual: testimony must land BELOW a checkpoint or the vouched
+      // floor withholds it from fusion for a full cycle — checkpoint right
+      // after recording so a witness is priceable the moment it is sworn.
+      await engine.storeView.checkpoint()
       return {
         recorded: true as const,
         claimId: attestation.claimId,
@@ -1240,6 +1256,7 @@ function createEndorseTool(engine: ProofEngine, evidenceLogPath?: string): ToolD
         decision: parsed.decision,
       }
       await engine.storeView.mark('attest/human', { ...attestation })
+      await engine.storeView.checkpoint()
       return {
         recorded: true as const,
         claimId,
@@ -1640,7 +1657,14 @@ export function toBaselineValue(
     ran: records.length,
     passing, failing, skipped,
     durationMs: records.reduce((acc, r) => acc + r.durationMs, 0),
-    failingLabels: records.filter(r => r.status !== 'pass' && r.status !== 'skipped').map(r => r.label),
+    failingLabels: records
+      // W13-L14 (V6-L residual, v0.24): an 'aborted' record is booked in the
+      // `skipped` count above (skipped/unrun) — listing it in failingLabels
+      // too double-booked one record in two failure channels, and the render's
+      // "failures here are pre-existing" framing then blamed a check that
+      // never ran. A record appears in exactly one bucket: aborted → skipped.
+      .filter(r => r.status !== 'pass' && r.status !== 'skipped' && r.status !== 'aborted')
+      .map(r => r.label),
     summary: `Baseline ${baseline.baselineId.slice(0, 12)}: ${passing} passing, ${failing} failing, ${skipped} skipped/unrun `
       + `across ${records.length} check(s). Failures here are pre-existing — they are NOT charged to later work.`,
     // The engine refuses to persist a batch that did not observe every check

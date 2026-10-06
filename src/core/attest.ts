@@ -240,13 +240,19 @@ export const DEFAULT_TRUST_WEIGHTS: TrustWeights = { classB: 0.7, classC: 0.9, h
  * bare numbers, so it guards its own door: refuse loudly at the factor and
  * fusion entries instead of trusting every upstream forever.
  *
- * V7-M6 (domain pin, two-face split): this closed interval IS the module's
- * documented semantics — the endpoints are legal for classB/classC (and for
- * humanProbability: 0 = "humans are always wrong", 1 = "humans are
- * infallible" — discouraged by the default's own comment, but defined, not
- * nonsense). The host config schema is expected to align to this SAME
- * closed interval; a config layer rejecting values the core documents as
- * meaningful gives one domain two answers.
+ * V7-M6 (domain pin, two-face contract, corrected v0.24): this closed
+ * interval IS the module's documented semantics — the endpoints are legal for
+ * classB/classC (and for humanProbability: 0 = "humans are always wrong",
+ * 1 = "humans are infallible" — discouraged by the default's own comment,
+ * but defined, not nonsense). The host config layer (`src/config.ts`)
+ * deliberately exposes the NARROWER open band [0.01, 0.99] for classB/classC:
+ * κ=0 and κ=1 are the two degenerate corners (p^0 = 1 — a reject stops
+ * discounting anything; κ=1 drops the exponent entirely) that a deployment
+ * knob must not sit at, even though the core accepts them as defined
+ * mathematics for programmatic callers. The split is one-directional by
+ * design: every config-legal value is core-legal, so no value can be
+ * accepted at one face and refused at the other — the only two-answers
+ * failure mode a domain split can have.
  */
 function assertTrustWeights(weights: TrustWeights): void {
   for (

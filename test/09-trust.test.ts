@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 
 import { EvidenceStore, buildBaseline, makeEvidence, snapshotWorkspace, createVerifiedView } from '../src/core/evidence.ts'
+import { selectPublishable } from '../src/core/transparency.ts'
 import { GENESIS_PREV, checkpointSignedData, lineDigest, walkChain } from '../src/core/trust.ts'
 import { addressOf, sha256 } from '../src/core/hash.ts'
 import type { SignerPort } from '../src/core/ports.ts'
@@ -1380,6 +1381,86 @@ test('createVerifiedView.bestCheckpoint: verified / refuted / unverifiable / non
   assert.equal(byView.ok, (await s2.audit()).ok)
 })
 
+// -- P5: the candidate sequence behind bestCheckpoint --------------------------
+
+test('P5: publishableCandidates — the descending non-liar sequence; bestCheckpoint is candidates[0] adjudicated', async () => {
+  // An unsigned chain has nothing publishable: the sequence is empty, the
+  // same fact bestCheckpoint states as 'none'.
+  const unsignedFs = MemoryFs.of({})
+  const unsignedStore = new EvidenceStore(unsignedFs, LOG, BASE, new FakeClock())
+  await unsignedStore.append(evidence('c1'))
+  assert.deepEqual(await createVerifiedView(unsignedStore).publishableCandidates(), [])
+
+  const fs = MemoryFs.of({})
+  const { store, signer } = trustedStore(fs)
+  const view = createVerifiedView(store)
+  for (const id of ['c1', 'c2', 'c3']) {
+    await store.append(evidence(id))
+    await store.checkpoint()
+  }
+  // Line layout: 0 ev, 1 cp(count 1), 2 ev, 3 cp(count 2), 4 ev, 5 cp(count 3).
+
+  let candidates = await view.publishableCandidates()
+  assert.deepEqual(candidates.map(c => c.payload.count), [3, 2, 1], 'descending: the newest publishable candidate first')
+  let best = await view.bestCheckpoint()
+  assert.equal(best.signature, 'verified')
+  assert.equal(best.checkpoint?.index, candidates[0]?.index, 'bestCheckpoint is exactly candidates[0], adjudicated — the two faces cannot disagree about which checkpoint is newest')
+
+  // THE ADVERSARY A: a tail transplant (an honestly signed checkpoint replayed
+  // at another position, re-chained). The Y-H-01 exclusion is enforced on the
+  // candidate pool itself — a head liar is not a candidate that fails, it is
+  // not a candidate at all.
+  const lines = await fs.readLines(LOG)
+  const cpLine = lines[5] as string
+  fs.mutate(LOG, `${[...lines, JSON.stringify({ ...JSON.parse(cpLine), prev: lineDigest(cpLine) })].join('\n')}\n`)
+  candidates = await view.publishableCandidates()
+  assert.deepEqual(candidates.map(c => c.index), [5, 3, 1], 'the transplant never enters the sequence')
+
+  // THE ADVERSARY B: refute the NEWEST candidate — its payload edited under a
+  // kept signature (structure stays sound: count matches the walk, position
+  // corroborated). bestCheckpoint answers 'refuted' — the single-selection
+  // one-vote veto, unchanged semantics — but the SEQUENCE still carries the
+  // older verifiable checkpoints: first-verifiable-wins (transparency's
+  // selectPublishable, the consumer wiring) publishes count 2 instead of
+  // refusing outright.
+  const nowLines = await fs.readLines(LOG)
+  nowLines[5] = (nowLines[5] as string).replace('"workspaceKey":"ws"', '"workspaceKey":"WS"')
+  fs.mutate(LOG, `${nowLines.join('\n')}\n`)
+  candidates = await view.publishableCandidates()
+  assert.deepEqual(candidates.map(c => c.index), [5, 3, 1], 'a refuted signature does not evict the candidate — adjudication is the consumer\'s walk, not the pool\'s')
+  best = await view.bestCheckpoint()
+  assert.equal(best.signature, 'refuted', 'compat: the single-selection face keeps its one-vote veto')
+  assert.equal(best.checkpoint?.index, 5)
+  // The consumer walk (the K1 wiring): first-verifiable-wins down the
+  // descending sequence. selectPublishable's own array contract is LOG ORDER
+  // (oldest first — it scans from the end), so the bridge is a reverse; with
+  // it, the refuted newest is tried and rejected, and the newest VERIFIABLE
+  // checkpoint (count 2) publishes instead of a flat refusal.
+  const { chosen, rejected } = await selectPublishable(
+    [...candidates].reverse(),
+    async cp => signer.verify(checkpointSignedData(cp.payload), cp.sig),
+  )
+  assert.equal(chosen?.payload.count, 2, 'the consumer walk falls past the refuted newest to the newest VERIFIABLE checkpoint')
+  assert.deepEqual(rejected.map(c => c.index), [5], 'only the refuted candidate was tried and rejected (rejected is in scan order, newest first)')
+
+  // The anchor-key rule rides the sequence exactly as it rides the single
+  // selection: a well-formed foreign-key checkpoint at the tail is never a
+  // candidate while the anchor names this key.
+  const withForeign = await fs.readLines(LOG)
+  const prevF = lineDigest(withForeign[withForeign.length - 1] as string)
+  fs.mutate(LOG, `${[...withForeign, forgedCheckpointLine(prevF, '3', 'foreign-key')].join('\n')}\n`)
+  candidates = await view.publishableCandidates()
+  assert.deepEqual(candidates.map(c => c.index), [5, 3, 1], 'the anchored key\'s candidates only — never a positional-later foreign stand-in')
+
+  // Loud-undefined anchor states answer [] (the latestSignedCheckpoint
+  // undefined rule); an anchor-less store keeps the any-key semantics.
+  fs.mutate(ANCHOR, '{not json at all')
+  assert.deepEqual(await view.publishableCandidates(), [], 'an unusable anchor publishes nothing — never a silent any-key fallback')
+  const anchorless = new EvidenceStore(fs, LOG, BASE, new FakeClock())
+  const anyKey = await createVerifiedView(anchorless).publishableCandidates()
+  assert.deepEqual(anyKey.map(c => c.keyId), ['foreign-key', 'fake-key', 'fake-key', 'fake-key'], 'never anchored keeps the any-key pool, newest first')
+})
+
 // -- Y-H-09 (v0.24): absorption is refused at READ time ------------------------
 
 test('Y-H-09: a pseudo-absorbed baseline is refused at read time — no signing boundary required', async () => {
@@ -1550,7 +1631,11 @@ test('V1-M9: agent-team/economics/claim/synthetic labels carry headRef — injec
   await store.mark('economics/quote', { quoteId: 'q1' })
   await store.mark('claim/jury', { claimId: 'c1', verdict: 'uphold' })
   await store.mark('synthetic/requested', { claimId: 's1', entry: 'x' })
-  const labels = ['agent-team/delegated', 'economics/quote', 'claim/jury', 'synthetic/requested'] as const
+  // P5: synthetic/run joins the list — the v0.24 leftover. The run marker is
+  // what lets a conjured offer join verification (the ran-set gate), a trust
+  // decision on exactly the pattern the list exists for.
+  await store.mark('synthetic/run', { claimId: 's1', entry: 'x', status: 'pass' })
+  const labels = ['agent-team/delegated', 'economics/quote', 'claim/jury', 'synthetic/requested', 'synthetic/run'] as const
   for (const label of labels) {
     const honest = await store.markersWith(label)
     assert.equal(honest[0]?.suspect, false, `${label}: the honest write reads clean`)
@@ -1578,4 +1663,51 @@ test('V1-M9: agent-team/economics/claim/synthetic labels carry headRef — injec
     assert.equal(view.degraded, false)
     assert.equal(view.records.length, 1, `${label}: the verified view keeps the twin out of the trusted pool`)
   }
+  // P5, mission pin: a fresh synthetic/run marker carries headRef and is NOT
+  // suspect; its injected twin IS suspect (visible on the audit's channel,
+  // never silently dropped).
+  const runTwins = (await store.markersWith('synthetic/run')).filter(m => m.suspect)
+  assert.equal(runTwins.length, 1, 'the injected synthetic/run twin reads suspect')
+  assert.equal(runTwins[0]?.payload.forged, true)
+})
+
+// -- P5: late adoption of synthetic/run — the documented compat rule ---------
+
+test('P5: late-adopted synthetic/run — a legacy headRef-less population degrades; a fresh witnessed run excludes the twins', async () => {
+  const fs = MemoryFs.of({})
+  const log = LOG
+  // A v0.24-era log: synthetic/run written while the label was NOT protected
+  // (no headRef witness). syntheticSpecs' ran-set must survive the upgrade —
+  // the generational fallback reads the whole legacy population degraded.
+  const legacy = [
+    { label: 'synthetic/run', claimId: 'k1', entry: 'a.mjs', status: 'pass' },
+    { label: 'synthetic/run', claimId: 'k2', entry: 'b.mjs', status: 'pass' },
+  ]
+  let prev = '0000000000000000000000000000000000000000000000000000000000000000'
+  const lines = legacy.map(payload => {
+    const line = JSON.stringify({ v: 2, kind: 'marker', at: '2026-01-01T00:00:00.000Z', prev, payload })
+    prev = lineDigest(line)
+    return line
+  })
+  fs.mutate(log, `${lines.join('\n')}\n`)
+  const store = new EvidenceStore(fs, log, BASE, new FakeClock())
+  const view = createVerifiedView(store)
+  const degraded = await view.markers('synthetic/run')
+  assert.equal(degraded.degraded, true, 'an all-legacy label degrades — the ran-set does not evaporate on upgrade')
+  assert.deepEqual(degraded.records.map(r => r.payload.claimId), ['k1', 'k2'])
+  assert.ok(degraded.records.every(r => r.degraded === true), 'each record is marked so consumers can refuse degraded trust')
+
+  // The same log with ONE fresh (witnessed) run marker: the mixed-generation
+  // rule applies — trusted pool wins, the headRef-less rows are excluded
+  // exactly like synthetic/requested's rule (documented, not smoothed over:
+  // re-running a conjured check re-mints a witnessed marker).
+  const fresh = new EvidenceStore(fs, log, BASE, new FakeClock())
+  await fresh.mark('synthetic/run', { claimId: 'k3', entry: 'c.mjs', status: 'pass' })
+  const mixed = await view.markers('synthetic/run')
+  assert.equal(mixed.degraded, false)
+  assert.deepEqual(
+    mixed.records.map(r => r.payload.claimId),
+    ['k3'],
+    'a trusted generation excludes the headRef-less rows — the same rule synthetic/requested already lives under',
+  )
 })

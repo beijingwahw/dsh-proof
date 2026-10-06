@@ -217,7 +217,11 @@ export const Config: Schema<Config> = Schema.object({
     command: Schema.union([Schema.string(), Schema.array(Schema.string())]).required(),
     kind: Schema.union(['test', 'build', 'lint', 'typecheck', 'benchmark', 'other']),
     paths: Schema.array(Schema.string()),
-    timeoutMs: Schema.number(),
+    // Y-L-18 (v0.24): the per-check override gets checkTimeoutMs's positive
+    // domain — a 0/negative override used to sail past the schema and become
+    // a check that can only ever time out (constant red, the over-rejection
+    // direction), discovered one run at a time instead of at config load.
+    timeoutMs: Schema.number().min(1),
     exclusive: Schema.boolean(),
   })).default([]),
   checkTimeoutMs: Schema.number().min(1).default(120_000),

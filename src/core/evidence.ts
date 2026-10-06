@@ -509,6 +509,22 @@ export interface SignedCheckpointView {
  * requests (`synthetic/requested`). Labels join this list exactly when a
  * consumer's trust decision reads them; informational labels stay out so
  * the witness bytes stay minimal.
+ *
+ * P5 (pattern-five termination): `synthetic/run` joins — the v0.24 leftover
+ * of exactly that survey. The run marker is what lets a conjured offer join
+ * verification (`syntheticSpecs` mints a spec only for a request whose
+ * claimId+entry appears under `synthetic/run`), which is a trust decision:
+ * an out-of-band twin under it promoted a never-executed script into the
+ * live check pool unflagged, while its sibling `synthetic/requested` was
+ * already protected. headRef compatibility follows the late-adopted-label
+ * rule every V1-M9 label already lives under: writes go through
+ * `markInternal`, so every fresh `synthetic/run` carries the witness
+ * automatically (write-side uniformity — no call site changes); pre-adoption
+ * logs carry none, read suspect, and are governed by the generational
+ * fallback — an all-legacy label degrades and keeps reading, a mixed
+ * generation excludes the headRef-less rows from the trusted pool exactly
+ * like `synthetic/requested`'s rule. Accepted and documented, not silently
+ * smoothed over: re-running the conjured check re-mints a witnessed marker.
  */
 export function isProtectedMarkerLabel(label: unknown): boolean {
   return typeof label === 'string'
@@ -519,7 +535,8 @@ export function isProtectedMarkerLabel(label: unknown): boolean {
       || label === 'agent-team/delegated'
       || label === 'economics/quote'
       || label === 'claim/jury'
-      || label === 'synthetic/requested')
+      || label === 'synthetic/requested'
+      || label === 'synthetic/run')
 }
 
 /**
@@ -1626,8 +1643,25 @@ export class EvidenceStore {
    * `bestCheckpointCore`) or the training-anchor pool (any well-formed
    * checkpoint, `lastWellFormedCheckpoint`); both pools exclude malformed
    * counts and — Y-H-01 — head liars.
+   *
+   * P5: the read/walk/anchor trinity is shared verbatim with
+   * {@link publishableCandidatesCore} (see `selectionSnapshot`) — the single
+   * answer and the candidate sequence draw from one snapshot per call, so
+   * the two faces cannot disagree about the bytes or the anchor state.
    */
   private async selectFromWalk(requireSigned: boolean): Promise<{ readonly best?: WalkedCheckpoint; readonly anchorUnusable: boolean }> {
+    const { walk, anchor, anchorUnusable } = await this.selectionSnapshot()
+    if (anchorUnusable) return { anchorUnusable: true }
+    return { best: selectBestCheckpoint(walk, anchor, requireSigned), anchorUnusable: false }
+  }
+
+  /**
+   * @internal The shared one-read selection snapshot: physical lines (the
+   * readLines convention), the chain walk, and the adjudicated anchor — or
+   * the loud `anchorUnusable` state (unparseable OR domain-invalid, the
+   * H-09/W1-M7 shapes) under which nothing is publishable.
+   */
+  private async selectionSnapshot(): Promise<{ readonly walk: ChainWalk; readonly anchor?: AnchorFile; readonly anchorUnusable: boolean }> {
     const walk = walkChain(await this.logLines())
     const anchorRaw = this.trust.anchorPath === undefined ? undefined : await this.fs.readFile(this.trust.anchorPath)
     const anchorOutcome = parseAnchorEx(anchorRaw)
@@ -1635,9 +1669,9 @@ export class EvidenceStore {
       // The loud-undefined anchor states (H-09/W1-M7): unparseable OR
       // domain-invalid. Nothing is publishable; never a silent any-key
       // fallback on exactly the hosts an attacker has been at.
-      return { anchorUnusable: true }
+      return { walk, anchorUnusable: true }
     }
-    return { best: selectBestCheckpoint(walk, anchorOutcome?.anchor, requireSigned), anchorUnusable: false }
+    return { walk, anchor: anchorOutcome?.anchor, anchorUnusable: false }
   }
 
   /**
@@ -1653,6 +1687,29 @@ export class EvidenceStore {
     const { best } = await this.selectFromWalk(true)
     if (best === undefined) return { headLiared: true }
     return { best: signedCheckpointViewOf(best), headLiared: best.headLiared === true }
+  }
+
+  /**
+   * @internal P5: the view-facing candidate core behind
+   * {@link createVerifiedView}.publishableCandidates — ONE physical snapshot
+   * (the same `selectionSnapshot` the single selection draws from), every
+   * structurally publishable checkpoint under the anchor-key rule, in
+   * DESCENDING (newest-first) order. Structural means: well-formed count,
+   * position corroborated (`headLiared` false — Y-H-01's exclusion, so no
+   * consumer of the sequence can notarise a transplant by forgetting the
+   * predicate), signature-bearing (`sig` + `keyId` present, so a key-holder
+   * downstream CAN verify). The signature itself is deliberately NOT
+   * adjudicated here — the sequence exists precisely so a consumer whose
+   * adjudication of `candidates[0]` fails (refuted, or a key this host does
+   * not hold) can walk down to the next candidate with its own verifier
+   * (transparency's `selectPublishable` first-verifiable-wins). The
+   * loud-undefined anchor states answer `[]`, the exact `latestSignedCheckpoint`
+   * `undefined` rule — never a silent any-key pool.
+   */
+  async publishableCandidatesCore(): Promise<readonly SignedCheckpointView[]> {
+    const { walk, anchor, anchorUnusable } = await this.selectionSnapshot()
+    if (anchorUnusable) return []
+    return publishableCandidateList(walk, anchor).map(signedCheckpointViewOf)
   }
 
   /**
@@ -1800,7 +1857,14 @@ export interface VerifiedMarkerView {
 
 /** {@link VerifiedChainView.markers} result. */
 export interface VerifiedMarkers {
-  /** The trusted pool in log order, filtered to `sinceLine` when given. */
+  /**
+   * The trusted pool in log order, filtered to the `[sinceLine, maxLine]`
+   * window when either bound is given (`sinceLine`: index >= sinceLine, the
+   * baseline-generation epoch floor; `maxLine`: index <= maxLine, its
+   * symmetric ceiling — P5: a consumer anchoring on "the state as of line N"
+   * (a checkpoint boundary, an incident marker) reads exactly the pool that
+   * existed at N, without re-slicing the log itself).
+   */
   readonly records: readonly VerifiedMarkerView[]
   /** True when the pool is a degraded (all-suspect legacy) generation. */
   readonly degraded: boolean
@@ -1857,13 +1921,31 @@ export interface VerifiedViewOptions {
  *   `isSuspectMarker` rescans were O(n²)~O(n³)); suspect position
  *   adjudication; the generational fallback so legacy logs degrade instead
  *   of evaporating; an optional `sinceLine` epoch window (baseline-generation
- *   aware consumers pass the anchoring line's index).
+ *   aware consumers pass the anchoring line's index) and its symmetric
+ *   `maxLine` ceiling (P5: "the pool as of line N" reads — both bounds apply
+ *   to the TRUSTED pool, so a suspect twin outside the window can never
+ *   re-enter by window arithmetic).
  * - `bestCheckpoint` — `latestSignedCheckpoint`'s selection with the
  *   signature actually ADJUDICATED (`verified`/`refuted`/`unverifiable`)
  *   and the X-H-03 head-liar mirror. Y-H-01 (v0.24): the publish predicate
  *   `signature === 'verified' && headLiared !== true` is enforced by the
  *   SELECTION itself — a head liar is never a candidate, so no consumer can
  *   forget the second half of the predicate.
+ * - `publishableCandidates` — P5: the candidate SEQUENCE behind
+ *   `bestCheckpoint`. The single-selection shape is newest-first with a
+ *   de-facto one-vote veto: when the newest structurally-publishable
+ *   checkpoint fails ADJUDICATION (refuted signature, or a key this host
+ *   does not hold), `bestCheckpoint` answers `refuted`/`unverifiable` and
+ *   every consumer of the single answer refuses — even when an older,
+ *   perfectly verifiable checkpoint sits right below it on the chain. The
+ *   sequence face exposes that fallback: every well-formed, position-
+ *   corroborated, signature-bearing candidate (the same pool
+ *   `selectBestCheckpoint` draws from, under the same anchor-key rule), in
+ *   DESCENDING order, signatures NOT adjudicated here — the consumer walks
+ *   it newest-first with its own verifier (transparency's
+ *   `selectPublishable` first-verifiable-wins semantics, living in the
+ *   evidence layer). `bestCheckpoint` is exactly `candidates[0]` adjudicated
+ *   — the two faces cannot disagree about which checkpoint is newest.
  * - `audit` — passthrough, so verdict paths stop cherry-picking single
  *   channels (X-H-09's `audit.ok` consumption lands on this surface).
  *
@@ -1873,8 +1955,9 @@ export interface VerifiedViewOptions {
  * rule, two entry points, zero forking surface.
  */
 export interface VerifiedChainView {
-  markers(label: string, options?: { readonly sinceLine?: number }): Promise<VerifiedMarkers>
+  markers(label: string, options?: { readonly sinceLine?: number; readonly maxLine?: number }): Promise<VerifiedMarkers>
   bestCheckpoint(): Promise<BestCheckpoint>
+  publishableCandidates(): Promise<readonly SignedCheckpointView[]>
   audit(): Promise<AuditReport>
 }
 
@@ -1924,7 +2007,16 @@ export function createVerifiedView(store: EvidenceStore, options: VerifiedViewOp
       const degraded = trusted.length === 0 && legacy.length > 0
       const pool = degraded ? legacy : trusted
       const sinceLine = markerOptions.sinceLine
-      const records = (sinceLine === undefined ? pool : pool.filter(m => m.index >= sinceLine))
+      const maxLine = markerOptions.maxLine
+      // P5: both window bounds are applied INLINE on the already-adjudicated
+      // pool (no second pass, no second read) — the window selects within the
+      // trusted/degraded pool decision, never around it, so a suspect twin
+      // outside the window stays out and a degraded generation inside the
+      // window still carries its `degraded` marking.
+      const inWindow = (m: MarkerRecord): boolean =>
+        (sinceLine === undefined || m.index >= sinceLine)
+        && (maxLine === undefined || m.index <= maxLine)
+      const records = pool.filter(inWindow)
         .map(m => (degraded ? { ...m, degraded: true as const } : m))
       return { records, degraded, last: records[records.length - 1] }
     },
@@ -1954,6 +2046,17 @@ export function createVerifiedView(store: EvidenceStore, options: VerifiedViewOp
       return honest
         ? { signature: 'verified', checkpoint: best, headLiared }
         : { signature: 'refuted', checkpoint: best, headLiared }
+    },
+
+    /**
+     * P5: the candidate sequence behind {@link bestCheckpoint} — see the
+     * interface doc. One snapshot per call (the store's shared selection
+     * core); `candidates[0]` is always the checkpoint `bestCheckpoint` would
+     * select, so the sequence is a strictly-more-informed view of the same
+     * selection, never a second opinion that can fork from it.
+     */
+    async publishableCandidates(): Promise<readonly SignedCheckpointView[]> {
+      return store.publishableCandidatesCore()
     },
 
     audit: (): Promise<AuditReport> => store.audit(),
@@ -1992,16 +2095,43 @@ async function verifiedEpochBound(lines: readonly string[], signer: SignerPort):
  * training-anchor pool (any well-formed checkpoint).
  */
 function selectBestCheckpoint(walk: ChainWalk, anchor: AnchorFile | undefined, requireSigned: boolean): WalkedCheckpoint | undefined {
-  const malformed = new Set(walk.malformedCheckpoints)
-  const pool = walk.checkpoints.filter(cp =>
-    !malformed.has(cp.index)
-    && !cp.headLiared
-    && (!requireSigned || (cp.sig !== null && cp.sig.length > 0 && cp.keyId !== null)))
+  const pool = checkpointPool(walk, requireSigned)
   if (pool.length === 0) return undefined
   if (anchor !== undefined && anchor.keyId !== '') {
     return pool.findLast(cp => cp.keyId === anchor.keyId)
   }
   return pool[pool.length - 1]
+}
+
+/**
+ * @internal The structurally-publishable pool both selection faces draw
+ * from: well-formed counts (the walk corroborates the self-report), positions
+ * the walk corroborates (`headLiared` false — Y-H-01), and — under
+ * `requireSigned` — a signature and keyId a downstream key-holder can verify
+ * under. Malformed and lying checkpoints are not "candidates that fail";
+ * they are not candidates at all.
+ */
+function checkpointPool(walk: ChainWalk, requireSigned: boolean): WalkedCheckpoint[] {
+  const malformed = new Set(walk.malformedCheckpoints)
+  return walk.checkpoints.filter(cp =>
+    !malformed.has(cp.index)
+    && !cp.headLiared
+    && (!requireSigned || (cp.sig !== null && cp.sig.length > 0 && cp.keyId !== null)))
+}
+
+/**
+ * @internal P5: the publish candidate sequence — the requireSigned pool
+ * under the anchor-key rule (an anchor naming a key restricts candidates to
+ * that key's checkpoints, exactly `selectBestCheckpoint`'s rule; anchor-less
+ * keeps the any-key semantics), in DESCENDING order so a consumer scanning
+ * with its own verifier (transparency's `selectPublishable` first-verifiable-
+ * wins) reaches the newest verifiable checkpoint first. `selectBestCheckpoint`
+ * over the same inputs is always `list[0]`.
+ */
+function publishableCandidateList(walk: ChainWalk, anchor: AnchorFile | undefined): WalkedCheckpoint[] {
+  const pool = checkpointPool(walk, true)
+  const keyed = anchor !== undefined && anchor.keyId !== '' ? pool.filter(cp => cp.keyId === anchor.keyId) : pool
+  return [...keyed].reverse()
 }
 
 /** @internal Narrow a walked checkpoint to the publish-facing view shape. */

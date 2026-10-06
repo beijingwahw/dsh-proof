@@ -4000,3 +4000,334 @@ test('v0.24 (Y-H-05): forged evidence rows above the last verified checkpoint ne
   assert.equal(attackedRun.report.grade, cleanRun.report.grade)
   assert.equal(attackedRun.auditFailed, undefined, 'the forged rows also fail no audit axis — the exclusion is the only defense')
 })
+
+// -- v0.25 (K1): the vouched floor everywhere — pattern 5, the shape-legal append --
+
+/**
+ * The one append helper every K1 test shares: an out-of-band marker line,
+ * CORRECTLY CHAINED — `prev` and (for protected labels) `headRef` both the
+ * digest of the physical predecessor, so the line passes every structural
+ * check the suspect position test has and reads back NON-suspect. This is
+ * pattern 5's exact shape: the writer did nothing a hash chain can detect;
+ * only the vouched floor (the content sits above the last checkpoint this
+ * host's key verified) can refuse it.
+ */
+async function appendChainedMarker(
+  fs: MemoryFs, logPath: string, payload: Record<string, unknown>,
+): Promise<void> {
+  const lines = ((await fs.readFile(logPath)) ?? '').split('\n').filter(l => l.trim().length > 0)
+  const prev = lineDigest(lines[lines.length - 1] as string)
+  await fs.appendLine(logPath, JSON.stringify({
+    v: 2,
+    kind: 'marker',
+    at: '2026-10-06T00:00:00.000Z',
+    prev,
+    payload: { ...payload, headRef: prev },
+  }))
+}
+
+/** The signed-engine shape every K1 test runs on: a host key that vouches, so a floor exists. */
+function flooredContractEngine(fs: MemoryFs, logger?: (message: string) => void) {
+  return new ProofEngine({
+    root: ROOT,
+    fs,
+    commands: new FakeCommands(),
+    workspace: new FakeWorkspace(ROOT),
+    clock: new FakeClock(),
+    workspaceKey: 'ws',
+    signer: () => Promise.resolve(new FakeKey('ws-key')),
+    impactGraphLimit: 1_000,
+    ...(logger !== undefined ? { verbose: true, logger } : {}),
+  })
+}
+
+test('v0.25 (K1): an out-of-band attest marker above the vouched floor prices nothing — κ starves, the count stays visible', async () => {
+  // (a) of the floor trio. One honest gen-0 uphold sits BELOW the floor
+  // (covered by delegateTask's boundary checkpoint); a gen-1 reject @0.99
+  // twin — correctly chained, headRef honest, everything the suspect test
+  // checks is green — rides ABOVE it. v0.24's κ fusion read the whole
+  // non-suspect pool, so the twin won the appeal race (highest gen) and
+  // collapsed the claim one append after the last verified checkpoint. The
+  // floor refuses it; the boundary marker NAMES it.
+  const build = async (): Promise<{ fs: MemoryFs; engine: ProofEngine; logPath: string }> => {
+    const fs = MemoryFs.of(surfaceProject())
+    const engine = flooredContractEngine(fs)
+    await engine.establishBaseline()
+    return { fs, engine, logPath: `${ROOT}/.proof/evidence.jsonl` }
+  }
+  const clean = await build()
+  const attacked = await build()
+  const claim = 'the retry loop honours cancellation'
+  for (const { engine } of [clean, attacked]) {
+    await seedJuryAttestation(engine, claim, { gen: 0, verdict: 'uphold', probability: 0.99 })
+    // The cheapest boundary verb that closes a checkpoint window over the
+    // honest witness (every delegation verb checkpoints — X-H-04).
+    await engine.delegateTask({ claim: 'unrelated obligation, opened to close the window' })
+  }
+  await appendChainedMarker(attacked.fs, attacked.logPath, {
+    label: 'attest/jury',
+    kind: 'attest/jury',
+    claimId: claimIdOf(claim),
+    gen: 1,
+    prompt: 'impostor deliberation',
+    rubricVersion: 'jury-rubric/v1',
+    model: 'impostor-model',
+    independence: 'fresh-context',
+    verdict: 'reject',
+    probability: 0.99,
+    output: '{"verdict":"reject","probability":0.99}',
+    at: 1_767_225_600_000,
+  })
+
+  const cleanRun = await clean.engine.verifyContract({ contract: { kind: 'llm-jury', claim } })
+  const attackedRun = await attacked.engine.verifyContract({ contract: { kind: 'llm-jury', claim } })
+  assert.equal(attackedRun.report.confidence, cleanRun.report.confidence,
+    'the above-floor twin contributed exactly nothing to the fusion — 0.99^0.7 either way')
+  assert.equal(attackedRun.report.grade, cleanRun.report.grade)
+  assert.equal(attackedRun.report.grade, 'proven', 'the honest gen-0 witness still certifies')
+  assert.equal(attackedRun.auditFailed, undefined, 'the twin broke no audit axis — the floor is the only defense')
+  assert.equal(attackedRun.contract.attestations?.length, 1, 'only the honest witness is summary-visible')
+  assert.equal(attackedRun.contract.attestations?.[0]?.gen, 0, 'the twin never entered the appeal race')
+  // Visible counting, never silent eviction: the boundary marker carries
+  // the withheld count; the clean chain mints no such field at all.
+  assert.ok(attacked.fs.log.some(l => l.includes('"claim/jury"') && l.includes('"aboveFloorAttestations":1')),
+    'the boundary marker names the one marker riding above the floor')
+  assert.ok(!clean.fs.log.some(l => l.includes('"aboveFloorAttestations"')),
+    'an honest chain (everything below the floor) mints no above-floor field')
+})
+
+test('v0.25 (K1): a fake drift marker above the vouched floor cannot move the epoch boundary', async () => {
+  // (c) of the floor trio. The drift epoch boundary is the LAST verified
+  // proof/verified marker carrying the id in scriptDrift; a fake one
+  // appended above the floor used to enter the pool (correctly chained ⇒
+  // non-suspect) and re-cut the boundary by position. V3-M1's last-wins
+  // semantics already made the re-cut conservative (a higher boundary only
+  // starves the drifted id further), so this pin is the invariant
+  // regression: clean and attacked chains must agree byte-for-byte on the
+  // number — the fake may not move the boundary in EITHER direction, and
+  // the verbose narrative says it was seen.
+  const build = async (): Promise<{ fs: MemoryFs; engine: ProofEngine; logPath: string; warnings: string[] }> => {
+    const fs = MemoryFs.of(driftProject())
+    const commands = new FakeCommands()
+    commands.on(() => true, { exitCode: 0, output: 'green' })
+    const warnings: string[] = []
+    const engine = new ProofEngine({
+      root: ROOT,
+      fs,
+      commands,
+      workspace: new FakeWorkspace(ROOT),
+      clock: new FakeClock(),
+      workspaceKey: 'ws',
+      signer: () => Promise.resolve(new FakeKey('ws-key')),
+      impactGraphLimit: 1_000,
+      verbose: true,
+      logger: m => warnings.push(m),
+    })
+    await engine.establishBaseline()
+    return { fs, engine, logPath: `${ROOT}/.proof/evidence.jsonl`, warnings }
+  }
+  const clean = await build()
+  const attacked = await build()
+  // Both chains drift package a's test body to a vacuous script (identical
+  // verb counts, so the chains stay byte-comparable).
+  let driftedId = ''
+  for (const side of [clean, attacked]) {
+    side.fs.mutate(`${ROOT}/packages/a/package.json`, JSON.stringify({ name: 'a', scripts: { test: 'node -e ""' } }))
+    const detection = await side.engine.verify({ changed: ['packages/b/src/b.ts'] })
+    assert.ok(detection.scriptDrift !== undefined && detection.scriptDrift.length === 1,
+      'fixture: the drift is on the record below the floor')
+    driftedId = detection.scriptDrift?.[0] ?? ''
+  }
+  assert.ok(driftedId.length > 0, 'fixture: the drifted id is known')
+  // The fake: a drift marker for the same id, appended above the floor,
+  // claiming a generational cut nobody made.
+  await appendChainedMarker(attacked.fs, attacked.logPath, {
+    label: 'proof/verified',
+    grade: 'stale',
+    claim: 'fake generational cut',
+    scriptDrift: [driftedId],
+  })
+  const cleanRun = await clean.engine.verify({ changed: ['packages/b/src/b.ts'] })
+  const attackedRun = await attacked.engine.verify({ changed: ['packages/b/src/b.ts'] })
+  assert.equal(attackedRun.report.confidence, cleanRun.report.confidence,
+    'the fake marker moved the epoch boundary not at all — same priors, same number')
+  assert.equal(attackedRun.report.grade, cleanRun.report.grade)
+  assert.ok(attacked.warnings.some(w => w.includes('ride above the last verified checkpoint')),
+    'the withheld drift marker is narrated, not silently dropped')
+})
+
+test('v0.25 (V4-M6): a forged tail twin no longer vetoes the publish — the newest verifiable checkpoint publishes, the twin lands on the record', async () => {
+  // The publish DoS: ONE appended checkpoint line — well-formed, own keyId,
+  // garbage signature, honest count and head — flipped bestCheckpoint to
+  // `refuted` and held the whole verb hostage (v0.24 refused the publish
+  // outright; every honest checkpoint below the twin was unpublishable).
+  // The fallback selects through `selectPublishable`, the same predicate
+  // the ptl CLI face uses: newest → oldest, first VERIFIABLE wins.
+  const fs = MemoryFs.of(project())
+  const engine = publishingEngine(fs)
+  await engine.establishBaseline()
+  await engine.verify({ changed: ['src/a.ts'] })
+  const logPath = `${ROOT}/.proof/evidence.jsonl`
+  const lines = ((await fs.readFile(logPath)) ?? '').split('\n').filter(l => l.trim().length > 0)
+  const recordsBefore = lines.filter(l => {
+    try {
+      const kind = (JSON.parse(l) as { kind?: unknown }).kind
+      return kind === 'evidence' || kind === 'marker'
+    } catch { return false }
+  }).length
+  const prev = lineDigest(lines[lines.length - 1] as string)
+  await fs.appendLine(logPath, JSON.stringify({
+    v: 2,
+    kind: 'checkpoint',
+    at: '2026-10-06T00:00:00.000Z',
+    prev,
+    // count/head honest for the position: well-formed and NOT a head liar,
+    // so the only thing wrong with this line is the signature — the exact
+    // `refuted` twin the positional-last selection cannot see past.
+    payload: { count: recordsBefore, head: prev, workspaceKey: 'ws', at: '2026-10-06T00:00:00.000Z' },
+    sig: 'sig:ws-key:forged-garbage',
+    keyId: 'ws-key',
+  }))
+
+  // v0.24: rejecting here was the bug — one bad line, every honest
+  // checkpoint below it held hostage. v0.25: the publish succeeds.
+  const published = await engine.publishCheckpoint()
+  assert.equal(published.duplicate, false)
+  const { log } = await loadPtl(fs, PTL_DIR)
+  assert.equal(log.size, 1, 'the forged twin minted no leaf of its own')
+  assert.equal(log.entries[0]!.count, recordsBefore,
+    'the published leaf carries the honest checkpoint the scan backed up to')
+  // W2-M3: a genuinely forged signature lands a chain fact even when an
+  // honest predecessor outvotes it — the skip is on the record.
+  assert.ok(fs.log.some(l => l.includes('ptl/publish-unadjudicated') && l.includes('failed adjudication and were skipped')),
+    'the skipped twin is recorded as unadjudicated')
+})
+
+test('v0.25 (V4-M6): when NO candidate verifies, the publish refuses loudly and lists the rejected', async () => {
+  const fs = MemoryFs.of(project())
+  const engine = publishingEngine(fs)
+  await engine.establishBaseline()
+  const logPath = `${ROOT}/.proof/evidence.jsonl`
+  // Rewrite EVERY checkpoint's signature in place (the sig is the last field
+  // of each line and nothing after a mid-log line digests it in a way the
+  // walk's checkpoint parser cares about beyond the chain-break channel the
+  // audit owns): every candidate is now a forgery, and the scan has nothing
+  // to back up to.
+  const lines = ((await fs.readFile(logPath)) ?? '').split('\n').filter(l => l.trim().length > 0)
+  let corrupted = 0
+  const rewritten = lines.map(l => {
+    try {
+      const parsed = JSON.parse(l) as { kind?: unknown; sig?: unknown }
+      if (parsed?.kind !== 'checkpoint' || typeof parsed.sig !== 'string') return l
+      corrupted += 1
+      return JSON.stringify({ ...parsed, sig: 'sig:ws-key:not-the-real-signature' })
+    } catch {
+      return l
+    }
+  })
+  assert.ok(corrupted > 0, 'fixture: the chain carries signed checkpoints to corrupt')
+  fs.mutate(logPath, `${rewritten.join('\n')}\n`)
+  await assert.rejects(
+    () => engine.publishCheckpoint(),
+    /refusing to publish: every candidate checkpoint failed signature verification.*rejected: log line/,
+    'the refusal names every rejected candidate by line',
+  )
+  assert.ok(fs.log.some(l => l.includes('ptl/publish-unadjudicated') && l.includes('failed signature verification')),
+    'the refusal is a chain fact before it is a throw')
+})
+
+test('v0.25 (K1/V3-M10): an appended proof/verified marker above the floor lifts no own leg', async () => {
+  // The V3-M10 family closes with the floor: slaQuote (v0.24), taskVerdict
+  // own-leg and export changedPaths (both this batch) all read
+  // marker-defined facts through the bounded pool. This chain carries NO
+  // honest verdict marker at all — the only one is the append, claiming
+  // 'proven'.
+  const fs = MemoryFs.of(project())
+  const engine = flooredContractEngine(fs)
+  await engine.establishBaseline()
+  const { taskId } = await engine.delegateTask({ claim: 'the migration is done' })
+  await appendChainedMarker(fs, `${ROOT}/.proof/evidence.jsonl`, {
+    label: 'proof/verified',
+    grade: 'proven',
+    claim: 'forged own-leg',
+  })
+  const verdict = await engine.taskVerdict({ taskId, ownGrade: 'proven' })
+  assert.equal(verdict.aboveFloorMarkers, 1, 'the withheld append is counted, visible on the result')
+  assert.ok(verdict.discrepancies !== undefined
+    && verdict.discrepancies.some(d => d.includes('has no proof/verified marker on this chain to stand on')),
+    'the own leg derives from NOTHING below the floor — the append lifts no grade')
+  assert.notEqual(verdict.composed.grade, 'proven', 'a self-report standing on a forged marker certifies nothing')
+})
+
+test('v0.25 (K1/V3-M10): an appended proof/verified marker above the floor shapes no training dataset', async () => {
+  // The export's changed-path context defaults to the latest proof/verified
+  // marker's `changed` list. This engine's own markers record the count, not
+  // the list — so the honest default is NO context; the append supplies a
+  // list from above the floor. v0.24 read it (the dataset's change-set
+  // context became the attacker's list, and under the default agent-only
+  // filter the unresolvable attribution minted `provenanceUnresolved`);
+  // v0.25 anchors on the newest NOTARISED verdict.
+  const build = async (): Promise<{ fs: MemoryFs; engine: ProofEngine; logPath: string }> => {
+    const fs = MemoryFs.of(project())
+    const engine = flooredContractEngine(fs)
+    await engine.establishBaseline()
+    await engine.verify({ changed: ['src/a.ts'] })
+    return { fs, engine, logPath: `${ROOT}/.proof/evidence.jsonl` }
+  }
+  const clean = await build()
+  const attacked = await build()
+  await appendChainedMarker(attacked.fs, attacked.logPath, {
+    label: 'proof/verified',
+    grade: 'stale',
+    claim: 'forged dataset context',
+    changed: ['src/attacker-context.ts'],
+  })
+  const cleanExport = await clean.engine.exportTrainingData({ provenanceFilter: 'agent-only' })
+  const attackedExport = await attacked.engine.exportTrainingData({ provenanceFilter: 'agent-only' })
+  assert.equal(attackedExport.manifest.provenanceUnresolved, cleanExport.manifest.provenanceUnresolved,
+    'the above-floor changed list resolved nothing and voided nothing — both exports agree')
+  assert.equal(attackedExport.manifest.provenanceUnresolved, undefined,
+    'no unresolvable attribution was invented from the append (v0.24 minted the flag here)')
+  assert.deepEqual(attackedExport.manifest.counts, cleanExport.manifest.counts,
+    'the dataset itself is byte-for-byte the clean chain\'s')
+})
+
+test('v0.25 (V2-L8): a fresh bootstrap over a foreign chain warns instead of mixing silently', async () => {
+  // The accidental-deployment shape: workspace A's engine established into
+  // an evidence dir, and workspace B's config reuses it. B's bootstrap used
+  // to append onto A's history with no signal at all. The warning is
+  // verbose-only and read-only — no chain byte changes either way, and an
+  // honest resume (same workspace identity) says nothing.
+  const fs = MemoryFs.of(project())
+  const first = new ProofEngine({
+    root: ROOT, fs, commands: new FakeCommands(), workspace: new FakeWorkspace(ROOT),
+    clock: new FakeClock(), workspaceKey: 'ws-a', impactGraphLimit: 1_000,
+  })
+  await first.establishBaseline()
+  const secondWarnings: string[] = []
+  const second = new ProofEngine({
+    root: ROOT, fs, commands: new FakeCommands(), workspace: new FakeWorkspace(ROOT),
+    clock: new FakeClock(), workspaceKey: 'ws-b', impactGraphLimit: 1_000,
+    verbose: true, logger: m => secondWarnings.push(m),
+  })
+  await second.establishBaseline()
+  assert.ok(secondWarnings.some(w => w.includes('WARNING') && w.includes('ws-b') && w.includes('foreign chain')),
+    'the bootstrap names the identity mismatch before appending to the foreign history')
+  const thirdWarnings: string[] = []
+  const third = new ProofEngine({
+    // The honest-resume control needs a log ONLY ws-a ever wrote to.
+    root: ROOT, fs: MemoryFs.of(project()), commands: new FakeCommands(), workspace: new FakeWorkspace(ROOT),
+    clock: new FakeClock(), workspaceKey: 'ws-a', impactGraphLimit: 1_000,
+    verbose: true, logger: m => thirdWarnings.push(m),
+  })
+  await third.establishBaseline()
+  const resumedWarnings: string[] = []
+  const resumed = new ProofEngine({
+    root: ROOT, fs: third.fsView as MemoryFs, commands: new FakeCommands(), workspace: new FakeWorkspace(ROOT),
+    clock: new FakeClock(), workspaceKey: 'ws-a', impactGraphLimit: 1_000,
+    verbose: true, logger: m => resumedWarnings.push(m),
+  })
+  await resumed.establishBaseline()
+  assert.ok(!resumedWarnings.some(w => w.includes('foreign chain')),
+    'an honest resume under one identity says nothing (the log is its own)')
+})

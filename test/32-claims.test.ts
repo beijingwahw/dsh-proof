@@ -646,3 +646,48 @@ test('claim 10: blank-line semantics agree across the store face and the MCP fac
   assert.ok(!viaMcp.some(r => r.payload.taskId === 'task-evil'),
     'the forged twin is excluded on BOTH faces — the blank-line domain must not become its witness')
 })
+
+// ---------------------------------------------------------------------------
+// v0.25 claims: the floor and the witness
+// ---------------------------------------------------------------------------
+
+test('claim 11: trust reads stop at the vouched floor — every fusion, DAG and drift consumer routes through the floor, fresh appends above it price nothing', async () => {
+  // Claim origin: the v0.25 "vouched floor everywhere" completion of the
+  // v0.24 section's closing bet — README (v0.25): "any trust decision
+  // consumes only what lies below the last verified checkpoint; a fresh,
+  // properly-shaped append above the floor is structurally inert". The
+  // behavioural pins live in test/05 (K1a/K1b/K1c); THIS contract guards the
+  // wiring itself: the day someone adds a new trust reader that forgets the
+  // floor, the static signature below changes and this claim goes red.
+  const engine = srcText('engine.ts')
+  assert.ok(/vouchedMarkersWith/.test(engine),
+    'claim 11a: engine.ts must have the floor-bounded reader (vouchedMarkersWith)')
+  for (const consumer of ['activeAttestationsAll', 'delegationObligations', 'scriptDriftFirstSeen']) {
+    // The function-body window (not a name-proximity regex): the reader the
+    // claim guards lives inside the consumer's own body, so the assertion
+    // extracts each private method's span and demands the floor call inside it.
+    const defAt = engine.indexOf(`private async ${consumer}`)
+    assert.ok(defAt !== -1, `claim 11b: ${consumer} must exist`)
+    const body = engine.slice(defAt, defAt + 3_000)
+    assert.ok(body.includes('vouchedMarkersWith'),
+      `claim 11b: ${consumer} must read through the vouched floor — a reader that forgot the floor reopens pattern five`)
+  }
+})
+
+test('claim 12: sworn testimony is checkpointed the moment it is recorded — a witness is priceable the moment it is sworn, not a cycle later', async () => {
+  // Claim origin: the K1 residual closed in v0.25 — testimony written by the
+  // DSH tools after the last boundary checkpoint used to sit ABOVE the floor
+  // for a full cycle, invisible to fusion. The fix checkpoints right after
+  // each attest write; this contract keeps the two writes together.
+  const tools = srcText('dsh/tools.ts')
+  for (const label of ['attest/jury', 'attest/human']) {
+    // Body window, same style as claim 11: the mark call and its checkpoint
+    // must sit in the same small span — testimony never waits a cycle.
+    const markAt = tools.indexOf(`mark('${label}'`)
+    assert.ok(markAt !== -1, `claim 12: the ${label} marker write must exist`)
+    const window = tools.slice(markAt, markAt + 700)
+    assert.ok(window.includes('storeView.checkpoint()'),
+      `claim 12: the ${label} write must be followed by a checkpoint — testimony above the vouched floor prices nothing`,
+    )
+  }
+})

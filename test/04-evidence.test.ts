@@ -347,6 +347,46 @@ test('VerifiedChainView.markers: the sinceLine epoch window and the mixed-genera
   assert.equal(afterTwin.degraded, false)
 })
 
+// -- P5: the symmetric maxLine ceiling — "the pool as of line N" reads -------
+
+test('P5: VerifiedChainView.markers has a maxLine ceiling symmetric to sinceLine — the pool as of line N', async () => {
+  const fs = MemoryFs.of({})
+  const clock = new FakeClock()
+  const log = '/ws/.proof/evidence.jsonl'
+  const store = new EvidenceStore(fs, log, '/ws/.proof/baseline.json', clock)
+  await store.mark('proof/verified', { grade: 'proven', gen: 1 })
+  const boundary = (await fs.readLines(log)).length // 1: gen 1 sits at index 0
+  await store.mark('proof/verified', { grade: 'stale', gen: 2 })
+  await store.mark('proof/verified', { grade: 'regressed', gen: 3 })
+
+  const view = createVerifiedView(store)
+  const all = await view.markers('proof/verified')
+  assert.equal(all.records.length, 3, 'sanity: the unwindowed pool sees every generation')
+
+  // The ceiling alone: only markers at or before the boundary line.
+  const asOf = await view.markers('proof/verified', { maxLine: boundary - 1 })
+  assert.deepEqual(asOf.records.map(r => r.payload.gen), [1], 'only markers at or before the ceiling are in the window')
+  assert.equal(asOf.last?.payload.gen, 1, 'last is last-wins WITHIN the window — never the physically last line')
+
+  // Both bounds: a [sinceLine, maxLine] band.
+  const band = await view.markers('proof/verified', { sinceLine: boundary, maxLine: boundary })
+  assert.deepEqual(band.records.map(r => r.payload.gen), [2], 'the band admits exactly the markers between the bounds')
+
+  // The window selects within the TRUSTED pool, never around it: an appended
+  // twin beyond the ceiling cannot re-enter by window arithmetic (it is out
+  // by suspect first, and the ceiling keeps it out even if it were not).
+  const lines = await fs.readLines(log)
+  const prev = lineDigest(lines[lines.length - 1] as string)
+  const twin = JSON.stringify({
+    v: 2, kind: 'marker', at: '2026-10-06T00:00:00.000Z', prev,
+    payload: { label: 'proof/verified', grade: 'proven', gen: 9, headRef: 'ff'.repeat(32) },
+  })
+  fs.mutate(log, `${[...lines, twin].join('\n')}\n`)
+  const stillAsOf = await view.markers('proof/verified', { maxLine: boundary - 1 })
+  assert.deepEqual(stillAsOf.records.map(r => r.payload.gen), [1], 'the twin is outside the window and outside the pool — doubly out')
+  assert.equal((await store.markersWith('proof/verified')).length, 4, 'raw face keeps everything: suspect is visible, not deleted')
+})
+
 // -- V1-M5/M6 (v0.24): the degraded pool only reaches DOWN to the anchor -------
 
 test('V1-M6: the generational fallback stops at the last verified checkpoint — a fresh headRef-less injection is not legacy history', async () => {

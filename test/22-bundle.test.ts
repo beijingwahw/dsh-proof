@@ -30,11 +30,25 @@ const ANCHOR = '/trust/anchors/ws/anchor.json'
 const AT = '2026-10-06T00:00:00.000Z'
 const WS = snapshotWorkspace('head1', ['src/a.ts'])
 
-/** Deterministic stand-in for the host key: the attacker knows its keyId, never its secret. */
+/**
+ * Deterministic stand-in for the host key: the attacker knows its keyId,
+ * never its secret.
+ *
+ * Y-M-36 (v0.24): the fixture now HAS a secret. `sig = sha256(data)` with no
+ * key material meant every "signature cannot be forged" assertion in this
+ * file only ever pinned "a garbage string is refused" — an attacker who can
+ * re-hash the public payload could have computed every signature in this
+ * suite. Keying the digest off module-private material makes the forged
+ * signatures the negative tests plant (sig 'FORGED', 'sig:forged', …)
+ * stand for what they claim: bytes the key holder never produced.
+ */
+const FAKE_SIGNER_SECRET = 'fixture-host-key-material-never-published'
 class FakeSigner implements SignerPort {
   readonly keyId = 'fake-key'
-  async sign(data: string): Promise<string> { return `sig:${sha256(data)}` }
-  async verify(data: string, signature: string): Promise<boolean> { return signature === `sig:${sha256(data)}` }
+  async sign(data: string): Promise<string> { return `sig:${sha256(`${FAKE_SIGNER_SECRET}:${data}`)}` }
+  async verify(data: string, signature: string): Promise<boolean> {
+    return signature === `sig:${sha256(`${FAKE_SIGNER_SECRET}:${data}`)}`
+  }
 }
 
 /** The bundle-verifier's view of the same key: it can only verify, never sign. */

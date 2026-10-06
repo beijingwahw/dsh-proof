@@ -43,6 +43,16 @@ export const GENESIS_PREV = sha256('dsh-proof/chain/genesis')
  * breaks an old chain: tolerance extends only to a byte no honest writer
  * ever produced. (A `\r` in the *middle* of a line is not a line terminator
  * and still changes the digest — mid-line edits remain fully detected.)
+ *
+ * V1-L13 (documented residual): the same tolerance means a trailing `\r`
+ * APPENDED to a line is undetectable by any digest-based check — the chain
+ * link, `headRef` witnesses and checkpoint heads all digest the stripped
+ * form, and `JSON.parse` tolerates the trailing whitespace, so the edited
+ * bytes parse, chain and address exactly like the honest ones. That is the
+ * accepted price of never mass-invalidating an honest chain on a CRLF
+ * rewrite; it buys no attacker anything (the edit changes no JSON value any
+ * consumer reads), and it is pinned by the W1-L10 tests rather than silently
+ * smoothed over. Everything but the terminator byte stays fully detected.
  */
 export function lineDigest(line: string): string {
   return sha256(line.endsWith('\r') ? line.replace(/\r+$/, '') : line)

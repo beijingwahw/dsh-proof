@@ -19,6 +19,17 @@ export class MemoryFs implements FsPort {
   files = new Map<string, string>()
   log: string[] = []
   /**
+   * V8-L3 (v0.24): directories the fake knows exist WITHOUT any file under
+   * them. The production port (`NodeFsPort.readDir`) answers `[]` for an
+   * existing-but-empty directory and `undefined` only for a path that is not
+   * a directory at all; the fake used to fold BOTH into `undefined`, so
+   * "exists, empty" — a shape tests need to pin (e.g. an empty coverage
+   * staging dir) — was unexpressible. A directory registers here via
+   * `mkdirp`; any path with files under it exists implicitly, exactly as
+   * before.
+   */
+  private readonly dirs = new Set<string>()
+  /**
    * Per-path mtime clock (instance-level counter). `stat` used to report a
    * constant `mtimeMs: 0`, which made cache-invalidation-by-mtime untestable:
    * the LSP resolver versions documents as `mtimeMs:size`, so a file rewritten
@@ -41,12 +52,17 @@ export class MemoryFs implements FsPort {
   }
 
   async readDir(path: string): Promise<string[] | undefined> {
-    const prefix = `${normalize(path).replace(/\/+$/, '')}/`
+    const key = normalize(path)
+    const prefix = `${key.replace(/\/+$/, '')}/`
     const names = new Set<string>()
-    for (const key of this.files.keys()) {
-      if (key.startsWith(prefix)) names.add(key.slice(prefix.length).split('/')[0] as string)
+    for (const fileKey of this.files.keys()) {
+      if (fileKey.startsWith(prefix)) names.add(fileKey.slice(prefix.length).split('/')[0] as string)
     }
-    return names.size > 0 ? [...names].sort() : undefined
+    // V8-L3: exists-but-empty answers [] (production semantics — see the
+    // `dirs` field note); only a path that is neither a parent of any file
+    // nor a registered directory answers undefined.
+    if (names.size > 0) return [...names].sort()
+    return this.dirs.has(key) || this.dirs.has(key.replace(/\/+$/, '')) ? [] : undefined
   }
 
   async stat(path: string): Promise<FileStat | undefined> {
@@ -91,7 +107,28 @@ export class MemoryFs implements FsPort {
     this.files.set(normalize(path), contents)
   }
 
-  async mkdirp(): Promise<void> { /* memory fs needs no directories */ }
+  async mkdirp(path: string): Promise<void> {
+    // The memory fs needs no directories for file placement — but registering
+    // the path makes "exists, empty" expressible for readDir (V8-L3), which
+    // the production port answers with [] rather than undefined.
+    this.dirs.add(normalize(path).replace(/\/+$/, ''))
+  }
+
+  /**
+   * V8-L3 (v0.24): the optional recursive-delete capability, mirroring
+   * `NodeFsPort.removeDir` — deletes every file under the prefix (and the
+   * registered directories at/under it). Best-effort like the production
+   * port: never throws, exactly what a staging cleanup may ask of it.
+   */
+  async removeDir(path: string): Promise<void> {
+    const prefix = `${normalize(path).replace(/\/+$/, '')}/`
+    for (const key of [...this.files.keys()]) {
+      if (key.startsWith(prefix)) this.files.delete(key)
+    }
+    for (const dir of [...this.dirs]) {
+      if (dir === prefix.slice(0, -1) || dir.startsWith(prefix)) this.dirs.delete(dir)
+    }
+  }
 
   /** Test helper: mutate a file behind the engine's back. */
   mutate(path: string, contents: string): void {

@@ -707,11 +707,17 @@ function withinBudgetObligation(input: ContractInput): ObligationResult {
   // budget component was decorative). Non-positive budgets are refused for
   // the same reason: a bound that cannot bind is a misdelivery of the
   // contract, and the honest answer is not-met with the fix stated.
-  if (!Number.isFinite(budget) || budget <= 0) {
+  // Y-M-07 (v0.24): the ABSURD-MAGNITUDE twin of the same disease — 1e308 is
+  // finite but equally vacuous. The DSH tool face and the MCP face both cap
+  // budgetMs at 1e12 ms (≈ 11.6 days); this pure layer used to accept
+  // anything finite, so a contract that reached it through any other door
+  // (programmatic, replayed, future face) dodged the ceiling the two tool
+  // faces already enforce. One budget domain, three faces, one answer.
+  if (!Number.isFinite(budget) || budget <= 0 || budget > 1e12) {
     return {
       id: 'within-budget',
       met: false,
-      detail: `contract.budgetMs must be a finite positive number of milliseconds, got ${budget} — restate the budget the benchmark must actually stay under`,
+      detail: `contract.budgetMs must be a finite positive number of milliseconds, at most 1e12, got ${budget} — restate the budget the benchmark must actually stay under`,
     }
   }
   const found = benchmarkRecords(input)

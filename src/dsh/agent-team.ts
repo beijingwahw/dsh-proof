@@ -191,6 +191,12 @@ const CLAIM_LIMIT = 500
  * (which is what a `task`/`description` field narrows to). Trimmed, and
  * truncated to 500 characters so a whole child prompt cannot become the
  * obligation's content address input.
+ *
+ * V6-L13 (v0.24): the truncation is LOUD — the cut text carries a baked-in
+ * flag naming the original length, the same discipline as the DSH tools'
+ * `capToolString`. A silent slice made an obligation's claim LOOK complete on
+ * the chain while the host event had said more; the flag is a chain fact the
+ * reader can see without the event.
  */
 function claimOf(event: TeamBridgeEvent): string | undefined {
   const raw = typeof event.claim === 'string'
@@ -199,7 +205,9 @@ function claimOf(event: TeamBridgeEvent): string | undefined {
   if (raw === undefined) return undefined
   const text = raw.trim()
   if (text.length === 0) return undefined
-  return text.length > CLAIM_LIMIT ? text.slice(0, CLAIM_LIMIT) : text
+  return text.length > CLAIM_LIMIT
+    ? `${text.slice(0, CLAIM_LIMIT)}…[claim truncated from ${text.length} chars]`
+    : text
 }
 
 /**
@@ -233,12 +241,17 @@ export function createTeamBridge(deps: TeamBridgeDeps): {
   /** Host task id → engine task id, for every obligation this bridge minted. */
   const hostToEngine = new Map<string, string>()
   /**
-   * W7-M9: one-shot rehydration of the persisted mappings. Mappings this
-   * process minted AFTER the reader's snapshot win (`set`-if-absent), so a
-   * re-read racing a fresh delegation never rolls a fresh edge back to a
-   * stale chain copy. A failed read rehydrates nothing and never throws —
-   * the bridge then behaves exactly as it did before the chain grew a
-   * memory.
+   * W7-M9: one-shot rehydration of the persisted mappings. The chain list is
+   * in append order (oldest first), and V6-L13 (v0.24) makes rehydration
+   * apply it with NEWEST-WINS — an unconditional `set` — so a host that
+   * REUSES a hostTaskId gets the same answer fresh and restarted: the mapping
+   * this process would overwrite in flight (line: `hostToEngine.set(...)`
+   * after every mint) is the same one the chain's LAST marker for that id
+   * supplies on rehydrate. The pre-fix `set`-if-absent let the OLDEST marker
+   * win offline while the NEWEST won in-process — a restarted bridge quietly
+   * re-linked a reused id's children to the superseded obligation. A failed
+   * read rehydrates nothing and never throws — the bridge then behaves
+   * exactly as it did before the chain grew a memory.
    */
   let rehydrated: Promise<void> | undefined
   const ensureMappings = (): Promise<void> => {
@@ -247,9 +260,7 @@ export function createTeamBridge(deps: TeamBridgeDeps): {
         if (deps.mappings === undefined) return
         try {
           for (const pair of await deps.mappings()) {
-            if (!hostToEngine.has(pair.hostTaskId)) {
-              hostToEngine.set(pair.hostTaskId, pair.engineTaskId)
-            }
+            hostToEngine.set(pair.hostTaskId, pair.engineTaskId)
           }
         } catch {
           /* an unreadable chain rehydrates nothing; see above */

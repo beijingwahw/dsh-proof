@@ -60,6 +60,7 @@ import { generateKeyPairSync } from 'node:crypto'
 
 import { GitWorkspace, NodeCommandPort, NodeEd25519Signer, NodeFsPort, parsePorcelainZ, resolveCmdShim } from '../src/node-ports.ts'
 import type { CommandPort, CommandResult } from '../src/core/ports.ts'
+import { MemoryFs } from './helpers.ts'
 
 // <workspace>/.openclaw/tmp/... — the designated scratch area (one level
 // ABOVE the repo: the workspace root, not the checkout).
@@ -983,4 +984,45 @@ test('GIT: changedSince separates the ref from pathspecs with "--" (B8-L5)', asy
     'a ref beginning with "-" must never be parseable as a git option')
   // The separator changes nothing on the real repository.
   assert.ok((await new GitWorkspace(GIT_ROOT).changedSince('HEAD')).includes('keep.ts'))
+})
+
+// -- V8-L3: MemoryFs fidelity with the production port's directory semantics ----------
+
+test('V8-L3: MemoryFs.readDir answers [] for an existing-but-empty dir and undefined for no dir — same as NodeFsPort', async () => {
+  // The production port (fsp.readdir) answers [] for a directory that exists
+  // and holds nothing, and undefined (via the catch) only for a path that is
+  // not a directory at all; the fake used to fold both into undefined, so
+  // "exists, empty" was unexpressible in tests. Real-port parity is asserted
+  // against an actual empty directory on the real filesystem.
+  const realDir = join(SCRATCH, `node-ports-emptydir-${process.pid}`)
+  await fsp.rm(realDir, { recursive: true, force: true })
+  await fsp.mkdir(realDir, { recursive: true })
+  try {
+    const real = new NodeFsPort()
+    assert.deepEqual(await real.readDir(realDir), [], 'production: exists-but-empty answers []')
+
+    const fake = new MemoryFs()
+    assert.equal(await fake.readDir('/ws/never-made'), undefined, 'fake: a path with no files and no mkdirp is not a directory')
+    await fake.mkdirp('/ws/empty')
+    assert.deepEqual(await fake.readDir('/ws/empty'), [], 'fake: an explicitly created empty dir answers [] (production parity)')
+    await fake.writeFile('/ws/full/a.txt', 'a')
+    await fake.writeFile('/ws/full/sub/b.txt', 'b')
+    assert.deepEqual(await fake.readDir('/ws/full'), ['a.txt', 'sub'], 'fake: names only, sorted, directories included as names')
+
+    // removeDir — the optional τ capability, mirroring NodeFsPort.removeDir:
+    // deletes the whole subtree, best-effort, never throws.
+    assert.equal(typeof fake.removeDir, 'function', 'the fake implements the optional capability')
+    await fake.removeDir('/ws/full')
+    assert.equal(await fake.readFile('/ws/full/a.txt'), undefined, 'the tree is gone')
+    assert.equal(await fake.readFile('/ws/full/sub/b.txt'), undefined)
+    assert.equal(await fake.readDir('/ws/full'), undefined, 'an implicitly-existing dir with no files left is no longer one')
+
+    // Cross-port parity for removeDir on the real filesystem.
+    await fsp.mkdir(join(realDir, 'nested'), { recursive: true })
+    await fsp.writeFile(join(realDir, 'nested', 'x.txt'), 'x', 'utf8')
+    await real.removeDir(realDir)
+    assert.equal(existsSync(realDir), false, 'production removeDir takes the tree down')
+  } finally {
+    await fsp.rm(realDir, { recursive: true, force: true })
+  }
 })
