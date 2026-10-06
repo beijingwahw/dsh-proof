@@ -1,5 +1,5 @@
 /**
- * Agent Proof Protocol (APP/1.3) — the protocol constants layer.
+ * Agent Proof Protocol (APP/1.4) — the protocol constants layer.
  *
  * Everything a producer emits and a consumer interprets is named here: the
  * wire vocabularies (verdicts, grades, check statuses, chain modes, claim
@@ -58,8 +58,21 @@ export const PROTOCOL_NAME = 'agent-proof-protocol' as const
  * is unintelligible to every APP/1.2 verifier — and to every earlier one — in
  * both directions, by construction. Downgrading this constant back is a
  * wire-compatibility break, not a cosmetic edit.
+ *
+ * v0.21: APP/1.3 → APP/1.4 — the FOURTH tool-surface expansion (11 → 13): the
+ * verification-economics pair (`proof_economics` — the ledger of what a
+ * verification cost, read back off the chain's own boundary markers, and
+ * `proof_sla_quote` — the service-level quote that prices what a grade leaves
+ * undetected as an insurable risk). The vocabularies, the content addressing,
+ * the chain/checkpoint formats, the bundle format, the responsibility DAG and
+ * the training export are all byte-for-byte unchanged; what grew is WHAT THE
+ * TOOLS CAN SAY, for the fourth time. Same honest mechanics as every prior
+ * bump: the version is fingerprint material, so every APP/1.4 manifest is
+ * unintelligible to every APP/1.3 verifier — and to every earlier one — in
+ * both directions, by construction. Downgrading this constant back is a
+ * wire-compatibility break, not a cosmetic edit.
  */
-export const PROTOCOL_VERSION = 'APP/1.3' as const
+export const PROTOCOL_VERSION = 'APP/1.4' as const
 
 /** Media type of a single proof document (a `ProofReport`-shaped value). */
 export const PROOF_MEDIA_TYPE = 'application/vnd.app.proof+json' as const
@@ -130,7 +143,7 @@ export const CHECK_STATUSES = ['pass', 'fail', 'error', 'timeout', 'aborted', 's
  * `protocolHeader` returns the empty skeleton.
  */
 export interface BundleManifest {
-  /** The protocol dialect, always `APP/1.3` for this module. */
+  /** The protocol dialect, always `APP/1.4` for this module. */
   protocol: typeof PROTOCOL_VERSION
   /** The producing implementation's vocabulary fingerprint (`appFingerprint()`). */
   appFingerprint: string

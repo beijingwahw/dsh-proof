@@ -92,6 +92,16 @@ import type { ComposedVerdict, DagNode, DelegationSubmission, TaskObligation } f
 // imports above: the core barrel is not this batch's to edit.
 import { distillTrainingSet } from './core/training.ts'
 import type { SampleFidelity, TrainingManifest, TrainingSample } from './core/training.ts'
+// v0.21: the engine-economics domain (E1's core/economics.ts) — run ledgers
+// (what a verification spent and what the spend bought) and SLA pricing (what
+// a proven grade underwrites). The engine owns the seams: this run's records,
+// the scheduler's prior/posterior trajectory and the consumed-witness count
+// feed the ledger; input defense and the `economics/quote` marker wrap
+// `priceSla`. Consumed straight from the module, the same discipline as the
+// contract/attest/synthetic/coverage/training imports above: the core barrel
+// is not this batch's to edit.
+import { priceSla, summarizeRunLedger } from './core/economics.ts'
+import type { RateCard, RunLedger, SlaQuote } from './core/economics.ts'
 // v0.19: the ONE engine→app edge, deliberate. `verifyBundle` is the
 // authoritative implementation of the APP bundle exchange format (manifest
 // digests, chain walk, anchor adjudication), and `submitDelegation` must
@@ -244,6 +254,16 @@ export interface VerifyOptions {
    * was proven, not only that something was.
    */
   readonly claim?: string
+  /**
+   * v0.21: price this run. When supplied, the outcome carries an `economics`
+   * block — the run's ledger (compute spent, assertions bought, per-dollar
+   * efficiency) plus the claim-probability trajectory the scheduler moved it
+   * through. Absent = absent: the outcome's shape without the option is
+   * unchanged, so consumers that never asked see nothing new. The rate card
+   * is validated at the verb boundary BEFORE any check runs — a negative
+   * price must refuse the run, not silently price it backwards.
+   */
+  readonly economics?: { readonly rate: RateCard }
 }
 
 export interface VerifyOutcome {
@@ -306,6 +326,22 @@ export interface VerifyOutcome {
   readonly scriptDrift?: readonly string[]
   /** H5②: baseline checks whose definitions vanished from discovery. */
   readonly vanished?: readonly string[]
+  /**
+   * v0.21: what this run cost and what it bought — present exactly when the
+   * caller supplied `economics.rate`. `ledger` prices the run (compute ms,
+   * assertions, per-dollar efficiency over the records THIS run produced);
+   * `priorProbability`/`posteriorProbability` are the bayesian scheduler's
+   * session-start (Π priors) and final (Π factors) claim probabilities —
+   * `null` on the whole-batch path, where the confidence number is
+   * display-only and no wave plan certified anything (`verifyContract`'s
+   * machine path is the one exception: its posterior is the final, possibly
+   * attestation-fused confidence the verdict rode on).
+   */
+  readonly economics?: {
+    readonly ledger: RunLedger
+    readonly priorProbability: number | null
+    readonly posteriorProbability: number | null
+  }
 }
 
 /**
@@ -1351,6 +1387,9 @@ export class ProofEngine {
 
   /** Re-run the checks this change set made stale, and grade the claim. */
   async verify(options: VerifyOptions = {}): Promise<VerifyOutcome> {
+    // v0.21: refuse a backwards price card BEFORE anything runs — a run whose
+    // ledger would lie about its own cost is worse than no ledger at all.
+    if (options.economics !== undefined) this.assertRateCard(options.economics.rate, 'verify')
     // M7: verification judges the workspace as it is now — a check added
     // since the last verb must be in the pool this run, or it would neither
     // run nor block the grade.
@@ -1431,15 +1470,26 @@ export class ProofEngine {
     const records: Evidence[] = []
     let schedule: VerifyOutcome['schedule']
     let confidence: ConfidenceInput | undefined
+    // v0.21: the ledger's inputs, filled by whichever regime ran. The
+    // whole-batch path prices NO probability trajectory (its confidence is
+    // display-only — grading stayed binary), so its prior/posterior stay
+    // null while the per-check factors still ride the ledger.
+    let ledgerPriors: ReadonlyMap<string, CheckPrior> | undefined
+    let priorProbability: number | null = null
+    let posteriorProbability: number | null = null
     if (bayesian && runSet.length > 0) {
       const plan = await this.runBayesianSchedule(runSet, changed, graph, snapshot, options, coverageDir, scriptDrifted)
       records.push(...plan.records)
       schedule = plan.schedule
       confidence = plan.confidence
+      ledgerPriors = plan.priors
+      priorProbability = plan.priorProbability
+      posteriorProbability = plan.posteriorProbability
     } else {
       // Priors must snapshot the log BEFORE this run appends to it — history
       // is what the check brought to the table, not what it did just now.
       const priors = await this.priorsFor(runSet, changed, graph, scriptDrifted)
+      ledgerPriors = runSet.length > 0 ? priors : undefined
       const batch = await this.runner.run(runSet, {
         concurrency: this.options.concurrency,
         totalBudgetMs: this.options.verifyBudgetMs,
@@ -1491,6 +1541,24 @@ export class ProofEngine {
 
     // M19b: what the caller claims this run proves, when they said so.
     const claimText = markerText(options.claim)
+    // v0.21: the ledger, when the caller asked to price the run — computed
+    // before the boundary marker so the chain carries the price (E3's
+    // proof_economics replays it from here). Caliber of `humanReviewItems`:
+    // plain verify() fuses NO testimony (v0.9 semantics are locked —
+    // attestations never touch this verb's grade or confidence), so the
+    // honest count of B/C witnesses consumed by THIS judgment is zero.
+    // (verifyContract is where witnesses actually fuse; its ledger counts
+    // them there.)
+    const economics = options.economics !== undefined
+      ? this.runEconomics(
+        options.economics.rate,
+        collected.records,
+        this.ledgerFactorsOf(ledgerPriors, confidence?.factors),
+        priorProbability,
+        posteriorProbability,
+        0,
+      )
+      : undefined
     await this.store.mark('proof/verified', {
       grade: report.grade, root: report.root, changed: changed.length,
       attribution: attribution.method,
@@ -1517,12 +1585,16 @@ export class ProofEngine {
       ...(scriptDrifted.size > 0 ? { scriptDrift: [...scriptDrifted].sort() } : {}),
       // H5②: which anchored checks lost their definitions — same visibility.
       ...(vanished.length > 0 ? { vanished } : {}),
+      // v0.21: the priced run rides the marker — a priced run is a chain
+      // fact (proof_economics replays exactly these bytes).
+      ...(economics !== undefined ? { economics } : {}),
     })
     // Every claim-grade boundary closes the checkpoint window.
     await this.store.checkpoint()
     return {
       report, checks, selection, changed, attribution,
       ...(degraded ? { degraded: true as const } : {}),
+      ...(economics !== undefined ? { economics } : {}),
       ...(schedule !== undefined ? { schedule } : {}),
       ...(collected.summary !== undefined
         ? {
@@ -1573,6 +1645,9 @@ export class ProofEngine {
    */
   async verifyContract(options: ContractVerifyOptions): Promise<ContractVerifyOutcome> {
     const { contract, ...rest } = options
+    // v0.21: same boundary rule as verify() — a malformed price card refuses
+    // the verb before any path (jury or machine) spends anything.
+    if (rest.economics !== undefined) this.assertRateCard(rest.economics.rate, 'verifyContract')
     // M7: a claim verdict re-discovers, exactly like plain verify() — the
     // obligations are judged against the workspace's current check pool.
     const specs = await this.loadChecks(true)
@@ -1640,12 +1715,20 @@ export class ProofEngine {
         unmet: verdict.obligations.filter(o => !o.met).map(o => o.id),
       })
       await this.store.checkpoint()
+      // v0.21: a docs-only verdict consumed no machine compute and no B/C
+      // testimony (the self-attestation cap is the author's own, priced as
+      // such by being left out of `humanReviewItems`), so its ledger prices
+      // an honest zero and no factor trajectory exists.
+      const economics = rest.economics !== undefined
+        ? this.runEconomics(rest.economics.rate, [], undefined, null, null, 0)
+        : undefined
       return {
         report,
         checks: [],
         selection,
         changed,
         attribution,
+        ...(economics !== undefined ? { economics } : {}),
         contract: {
           kind: verdict.kind,
           obligations: verdict.obligations,
@@ -1746,12 +1829,21 @@ export class ProofEngine {
               }),
       })
       await this.store.checkpoint()
+      // v0.21: llm-jury consumed no machine compute, but its judge IS the
+      // chain's active testimony — `humanReviewItems` counts exactly the B/C
+      // witnesses this verdict rested on. No factor model ran, so the
+      // probability trajectory stays null (the fused product is testimony
+      // arithmetic, not a scheduler posterior).
+      const economics = rest.economics !== undefined
+        ? this.runEconomics(rest.economics.rate, [], undefined, null, null, active.length)
+        : undefined
       return {
         report,
         checks: [],
         selection,
         changed,
         attribution,
+        ...(economics !== undefined ? { economics } : {}),
         contract: {
           kind: verdict.kind,
           obligations: verdict.obligations,
@@ -1913,7 +2005,13 @@ export class ProofEngine {
     // they were: no witness unlocks a regressed claim. Plain `verify()` never
     // consults attestations at all (v0.9 semantics locked).
     const claimActive = attestationsFor(await this.activeAttestationsAll(), claimIdOf(contract.claim))
+    // v0.21: the ledger's `humanReviewItems` counts the B/C witnesses that
+    // actually fused into this verdict's confidence — zero when no active
+    // witness exists or the machine run earned no confidence number to fuse
+    // into, `claimActive.length` when the fusion loop below ran.
+    let consumedWitnesses = 0
     if (claimActive.length > 0 && graded.confidence !== undefined) {
+      consumedWitnesses = claimActive.length
       let fused = graded.confidence
       for (const att of claimActive) fused = fuseConfidence(fused, att, this.trustWeights)
       const machineDecisive = batch.records.some(r => isDecisiveStatus(r.status))
@@ -1962,6 +2060,22 @@ export class ProofEngine {
     // M19b: the caller's claim text for this verdict, when supplied — the
     // contract's own claim already lives in the attest/jury markers.
     const claimText = markerText(rest.claim)
+    // v0.21: the machine path's ledger. `posteriorProbability` is the FINAL
+    // confidence — the machine product after the κ fusion above (the number
+    // the grade actually rode on); the whole-batch regime has no scheduler
+    // prior product, so `priorProbability` stays null. Per-check factors ride
+    // the ledger from the same priors/updateFactors pair verify()'s 'set'
+    // path uses.
+    const economics = rest.economics !== undefined
+      ? this.runEconomics(
+        rest.economics.rate,
+        collected.records,
+        this.ledgerFactorsOf(runSpecs.length > 0 ? priors : undefined, confidence?.factors),
+        null,
+        typeof graded.confidence === 'number' ? graded.confidence : null,
+        consumedWitnesses,
+      )
+      : undefined
     await this.store.mark('proof/verified', {
       grade: graded.grade,
       root: graded.root,
@@ -1994,6 +2108,7 @@ export class ProofEngine {
       changed,
       attribution,
       ...(degraded ? { degraded: true as const } : {}),
+      ...(economics !== undefined ? { economics } : {}),
       ...(collected.summary !== undefined
         ? {
             coverage: {
@@ -2014,6 +2129,94 @@ export class ProofEngine {
         // κ: the fused-in witnesses, for hosts surfacing who vouched.
         ...(claimActive.length > 0 ? { attestations: this.attestationSummary(claimActive) } : {}),
       },
+    }
+  }
+
+  // -- SLA pricing (v0.21) --------------------------------------------------
+
+  /**
+   * v0.21: price one proof grade as a service-level agreement — what it would
+   * cost to underwrite "this claim holds" at the confidence the evidence
+   * reached. The pricing itself is `core/economics.ts`'s (`priceSla`); the
+   * engine owns the boundary and the chain:
+   *
+   * - input defense FIRST — grade (the `ProofGrade` vocabulary, by value),
+   *   confidence (a probability, [0,1]) and the rate card (non-negative
+   *   prices) are validated before anything is priced or written, so a
+   *   refused quote leaves the chain untouched;
+   * - the FULL quote lands as an `economics/quote` marker — a price that
+   *   cannot be audited is a number, not a quote, and the quote's own bytes
+   *   are the auditable thing (premium inputs, decision, exclusions, terms);
+   * - determinism is the pricing module's: the same inputs mint the same
+   *   `quoteId`, so a re-quote is detectable as one, never mistaken for a
+   *   re-price. The returned `marker: true` tag says the quote is on-chain;
+   *   the marker payload is the quote verbatim.
+   */
+  async slaQuote(input: {
+    /** The grade being priced — must be one of the `ProofGrade` vocabulary. */
+    readonly grade: ProofGrade
+    /** The confidence the evidence reached; omit for the grade's own default. */
+    readonly confidence?: number
+    /** What a breach would cost the underwriter, in `rate.currency`. */
+    readonly coverageAmount: number
+    readonly rate: RateCard
+    readonly deductible?: number
+    readonly minPremium?: number
+  }): Promise<SlaQuote & { marker: true }> {
+    if (typeof input.grade !== 'string' || !DELEGATION_GRADES.has(input.grade)) {
+      throw new Error(`slaQuote: grade must be one of ${[...DELEGATION_GRADES].join(' | ')} — got ${JSON.stringify(input.grade)}`)
+    }
+    if (input.confidence !== undefined
+      && (typeof input.confidence !== 'number' || !Number.isFinite(input.confidence)
+        || input.confidence < 0 || input.confidence > 1)) {
+      throw new Error('slaQuote: confidence must be a finite number in [0, 1] when provided')
+    }
+    if (typeof input.coverageAmount !== 'number' || !Number.isFinite(input.coverageAmount) || input.coverageAmount <= 0) {
+      throw new Error('slaQuote: coverageAmount must be a finite positive number')
+    }
+    if (input.deductible !== undefined
+      && (typeof input.deductible !== 'number' || !Number.isFinite(input.deductible) || input.deductible < 0)) {
+      throw new Error('slaQuote: deductible must be a finite non-negative number when provided')
+    }
+    if (input.minPremium !== undefined
+      && (typeof input.minPremium !== 'number' || !Number.isFinite(input.minPremium) || input.minPremium < 0)) {
+      throw new Error('slaQuote: minPremium must be a finite non-negative number when provided')
+    }
+    this.assertRateCard(input.rate, 'slaQuote')
+    const quote = priceSla({
+      grade: input.grade,
+      ...(input.confidence !== undefined ? { confidence: input.confidence } : {}),
+      coverageAmount: input.coverageAmount,
+      rate: input.rate,
+      ...(input.deductible !== undefined ? { deductible: input.deductible } : {}),
+      ...(input.minPremium !== undefined ? { minPremium: input.minPremium } : {}),
+    })
+    await this.store.mark('economics/quote', { ...quote })
+    return { ...quote, marker: true as const }
+  }
+
+  /**
+   * v0.21: rate-card defense shared by every economics-wired verb. A price
+   * card is host input at a trust boundary, so it is refused BY VALUE —
+   * currency must be the one the ledger speaks, and every rate must be a
+   * finite non-negative number. Negative prices are not "discounts": a
+   * negative computePerMs makes spending money REDUCE cost, and a negative
+   * humanReviewPerItem pays the ledger for consuming review.
+   */
+  private assertRateCard(rate: RateCard, verb: string): void {
+    if (rate === null || typeof rate !== 'object') {
+      throw new Error(`${verb}: rate must be a RateCard object { currency, computePerMs, humanReviewPerItem? }`)
+    }
+    if (rate.currency !== 'USD') {
+      throw new Error(`${verb}: rate.currency must be 'USD' — got ${JSON.stringify(rate.currency)}`)
+    }
+    if (typeof rate.computePerMs !== 'number' || !Number.isFinite(rate.computePerMs) || rate.computePerMs < 0) {
+      throw new Error(`${verb}: rate.computePerMs must be a finite non-negative number`)
+    }
+    if (rate.humanReviewPerItem !== undefined
+      && (typeof rate.humanReviewPerItem !== 'number' || !Number.isFinite(rate.humanReviewPerItem)
+        || rate.humanReviewPerItem < 0)) {
+      throw new Error(`${verb}: rate.humanReviewPerItem must be a finite non-negative number when provided`)
     }
   }
 
@@ -2948,13 +3151,34 @@ export class ProofEngine {
     coverageDir?: string,
     /** H5: drifted checks, priced at the synthetic tier inside `priorsFor`. */
     drifted?: ReadonlySet<string>,
-  ): Promise<{ records: Evidence[]; schedule: NonNullable<VerifyOutcome['schedule']>; confidence: ConfidenceInput }> {
+  ): Promise<{
+    records: Evidence[]
+    schedule: NonNullable<VerifyOutcome['schedule']>
+    confidence: ConfidenceInput
+    /**
+     * v0.21: the claim probability at session start — Π priors over the plan,
+     * snapshotted before wave one (the same `claimProbability` arithmetic the
+     * stop conditions use, so the ledger's "before" and the scheduler's own
+     * baseline are one number, not two that can drift).
+     */
+    priorProbability: number
+    /**
+     * v0.21: the FINAL claim probability — Π final factors (posteriors for
+     * decisive checks, priors for everything the plan left resting). This is
+     * exactly the number the report's `confidence` carries, by construction.
+     */
+    posteriorProbability: number
+    /** v0.21: the plan's priors, for the ledger's per-check {prior, posterior} factors. */
+    priors: ReadonlyMap<string, CheckPrior>
+  }> {
     const priors = await this.priorsFor(affected, changed, graph, drifted)
     const target = this.options.certifyTarget
     const specById = new Map(affected.map(c => [c.id, c] as const))
     const factors = new Map<string, number>()
     for (const prior of priors.values()) factors.set(prior.checkId, prior.priorHealthy)
     const model: ClaimModel = { factors }
+    // v0.21: the "before" number, priced once, before any wave can move it.
+    const priorProbability = claimProbability(model)
     const pending = new Map<string, CheckPrior>(priors)
 
     const records: Evidence[] = []
@@ -3069,6 +3293,13 @@ export class ProofEngine {
       records,
       schedule: { mode: 'bayesian' as const, waves, stoppedEarly, skippedByPlan },
       confidence: { target, factors, runCheckIds, skippedByPlan },
+      // v0.21: the trajectory the wave plan moved the claim through — from
+      // the Π-priors snapshot above to the final factor product. (Equal to
+      // the report's `confidence`, which `assembleProof` derives from the
+      // same final factor map.)
+      priorProbability,
+      posteriorProbability: claimProbability(model),
+      priors,
     }
   }
 
@@ -3134,6 +3365,63 @@ export class ProofEngine {
       }
     }
     return { target: this.options.certifyTarget, factors, runCheckIds, skippedByPlan: [] }
+  }
+
+  /**
+   * v0.21: per-check {prior, posterior} pairs for the run ledger — assembled
+   * from the priors the run priced (`priorsFor`) and the FINAL factor map
+   * (`runBayesianSchedule`'s live model, or `updateFactors`' fold on the
+   * whole-batch path — both leave a posterior for decisive checks and the
+   * prior for everything else). Only checkIds present in BOTH maps ride: a
+   * factor without a prior cannot speak to what was purchased, and a prior
+   * without a factor says the run never modeled it. Sorted for ledger
+   * determinism (content-addressing discipline: these numbers are quotable).
+   */
+  private ledgerFactorsOf(
+    priors: ReadonlyMap<string, CheckPrior> | undefined,
+    finalFactors: ReadonlyMap<string, number> | undefined,
+  ): ReadonlyArray<{ checkId: string; prior: number; posterior: number }> | undefined {
+    if (priors === undefined || finalFactors === undefined) return undefined
+    const out: { checkId: string; prior: number; posterior: number }[] = []
+    for (const checkId of [...priors.keys()].sort()) {
+      const prior = priors.get(checkId)
+      const posterior = finalFactors.get(checkId)
+      if (prior === undefined || posterior === undefined) continue
+      out.push({ checkId, prior: prior.priorHealthy, posterior })
+    }
+    return out.length > 0 ? out : undefined
+  }
+
+  /**
+   * v0.21: assemble one run's economics block — the ledger plus the
+   * probability trajectory it was handed. The records are THIS run's own
+   * (the caller passes the coverage-enriched set the chain actually holds);
+   * `humanReviewItems` counts the B/C witnesses the consuming verdict
+   * actually fused (0 for plain `verify`, whose v0.9 semantics consult no
+   * testimony); null probabilities are OMITTED from the ledger input rather
+   * than passed as null, so the core's optional fields keep meaning "this
+   * run has no such number", not "this run has a null one".
+   */
+  private runEconomics(
+    rate: RateCard,
+    records: readonly Evidence[],
+    factors: ReadonlyArray<{ checkId: string; prior: number; posterior: number }> | undefined,
+    priorProbability: number | null,
+    posteriorProbability: number | null,
+    humanReviewItems: number,
+  ): NonNullable<VerifyOutcome['economics']> {
+    return {
+      ledger: summarizeRunLedger({
+        records,
+        rate,
+        ...(factors !== undefined ? { factors } : {}),
+        ...(priorProbability !== null ? { priorProbability } : {}),
+        ...(posteriorProbability !== null ? { posteriorProbability } : {}),
+        humanReviewItems,
+      }),
+      priorProbability,
+      posteriorProbability,
+    }
   }
 
   /**

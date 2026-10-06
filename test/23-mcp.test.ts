@@ -3,12 +3,15 @@
  *
  * Spawns `node --experimental-strip-types src/app/mcp-entry.ts` against a
  * minimal real npm project and drives it over newline-delimited JSON-RPC 2.0
- * on stdio: the handshake, the eleven-tool APP/1.3 contract, a real baseline →
+ * on stdio: the handshake, the thirteen-tool APP/1.4 contract, a real baseline →
  * verify → status → bundle → publish → log-verify chain, then the v0.19
  * responsibility DAG end to end (delegate → task overview/detail → honest
  * bundle submit → forged bundle refusal), then the v0.20 training-export
  * valve (private default with no samples on the wire, full + path writing the
- * JSONL dataset to disk, the loud enum refusal) — real `npm test`, real
+ * JSONL dataset to disk, the loud enum refusal), then the v0.21
+ * verification-economics pair (the SLA quote's offer/denied doors over the
+ * real engine, and proof_economics' honest absence until a rate-carrying
+ * verification lands a ledger on the chain) — real `npm test`, real
  * evidence, real Ed25519 chain, real transparency log — and the error paths
  * (unknown tool, bogus claim kind, malformed JSON line). Nothing is stubbed —
  * this is the test that proves any foreign harness can drive the proof
@@ -35,13 +38,15 @@ const WORKSPACE = join(fileURLToPath(new URL('../../../.openclaw/tmp', import.me
 
 // v0.18 (APP/1.1): the transparency-log tools joined the frozen contract;
 // v0.19 (APP/1.2): the responsibility-DAG tools took it to ten; v0.20
-// (APP/1.3): the training-export tool takes it to eleven — appended in order
+// (APP/1.3): the training-export tool took it to eleven; v0.21 (APP/1.4):
+// the verification-economics tools take it to thirteen — appended in order
 // so every earlier dialect's prefix is unchanged.
 const MCP_TOOLS = [
   'proof_status', 'proof_baseline', 'proof_verify', 'proof_claim', 'proof_bundle',
   'proof_publish', 'proof_log_verify',
   'proof_delegate', 'proof_delegate_submit', 'proof_task',
   'proof_training_export',
+  'proof_economics', 'proof_sla_quote',
 ] as const
 
 const CHECK_SCRIPT = [
@@ -207,7 +212,7 @@ test('initialize handshake answers with the server identity and a supported prot
     serverInfo: { name: string; version: string }
   }
   assert.equal(result.serverInfo.name, 'agent-proof-protocol')
-  assert.equal(result.serverInfo.version, '0.20.0')
+  assert.equal(result.serverInfo.version, '0.21.0')
   assert.equal(result.protocolVersion, '2025-06-18', 'a requested supported version is echoed back')
   assert.equal(result.capabilities.tools.listChanged, false)
 })
@@ -233,7 +238,7 @@ test('notifications/initialized produces no reply and ping answers an empty resu
   assert.deepEqual(pong.result, {})
 })
 
-test('tools/list exposes exactly the eleven APP/1.3 contract tools', async () => {
+test('tools/list exposes exactly the thirteen APP/1.4 contract tools', async () => {
   const response = await client.request('tools/list', {})
   assert.equal(response.error, undefined)
   const tools = (response.result as {
@@ -242,7 +247,7 @@ test('tools/list exposes exactly the eleven APP/1.3 contract tools', async () =>
   assert.deepEqual(
     tools.map(t => t.name).sort(),
     [...MCP_TOOLS].sort(),
-    'the cross-agent contract is exactly eleven tools',
+    'the cross-agent contract is exactly thirteen tools',
   )
   for (const tool of tools) {
     assert.equal(tool.inputSchema.type, 'object', `${tool.name} inputSchema must be an object schema`)
@@ -282,6 +287,54 @@ test('tools/list exposes exactly the eleven APP/1.3 contract tools', async () =>
   assert.deepEqual(trainingProps?.fidelity?.enum, ['full', 'private'])
   assert.equal(trainingProps?.fidelity?.default, 'private', 'the privacy default is pinned in the schema itself')
   assert.deepEqual(trainingProps?.provenanceFilter?.enum, ['agent-only', 'all'])
+  // v0.21: the verification-economics pair's parameter faces — the economics
+  // query demands a real rate card (computePerMs required), and the quote
+  // speaks the five-grade scale with a USD-only currency enum and no required
+  // pricing knobs beyond the grade and the coverage.
+  const economics = tools.find(t => t.name === 'proof_economics')!
+  assert.deepEqual(
+    (economics.inputSchema as { required?: string[] }).required,
+    ['computePerMs'],
+    'the rate card\'s compute price is the one required argument',
+  )
+  const economicsProps = (economics.inputSchema as {
+    properties?: Record<string, { type?: string; exclusiveMinimum?: number }>
+  }).properties
+  assert.equal(economicsProps?.computePerMs?.type, 'number')
+  assert.equal(economicsProps?.computePerMs?.exclusiveMinimum, 0, 'a zero-or-negative rate is refused by the schema itself')
+  assert.equal(economicsProps?.humanReviewPerItem?.type, 'number')
+  const sla = tools.find(t => t.name === 'proof_sla_quote')!
+  assert.deepEqual(
+    ((sla.inputSchema as { required?: string[] }).required ?? []).slice().sort(),
+    ['coverageAmount', 'grade'],
+  )
+  const slaProps = (sla.inputSchema as {
+    properties?: Record<string, { type?: string; enum?: string[]; minimum?: number; maximum?: number; exclusiveMinimum?: number }>
+  }).properties
+  assert.deepEqual(slaProps?.grade?.enum, ['proven', 'regressed', 'stale', 'unproven', 'no-baseline'])
+  assert.equal(slaProps?.coverageAmount?.type, 'number')
+  assert.equal(slaProps?.coverageAmount?.exclusiveMinimum, 0)
+  assert.equal(slaProps?.confidence?.type, 'number')
+  assert.equal(slaProps?.confidence?.minimum, 0)
+  assert.equal(slaProps?.confidence?.maximum, 1)
+  assert.deepEqual(slaProps?.currency?.enum, ['USD'], 'only USD is priced — a singleton enum, not a free string')
+  assert.equal(slaProps?.deductible?.type, 'number')
+  assert.equal(slaProps?.minPremium?.type, 'number')
+  // And the economics description does its one navigational job: it tells a
+  // caller with no ledger on the chain exactly how to mint one — v0.21 closed
+  // the seam: proof_verify itself accepts the rate card on this MCP face.
+  assert.ok(
+    economics.description.includes('economics: {computePerMs, humanReviewPerItem?}'),
+    'the description names the rate-carrying verify entry point that mints a ledger',
+  )
+  // The seam it names must actually exist: proof_verify's schema carries the
+  // economics rate card with computePerMs required.
+  const verify = tools.find(t => t.name === 'proof_verify')!
+  const verifyEconomics = (verify.inputSchema as {
+    properties?: Record<string, { type?: string; required?: string[] }>
+  }).properties?.economics
+  assert.equal(verifyEconomics?.type, 'object', 'proof_verify prices the run when asked')
+  assert.deepEqual(verifyEconomics?.required, ['computePerMs'])
 })
 
 test('an unknown method is a JSON-RPC -32601 error', async () => {
@@ -357,7 +410,7 @@ test('proof_bundle exports a manifest that digests the evidence log', async () =
     }
   }
   assert.ok(value.bundle !== undefined, 'a small bundle rides the response in full')
-  assert.equal(value.bundle.manifest.protocol, 'APP/1.3')
+  assert.equal(value.bundle.manifest.protocol, 'APP/1.4')
   const entry = value.bundle.manifest.files.find(f => f.path === 'evidence.jsonl')
   assert.ok(entry !== undefined, 'the manifest digests evidence.jsonl')
   assert.match(entry.sha256, /^[0-9a-f]{64}$/)
@@ -593,7 +646,7 @@ test('proof_task before any submission: the overview lists the DAG, the parent c
 
 test('proof_delegate_submit with an honestly minted worker bundle composes the obligation proven', async () => {
   const bundle = await mintWorkerBundle()
-  assert.equal(bundle.manifest.protocol, 'APP/1.3', 'the worker exports the current dialect')
+  assert.equal(bundle.manifest.protocol, 'APP/1.4', 'the worker exports the current dialect')
 
   // The child submits: a green baseline+verify chain minted into a bundle,
   // with no grade claimed — the derivation must earn 'proven' on its own.
@@ -749,6 +802,126 @@ test('proof_training_export refuses an unintelligible fidelity loudly, never sil
 })
 
 // ---------------------------------------------------------------------------
+// v0.21 (APP/1.4): the verification-economics pair over the real subprocess.
+// proof_sla_quote prices what a grade leaves undetected through the engine's
+// own underwriting verb (offer / denied / manual-underwriting, exclusions, a
+// chain-addressed quoteId); proof_economics reads ledgers back off the chain
+// — and this MCP face deliberately never runs a rate-carrying verification
+// (proof_verify's parameter surface stays minimal), so the honest answer
+// until one lands is the pinned no-ledger error.
+// ---------------------------------------------------------------------------
+
+test('proof_sla_quote prices a proven grade: coverage 10000 at confidence 0.97 costs exactly 300', async () => {
+  const result = await callTool('proof_sla_quote', { grade: 'proven', confidence: 0.97, coverageAmount: 10000 })
+  assert.equal(result.isError, undefined, `quote errored: ${result.content[0]?.text}`)
+  const quote = result.structuredContent as {
+    quoteId?: string
+    vehicle?: string
+    grade?: string
+    confidenceAtIssue?: number | null
+    decision?: { class?: string; premium?: number; pUndetected?: number; deductible?: number; coverageAmount?: number; reason?: unknown }
+    exclusions?: unknown[]
+    currency?: string
+    marker?: boolean
+  }
+  // The pure risk-pricing identity, pinned to the money spec: premium is
+  // exactly coverageAmount × (1 − confidence) — not the float-noise
+  // 300.0000000000003 a naive implementation would emit, and not a penny
+  // more or less.
+  const decision = quote.decision
+  assert.equal(decision?.class, 'offer', `a proven grade earns an offer: ${JSON.stringify(quote.decision)}`)
+  assert.equal(decision?.premium, 300, 'premium = 10000 × (1 − 0.97), rounded to the money spec — exactly 300')
+  assert.equal(typeof decision?.pUndetected, 'number', 'the offer names the residual risk it priced')
+  assert.ok(Math.abs(decision!.pUndetected! - 0.03) < 1e-9, 'pUndetected is the 1 − confidence residual (≈ 0.03)')
+  assert.equal(typeof decision?.deductible, 'number', 'the offer carries the deductible it was written with')
+  assert.equal(decision?.coverageAmount, 10000, 'the offer carries the coverage verbatim')
+  assert.equal(quote.confidenceAtIssue, 0.97, 'the quote records the confidence it was priced at')
+  assert.equal(quote.grade, 'proven')
+  assert.equal(quote.currency, 'USD', 'the only priced currency, stamped on the quote itself')
+  // The policy's fine print is a first-class part of the quote: the known
+  // blind spots ride out as an exclusions list, never as prose.
+  assert.ok(Array.isArray(quote.exclusions), 'exclusions is an array — the blind spots, itemized')
+  assert.ok((quote.exclusions ?? []).length > 0, 'a real quote always excludes something — an empty list would claim omniscience')
+  for (const exclusion of quote.exclusions ?? []) {
+    assert.equal(typeof exclusion, 'string', 'each exclusion is quotable text')
+  }
+  // And the quote is chain-addressable: quoteId is the 16-hex short form of a
+  // sha256 over the quote's own pricing content (the same shape workspaceKey
+  // uses), and the marker tag says it landed on the evidence chain.
+  assert.match(quote.quoteId ?? '', /^[0-9a-f]{16}$/, 'quoteId is a 16-hex short digest')
+  assert.equal(quote.marker, true, 'the quote is on-chain — a price that cannot be audited is a number, not a quote')
+})
+
+test('proof_sla_quote refuses a regressed grade honestly — denied, with the reason on the record', async () => {
+  const result = await callTool('proof_sla_quote', { grade: 'regressed', confidence: 0.9, coverageAmount: 5000 })
+  assert.equal(result.isError, undefined, `a refusal is a QUOTE (denied), not a tool error: ${result.content[0]?.text}`)
+  const quote = result.structuredContent as {
+    decision?: { class?: string; premium?: unknown; reason?: unknown }
+  }
+  const decision = quote.decision
+  assert.equal(decision?.class, 'denied', `a regressed grade is refused: ${JSON.stringify(quote.decision)}`)
+  assert.ok(typeof decision?.reason === 'string' && (decision!.reason as string).length > 0,
+    'the denial carries a reason — an insurer that refuses silently is indistinguishable from one that crashed')
+  assert.equal(decision?.premium, undefined, 'a denied grade is never quietly priced as an offer')
+
+  // And the third door, named for completeness: a stale grade is neither
+  // priced nor refused — the evidence is not decisive enough to price
+  // mechanically, so a human underwriter takes over.
+  const stale = await callTool('proof_sla_quote', { grade: 'stale', coverageAmount: 1000 })
+  assert.equal(stale.isError, undefined)
+  const staleDecision = (stale.structuredContent as { decision?: { class?: string; reason?: unknown } }).decision
+  assert.equal(staleDecision?.class, 'manual-underwriting', 'a stale grade goes to a human, never to a formula')
+  assert.ok(typeof staleDecision?.reason === 'string' && (staleDecision!.reason as string).length > 0)
+})
+
+test('proof_sla_quote refuses malformed usage loudly — grade, coverage, currency', async () => {
+  // A grade the five-value scale does not name is refused, never guessed at.
+  const bogusGrade = await callTool('proof_sla_quote', { grade: 'over-the-moon', coverageAmount: 100 })
+  assert.equal(bogusGrade.isError, true)
+  const gradeText = bogusGrade.content[0]!.text
+  assert.match(gradeText, /grade/, 'the error names the offending argument')
+  assert.match(gradeText, /over-the-moon/, 'the error echoes the offending value')
+  assert.ok(!gradeText.includes('"proven"'), 'the answer must not read like a quote')
+
+  // A non-positive coverage amount prices nothing honestly.
+  const negative = await callTool('proof_sla_quote', { grade: 'proven', coverageAmount: -5 })
+  assert.equal(negative.isError, true)
+  assert.match(negative.content[0]!.text, /coverageAmount/, 'the error names the offending argument')
+
+  // Only USD is priced: a foreign currency is refused, never converted at a
+  // rate nobody agreed to.
+  const foreign = await callTool('proof_sla_quote', { grade: 'proven', coverageAmount: 100, currency: 'EUR' })
+  assert.equal(foreign.isError, true)
+  const currencyText = foreign.content[0]!.text
+  assert.match(currencyText, /currency/, 'the error names the offending argument')
+  assert.match(currencyText, /EUR/, 'the error echoes the offending value')
+  assert.ok(currencyText.includes('USD'), 'the error names the only priced currency')
+})
+
+test('proof_economics honestly reports the absent ledger — with the exact remedy pinned', async () => {
+  // This MCP face never runs a rate-carrying verification (proof_verify's
+  // parameter surface stays minimal by design), and no earlier test minted a
+  // ledger, so the chain holds no economics: the honest answer is the pinned
+  // absence — never a fabricated ledger, never a recomputation.
+  const result = await callTool('proof_economics', { computePerMs: 0.001 })
+  assert.equal(result.isError, true, 'no ledger on the chain is a tool error, not an empty quote')
+  const text = result.content[0]!.text
+  assert.ok(
+    text.includes('no economics on the last run — pass economics:{rate} to proof_verify/proof_claim first'),
+    `the absence is pinned verbatim, remedy included: ${text}`,
+  )
+
+  // The rate card guard is this face's own, priced against nothing: a missing
+  // or non-positive compute price is refused now, not on the next run.
+  const noRate = await callTool('proof_economics', {})
+  assert.equal(noRate.isError, true, 'computePerMs is required — the card you ask under must be a card')
+  assert.match(noRate.content[0]!.text, /computePerMs/, 'the error names the offending argument')
+  const zeroRate = await callTool('proof_economics', { computePerMs: 0 })
+  assert.equal(zeroRate.isError, true, 'a zero rate prices time backwards — refused loudly')
+  assert.match(zeroRate.content[0]!.text, /computePerMs/)
+})
+
+// ---------------------------------------------------------------------------
 // error paths
 // ---------------------------------------------------------------------------
 
@@ -794,4 +967,29 @@ test('a malformed JSON line gets a -32700 JSON-RPC error response', async () => 
   const message = JSON.parse(line) as { id: unknown; error: { code: number; message: string } }
   assert.equal(message.error.code, -32700)
   assert.equal(message.id, null, 'a parse error answers with id null — the line carried none')
+})
+
+test('a priced verify mints a ledger proof_economics replays verbatim off the chain', async () => {
+  // v0.21 seam closure: proof_verify accepts the rate card directly on this
+  // MCP face, the ledger rides the boundary marker, and proof_economics
+  // replays those bytes — pricing is a chain fact, not a caller's word.
+  const priced = await callTool('proof_verify', {
+    changed: ['check.mjs'],
+    economics: { computePerMs: 0.001 },
+  }, 60_000)
+  assert.equal(priced.isError, undefined, 'a priced verify succeeds')
+
+  const replay = await callTool('proof_economics', { computePerMs: 0.001 }, 60_000)
+  assert.equal(replay.isError, undefined, 'the ledger is on the chain and replays')
+  const replayed = (replay.structuredContent ?? {}) as {
+    economics?: { ledger?: { computeMs?: number; cost?: number; assertions?: number } }
+  }
+  const ledger = replayed.economics?.ledger
+  assert.ok(typeof ledger?.computeMs === 'number' && ledger.computeMs >= 0)
+  // 0.001 USD per ms: cost must equal computeMs × rate at the 6-decimal spec.
+  assert.ok(ledger!.cost !== undefined)
+  assert.ok(Math.abs(ledger!.cost! - ledger!.computeMs! * 0.001) < 1e-6,
+    'the replayed price is exactly the measured compute at the stated rate')
+  assert.ok(typeof ledger!.assertions === 'number' && ledger!.assertions >= 1,
+    'a decisive run priced its assertions')
 })

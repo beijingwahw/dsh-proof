@@ -8,14 +8,15 @@
  * directly unit-testable) and `runMcpServer` is the thin newline-delimited
  * stdio loop around it.
  *
- * APP/1.3 cross-agent contract: exactly eleven tools — `MCP_TOOLS` below is
+ * APP/1.4 cross-agent contract: exactly thirteen tools — `MCP_TOOLS` below is
  * the frozen list every consumer agrees on. (APP/1.0 spoke five; the §6
  * transparency-log expansion took it to seven with `proof_publish` and
  * `proof_log_verify`; the v0.19 responsibility-DAG expansion took it to ten
  * with `proof_delegate`, `proof_delegate_submit` and `proof_task`; the v0.20
- * training-export expansion took it to eleven with `proof_training_export`.
- * Each bump is what lets an older consumer refuse the wider dialect instead
- * of guessing at it.)
+ * training-export expansion took it to eleven with `proof_training_export`;
+ * the v0.21 verification-economics expansion takes it to thirteen with
+ * `proof_economics` and `proof_sla_quote`. Each bump is what lets an older
+ * consumer refuse the wider dialect instead of guessing at it.)
  *
  * Transport note: MCP stdio is newline-delimited JSON (one JSON-RPC 2.0
  * message per line), NOT LSP-style Content-Length framing. Protocol-level
@@ -45,7 +46,7 @@ import { buildBundle } from './bundle.ts'
 import { GRADE_VALUES } from './protocol.ts'
 
 // ---------------------------------------------------------------------------
-// The APP/1.3 contract — frozen with the other agents. Exactly eleven tools.
+// The APP/1.4 contract — frozen with the other agents. Exactly thirteen tools.
 // ---------------------------------------------------------------------------
 
 export const MCP_TOOLS = [
@@ -59,6 +60,10 @@ export const MCP_TOOLS = [
   // behavior dataset, distilled off the chain. Appended so the APP/1.2 prefix
   // is unchanged for a positional reader.
   'proof_training_export',
+  // v0.21: the verification-economics pair — the cost ledger read back off the
+  // chain's own boundary markers, and the SLA quote that prices what a grade
+  // leaves undetected. Appended so the APP/1.3 prefix is unchanged too.
+  'proof_economics', 'proof_sla_quote',
 ] as const
 
 /** ζ: the five contract kinds `proof_claim` accepts — mirrors dsh/tools.ts's private list. */
@@ -107,7 +112,7 @@ export interface McpServerOptions extends McpEngineDeps {
 // ---------------------------------------------------------------------------
 
 export const MCP_SERVER_NAME = 'agent-proof-protocol'
-export const MCP_DEFAULT_VERSION = '0.20.0'
+export const MCP_DEFAULT_VERSION = '0.21.0'
 
 /**
  * Protocol versions this server speaks, newest first. A client asking for a
@@ -251,6 +256,31 @@ const TRAINING_EXPORT_DESCRIPTION =
   + 'the samples through the engine API. Requires a baseline and at least one verification on the chain (run '
   + 'proof_baseline, then work and proof_verify — the evidence IS the dataset).'
 
+const ECONOMICS_DESCRIPTION =
+  'Read the economics ledger of the most recent verification this workspace ran — WHAT THE PROOF COST, read back '
+  + 'off the tamper-evident evidence chain, never recomputed here and never taken on the caller\'s word. A ledger '
+  + 'exists only when the verification ran WITH a rate card: pass `economics: {computePerMs, humanReviewPerItem?}` '
+  + 'to proof_verify (this MCP face accepts it directly), and the boundary marker records the ledger (computeMs, '
+  + 'cost, assertions, costPerAssertion, purchased confidence, info nats) plus the prior probability it moved '
+  + 'from. This tool then scans the chain and REPLAYS the most recent proof/claim marker that carries one, '
+  + 'verbatim — grade and all. The arguments here are the rate card you are asking under (computePerMs required, '
+  + '> 0; humanReviewPerItem optional): they are validated and echoed, but they price nothing new and change no '
+  + 'future run — this is a PURE QUERY over evidence that already exists. If the chain holds no economics yet, '
+  + 'the error says exactly how to mint one.'
+
+const SLA_QUOTE_DESCRIPTION =
+  'Price a service-level agreement over a verification grade — the INSURANCE reading of what proof leaves '
+  + 'undetected. The premium is pure risk pricing: premium = coverageAmount × (1 − confidence), the expected '
+  + 'loss the run\'s residual risk (`pUndetected` = 1 − confidence) leaves open; the offer carries the '
+  + 'deductible and coverage amount verbatim. Honest underwriting, three doors: a `proven` grade earns an '
+  + 'OFFER; a `regressed` grade is honestly REFUSED (denied — a run that already failed its own baseline is '
+  + 'not a risk to underwrite, and the reason says so); a `stale` grade goes to MANUAL UNDERWRITING (the '
+  + 'evidence is not decisive enough to price mechanically). `exclusions` are the known blind spots written '
+  + 'into the policy as words — what this quote does NOT cover, made part of the contract instead of fine '
+  + 'print. The quote lands on the evidence chain like every other boundary (its `quoteId` addresses it), so a '
+  + 'quoted premium cannot be silently rewritten after the fact. Only USD is priced; `deductible` shifts the '
+  + 'first losses to you; `minPremium` is the smallest premium worth writing at all.'
+
 const MCP_TOOL_LIST: ToolDescriptor[] = [
   {
     name: 'proof_status',
@@ -275,6 +305,18 @@ const MCP_TOOL_LIST: ToolDescriptor[] = [
         },
         all: { type: 'boolean', description: 'Ignore impact analysis and re-run every discovered check.' },
         claim: { type: 'string', description: 'The claim being verified, for the record.' },
+        economics: {
+          type: 'object',
+          description: 'Price this run as it verifies: a rate card (computePerMs required > 0, the USD cost of a '
+            + 'millisecond of verification compute; humanReviewPerItem optional, per human-reviewed item). The '
+            + 'ledger (cost, costPerAssertion, purchased confidence, info nats) rides the boundary marker and is '
+            + 'replayable via proof_economics.',
+          properties: {
+            computePerMs: { type: 'number', description: 'USD per millisecond of verification compute (required, > 0).' },
+            humanReviewPerItem: { type: 'number', description: 'USD per human-reviewed item (B/C testimony), optional.' },
+          },
+          required: ['computePerMs'],
+        },
       },
     },
   },
@@ -462,6 +504,77 @@ const MCP_TOOL_LIST: ToolDescriptor[] = [
       },
     },
   },
+  {
+    name: 'proof_economics',
+    description: ECONOMICS_DESCRIPTION,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        computePerMs: {
+          type: 'number',
+          exclusiveMinimum: 0,
+          description: 'The rate card\'s compute price per millisecond you are asking under — a number > 0. '
+            + 'Required and validated, but priced against nothing here: this tool replays the ledger the last '
+            + 'rate-carrying verification recorded on the chain.',
+        },
+        humanReviewPerItem: {
+          type: 'number',
+          minimum: 0,
+          description: 'Optional price of one human-review item under the same card — echoed with the reply for '
+            + 'the record, never used to re-price the past.',
+        },
+      },
+      required: ['computePerMs'],
+    },
+  },
+  {
+    name: 'proof_sla_quote',
+    description: SLA_QUOTE_DESCRIPTION,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        grade: {
+          type: 'string',
+          enum: ['proven', 'regressed', 'stale', 'unproven', 'no-baseline'],
+          description: 'The verification grade the quote is written against — one of the five-grade scale. The '
+            + 'grade decides the door: proven earns an offer, regressed is honestly denied, stale goes to manual '
+            + 'underwriting.',
+        },
+        coverageAmount: {
+          type: 'number',
+          exclusiveMinimum: 0,
+          description: 'What a failure getting through would cost you, in USD — the sum the policy would pay '
+            + 'against. A number > 0.',
+        },
+        confidence: {
+          type: 'number',
+          minimum: 0,
+          maximum: 1,
+          description: 'The run\'s confidence you are buying cover for, in [0, 1]. The premium prices exactly '
+            + 'the residual: coverageAmount × (1 − confidence).',
+        },
+        currency: {
+          type: 'string',
+          enum: ['USD'],
+          description: 'The quote\'s currency. Only USD is priced today; any other value is refused loudly, '
+            + 'never silently converted.',
+        },
+        deductible: {
+          type: 'number',
+          minimum: 0,
+          description: 'First-loss amount you carry yourself before the policy pays — shifts cheap claims off '
+            + 'the premium. Optional, >= 0.',
+        },
+        minPremium: {
+          type: 'number',
+          minimum: 0,
+          description: 'The smallest premium worth writing at all — an offer below it is not made. Optional, '
+            + '>= 0.',
+        },
+      },
+      required: ['grade', 'coverageAmount'],
+    },
+  },
 ]
 
 // ---------------------------------------------------------------------------
@@ -509,6 +622,27 @@ function stringArray(value: unknown): string[] | undefined {
   return value.filter((entry): entry is string => typeof entry === 'string')
 }
 
+/** v0.21: narrow a tool argument into a rate card; an Error means loud usage failure. */
+function rateCardOf(value: unknown): { currency: 'USD'; computePerMs: number; humanReviewPerItem?: number } | undefined | Error {
+  if (value === undefined) return undefined
+  if (typeof value !== 'object' || value === null) return new Error('economics must be an object {computePerMs, humanReviewPerItem?}')
+  const raw = value as Record<string, unknown>
+  const computePerMs = raw.computePerMs
+  if (typeof computePerMs !== 'number' || !Number.isFinite(computePerMs) || computePerMs <= 0) {
+    return new Error('economics.computePerMs must be a number > 0 (the USD cost of a millisecond of verification compute)')
+  }
+  const humanReviewPerItem = raw.humanReviewPerItem
+  if (humanReviewPerItem !== undefined
+    && (typeof humanReviewPerItem !== 'number' || !Number.isFinite(humanReviewPerItem) || humanReviewPerItem < 0)) {
+    return new Error('economics.humanReviewPerItem must be a number >= 0')
+  }
+  return {
+    currency: 'USD',
+    computePerMs,
+    ...(humanReviewPerItem !== undefined ? { humanReviewPerItem } : {}),
+  }
+}
+
 async function callStatusTool(deps: McpEngineDeps): Promise<McpToolResult> {
   // Same projection the DSH tool face uses (dsh/tools.ts createStatusTool) —
   // the MCP face must not diverge from what session logs already record.
@@ -530,9 +664,12 @@ async function callVerifyTool(deps: McpEngineDeps, args: Record<string, unknown>
   // engine's verify() takes no claim text, exactly like dsh/tools.ts.
   void args.claim
   const changed = stringArray(args.changed)
+  const rate = rateCardOf(args.economics)
+  if (rate instanceof Error) return toolError({ error: `proof_verify: ${rate.message}` })
   const outcome = await deps.engine.verify({
     ...(changed !== undefined ? { changed } : {}),
     ...(args.all === true ? { all: true } : {}),
+    ...(rate !== undefined ? { economics: { rate } } : {}),
     signal: freshSignal(),
   })
   return toolResult(toVerifyValue(
@@ -1257,6 +1394,230 @@ async function callTrainingExportTool(deps: McpEngineDeps, args: Record<string, 
   })
 }
 
+// ---------------------------------------------------------------------------
+// v0.21 (APP/1.4): the verification-economics tools — the 11 → 13 expansion.
+//
+// Two halves of one question ("what is proof worth?"), split by where the
+// truth lives: `proof_economics` READS (the cost ledger is a chain fact —
+// this face replays the most recent rate-carrying proof/claim marker,
+// exactly like the task overview reads delegation markers back off the log),
+// and `proof_sla_quote` ASKS THE ENGINE (the underwriting math — premium,
+// refusal doors, exclusions — is the engine's `slaQuote` verb, frozen with
+// the engine workstream; this face adjudicates untrusted ARGUMENTS and passes
+// the quote through verbatim, never re-deriving a premium).
+// ---------------------------------------------------------------------------
+
+/**
+ * The engine-side SLA-quote contract, as frozen with the engine workstream
+ * (E2). Declared HERE (not imported) for the same reason as
+ * `DelegationVerbs`/`TrainingExportVerbs` above: the engine grows into it in
+ * parallel, and `slaQuoteVerbs` narrows the live engine against it at
+ * runtime, so this server degrades to a clean capability error — never a
+ * crash — on a build whose engine has not landed the quote yet. The return is
+ * intentionally opaque: the decision shape (offer / denied /
+ * manual-underwriting, exclusions, quoteId, the chain marker) is the engine's
+ * to define and this face's to carry, verbatim.
+ */
+interface SlaQuoteVerbs {
+  slaQuote(input: {
+    grade: string
+    coverageAmount: number
+    confidence?: number
+    /** The rate card the quote is written under — currency plus its price legs. */
+    rate: { currency: string; computePerMs: number; humanReviewPerItem?: number }
+    deductible?: number
+    minPremium?: number
+  }): Promise<Record<string, unknown>>
+}
+
+/**
+ * The live engine's SLA-quote verb, or undefined when this build's engine
+ * does not implement the quote yet. Same per-call existence check as the
+ * delegation and training-export seams.
+ */
+function slaQuoteVerbs(engine: ProofEngine): SlaQuoteVerbs | undefined {
+  const candidate = engine as unknown as Partial<Record<keyof SlaQuoteVerbs, unknown>>
+  return typeof candidate.slaQuote === 'function'
+    ? (candidate as SlaQuoteVerbs)
+    : undefined
+}
+
+function slaQuoteUnavailable(): McpToolResult {
+  return toolError({
+    error: 'proof_sla_quote: this engine build does not implement the SLA-quote verb (slaQuote) '
+      + '— no quote can be written on this build',
+  })
+}
+
+/**
+ * A boundary marker that carries an economics ledger: the label it rode on,
+ * when the chain recorded it, and the ledger payload verbatim. `label`/`at`
+ * are read but never trusted for anything beyond naming the reply — the
+ * `economics` object itself is the artifact being replayed.
+ */
+interface EconomicsMarker {
+  label: string
+  at: string | null
+  economics: Record<string, unknown>
+}
+
+/**
+ * The most recent proof/claim boundary marker on the evidence chain whose
+ * payload carries an `economics` object — the ledger a rate-carrying
+ * verification recorded. Same defensive read as `taskOverview`: the raw log
+ * lines are parsed through the engine's own fs port, an unreadable log
+ * degrades to "no economics found" rather than a throw, and any line with the
+ * wrong shape is skipped, not guessed at. Newest wins: the chain is an
+ * append-only log, so the LAST matching marker in file order is the last one
+ * minted.
+ */
+async function latestEconomicsMarker(deps: McpEngineDeps): Promise<EconomicsMarker | undefined> {
+  let lines: readonly string[]
+  try {
+    lines = await deps.engine.fsView.readLines(deps.evidenceLogPath)
+  } catch {
+    return undefined
+  }
+  let found: EconomicsMarker | undefined
+  for (const line of lines) {
+    let envelope: { kind?: unknown; at?: unknown; payload?: unknown }
+    try {
+      envelope = JSON.parse(line) as { kind?: unknown; at?: unknown; payload?: unknown }
+    } catch {
+      continue
+    }
+    if (envelope?.kind !== 'marker') continue
+    const payload = envelope.payload
+    if (typeof payload !== 'object' || payload === null) continue
+    const record = payload as Record<string, unknown>
+    const label = typeof record.label === 'string' ? record.label : ''
+    // Only the verification boundaries can carry a ledger — a delegation or
+    // synthetic marker with a stray `economics` field is not a run's account.
+    if (!label.startsWith('proof/') && !label.startsWith('claim/')) continue
+    const economics = record.economics
+    if (typeof economics !== 'object' || economics === null || Array.isArray(economics)) continue
+    found = {
+      label,
+      at: typeof envelope.at === 'string' ? envelope.at : null,
+      economics: economics as Record<string, unknown>,
+    }
+  }
+  return found
+}
+
+async function callEconomicsTool(deps: McpEngineDeps, args: Record<string, unknown>): Promise<McpToolResult> {
+  // The rate card is validated loudly even though this query prices nothing:
+  // a caller handing a malformed card must be told NOW, not on the next
+  // rate-carrying verification — same loud-argument discipline as every enum
+  // guard in this face.
+  const computePerMs = args.computePerMs
+  if (typeof computePerMs !== 'number' || !Number.isFinite(computePerMs) || computePerMs <= 0) {
+    return toolError({
+      error: 'proof_economics: computePerMs is required — the rate card\'s compute price per millisecond, '
+        + `a number > 0 (got ${typeof computePerMs === 'number' ? String(computePerMs) : JSON.stringify(computePerMs) ?? 'absent'})`,
+    })
+  }
+  const humanReviewPerItem = args.humanReviewPerItem
+  if (humanReviewPerItem !== undefined
+    && (typeof humanReviewPerItem !== 'number' || !Number.isFinite(humanReviewPerItem) || humanReviewPerItem < 0)) {
+    return toolError({
+      error: `proof_economics: humanReviewPerItem must be a number >= 0 (got ${JSON.stringify(humanReviewPerItem)})`,
+    })
+  }
+  // The read itself: the chain's own bytes, never a recomputation. No match =
+  // the honest absence, with the exact remedy pinned.
+  const found = await latestEconomicsMarker(deps)
+  if (found === undefined) {
+    return toolError({
+      error: 'proof_economics: no economics on the last run — pass economics:{rate} to proof_verify/proof_claim '
+        + 'first (the engine or DSH tool face; this MCP face keeps proof_verify\'s parameters minimal), '
+        + 'then query this tool to replay the ledger',
+    })
+  }
+  return toolResult({
+    label: found.label,
+    ...(found.at !== null ? { at: found.at } : {}),
+    economics: found.economics,
+    rate: {
+      currency: 'USD',
+      computePerMs,
+      ...(typeof humanReviewPerItem === 'number' ? { humanReviewPerItem } : {}),
+    },
+    note: 'replayed verbatim from the evidence chain — the ledger is a fact the hash chain protects, '
+      + 'not a recomputation; the rate above is the card you asked under, priced against nothing',
+  })
+}
+
+async function callSlaQuoteTool(deps: McpEngineDeps, args: Record<string, unknown>): Promise<McpToolResult> {
+  // Argument adjudication first, engine second: every usage error is a tool
+  // error naming the offending argument, mirroring the enum guards above.
+  if (!isGradeValue(args.grade)) {
+    return toolError({
+      error: `proof_sla_quote: grade must be one of ${GRADES.join(' | ')} `
+        + `(got ${typeof args.grade === 'string' ? JSON.stringify(args.grade) : 'a non-string value'}); `
+        + 'the grade is what the quote underwrites — an unintelligible grade is refused, never guessed at',
+    })
+  }
+  const grade = args.grade as string
+  const coverageAmount = args.coverageAmount
+  if (typeof coverageAmount !== 'number' || !Number.isFinite(coverageAmount) || coverageAmount <= 0) {
+    return toolError({
+      error: `proof_sla_quote: coverageAmount is required — what a failure getting through would cost you, a number > 0 (got ${JSON.stringify(coverageAmount) ?? 'absent'})`,
+    })
+  }
+  const confidence = args.confidence
+  if (confidence !== undefined
+    && (typeof confidence !== 'number' || !Number.isFinite(confidence) || confidence < 0 || confidence > 1)) {
+    return toolError({
+      error: `proof_sla_quote: confidence must be a number in [0, 1] (got ${JSON.stringify(confidence)})`,
+    })
+  }
+  // Only USD is priced today: an explicit currency is checked against the
+  // singleton, never silently converted.
+  const currency = args.currency
+  if (currency !== undefined && currency !== 'USD') {
+    return toolError({
+      error: `proof_sla_quote: currency must be 'USD' (got ${JSON.stringify(currency)}) — the only currency the `
+        + 'quote prices today; a foreign currency is refused loudly, never converted at a rate nobody agreed to',
+    })
+  }
+  const deductible = args.deductible
+  if (deductible !== undefined
+    && (typeof deductible !== 'number' || !Number.isFinite(deductible) || deductible < 0)) {
+    return toolError({
+      error: `proof_sla_quote: deductible must be a number >= 0 (got ${JSON.stringify(deductible)})`,
+    })
+  }
+  const minPremium = args.minPremium
+  if (minPremium !== undefined
+    && (typeof minPremium !== 'number' || !Number.isFinite(minPremium) || minPremium < 0)) {
+    return toolError({
+      error: `proof_sla_quote: minPremium must be a number >= 0 (got ${JSON.stringify(minPremium)})`,
+    })
+  }
+  const verbs = slaQuoteVerbs(deps.engine)
+  if (verbs === undefined) return slaQuoteUnavailable()
+  // The bridge rate card: this MCP face deliberately carries NO compute price
+  // (the premium is pure risk pricing — coverageAmount × (1 − confidence) —
+  // so a compute leg would be a placeholder used by nothing). The card is
+  // still owed to the engine contract, so it gets the one honest value for
+  // "no compute component priced here": zero. Callers who want compute-priced
+  // economics pass a real rate through the verify face and read it back with
+  // proof_economics.
+  const quote = await verbs.slaQuote({
+    grade,
+    coverageAmount,
+    ...(typeof confidence === 'number' ? { confidence } : {}),
+    rate: { currency: 'USD', computePerMs: 0 },
+    ...(typeof deductible === 'number' ? { deductible } : {}),
+    ...(typeof minPremium === 'number' ? { minPremium } : {}),
+  })
+  // Verbatim pass-through: the decision shape (offer/denied/manual-
+  // underwriting), exclusions, quoteId and the marker flag are the engine's
+  // value object — this face re-derives nothing.
+  return toolResult(quote)
+}
+
 async function callTool(deps: McpEngineDeps, params: unknown): Promise<McpToolResult> {
   const name = typeof params === 'object' && params !== null
     ? (params as { name?: unknown }).name
@@ -1275,6 +1636,8 @@ async function callTool(deps: McpEngineDeps, params: unknown): Promise<McpToolRe
       case 'proof_delegate_submit': return await callDelegateSubmitTool(deps, args)
       case 'proof_task': return await callTaskTool(deps, args)
       case 'proof_training_export': return await callTrainingExportTool(deps, args)
+      case 'proof_economics': return await callEconomicsTool(deps, args)
+      case 'proof_sla_quote': return await callSlaQuoteTool(deps, args)
       default:
         // Unknown tool: MCP tool-error semantics (isError result), with the
         // name spelled out so a foreign agent can self-correct.

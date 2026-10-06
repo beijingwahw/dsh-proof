@@ -1,4 +1,4 @@
-# Agent Proof Protocol (APP) 1.3
+# Agent Proof Protocol (APP) 1.4
 
 **An open standard for machine-verifiable completion claims.**
 
@@ -6,9 +6,9 @@
 |---|---|
 | Status | Draft |
 | Protocol name | `agent-proof-protocol` |
-| Version | `APP/1.3` |
-| Reference implementation | dsh-proof v0.20.0 |
-| Supersedes | `APP/1.2` (dsh-proof v0.19.0) — tool-surface expansion only, see §6/§8/§11 |
+| Version | `APP/1.4` |
+| Reference implementation | dsh-proof v0.21.0 |
+| Supersedes | `APP/1.3` (dsh-proof v0.20.0) — tool-surface expansion only, see §6/§8/§12 |
 | Proof media type | `application/vnd.app.proof+json` |
 | Bundle media type | `application/vnd.app.proof-bundle+json` |
 | Constants module | `src/app/protocol.ts` (this repository) |
@@ -107,7 +107,7 @@ A **proof bundle** (media type `application/vnd.app.proof-bundle+json`) moves a 
 
 ```json
 {
-  "protocol": "APP/1.3",
+  "protocol": "APP/1.4",
   "appFingerprint": "<sha256 hex>",
   "workspaceKey": "<stable workspace identity>",
   "createdAt": "<ISO timestamp>",
@@ -125,13 +125,13 @@ A **proof bundle** (media type `application/vnd.app.proof-bundle+json`) moves a 
 
 ## §6 Verification API
 
-APP/1.3's conformance surface is eleven model-facing tools (reference: `src/app/mcp-server.ts`):
+APP/1.4's conformance surface is thirteen model-facing tools (reference: `src/app/mcp-server.ts`):
 
 | tool | input (essentials) | output (essentials) |
 |---|---|---|
 | `proof_status` | — | baseline presence, discovered checks, latest evidence per check, chain mode and integrity. Read-only |
 | `proof_baseline` | — | runs every discovered check, records evidence, saves the baseline view, checkpoints |
-| `proof_verify` | `changed?: string[]`, `all?: boolean` | grade, per-check verdicts, regression attribution, evidence root |
+| `proof_verify` | `changed?: string[]`, `all?: boolean`, `economics?: {computePerMs, humanReviewPerItem?}` | grade, per-check verdicts, regression attribution, evidence root. With `economics` the run is priced: the ledger rides the boundary marker (a price is a chain fact, replayable via `proof_economics`) |
 | `proof_claim` | `claim`, optional contract params (`kind`, `budgetMs`, `review`, `entryPoints`) | `proven: true` only when the contract's obligations all hold; otherwise `blockers` is the to-do list |
 | `proof_bundle` | — | assembles the §5 bundle: manifest (with `appFingerprint`) + files, digests recomputed at pack time |
 | `proof_publish` | — | appends the workspace's latest *signed* checkpoint to the transparency log (§9) as one Merkle leaf and mints a fresh operator-signed tree head: `{sequence, duplicate, leafHash, treeSize, root, logId, at, inclusionProof, sth}`. Idempotent by leaf hash — republishing the same checkpoint answers `duplicate: true` and the tree does not grow. Requires a configured log and a signed checkpoint on the chain; failure is a clean tool error, never a half-published tree |
@@ -140,6 +140,8 @@ APP/1.3's conformance surface is eleven model-facing tools (reference: `src/app/
 | `proof_delegate_submit` | `taskId`, `bundle` (a §5 export), optional `claimedGrade` (one of the five grades), `byWorkspace?` | adjudicates the bundle from its own bytes — the §5 verifier obligations, zero trust in the submitter — records `artifactVerified` plus the `bundleFingerprint` that anchors what was turned in, derives the default `claimedGrade` two-valued (verified bundle carrying a baseline → `proven`; anything else → `no-baseline` — finer grades MUST be declared explicitly), and returns the `composed` verdict over the rebuilt DAG; a claimed `proven` the artifact cannot back is booked as **forgery** (§10) |
 | `proof_task` | `taskId?`, optional `ownGrade` (one of the five grades) | without `taskId`, the whole-graph overview (every task, its parent, claim summary, submission state); with it, the recursive composed verdict of that task's subtree — grade, forged/regressed/unproven children, waivers, blockers, cycles (§10). `ownGrade` folds this workspace's own locally-earned grade into the composition |
 | `proof_training_export` | optional `fidelity` (`full` \| `private`), `provenanceFilter` (`agent-only` \| `all`), `license`, `path` | distills the evidence chain into a labeled training dataset (`dsh-training/1`, §11) and returns the manifest (reward-table snapshot, sample-counts, Merkle `root`, `provenanceFilter`), the chain `anchor` `{count, head, keyId?}` of the export moment, and `sampleCount`. **The samples themselves never ride the response** — a caller that wants the dataset passes `path` and the engine writes the JSONL samples plus the manifest document to disk (`writtenTo` names where); unknown enum values are refused loudly, never silently defaulted (omitted `fidelity` exports the `private` tier — zero output text — by default) |
+| `proof_economics` | `computePerMs` (required, > 0), `humanReviewPerItem?` (≥ 0) | **a pure query**: replays verbatim the economics ledger the most recent rate-carrying verification marker on the chain recorded (§12) — label, timestamp, ledger bytes, plus the echoed rate card. Nothing is recomputed and nothing is priced here: the arguments are validated loudly (a malformed card is told off now, not on the next run) but they change no chain fact; no ledger on the chain answers the honest absence with the exact remedy |
+| `proof_sla_quote` | `grade` (one of the five, required), `coverageAmount` (finite > 0, required), `confidence?` ([0, 1]), `currency` (`USD` only — anything else is refused, never converted), `deductible?` (≥ 0), `minPremium?` (≥ 0) | an insurance-style SLA quote over a graded proof (§12): `proven` earns an offer (`premium = coverageAmount × (1 − confidence)`), `regressed` is honestly denied, `stale` / `unproven` / `no-baseline` route to manual underwriting. The full quote — pricing content, exclusions, terms version — is content-addressed (`quoteId`) and lands on the chain as an `economics/quote` marker, so a quoted premium cannot be silently rewritten after the fact |
 
 **APP/1.0 → APP/1.1 is a tool-surface expansion, nothing else.** The two transparency tools joined the conformance face; the vocabularies (§2), the content addressing (§3), the chain and checkpoint formats (§4) and the bundle format (§5) are byte-for-byte what APP/1.0 defined — an old bundle remains exactly as verifiable as the day it was minted. What did move is the dialect marking: `PROTOCOL_VERSION` is fingerprint material (§8), so every APP/1.1 manifest self-identifies as mutually unintelligible with every APP/1.0 one, and each side refuses the other instead of guessing. A deployment that runs no transparency log keeps a conforming APP/1.1 face: `proof_publish` / `proof_log_verify` answer a clean configuration error when no log is configured, and bundles without a `transparency` record verify as they always have.
 
@@ -147,7 +149,9 @@ APP/1.3's conformance surface is eleven model-facing tools (reference: `src/app/
 
 **APP/1.2 → APP/1.3 repeats it a third time (10 → 11).** The training-export tool joined the conformance face; the vocabularies (§2), the content addressing (§3), the chain and checkpoint formats (§4), the bundle format (§5) and the delegation semantics (§10) are byte-for-byte untouched, and the version-only fingerprint shift makes every APP/1.3 manifest mutually unintelligible with every APP/1.2 one — a consumer never silently accepts a dialect whose training-export semantics it has not implemented. The dataset itself — sample kinds, the reward table, privacy tiers, the provenance filter, content addressing and the chain anchor — is specified in §11.
 
-**Out of scope for v1:** `proof_jury`, `proof_jury_submit`, `proof_endorse`, `proof_conjure` and `proof_conjure_run` exist in the reference implementation but are NOT part of APP/1.3 conformance. They depend on host-held seams an open protocol cannot assume — an isolated deliberation model (Class B testimony), a human approval gate (Class C endorsement), and a sandbox plus session context for conjured tests. Hosts MAY expose them as extensions.
+**APP/1.3 → APP/1.4 repeats it a fourth time (11 → 13).** The verification-economics pair joined the conformance face (`proof_economics`, `proof_sla_quote`, plus the `economics` parameter on `proof_verify`); the vocabularies (§2), the content addressing (§3), the chain and checkpoint formats (§4), the bundle format (§5), the delegation semantics (§10) and the training export (§11) are byte-for-byte untouched, and the version-only fingerprint shift makes every APP/1.4 manifest mutually unintelligible with every APP/1.3 one — a consumer never silently accepts a dialect whose pricing semantics it has not implemented. The economics themselves — the run ledger, the SLA doors, the exclusions, the injected rate card — are specified in §12.
+
+**Out of scope for v1:** `proof_jury`, `proof_jury_submit`, `proof_endorse`, `proof_conjure` and `proof_conjure_run` exist in the reference implementation but are NOT part of APP/1.4 conformance. They depend on host-held seams an open protocol cannot assume — an isolated deliberation model (Class B testimony), a human approval gate (Class C endorsement), and a sandbox plus session context for conjured tests. Hosts MAY expose them as extensions.
 
 ## §7 Security considerations
 
@@ -166,9 +170,9 @@ APP/1.3's conformance surface is eleven model-facing tools (reference: `src/app/
 
 ## §8 Conformance
 
-An APP/1.3 implementation MUST implement content addressing (§3), tamper evidence (§4) and the exchange format (§5) exactly as specified, and MUST expose the eleven tools of §6. A transparency log (§9) is an optional deployment: the two transparency tools presuppose an operator-run log and MAY answer a clean configuration error when none is configured. The three delegation tools of §10 are part of the conformance face; an implementation that mints obligations MUST compose verdicts by the §10 lattice exactly. The training-export tool of §11 is likewise part of the conformance face; an implementation that mints datasets MUST follow the §11 reward table and honesty rules exactly.
+An APP/1.4 implementation MUST implement content addressing (§3), tamper evidence (§4) and the exchange format (§5) exactly as specified, and MUST expose the thirteen tools of §6. A transparency log (§9) is an optional deployment: the two transparency tools presuppose an operator-run log and MAY answer a clean configuration error when none is configured. The three delegation tools of §10 are part of the conformance face; an implementation that mints obligations MUST compose verdicts by the §10 lattice exactly. The training-export tool of §11 is likewise part of the conformance face; an implementation that mints datasets MUST follow the §11 reward table and honesty rules exactly. The verification-economics tools of §12 are part of the conformance face; an implementation that prices runs MUST follow the §12 ledger semantics exactly — null for the unmeasured, never zero; null per dollar at zero cost, never Infinity — and MUST NOT embed a price: the rate card is injected by the deployer at every pricing call, never a constant of the implementation.
 
-**Implementation fingerprint.** `appFingerprint()` (`src/app/protocol.ts`) is `sha256(canonicalJson(...))` over the five vocabularies plus one string per load-bearing rule — `addressing: 'sha256(canonicalJson(v))'`, `chain: 'prev=sha256(prevLine)'`, `signature: 'ed25519(canonicalJson(checkpointPayload))'`. It is the dialect's digest: any change to a vocabulary value or to one of these rules MUST produce a different fingerprint. Producers stamp it into every manifest; consumers MUST refuse to interpret a bundle whose fingerprint they cannot reproduce against their own constants, rather than guess at the dialect. The APP/1.0 → APP/1.1 bump is this rule applied honestly to the tool surface: the vocabularies and rule strings are untouched, but `PROTOCOL_VERSION` is itself fingerprint material, so the seven-tool expansion moved the fingerprint by construction — a consumer that could silently read a 1.1 manifest while believing it spoke 1.0 would never learn that two tools' semantics exist; the moved fingerprint makes the dialects refuse each other loudly instead. The APP/1.1 → APP/1.2 bump applies the same rule for the same reason: nothing but the three delegation tools moved, and the version-only fingerprint shift makes every APP/1.2 manifest mutually unintelligible with every APP/1.1 one — a consumer never silently accepts a dialect whose delegation semantics it has not implemented. The APP/1.2 → APP/1.3 bump repeats it a third time: the single training-export tool moved nothing else, and the version-only shift keeps every APP/1.3 manifest mutually unintelligible with every earlier dialect — a consumer never silently accepts a dialect whose training-export semantics (§11) it has not implemented.
+**Implementation fingerprint.** `appFingerprint()` (`src/app/protocol.ts`) is `sha256(canonicalJson(...))` over the five vocabularies plus one string per load-bearing rule — `addressing: 'sha256(canonicalJson(v))'`, `chain: 'prev=sha256(prevLine)'`, `signature: 'ed25519(canonicalJson(checkpointPayload))'`. It is the dialect's digest: any change to a vocabulary value or to one of these rules MUST produce a different fingerprint. Producers stamp it into every manifest; consumers MUST refuse to interpret a bundle whose fingerprint they cannot reproduce against their own constants, rather than guess at the dialect. The APP/1.0 → APP/1.1 bump is this rule applied honestly to the tool surface: the vocabularies and rule strings are untouched, but `PROTOCOL_VERSION` is itself fingerprint material, so the seven-tool expansion moved the fingerprint by construction — a consumer that could silently read a 1.1 manifest while believing it spoke 1.0 would never learn that two tools' semantics exist; the moved fingerprint makes the dialects refuse each other loudly instead. The APP/1.1 → APP/1.2 bump applies the same rule for the same reason: nothing but the three delegation tools moved, and the version-only fingerprint shift makes every APP/1.2 manifest mutually unintelligible with every APP/1.1 one — a consumer never silently accepts a dialect whose delegation semantics it has not implemented. The APP/1.2 → APP/1.3 bump repeats it a third time: the single training-export tool moved nothing else, and the version-only shift keeps every APP/1.3 manifest mutually unintelligible with every earlier dialect — a consumer never silently accepts a dialect whose training-export semantics (§11) it has not implemented. The APP/1.3 → APP/1.4 bump repeats it a fourth time: the two economics tools (and `proof_verify`'s `economics` parameter) moved nothing else, and the version-only shift keeps every APP/1.4 manifest mutually unintelligible with every earlier dialect — a consumer never silently accepts a dialect whose pricing semantics (§12) it has not implemented.
 
 **Backward compatibility.** Evolution of the canonical addressing rules MUST NOT change the address of any existing value. The sanctioned mechanism is additive optional fields that are *omitted* (never `null`) when absent — canonical JSON drops them, so historical records keep their digests, and old artifacts that predate a field skip (rather than fail) its checks. This is the standing precedent of the reference implementation: `Evidence.source`, `synthetic` and `coverage`, `WorkspaceSnapshot.dirtyDigests`, and the anchor's `workspaceKey` were all added this way, without moving a single existing address.
 
@@ -281,3 +285,44 @@ The table is pinned by tests, deliberately not a knob (a reward table that varie
 - **Cross-deployment aggregation trust is unsolved**: merging datasets from multiple exporters raises "whose data is this, and was it poisoned?" — questions this version does not answer. Anchoring dataset provenance in the transparency log (§9) — anti data-laundering for training sets — is the future direction, not a property of APP/1.3.
 
 Reference implementation: `src/core/training.ts` (pure domain — the schema, reward law, sample shapes, distillation; deterministic, no clock, no I/O) and the engine verb `exportTrainingData` (`src/engine.ts` — chain state in, `DistillInput` assembled, dataset and anchor out), with `proof_training_export` (`src/app/mcp-server.ts`) as the protocol face.
+
+## §12 Verification economics
+
+Everything before §12 made trust **recomputable**; §12 gives it a **unit cost**. The seed was planted in v0.9: the bayesian scheduler already ranked checks by expected information gain per millisecond — certainty per unit cost, as a scheduling decision. §12 restates the same measured facts as a statement any party can read: what one verification run consumed, what the spend bought, and what an insurer-style service level over a `proven` grade is worth. Two disciplines govern every number: **only the measurable is measured** (durations and counts come off records the engine already produced; what was not measured is not invented), and **prices are injected, never embedded** (the deployer supplies a `RateCard`; swap the card and the same evidence reprices — a hardcoded rate would be a lie with a decimal point).
+
+**The run ledger.** A verification that runs with `economics: {rate}` returns — and records on the chain — a ledger restating the run as a statement of cost and purchase:
+
+- `computeMs` — Σ `durationMs` over **every** record; a timed-out check burned the milliseconds all the same.
+- `cost` — `computeMs × computePerMs + humanReviewItems × humanReviewPerItem` under the injected card, rounded to six decimal places (the money spec — floating-point dust never reaches a statement).
+- `assertions` — the decisive records: each decisive check answer is one verified assertion (`pass`/`fail` settle the check's question; the non-decisive statuses never did). `skippedCount` rides along so the statement shows spend that bought no assertion rather than hiding it — sunk cost, visible.
+- `costPerAssertion` — `cost / max(1, assertions)`.
+- `confidencePurchased` — `posterior − prior`: the marginal confidence the verification actually bought. `null` when either side was never measured — never zero, because an unmeasured purchase must not be pretended away; a negative value is reported as-is (a run that *lost* confidence is a real outcome).
+- `confidencePerDollar`, `natsPerDollar` — `null` whenever `cost ≤ 0`: a free run bought confidence, but it bought nothing *per dollar*, and `Infinity` on a financial statement is never an answer.
+- `infoNats` — Σ `H(prior) − H(posterior)` per check factor, in nats, **signed**: a factor folding toward failure contributes negatively, because paying to learn the claim broke is still information gained — honest bookkeeping counts information, not news enjoyed.
+
+The priced run is a **chain fact**: the ledger rides the `proof/verified` marker exactly as the wave plan and coverage summary do, and `proof_economics` replays those bytes verbatim — it never recomputes a price, never trusts a caller's summary, and answers the honest absence (no rate-carrying run on the chain) with the exact remedy. The contract paths each carry their own honest caliber: a `docs-only` verdict consumed no machine compute and no paid review, so its ledger prices an honest zero; an `llm-jury` verdict prices the testimony it consumed (`humanReviewItems` counts exactly the B/C witnesses the verdict rested on); the machine contract path reports the **final** confidence — the number after any κ fusion — as its posterior.
+
+**The SLA pricer — three doors, no fourth.** `proof_sla_quote` turns a graded proof into an insurance-style offer (`dsh-proof/SLA-1`):
+
+- `proven` + a measured confidence in [0, 1] → **offer**: `pUndetected = 1 − confidence`, `premium = max(minPremium ?? 0, coverageAmount × pUndetected)`. The deductible is claim-time excess, passed through verbatim — never added into the premium. **No second β**: the confidence supplied here already absorbed every false-pass discount on its way in (the organic 0.02 of the scheduler, the synthetic 0.15 of v0.12), so `1 − confidence` *is* the comprehensive probability a defect went undetected; multiplying another β in would discount the discount and quietly under-price the book.
+- `regressed` → **denied**, in one honest sentence: the delivery failed verification — the claim already broke. Insuring it would be selling coverage for a known loss.
+- `stale` / `unproven` / `no-baseline`, or a `proven` without a measured (or in-range) confidence → **manual underwriting**: evidence exists but this formula honestly cannot price it; a human underwriter takes over rather than a number being invented.
+
+Every quote is **content-addressed over its own pricing content**: `quoteId` is the first 16 hex of the sha256 over `{vehicle, grade, confidenceAtIssue, decision (class + numbers, never the prose), exclusions, termsVersion}`. The same inputs mint the same bytes; changing the coverage by one cent mints a different quote; rewording a denial re-prices nothing. The rate card is deliberately **not** part of the address — repricing the deployment leaves the quote bytes alone, so a quote is a fact about the risk, not about the day's prices. The full quote lands on the chain as an `economics/quote` marker: a quoted premium cannot be silently rewritten after the fact.
+
+**Exclusions — the honest edges, written into the policy.** Every quote carries five exclusion clauses verbatim, pinned by the tests (an exclusion nobody can quote is a promise nobody made):
+
+1. Attribution keys on command strings — the same defect hidden behind a rewritten command line is not covered (§7's shell blind spot, restated as policy).
+2. The transparency log witnesses one operator's view — a divergent fork view held by another operator is not covered (§9's split-view limit, restated as policy).
+3. Evidence appended after the last signed checkpoint carries chain cover only — the tail window is not covered.
+4. Human endorsements price accepted risk, not verified fact — the accepted-risk portion of an endorsement is not covered (§10's waivers, restated as policy).
+5. Non-decisive outcomes (timeout, error, aborted, skipped) verified nothing — the surface they never answered is not covered.
+
+**Honest limits**, stated rather than hidden:
+
+- The rate card is the **deployer's injected cost basis, not a real bill**: `computePerMs` and `humanReviewPerItem` are declarations of what compute and review cost a deployment, and the ledger is only as honest as the card.
+- `pUndetected` is a **model probability, not actuarial claims history**: it descends from the v0.9 posterior, with all of that model's admitted distortions (independence above all) — no loss data feeds it.
+- The premium is an **illustrative, model-based quote, not a financial product**: no regulator, no reserve, no claims process stands behind `dsh-proof/SLA-1`; it is a written convention for pricing residual risk, in the same spirit and with the same limits as the §11 reward table.
+- A negative `infoNats` means the money bought **bad news** — the claim's probability fell. That is still information, deliberately reported with its sign; the ledger counts learning, not comfort.
+
+Reference implementation: `src/core/economics.ts` (pure domain — the ledger, the pricer, the exclusions; deterministic, no clock, no I/O, every amount at the six-decimal money spec) and the engine verbs (`VerifyOptions.economics` on `verify` / `verifyContract`, `slaQuote` — input defense first, the ledger on the `proof/verified` marker, the full quote on the `economics/quote` marker), with `proof_verify`'s `economics` parameter, `proof_economics` and `proof_sla_quote` (`src/app/mcp-server.ts`) as the protocol face. The rate card is a **query-time parameter, not a configuration key**: pricing rides the tool call so the same chain reprices under different cards without redeploying anything.

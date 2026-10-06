@@ -2771,3 +2771,233 @@ test('v0.20: an empty chain exports an honest empty dataset — no throw, zero c
   assert.equal(exported.manifest.fidelity, 'private')
   assert.equal(exported.manifest.provenanceFilter, 'agent-only')
 })
+
+// -- v0.21: engine economics (E1 wiring) ----------------------------------
+//
+// The engine owns three seams over core/economics.ts: the run ledger rides
+// verify/verifyContract when a rate card is supplied (optional on purpose —
+// the outcome's shape without it is unchanged), the scheduler's
+// prior/posterior trajectory feeds the ledger's "what was purchased", and
+// slaQuote wraps the pricer with boundary defense plus an auditable
+// `economics/quote` marker.
+
+/** Read every `economics/quote` marker payload back off the chain, in log order. */
+async function quoteMarkers(fs: MemoryFs): Promise<Record<string, unknown>[]> {
+  const lines = await fs.readLines(`${ROOT}/.proof/evidence.jsonl`)
+  const out: Record<string, unknown>[] = []
+  for (const line of lines) {
+    const envelope = JSON.parse(line) as { kind?: string; payload?: { label?: string } }
+    if (envelope.kind === 'marker' && envelope.payload?.label === 'economics/quote') {
+      out.push(envelope.payload as Record<string, unknown>)
+    }
+  }
+  return out
+}
+
+test('v0.21: a bayesian verify with economics prices what the run spent and bought', async () => {
+  const fs = MemoryFs.of(project())
+  // Explicit durations, so the ledger's computeMs has an exact independent
+  // expectation: 40ms (test) + 60ms (build) = 100ms of measured compute.
+  const commands = new FakeCommands()
+    .on(argv => argv.includes('test'), { exitCode: 0, output: 'ok', durationMs: 40 })
+    .on(argv => argv.includes('build'), { exitCode: 0, output: 'ok', durationMs: 60 })
+  const engine = makeEngine(fs, commands)
+  await engine.establishBaseline()
+
+  const outcome = await engine.verify({
+    changed: ['src/a.ts'],
+    economics: { rate: { currency: 'USD', computePerMs: 0.001 } },
+  })
+  assert.ok(outcome.economics, 'the economics block is present when a rate was supplied')
+  const { ledger, priorProbability, posteriorProbability } = outcome.economics
+  assert.equal(ledger.computeMs, 100, "computeMs is exactly Σ durationMs over this run's records")
+  assert.equal(ledger.assertions, 2)
+  assert.equal(ledger.decisiveCount, 2, 'both checks answered decisively')
+  assert.equal(ledger.skippedCount, 0)
+  assert.ok(priorProbability !== null && priorProbability > 0 && priorProbability < 1,
+    'the scheduler priors price a real, non-degenerate "before"')
+  // Independent cross-check: the posterior is the report's own final product
+  // — same factor map, same sorted multiplication, so the two numbers are
+  // one number, never two that drifted.
+  assert.equal(posteriorProbability, outcome.report.confidence)
+  assert.ok(posteriorProbability !== null && posteriorProbability > priorProbability,
+    'two green decisive passes bought certainty')
+  assert.ok(ledger.confidencePurchased !== null
+    && Math.abs(ledger.confidencePurchased - (posteriorProbability - priorProbability)) < 1e-12,
+    'confidencePurchased is exactly posterior − prior')
+  assert.ok(ledger.infoNats > 0, 'each green pass resolved entropy')
+  assert.equal(ledger.humanReviewItems, 0, 'plain verify fuses no B/C testimony (v0.9 semantics)')
+  assert.ok(ledger.cost > 0)
+  assert.ok(ledger.costPerAssertion > 0)
+  assert.ok(ledger.confidencePerDollar !== null && ledger.confidencePerDollar > 0)
+  assert.ok(ledger.natsPerDollar !== null && ledger.natsPerDollar > 0)
+
+  // Without the option the outcome's shape is unchanged: no economics key at
+  // all — canonical consumers that never asked see nothing new.
+  const plain = await engine.verify({ changed: ['src/a.ts'] })
+  assert.ok(!('economics' in plain), 'no economics key when no rate was supplied')
+})
+
+test('v0.21: a budget-starved run with economics shows every skip and prices no purchase', async () => {
+  const fs = MemoryFs.of(project())
+  const commands = new FakeCommands()
+  const anchoring = makeEngine(fs, commands)
+  await anchoring.establishBaseline()
+  const starved = new ProofEngine({
+    root: ROOT,
+    fs,
+    commands,
+    workspace: new FakeWorkspace(ROOT),
+    clock: new FakeClock(),
+    verifyBudgetMs: 1,
+    concurrency: 2,
+  })
+  const outcome = await starved.verify({
+    changed: ['src/a.ts'],
+    all: true,
+    economics: { rate: { currency: 'USD', computePerMs: 0.001, humanReviewPerItem: 2 } },
+  })
+  assert.equal(outcome.report.grade, 'stale')
+  assert.ok(outcome.economics)
+  const { ledger, priorProbability, posteriorProbability } = outcome.economics
+  // Whole-batch path: confidence is display-only here, no scheduler
+  // trajectory was priced — the numbers are null, not guessed.
+  assert.equal(priorProbability, null)
+  assert.equal(posteriorProbability, null)
+  assert.equal(ledger.computeMs, 0, 'skipped records carry no measured duration')
+  assert.ok(ledger.skippedCount > 0, 'the sunk cost is visible, not hidden')
+  assert.equal(ledger.skippedCount, outcome.report.unverified.length,
+    'every skipped check shows in the ledger exactly once')
+  assert.equal(ledger.decisiveCount, 0)
+  assert.equal(ledger.cost, 0)
+  assert.equal(ledger.confidencePurchased, null, 'nothing was purchased — the ledger says null, not zero')
+  assert.equal(ledger.confidencePerDollar, null, 'a free run bought nothing per dollar')
+  assert.equal(ledger.natsPerDollar, null)
+})
+
+test('v0.21: slaQuote prices a proven grade, records the full quote on chain, and replays deterministically', async () => {
+  const fs = MemoryFs.of(project())
+  const engine = makeEngine(fs, new FakeCommands())
+  const rate = { currency: 'USD' as const, computePerMs: 0.0001 }
+
+  const first = await engine.slaQuote({ grade: 'proven', confidence: 0.97, coverageAmount: 10_000, rate })
+  assert.ok(first.marker === true, 'the return tags that the quote is on-chain')
+  assert.equal(first.vehicle, 'dsh-proof/SLA-1')
+  assert.equal(first.currency, 'USD')
+  assert.equal(first.termsVersion, 'SLA-1')
+  assert.equal(first.grade, 'proven')
+  assert.equal(first.confidenceAtIssue, 0.97)
+  if (first.decision.class !== 'offer') assert.fail(`expected an offer, got ${first.decision.class}`)
+  assert.equal(first.decision.premium, 300, 'premium = coverage × P(undetected) = 10000 × 0.03, at the money spec')
+  assert.equal(first.decision.pUndetected > 0, true)
+
+  // The FULL quote is on the chain — pricing is auditable from its own bytes.
+  const onChain = await quoteMarkers(fs)
+  assert.equal(onChain.length, 1)
+  const payload = onChain[0]
+  assert.ok(payload)
+  assert.equal(payload.quoteId, first.quoteId)
+  assert.equal(payload.grade, 'proven')
+  assert.deepEqual(payload.decision, first.decision)
+  assert.deepEqual(payload.exclusions, first.exclusions)
+  assert.equal(payload.confidenceAtIssue, 0.97)
+  assert.equal(payload.termsVersion, 'SLA-1')
+
+  // Same inputs mint the same quoteId — pricing is a pure function of its
+  // inputs, so a re-quote is detectable as one, never mistaken for a re-price.
+  const second = await engine.slaQuote({ grade: 'proven', confidence: 0.97, coverageAmount: 10_000, rate })
+  assert.equal(second.quoteId, first.quoteId)
+
+  // A regressed grade underwrites nothing: coverage for a known loss is denied.
+  const denied = await engine.slaQuote({ grade: 'regressed', coverageAmount: 10_000, rate })
+  assert.equal(denied.decision.class, 'denied')
+})
+
+test('v0.21: slaQuote refuses malformed inputs at the boundary and writes nothing', async () => {
+  const fs = MemoryFs.of(project())
+  const engine = makeEngine(fs, new FakeCommands())
+  const goodRate = { currency: 'USD' as const, computePerMs: 0.0001 }
+
+  await assert.rejects(
+    engine.slaQuote({ grade: 'proven', coverageAmount: 10_000, rate: { ...goodRate, computePerMs: -0.001 } }),
+    /rate\.computePerMs/,
+  )
+  await assert.rejects(
+    engine.slaQuote({ grade: 'wat' as unknown as ProofGrade, coverageAmount: 10_000, rate: goodRate }),
+    /grade must be one of/,
+  )
+  await assert.rejects(
+    engine.slaQuote({ grade: 'proven', confidence: 1.5, coverageAmount: 10_000, rate: goodRate }),
+    /confidence/,
+  )
+  await assert.rejects(
+    engine.slaQuote({ grade: 'proven', coverageAmount: 10_000, rate: { ...goodRate, humanReviewPerItem: -1 } }),
+    /rate\.humanReviewPerItem/,
+  )
+  // A refused quote leaves the chain untouched.
+  assert.equal((await quoteMarkers(fs)).length, 0)
+
+  // The same defense guards the verify seam: a negative price card refuses
+  // the run before any check executes.
+  await assert.rejects(
+    engine.verify({ changed: ['src/a.ts'], economics: { rate: { currency: 'USD', computePerMs: -1 } } }),
+    /rate\.computePerMs/,
+  )
+})
+
+test('v0.21: verifyContract (machine path) carries economics with the final confidence as posterior', async () => {
+  const fs = MemoryFs.of(project())
+  const engine = makeEngine(fs, new FakeCommands())
+  await engine.establishBaseline()
+  const outcome = await engine.verifyContract({
+    contract: { kind: 'behavior-preserving', claim: 'the refactor changes nothing observable' },
+    changed: ['src/a.ts'],
+    economics: { rate: { currency: 'USD', computePerMs: 0.001 } },
+  })
+  assert.ok(outcome.economics)
+  // Whole-batch regime: no scheduler prior product exists; the posterior is
+  // the FINAL confidence the verdict rode on (this is where attestation
+  // fusion would have applied — none is active on this chain).
+  assert.equal(outcome.economics.priorProbability, null)
+  assert.equal(outcome.economics.posteriorProbability, outcome.report.confidence)
+  assert.equal(outcome.economics.ledger.computeMs, 10, 'two checks at the fake port default 5ms')
+  assert.equal(outcome.economics.ledger.decisiveCount, 2)
+  assert.equal(outcome.economics.ledger.humanReviewItems, 0)
+  // Without the option, the contract outcome keeps its pre-v0.21 shape.
+  const plain = await engine.verifyContract({
+    contract: { kind: 'behavior-preserving', claim: 'the refactor changes nothing observable' },
+    changed: ['src/a.ts'],
+  })
+  assert.ok(!('economics' in plain))
+})
+
+test('v0.21: an llm-jury verdict prices the testimony it consumed', async () => {
+  const fs = MemoryFs.of(project())
+  const engine = makeEngine(fs, new FakeCommands())
+  const claim = 'the retry loop no longer swallows lock timeouts'
+  // One active Class B witness for the claim — seeded exactly as the attest
+  // tooling writes it (the marker payload IS the attestation).
+  await engine.storeView.mark('attest/jury', {
+    kind: 'attest/jury',
+    claimId: claimIdOf(claim),
+    gen: 0,
+    prompt: 'deliberate on the claim against the given context',
+    rubricVersion: 'jury-rubric/v1',
+    model: 'test-juror/v1',
+    independence: 'fresh-context',
+    verdict: 'uphold',
+    probability: 0.99,
+    output: '{"verdict":"uphold","probability":0.99}',
+    at: 1_700_000_000_000,
+  })
+  const outcome = await engine.verifyContract({
+    contract: { kind: 'llm-jury', claim },
+    economics: { rate: { currency: 'USD', computePerMs: 0.001, humanReviewPerItem: 2 } },
+  })
+  assert.ok(outcome.economics)
+  assert.equal(outcome.economics.ledger.computeMs, 0, 'no command ever ran on the jury path')
+  assert.equal(outcome.economics.ledger.humanReviewItems, 1, 'the active jury witness is what this verdict consumed')
+  assert.equal(outcome.economics.ledger.cost, 2, 'one review item × $2 — the testimony is the whole bill')
+  assert.equal(outcome.economics.priorProbability, null)
+  assert.equal(outcome.economics.posteriorProbability, null, 'testimony arithmetic is not a scheduler posterior')
+})
