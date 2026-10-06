@@ -25,6 +25,7 @@ import { createProofTools } from './dsh/tools.ts'
 import { WorkspaceWatch, driftNarrative, isMutationToolName, toWorkspaceRelative } from './dsh/observe.ts'
 import { buildPolicySection } from './dsh/prompt.ts'
 import { createLspResolver } from './dsh/lsp-impact.ts'
+import { attachTeamBridge, createTeamBridge } from './dsh/agent-team.ts'
 import { sha256 } from './core/hash.ts'
 import { NodeFsPort } from './node-ports.ts'
 import type { FsPort } from './core/ports.ts'
@@ -361,6 +362,26 @@ export function apply(ctx: Context, config: Config): void {
     })
   }
 
+  // -- experimental agent-team bridge (v0.19) -----------------------------
+  // Strictly opt-in (config.agentTeamBridge, default false): the host's
+  // agent-team API is unreleased, so the event vocabulary is duck-typed at
+  // runtime. A recognized delegation event is mirrored onto the chain as a
+  // signed obligation and the worker's handoff instruction rides the event's
+  // payload back to the child context. When no seam is spoken here, the
+  // bridge goes idle with ONE stderr line — proof_delegate via the MCP/engine
+  // face stays the first-class path, and a host without team events sees no
+  // behavior change at all.
+  if (config.agentTeamBridge === true) {
+    const stderrLine = (line: string): void => { console.error(line) }
+    const bridge = createTeamBridge({
+      delegate: input => engine.delegateTask(input),
+      instructionOf: teamHandoffInstruction,
+      stderr: stderrLine,
+    })
+    const attached = attachTeamBridge(ctx, bridge, stderrLine)
+    log(`agent-team bridge ${attached ? 'attached' : 'idle: no delegation seam'} (experimental)`)
+  }
+
   // -- system-prompt section ----------------------------------------------
   let disposeSection: (() => void) | undefined
   if (config.promptSection && host.systemPrompt) {
@@ -404,6 +425,40 @@ export function apply(ctx: Context, config: Config): void {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * v0.19: the worker's handoff instruction the agent-team bridge injects into
+ * a delegated subtask's context. Worded after the MCP `proof_delegate` face's
+ * own handoff (src/app/mcp-server.ts `handoffInstruction`) — same protocol
+ * steps, same precondition sentence — so a worker reached through the bridge
+ * and one reached through proof_direct MCP are told exactly the same thing.
+ * Exported for the wiring tests, which pin its textual elements.
+ */
+export function teamHandoffInstruction(taskId: string, obligationId: string, claim: string): string {
+  return [
+    `DELEGATED OBLIGATION ${taskId} (obligation ${obligationId})`,
+    '',
+    'You are the worker agent for a delegated obligation on the agent-proof-protocol',
+    'responsibility DAG. Make the claim below true IN YOUR OWN WORKSPACE, then prove',
+    'it and submit the proof back to the orchestrator that delegated it.',
+    '',
+    'CLAIM (what must become true):',
+    `  ${claim}`,
+    '',
+    'YOUR PART OF THE PROTOCOL, in order:',
+    "  1. proof_baseline  — anchor your workspace's starting state before you change anything.",
+    '  2. Do the work that makes the claim true.',
+    '  3. proof_verify (or proof_claim carrying the claim text) — the affected checks must',
+    '     re-run, and your session must grade "proven" with zero regressions before you',
+    '     may submit.',
+    '  4. proof_bundle    — export the tamper-evident APP bundle of your evidence chain.',
+    `  5. Submit it back with proof_delegate_submit { taskId: ${JSON.stringify(taskId)}, bundle: <the bundle proof_bundle returned> }.`,
+    '',
+    'Your "proven" is the precondition of the parent task\'s "proven": until your bundle',
+    'verifies, everything above you in the task graph stays stale — and a forged or',
+    'regressed submission is attributed to you by taskId, never silently absorbed.',
+  ].join('\n')
+}
 
 /** The harness home directory: keys and anchors live under `<home>/proof`. */
 function dshHome(): string {

@@ -1,4 +1,4 @@
-# Agent Proof Protocol (APP) 1.1
+# Agent Proof Protocol (APP) 1.2
 
 **An open standard for machine-verifiable completion claims.**
 
@@ -6,9 +6,9 @@
 |---|---|
 | Status | Draft |
 | Protocol name | `agent-proof-protocol` |
-| Version | `APP/1.1` |
-| Reference implementation | dsh-proof v0.18.0 |
-| Supersedes | `APP/1.0` (dsh-proof v0.14.0) — tool-surface expansion only, see §6/§8 |
+| Version | `APP/1.2` |
+| Reference implementation | dsh-proof v0.19.0 |
+| Supersedes | `APP/1.1` (dsh-proof v0.18.0) — tool-surface expansion only, see §6/§8 |
 | Proof media type | `application/vnd.app.proof+json` |
 | Bundle media type | `application/vnd.app.proof-bundle+json` |
 | Constants module | `src/app/protocol.ts` (this repository) |
@@ -107,7 +107,7 @@ A **proof bundle** (media type `application/vnd.app.proof-bundle+json`) moves a 
 
 ```json
 {
-  "protocol": "APP/1.1",
+  "protocol": "APP/1.2",
   "appFingerprint": "<sha256 hex>",
   "workspaceKey": "<stable workspace identity>",
   "createdAt": "<ISO timestamp>",
@@ -125,7 +125,7 @@ A **proof bundle** (media type `application/vnd.app.proof-bundle+json`) moves a 
 
 ## §6 Verification API
 
-APP/1.1's conformance surface is seven model-facing tools (reference: `src/app/mcp-server.ts`):
+APP/1.2's conformance surface is ten model-facing tools (reference: `src/app/mcp-server.ts`):
 
 | tool | input (essentials) | output (essentials) |
 |---|---|---|
@@ -136,10 +136,15 @@ APP/1.1's conformance surface is seven model-facing tools (reference: `src/app/m
 | `proof_bundle` | — | assembles the §5 bundle: manifest (with `appFingerprint`) + files, digests recomputed at pack time |
 | `proof_publish` | — | appends the workspace's latest *signed* checkpoint to the transparency log (§9) as one Merkle leaf and mints a fresh operator-signed tree head: `{sequence, duplicate, leafHash, treeSize, root, logId, at, inclusionProof, sth}`. Idempotent by leaf hash — republishing the same checkpoint answers `duplicate: true` and the tree does not grow. Requires a configured log and a signed checkpoint on the chain; failure is a clean tool error, never a half-published tree |
 | `proof_log_verify` | `sequence?`, `leafHash?` (together or apart), `publishedTreeSize?` + `publishedRoot?` (paired) | audits the transparency log from its own bytes — nothing the caller asserts is trusted: recomputes the root; adjudicates the signed tree head (size, root, signature — a missing operator key is `not-checked`, never valid); inclusion of the entry at `sequence` (leaf hash recomputed, then verified against the recomputed root); consistency from a previously published `(treeSize, root)` to the current tree. `ok: false` with the problems named on any failure |
+| `proof_delegate` | `claim`, optional `acceptance` (verifiable acceptance criteria), `parentTaskId?` (nest under an existing task) | mints the child's **proof obligation** — the claim that must become true — as a chain record with a content-addressed identity (`obligationId`), guards the graph's acyclicity (a parent must already exist; `detectCycles` as defense in depth), and returns `{taskId, obligationId, obligation}` plus a ready-to-paste `instruction`: the worker handoff text naming the claim, the acceptance criteria, and the worker's half of the protocol (§10) |
+| `proof_delegate_submit` | `taskId`, `bundle` (a §5 export), optional `claimedGrade` (one of the five grades), `byWorkspace?` | adjudicates the bundle from its own bytes — the §5 verifier obligations, zero trust in the submitter — records `artifactVerified` plus the `bundleFingerprint` that anchors what was turned in, derives the default `claimedGrade` two-valued (verified bundle carrying a baseline → `proven`; anything else → `no-baseline` — finer grades MUST be declared explicitly), and returns the `composed` verdict over the rebuilt DAG; a claimed `proven` the artifact cannot back is booked as **forgery** (§10) |
+| `proof_task` | `taskId?`, optional `ownGrade` (one of the five grades) | without `taskId`, the whole-graph overview (every task, its parent, claim summary, submission state); with it, the recursive composed verdict of that task's subtree — grade, forged/regressed/unproven children, waivers, blockers, cycles (§10). `ownGrade` folds this workspace's own locally-earned grade into the composition |
 
 **APP/1.0 → APP/1.1 is a tool-surface expansion, nothing else.** The two transparency tools joined the conformance face; the vocabularies (§2), the content addressing (§3), the chain and checkpoint formats (§4) and the bundle format (§5) are byte-for-byte what APP/1.0 defined — an old bundle remains exactly as verifiable as the day it was minted. What did move is the dialect marking: `PROTOCOL_VERSION` is fingerprint material (§8), so every APP/1.1 manifest self-identifies as mutually unintelligible with every APP/1.0 one, and each side refuses the other instead of guessing. A deployment that runs no transparency log keeps a conforming APP/1.1 face: `proof_publish` / `proof_log_verify` answer a clean configuration error when no log is configured, and bundles without a `transparency` record verify as they always have.
 
-**Out of scope for v1:** `proof_jury`, `proof_jury_submit`, `proof_endorse`, `proof_conjure` and `proof_conjure_run` exist in the reference implementation but are NOT part of APP/1.1 conformance. They depend on host-held seams an open protocol cannot assume — an isolated deliberation model (Class B testimony), a human approval gate (Class C endorsement), and a sandbox plus session context for conjured tests. Hosts MAY expose them as extensions.
+**APP/1.1 → APP/1.2 repeats the same move on the same terms.** The three delegation tools joined the conformance face (7 → 10); the vocabularies (§2), the content addressing (§3), the chain and checkpoint formats (§4) and the bundle format (§5) are untouched, and the fingerprint moved by construction — an APP/1.1 consumer refuses an APP/1.2 manifest instead of guessing at delegation semantics it never agreed to. The three tools carry a three-party role split, one line each: the **orchestrator** speaks `proof_delegate` and `proof_task`; the **worker** proves the obligation in its own workspace with `proof_baseline` / `proof_verify` (or `proof_claim`) / `proof_bundle` and hands the export back through `proof_delegate_submit`; a third-party **auditor** verifies the published checkpoint history with `proof_log_verify` (§9) and the submitted bundles from their own bytes (§5). The delegation semantics themselves — obligations, the composition lattice, forgery — are specified in §10.
+
+**Out of scope for v1:** `proof_jury`, `proof_jury_submit`, `proof_endorse`, `proof_conjure` and `proof_conjure_run` exist in the reference implementation but are NOT part of APP/1.2 conformance. They depend on host-held seams an open protocol cannot assume — an isolated deliberation model (Class B testimony), a human approval gate (Class C endorsement), and a sandbox plus session context for conjured tests. Hosts MAY expose them as extensions.
 
 ## §7 Security considerations
 
@@ -158,9 +163,9 @@ APP/1.1's conformance surface is seven model-facing tools (reference: `src/app/m
 
 ## §8 Conformance
 
-An APP/1.1 implementation MUST implement content addressing (§3), tamper evidence (§4) and the exchange format (§5) exactly as specified, and MUST expose the seven tools of §6. A transparency log (§9) is an optional deployment: the two transparency tools presuppose an operator-run log and MAY answer a clean configuration error when none is configured.
+An APP/1.2 implementation MUST implement content addressing (§3), tamper evidence (§4) and the exchange format (§5) exactly as specified, and MUST expose the ten tools of §6. A transparency log (§9) is an optional deployment: the two transparency tools presuppose an operator-run log and MAY answer a clean configuration error when none is configured. The three delegation tools of §10 are part of the conformance face; an implementation that mints obligations MUST compose verdicts by the §10 lattice exactly.
 
-**Implementation fingerprint.** `appFingerprint()` (`src/app/protocol.ts`) is `sha256(canonicalJson(...))` over the five vocabularies plus one string per load-bearing rule — `addressing: 'sha256(canonicalJson(v))'`, `chain: 'prev=sha256(prevLine)'`, `signature: 'ed25519(canonicalJson(checkpointPayload))'`. It is the dialect's digest: any change to a vocabulary value or to one of these rules MUST produce a different fingerprint. Producers stamp it into every manifest; consumers MUST refuse to interpret a bundle whose fingerprint they cannot reproduce against their own constants, rather than guess at the dialect. The APP/1.0 → APP/1.1 bump is this rule applied honestly to the tool surface: the vocabularies and rule strings are untouched, but `PROTOCOL_VERSION` is itself fingerprint material, so the seven-tool expansion moved the fingerprint by construction — a consumer that could silently read a 1.1 manifest while believing it spoke 1.0 would never learn that two tools' semantics exist; the moved fingerprint makes the dialects refuse each other loudly instead.
+**Implementation fingerprint.** `appFingerprint()` (`src/app/protocol.ts`) is `sha256(canonicalJson(...))` over the five vocabularies plus one string per load-bearing rule — `addressing: 'sha256(canonicalJson(v))'`, `chain: 'prev=sha256(prevLine)'`, `signature: 'ed25519(canonicalJson(checkpointPayload))'`. It is the dialect's digest: any change to a vocabulary value or to one of these rules MUST produce a different fingerprint. Producers stamp it into every manifest; consumers MUST refuse to interpret a bundle whose fingerprint they cannot reproduce against their own constants, rather than guess at the dialect. The APP/1.0 → APP/1.1 bump is this rule applied honestly to the tool surface: the vocabularies and rule strings are untouched, but `PROTOCOL_VERSION` is itself fingerprint material, so the seven-tool expansion moved the fingerprint by construction — a consumer that could silently read a 1.1 manifest while believing it spoke 1.0 would never learn that two tools' semantics exist; the moved fingerprint makes the dialects refuse each other loudly instead. The APP/1.1 → APP/1.2 bump applies the same rule for the same reason: nothing but the three delegation tools moved, and the version-only fingerprint shift makes every APP/1.2 manifest mutually unintelligible with every APP/1.1 one — a consumer never silently accepts a dialect whose delegation semantics it has not implemented.
 
 **Backward compatibility.** Evolution of the canonical addressing rules MUST NOT change the address of any existing value. The sanctioned mechanism is additive optional fields that are *omitted* (never `null`) when absent — canonical JSON drops them, so historical records keep their digests, and old artifacts that predate a field skip (rather than fail) its checks. This is the standing precedent of the reference implementation: `Evidence.source`, `synthetic` and `coverage`, `WorkspaceSnapshot.dirtyDigests`, and the anchor's `workspaceKey` were all added this way, without moving a single existing address.
 
@@ -210,3 +215,27 @@ Any failure names the broken check. A missing capability — no operator key at 
 v1 specifies a **single-operator, file-backed log**. What is cryptographically guaranteed: the log's own history cannot be rewritten undetectably — an interior edit moves the root, a truncation shrinks the tree, both fail the head signature or the consistency proof, and the operator cannot sign a second self-consistent history without tripping the rewind guard. What is explicitly NOT guaranteed: a **split-view** operator — one serving different trees to different verifiers — cannot be caught by any single log alone; detecting it requires multiple witnesses or gossip between auditors (the full certificate-transparency answer), which is **future work**, not a property of this version. And per the dumb-notary principle, the log does not verify the workspace signatures it hosts: a published checkpoint proves publication, and the workspace signature is adjudicated separately by whoever holds the workspace public key.
 
 Reference implementation: `src/core/transparency.ts` (pure domain — RFC 6962 Merkle tree, inclusion and consistency proofs, verifiers written as the exact mirror of the generators, pinned against the RFC's own §2.1.3 worked example) and `src/app/ptl-entry.ts` (the standalone auditor CLI). A three-step audit walkthrough ships as `examples/ptl-workflow.md`.
+
+## §10 Responsibility DAG
+
+Everything before §10 proves things *inside one workspace*. Delegation in a multi-agent system is a handshake with no memory: a parent task sends work down, a child agent reports "done", and the parent's proof silently inherits a claim nobody verified. APP/1.2 gives that handshake a topology and a law: a **cross-agent responsibility DAG** in which a delegated task carries a **proof obligation**, a parent task's `proven` is *preconditioned on all its children being proven*, and every edge is a bundle any party can re-verify.
+
+**Obligations.** `proof_delegate` mints a `TaskObligation`: WHAT the child must prove (the `claim`, plus optional verifiable `acceptance` criteria), for whom (`issuedByWorkspace`), when, under which parent (`parentTaskId`). Its identity is the content address of the whole record — `obligationId` is the first 16 hex of `sha256(canonicalJson(obligation))`, the same shape and reasoning as claim ids — so rewording a claim mints a new obligation, never a silent edit of an old one. Delegation edges only point backwards in time (a parent MUST already exist), and the engine runs `detectCycles` over the resulting graph as defense in depth: a cycle anywhere is refused before composition — a circular responsibility chain proves nothing and MUST NOT be folded as if it did.
+
+**Edges are bundles.** The child proves the obligation **in its own workspace** — `proof_baseline`, the work, `proof_verify` / `proof_claim`, `proof_bundle` — and submits the §5 export back with `proof_delegate_submit`. The parent adjudicates the submission from its own bytes (the §5 verifier obligations; zero trust in the submitter): `artifactVerified` records the adjudication, and `bundleFingerprint` — the order-independent digest over the manifest's content-digest column — anchors exactly which bytes the submission stands behind. This is where the §5 exchange format earns its keep: the edge of the DAG is a self-contained proof artifact, not an opinion crossing a trust boundary.
+
+**The composition lattice.** A parent's grade folds its children pessimistically, in strict priority order:
+
+1. **Forgery or regression outranks everything.** A child that *claimed* `proven` whose artifact does not verify is **forgery**; a child whose effective grade is `regressed` (claimed, or composed from below) is broken work. Either makes the parent `regressed` — and **no waiver can buy it out**: a waiver excuses *missing* work, never broken or forged work (the same symmetry as v0.11's rule that an endorsement cannot buy broken work).
+2. **Else any unwaived child that is missing work** — never submitted, or submitted `stale` / `unproven` / `no-baseline` — makes the parent `stale`: a process gap that blocks `proven` without claiming anything was broken.
+3. **Else every child is proven or waived**, and the parent's grade is its **own** evidence, reported as-is even when it degrades; a pure delegator (no evidence of its own) is `proven` — there is nothing of its own to fail.
+
+Composition is recursive over the whole subtree, memoised (a grandchild shared by two parents composes once and answers both identically — the diamond), and an obligation is discharged by a submitted bundle or a recorded waiver — never by a green subtree alone: a task issued an obligation but submitted nothing stays *unsubmitted* at its parent's level even over a green subtree, because nobody proved ITS claim.
+
+**Honest grades across a trust boundary.** The engine cannot re-run the child's checks — they ran in another workspace, against another baseline — so `claimedGrade` is testimony, kept strictly separate from `artifactVerified`. The default derivation is deliberately two-valued: a verified bundle carrying a baseline reads `proven`, anything else defaults to `no-baseline`. Every finer grade (`unproven`, `stale`, `regressed`) is a workspace-local judgment the submitter MUST declare explicitly — and a declared grade the artifact cannot back is forgery, booked exactly like an inflated `proven` (priority 1). Fine-grained honesty across the seam rests on explicit declaration plus zero-trust artifact verification, nothing else.
+
+**Waivers.** `waiveDelegation` records a named human's risk acceptance (`by` and `reason` mandatory — an anonymous or unexplained acceptance is not an acceptance, it is an erasure). The engine only keeps the books; whether a waiver lifts anything is the lattice's judgment, and over forged or regressed work it is refused by semantics, recorded and visible.
+
+**Honest limits.** The composed verdict names forged children, regressed children, unproven children and waivers — descriptive lists in a fixed order, the same story for every reader. What the engine cannot do is substitute for the child's workspace: the artifact verdict is bundle verification (structure, digests, chain), not a re-execution of the child's checks; the fine grade rests on the submitter's explicit declaration, priced honestly by the forgery rule.
+
+Reference implementation: `src/core/obligations.ts` (pure domain — obligations, submissions, the composition lattice, cycle detection; deterministic, no clock, no I/O) and the four engine verbs `delegateTask` / `submitDelegation` / `taskVerdict` / `waiveDelegation` (`src/engine.ts`), with the three MCP tools (`src/app/mcp-server.ts`) as the protocol face.

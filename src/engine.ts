@@ -16,7 +16,7 @@
 
 import type {
   Baseline, ChangeProvenance, ChangeSetResolution, CheckSpec, CheckStatus, Clock, CommandPort,
-  DefinitionResolverPort, DependencyGraph, Evidence, FsPort, RelPath,
+  DefinitionResolverPort, DependencyGraph, Evidence, FsPort, ProofGrade, RelPath,
   SelectionResult, SignerPort, WorkspacePort, WorkspaceSnapshot,
 } from './core/index.ts'
 import {
@@ -76,6 +76,24 @@ import {
   appendPtlEntry, loadPtl, ptlLeafHash, savePtlHead, sthSignedData,
 } from './core/transparency.ts'
 import type { PtlEntry, SignedTreeHead } from './core/transparency.ts'
+// v0.19: the responsibility-DAG domain (core/obligations.ts) — obligations,
+// submissions and verdict composition, consumed straight from the module.
+// Same discipline as the contract/attest/synthetic/coverage imports above:
+// the core barrel is not this batch's to edit, and a direct import keeps the
+// dependency explicit.
+import {
+  bundleFingerprint, composeTaskVerdict, detectCycles, obligationIdOf,
+} from './core/obligations.ts'
+import type { ComposedVerdict, DagNode, DelegationSubmission, TaskObligation } from './core/obligations.ts'
+// v0.19: the ONE engine→app edge, deliberate. `verifyBundle` is the
+// authoritative implementation of the APP bundle exchange format (manifest
+// digests, chain walk, anchor adjudication), and `submitDelegation` must
+// adjudicate a submitted bundle under exactly that authority rather than the
+// engine growing a second, drift-prone copy of the same rules. No cycle:
+// app/bundle.ts depends only on src/core/* and its sibling protocol.ts —
+// never on the engine.
+import { verifyBundle } from './app/bundle.ts'
+import type { ProofBundle } from './app/bundle.ts'
 import { NodeCommandPort, NodeEd25519Signer, NodeFsPort, GitWorkspace, SystemClock } from './node-ports.ts'
 
 export interface EngineOptions {
@@ -399,6 +417,36 @@ export interface ConjureRunResult {
   readonly outputHead: string
 }
 
+/** v0.19: what `delegateTask` minted and committed to the chain. */
+export interface DelegateTaskResult {
+  /** Engine-minted sequence identity (`task-<n>`), unique on this chain. */
+  readonly taskId: string
+  /** `obligationIdOf(obligation)` — the responsibility's content address. */
+  readonly obligationId: string
+  /** The obligation exactly as it rode the `delegation/created` marker. */
+  readonly obligation: TaskObligation
+}
+
+/** v0.19: what `submitDelegation` recorded, and what the DAG composes over it. */
+export interface SubmitDelegationResult {
+  /** The submission exactly as it rode the `delegation/verdict` marker. */
+  readonly submission: DelegationSubmission
+  /** Verdict composed over the whole rebuilt DAG, with NO own-workspace grade. */
+  readonly composed: ComposedVerdict
+}
+
+/**
+ * v0.19: what `taskVerdict` rebuilt and concluded. `nodes` is the full DAG
+ * the verdict was composed over (so hosts can surface the sub-tree, not just
+ * the grade) and `cycles` is the defense-in-depth report — empty on any
+ * chain this engine alone wrote to.
+ */
+export interface TaskVerdictResult {
+  readonly composed: ComposedVerdict
+  readonly nodes: readonly DagNode[]
+  readonly cycles: string[]
+}
+
 /**
  * π: narrow one `synthetic/requested` marker payload back into a
  * `SyntheticRequest`. Malformed payloads (older chains, foreign writes)
@@ -412,6 +460,107 @@ function syntheticRequestOf(payload: Record<string, unknown>): SyntheticRequest 
   }
   if (!Array.isArray(paths) || !paths.every(p => typeof p === 'string')) return undefined
   return { claimId, claim, paths, entry, requestedAt }
+}
+
+/**
+ * v0.19: the `ProofGrade` vocabulary as a runtime set, so a foreign
+ * `claimedGrade`/`ownGrade` string (tool boundary, hostile caller) is
+ * refused BY VALUE, never trusted by type. Mirrors `ProofGrade` in
+ * core/evidence.ts — the engine owns no grades of its own.
+ */
+const DELEGATION_GRADES: ReadonlySet<string> = new Set([
+  'proven', 'unproven', 'regressed', 'no-baseline', 'stale',
+])
+
+/**
+ * v0.19: narrow one `delegation/created` marker payload back into a
+ * `TaskObligation`. Same rule as `syntheticRequestOf`: a marker that cannot
+ * prove its own shape mints nothing — a malformed obligation cannot join the
+ * responsibility DAG, define a taskId, or authorise a submission.
+ */
+function obligationOf(payload: Record<string, unknown>): TaskObligation | undefined {
+  const { v, taskId, parentTaskId, claim, acceptance, issuedAt, issuedByWorkspace } = payload as Record<string, unknown>
+  if (v !== 1
+    || typeof taskId !== 'string' || taskId.length === 0
+    || typeof claim !== 'string'
+    || typeof issuedAt !== 'string'
+    || typeof issuedByWorkspace !== 'string') {
+    return undefined
+  }
+  if (parentTaskId !== undefined && typeof parentTaskId !== 'string') return undefined
+  if (acceptance !== undefined && typeof acceptance !== 'string') return undefined
+  return {
+    v: 1,
+    taskId,
+    ...(parentTaskId !== undefined ? { parentTaskId } : {}),
+    claim,
+    ...(acceptance !== undefined ? { acceptance } : {}),
+    issuedAt,
+    issuedByWorkspace,
+  }
+}
+
+/**
+ * v0.19: narrow one `delegation/verdict` marker's submission payload back
+ * into a `DelegationSubmission`. Structural only — whether the submission
+ * may lift its parent's verdict is the composer's judgment (core), never the
+ * parser's.
+ */
+function submissionOf(value: unknown): DelegationSubmission | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const {
+    childWorkspace, bundleRoot, claimedGrade, artifactVerified,
+    transparencyVerified, problems, submittedAt,
+  } = value as Record<string, unknown>
+  if (typeof childWorkspace !== 'string'
+    || (bundleRoot !== null && bundleRoot !== undefined && typeof bundleRoot !== 'string')
+    || typeof claimedGrade !== 'string' || !DELEGATION_GRADES.has(claimedGrade)
+    || typeof artifactVerified !== 'boolean'
+    || typeof submittedAt !== 'string') {
+    return undefined
+  }
+  if (transparencyVerified !== undefined && typeof transparencyVerified !== 'boolean') return undefined
+  if (problems !== undefined && (!Array.isArray(problems) || !problems.every(p => typeof p === 'string'))) return undefined
+  return {
+    childWorkspace,
+    bundleRoot: bundleRoot === null ? null : bundleRoot as string,
+    claimedGrade: claimedGrade as ProofGrade,
+    artifactVerified,
+    ...(transparencyVerified !== undefined ? { transparencyVerified } : {}),
+    ...(problems !== undefined ? { problems: [...problems as string[]] } : {}),
+    submittedAt,
+  }
+}
+
+/**
+ * v0.19: shape-narrow an untrusted submitted value into a `ProofBundle` far
+ * enough that every field the ENGINE itself reads — `manifest.files` (the
+ * bundle fingerprint), `manifest.workspaceKey` (the child identity), `files`
+ * (the contents `verifyBundle` adjudicates) — is present with the right
+ * type. Deep adjudication (digests, chain walk, anchor, baseline
+ * self-addressing) stays with `verifyBundle`, the exchange format's
+ * authoritative verifier; this is only the "can this even be read" gate, and
+ * anything failing it is a caller error, not a forged proof to grade.
+ */
+function delegationBundleOf(value: unknown): ProofBundle {
+  const failure = 'submitDelegation: bundle is malformed — expected an APP proof bundle '
+    + '{ manifest: { workspaceKey, files: [{path, sha256}, ...] }, files: { [path]: contents } }'
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error(failure)
+  const { manifest, files } = value as { manifest?: unknown; files?: unknown }
+  if (manifest === null || typeof manifest !== 'object' || Array.isArray(manifest)) throw new Error(failure)
+  if (files === null || typeof files !== 'object' || Array.isArray(files)) throw new Error(failure)
+  const { workspaceKey, files: entries } = manifest as { workspaceKey?: unknown; files?: unknown }
+  if (typeof workspaceKey !== 'string' || workspaceKey.length === 0) throw new Error(failure)
+  if (!Array.isArray(entries)
+    || !entries.every(e => e !== null && typeof e === 'object' && !Array.isArray(e)
+      && typeof (e as { path?: unknown }).path === 'string'
+      && typeof (e as { sha256?: unknown }).sha256 === 'string')) {
+    throw new Error(failure)
+  }
+  for (const contents of Object.values(files as Record<string, unknown>)) {
+    if (typeof contents !== 'string') throw new Error(failure)
+  }
+  return value as ProofBundle
 }
 
 /**
@@ -2095,6 +2244,248 @@ export class ProofEngine {
       executed: summary.changedExecuted.length,
       uncovered: summary.changedUncovered.length,
     }
+  }
+
+  // -- responsibility DAG (v0.19) ----------------------------------------------
+
+  /**
+   * v0.19: delegate a task — mint the obligation and commit it to the chain
+   * BEFORE any work starts. The `delegation/created` marker payload IS the
+   * obligation (a chain fact, exactly like `synthetic/requested`): identity,
+   * claim, acceptance criteria, issuing workspace, timestamp.
+   *
+   * `taskId` is an engine-minted sequence number (`task-<n>`, n =
+   * `delegation/created` markers already on chain + 1) — deliberately not
+   * content-derived, because a responsibility is an act, not a text:
+   * delegating the same claim twice is two obligations.
+   *
+   * `parentTaskId`, when given, must name an obligation already on the
+   * chain (edges only point backwards in time), and the resulting edge set
+   * is run through `detectCycles` as defense in depth — the parent-must-
+   * already-exist rule already makes a cycle unreachable through this verb
+   * alone, but the day any other writer joins the graph, the backstop turns
+   * a silent cycle into a loud refusal.
+   */
+  async delegateTask(input: {
+    claim: string
+    parentTaskId?: string
+    acceptance?: string
+  }): Promise<DelegateTaskResult> {
+    if (typeof input.claim !== 'string' || input.claim.trim().length === 0) {
+      throw new Error('delegateTask: claim must be a non-empty string')
+    }
+    if (input.parentTaskId !== undefined
+      && (typeof input.parentTaskId !== 'string' || input.parentTaskId.length === 0)) {
+      throw new Error('delegateTask: parentTaskId must be a non-empty string when provided')
+    }
+    if (input.acceptance !== undefined && typeof input.acceptance !== 'string') {
+      throw new Error('delegateTask: acceptance must be a string when provided')
+    }
+    const existing = await this.delegationObligations()
+    if (input.parentTaskId !== undefined && !existing.some(o => o.taskId === input.parentTaskId)) {
+      throw new Error(`delegateTask: parentTaskId "${input.parentTaskId}" does not exist — delegate the parent task first`)
+    }
+    // The RAW marker count defines the sequence (not the parsed-obligation
+    // count): a malformed created-marker still consumed a place on the chain,
+    // and a taskId colliding with a marker we could not parse would be worse
+    // than a gap in the numbering.
+    const taskId = `task-${(await this.markersWith('delegation/created')).length + 1}`
+    // An acceptance that says nothing attaches nothing (M19b discipline: no
+    // empty fields are minted for parameters that were not meaningfully set).
+    const acceptance = input.acceptance !== undefined ? markerText(input.acceptance) : undefined
+    const obligation: TaskObligation = {
+      v: 1,
+      taskId,
+      ...(input.parentTaskId !== undefined ? { parentTaskId: input.parentTaskId } : {}),
+      claim: input.claim,
+      ...(acceptance !== undefined ? { acceptance } : {}),
+      issuedAt: new Date(this.clock.now()).toISOString(),
+      // The workspace that opened the obligation is THIS engine's stable
+      // identity — the same key checkpoints, anchors and PTL entries carry.
+      issuedByWorkspace: this.workspaceKey,
+    }
+    const cycles = detectCycles([...existing, obligation])
+    if (cycles.length > 0) {
+      throw new Error(`delegateTask: adding this delegation would close a cycle in the responsibility graph (${cycles.join(' <- ')})`)
+    }
+    await this.store.mark('delegation/created', { ...obligation })
+    return { taskId, obligationId: obligationIdOf(obligation), obligation }
+  }
+
+  /**
+   * v0.19: submit a delegation result — the child side of the handshake.
+   * The bundle is adjudicated by `verifyBundle` (the APP/1.1 authority — see
+   * the import note), and what it proved becomes the `delegation/verdict`
+   * marker's submission: who submitted, the bundle fingerprint the verdict
+   * anchors to, what grade the child CLAIMS, and whether the artifact itself
+   * verified.
+   *
+   * `claimedGrade` honesty boundary: the engine cannot re-run the child's
+   * checks (they ran in another workspace, against another baseline), so the
+   * default derivation is deliberately two-valued — a clean bundle carrying
+   * a baseline is what the child CALLS 'proven', anything else defaults to
+   * 'no-baseline'. Every finer grade ('unproven', 'stale', 'regressed') is a
+   * workspace-local judgment the submitter must DECLARE explicitly; the
+   * composer (core/obligations.ts) then treats a declared grade the artifact
+   * cannot back as forgery, which is exactly where an inflated claim belongs.
+   *
+   * The returned `composed` verdict is pure delegation synthesis — the
+   * own-workspace grade map is EMPTY. The parent's own evidence (its local
+   * `verify()` outcome) enters through `taskVerdict`'s `ownGrade`, whose
+   * consumer owns that judgment.
+   */
+  async submitDelegation(input: {
+    taskId: string
+    bundle: unknown
+    byWorkspace?: string
+    claimedGrade?: ProofGrade
+  }): Promise<SubmitDelegationResult> {
+    if (typeof input.taskId !== 'string' || input.taskId.length === 0) {
+      throw new Error('submitDelegation: taskId must be a non-empty string')
+    }
+    if (input.byWorkspace !== undefined
+      && (typeof input.byWorkspace !== 'string' || input.byWorkspace.trim().length === 0)) {
+      throw new Error('submitDelegation: byWorkspace must be a non-empty string when provided')
+    }
+    if (input.claimedGrade !== undefined && !DELEGATION_GRADES.has(input.claimedGrade)) {
+      throw new Error(`submitDelegation: claimedGrade must be one of ${[...DELEGATION_GRADES].join(' | ')} — got ${JSON.stringify(input.claimedGrade)}`)
+    }
+    const obligationExists = (await this.delegationObligations()).some(o => o.taskId === input.taskId)
+    if (!obligationExists) {
+      throw new Error(`submitDelegation: no delegation/created marker for taskId ${input.taskId} — call delegateTask first`)
+    }
+    // Shape-narrowed before anything touches it: `verifyBundle` defends its
+    // own reads, but the engine reads manifest.files and manifest.workspaceKey
+    // itself (fingerprint, child identity) and must not reach into shapes it
+    // has not proven.
+    const bundle = delegationBundleOf(input.bundle)
+    const verification = await verifyBundle(bundle)
+    const artifactVerified = verification.problems.length === 0
+      && verification.manifestOk
+      && verification.chainBreaks.length === 0
+    const claimedGrade: ProofGrade = input.claimedGrade
+      ?? (artifactVerified && verification.baselineId !== undefined ? 'proven' : 'no-baseline')
+    const problems = verification.problems.slice(0, 5)
+    const submission: DelegationSubmission = {
+      childWorkspace: input.byWorkspace ?? bundle.manifest.workspaceKey,
+      bundleRoot: bundleFingerprint(bundle.manifest.files),
+      claimedGrade,
+      artifactVerified,
+      ...(problems.length > 0 ? { problems } : {}),
+      submittedAt: new Date(this.clock.now()).toISOString(),
+    }
+    await this.store.mark('delegation/verdict', { taskId: input.taskId, submission })
+    // Composed over the WHOLE rebuilt graph — the marker above is part of it,
+    // so the returned verdict already includes this submission.
+    const composed = composeTaskVerdict(input.taskId, await this.delegationGraph(), new Map<string, ProofGrade>())
+    return { submission, composed }
+  }
+
+  /**
+   * v0.19: compose a task's verdict over the whole responsibility DAG
+   * rebuilt from the chain (`delegation/created` + `delegation/verdict` +
+   * `delegation/waive`). `ownGrade`, when given, is THIS workspace's own
+   * locally-earned grade for the task — the one leg submission cannot
+   * supply, because the parent's own evidence never left the parent's chain.
+   * `cycles` is the defense-in-depth report: empty on any chain this engine
+   * alone wrote to, populated the moment a foreign edge closed a loop.
+   */
+  async taskVerdict(input: { taskId: string; ownGrade?: ProofGrade }): Promise<TaskVerdictResult> {
+    if (typeof input.taskId !== 'string' || input.taskId.length === 0) {
+      throw new Error('taskVerdict: taskId must be a non-empty string')
+    }
+    if (input.ownGrade !== undefined && !DELEGATION_GRADES.has(input.ownGrade)) {
+      throw new Error(`taskVerdict: ownGrade must be one of ${[...DELEGATION_GRADES].join(' | ')} — got ${JSON.stringify(input.ownGrade)}`)
+    }
+    const nodes = await this.delegationGraph()
+    if (!nodes.some(n => n.obligation.taskId === input.taskId)) {
+      throw new Error(`taskVerdict: taskId ${input.taskId} does not exist on this chain — delegateTask first`)
+    }
+    const cycles = detectCycles(nodes.map(n => n.obligation))
+    const ownGrades = input.ownGrade !== undefined
+      ? new Map<string, ProofGrade>([[input.taskId, input.ownGrade]])
+      : new Map<string, ProofGrade>()
+    const composed = composeTaskVerdict(input.taskId, nodes, ownGrades)
+    return { composed, nodes, cycles }
+  }
+
+  /**
+   * v0.19: waive a task's obligation — record the risk acceptance, nothing
+   * more. The engine only keeps the books: whether a waiver may lift a
+   * verdict is the composer's judgment (core/obligations.ts), and a waiver
+   * over a FORGED or REGRESSED child is recorded here exactly like any
+   * other — the composition layer is the one that refuses it. `by` and
+   * `reason` are mandatory and non-empty: an anonymous or unexplained
+   * acceptance of risk is not an acceptance, it is an erasure.
+   */
+  async waiveDelegation(input: { taskId: string; by: string; reason: string }): Promise<void> {
+    if (typeof input.taskId !== 'string' || input.taskId.length === 0) {
+      throw new Error('waiveDelegation: taskId must be a non-empty string')
+    }
+    if (typeof input.by !== 'string' || input.by.trim().length === 0) {
+      throw new Error('waiveDelegation: by must be a non-empty string')
+    }
+    if (typeof input.reason !== 'string' || input.reason.trim().length === 0) {
+      throw new Error('waiveDelegation: reason must be a non-empty string')
+    }
+    const exists = (await this.delegationObligations()).some(o => o.taskId === input.taskId)
+    if (!exists) {
+      throw new Error(`waiveDelegation: no delegation/created marker for taskId ${input.taskId}`)
+    }
+    await this.store.mark('delegation/waive', {
+      taskId: input.taskId,
+      by: input.by.trim().slice(0, 200),
+      reason: input.reason.trim().slice(0, 200),
+      at: new Date(this.clock.now()).toISOString(),
+    })
+  }
+
+  /**
+   * v0.19: every `TaskObligation` on the chain, in log order. Malformed
+   * `delegation/created` payloads mint nothing (the `syntheticRequestOf`
+   * rule) — but note `delegateTask` still counts them for the sequence, so
+   * a skipped marker costs a taskId number, never a collision.
+   */
+  private async delegationObligations(): Promise<TaskObligation[]> {
+    const out: TaskObligation[] = []
+    for (const payload of await this.markersWith('delegation/created')) {
+      const obligation = obligationOf(payload)
+      if (obligation !== undefined) out.push(obligation)
+    }
+    return out
+  }
+
+  /**
+   * v0.19: rebuild the full responsibility DAG from the chain — obligations
+   * from `delegation/created`, the LATEST submission per task from
+   * `delegation/verdict` (log order, so a re-submission overwrites its
+   * predecessor — the appeal discipline attestations follow), and the LATEST
+   * waiver from `delegation/waive`. Markers that cannot prove their shape,
+   * and verdict/waive markers naming unknown tasks, are skipped: they can
+   * neither mint obligations nor mutate the ones that exist.
+   */
+  private async delegationGraph(): Promise<DagNode[]> {
+    const nodes = new Map<string, DagNode>()
+    for (const obligation of await this.delegationObligations()) {
+      nodes.set(obligation.taskId, { obligation })
+    }
+    for (const payload of await this.markersWith('delegation/verdict')) {
+      const { taskId, submission } = payload as Record<string, unknown>
+      if (typeof taskId !== 'string') continue
+      const parsed = submissionOf(submission)
+      const node = nodes.get(taskId)
+      if (parsed === undefined || node === undefined) continue
+      nodes.set(taskId, { ...node, submission: parsed })
+    }
+    for (const payload of await this.markersWith('delegation/waive')) {
+      const { taskId, by, reason, at } = payload as Record<string, unknown>
+      if (typeof taskId !== 'string' || typeof by !== 'string'
+        || typeof reason !== 'string' || typeof at !== 'string') continue
+      const node = nodes.get(taskId)
+      if (node === undefined) continue
+      nodes.set(taskId, { ...node, waiver: { by, reason, at } })
+    }
+    return [...nodes.values()]
   }
 
   // -- graded evidence (κ) ----------------------------------------------------

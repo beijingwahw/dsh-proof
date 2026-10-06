@@ -3,12 +3,14 @@
  *
  * Spawns `node --experimental-strip-types src/app/mcp-entry.ts` against a
  * minimal real npm project and drives it over newline-delimited JSON-RPC 2.0
- * on stdio: the handshake, the seven-tool APP/1.1 contract, a real baseline →
- * verify → status → bundle → publish → log-verify chain (real `npm test`,
- * real evidence, real Ed25519 chain, real transparency log), and the error
- * paths (unknown tool, bogus claim kind, malformed JSON line). Nothing is
- * stubbed — this is the test that proves any foreign harness can drive the
- * proof protocol end to end.
+ * on stdio: the handshake, the ten-tool APP/1.2 contract, a real baseline →
+ * verify → status → bundle → publish → log-verify chain, then the v0.19
+ * responsibility DAG end to end (delegate → task overview/detail → honest
+ * bundle submit → forged bundle refusal) — real `npm test`, real evidence,
+ * real Ed25519 chain, real transparency log — and the error paths (unknown
+ * tool, bogus claim kind, malformed JSON line). Nothing is stubbed — this is
+ * the test that proves any foreign harness can drive the proof protocol end
+ * to end.
  */
 
 import { test, before, after } from 'node:test'
@@ -19,16 +21,23 @@ import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 
 import { sha256 } from '../src/core/hash.ts'
+// v0.19: the worker's half of the delegation protocol is simulated in-process
+// by minting a real APP bundle from the fixture's evidence artifacts — the
+// same builder the proof_bundle tool itself calls.
+import { buildBundle } from '../src/app/bundle.ts'
 
 // The repo (for the entry script) and the scratch workspace per the task's
 // designated temp area: C:\mimoclaw_workspace\.openclaw\tmp\mcp-it-<pid>.
 const ENTRY = fileURLToPath(new URL('../src/app/mcp-entry.ts', import.meta.url))
 const WORKSPACE = join(fileURLToPath(new URL('../../../.openclaw/tmp', import.meta.url)), `mcp-it-${process.pid}`)
 
-// v0.18 (APP/1.1): the transparency-log tools join the frozen contract.
+// v0.18 (APP/1.1): the transparency-log tools joined the frozen contract;
+// v0.19 (APP/1.2): the responsibility-DAG tools take it to ten, appended in
+// order so the APP/1.1 prefix is unchanged.
 const MCP_TOOLS = [
   'proof_status', 'proof_baseline', 'proof_verify', 'proof_claim', 'proof_bundle',
   'proof_publish', 'proof_log_verify',
+  'proof_delegate', 'proof_delegate_submit', 'proof_task',
 ] as const
 
 const CHECK_SCRIPT = [
@@ -194,7 +203,7 @@ test('initialize handshake answers with the server identity and a supported prot
     serverInfo: { name: string; version: string }
   }
   assert.equal(result.serverInfo.name, 'agent-proof-protocol')
-  assert.equal(result.serverInfo.version, '0.18.0')
+  assert.equal(result.serverInfo.version, '0.19.0')
   assert.equal(result.protocolVersion, '2025-06-18', 'a requested supported version is echoed back')
   assert.equal(result.capabilities.tools.listChanged, false)
 })
@@ -220,7 +229,7 @@ test('notifications/initialized produces no reply and ping answers an empty resu
   assert.deepEqual(pong.result, {})
 })
 
-test('tools/list exposes exactly the seven APP/1.1 contract tools', async () => {
+test('tools/list exposes exactly the ten APP/1.2 contract tools', async () => {
   const response = await client.request('tools/list', {})
   assert.equal(response.error, undefined)
   const tools = (response.result as {
@@ -229,7 +238,7 @@ test('tools/list exposes exactly the seven APP/1.1 contract tools', async () => 
   assert.deepEqual(
     tools.map(t => t.name).sort(),
     [...MCP_TOOLS].sort(),
-    'the cross-agent contract is exactly seven tools',
+    'the cross-agent contract is exactly ten tools',
   )
   for (const tool of tools) {
     assert.equal(tool.inputSchema.type, 'object', `${tool.name} inputSchema must be an object schema`)
@@ -239,6 +248,20 @@ test('tools/list exposes exactly the seven APP/1.1 contract tools', async () => 
   assert.deepEqual((claim.inputSchema as { required?: string[] }).required, ['claim'])
   const kind = (claim.inputSchema as { properties?: Record<string, { enum?: string[] }> }).properties?.kind?.enum
   assert.deepEqual(kind, ['behavior-preserving', 'behavior-adding', 'perf-budget', 'docs-only', 'llm-jury'])
+  // v0.19: the delegation tools' parameter faces — the orchestrator's
+  // delegate needs a claim, the worker's submit needs a task and a bundle,
+  // and the task inspector's optional ownGrade speaks the five-grade scale.
+  const delegate = tools.find(t => t.name === 'proof_delegate')!
+  assert.deepEqual((delegate.inputSchema as { required?: string[] }).required, ['claim'])
+  const submit = tools.find(t => t.name === 'proof_delegate_submit')!
+  assert.deepEqual(
+    ((submit.inputSchema as { required?: string[] }).required ?? []).slice().sort(),
+    ['bundle', 'taskId'],
+  )
+  const task = tools.find(t => t.name === 'proof_task')!
+  assert.equal((task.inputSchema as { required?: string[] }).required, undefined, 'proof_task takes no required argument')
+  const ownGrade = (task.inputSchema as { properties?: Record<string, { enum?: string[] }> }).properties?.ownGrade?.enum
+  assert.deepEqual(ownGrade, ['proven', 'regressed', 'stale', 'unproven', 'no-baseline'])
 })
 
 test('an unknown method is a JSON-RPC -32601 error', async () => {
@@ -314,7 +337,7 @@ test('proof_bundle exports a manifest that digests the evidence log', async () =
     }
   }
   assert.ok(value.bundle !== undefined, 'a small bundle rides the response in full')
-  assert.equal(value.bundle.manifest.protocol, 'APP/1.1')
+  assert.equal(value.bundle.manifest.protocol, 'APP/1.2')
   const entry = value.bundle.manifest.files.find(f => f.path === 'evidence.jsonl')
   assert.ok(entry !== undefined, 'the manifest digests evidence.jsonl')
   assert.match(entry.sha256, /^[0-9a-f]{64}$/)
@@ -439,6 +462,190 @@ test('proof_log_verify audits the log: self-check, inclusion, consistency — an
 })
 
 // ---------------------------------------------------------------------------
+// v0.19: the responsibility DAG over the real subprocess — real delegation
+// markers on the real chain, a worker bundle minted from the fixture's own
+// artifacts (the cross-process story in miniature), and the engine's
+// adjudication of an honest vs a forged submission.
+// ---------------------------------------------------------------------------
+
+// The obligation the orchestrator delegates across the tests below.
+const DELEGATED_CLAIM = 'deliver the audit-report section with evidence citations'
+const DELEGATED_ACCEPTANCE = 'the section exists, cites at least three evidence records, and npm test passes'
+
+/**
+ * Mint the bundle a worker agent would export from ITS completed workspace.
+ * The fixture's store already holds a green baseline + verify chain by this
+ * point in the file (state chains, like the publish tests above), so this is
+ * the honest export: same builder, same artifacts, as proof_bundle itself.
+ */
+async function mintWorkerBundle(): Promise<{ manifest: { protocol: string }; files: Record<string, string> }> {
+  // mcp-entry's derivation, mirrored: workspaceKey = sha256(root)[:16], host
+  // mode stores evidence at <trustRoot>/workspaces/<key>.
+  const workspaceKey = sha256(WORKSPACE).slice(0, 16)
+  const storeDir = join(WORKSPACE, 'trust', 'workspaces', workspaceKey)
+  const evidenceLog = await fsp.readFile(join(storeDir, 'evidence.jsonl'), 'utf8')
+  const input: { evidenceLog: string; baselineJson?: string; anchorJson?: string } = { evidenceLog }
+  await fsp.readFile(join(storeDir, 'baseline.json'), 'utf8').then(
+    (baselineJson) => { input.baselineJson = baselineJson },
+    () => { /* absent — the bundle simply omits it */ },
+  )
+  await fsp.readFile(join(WORKSPACE, 'trust', 'anchors', workspaceKey, 'anchor.json'), 'utf8').then(
+    (anchorJson) => { input.anchorJson = anchorJson },
+    () => { /* absent — the bundle simply omits it */ },
+  )
+  const bundle = buildBundle(input, workspaceKey, new Date().toISOString())
+  return { manifest: bundle.manifest, files: { ...bundle.files } }
+}
+
+test('proof_delegate records the obligation and returns the worker handoff instruction', async () => {
+  const result = await callTool('proof_delegate', {
+    claim: DELEGATED_CLAIM,
+    acceptance: DELEGATED_ACCEPTANCE,
+  })
+  assert.equal(result.isError, undefined, `delegate errored: ${result.content[0]?.text}`)
+  const value = result.structuredContent as {
+    taskId: string
+    obligationId: string
+    obligation: { claim?: unknown; acceptance?: unknown }
+    instruction: string
+  }
+  assert.equal(value.taskId, 'task-1', 'the first delegation on a fresh chain numbers task-1')
+  assert.equal(typeof value.obligationId, 'string')
+  assert.ok(value.obligationId.length > 0, 'the obligation carries its own chain identity')
+  assert.equal(value.obligation.claim, DELEGATED_CLAIM, 'the obligation records the claim verbatim')
+  assert.equal(value.obligation.acceptance, DELEGATED_ACCEPTANCE, 'the obligation records the acceptance verbatim')
+  // The instruction is the wiring point: everything the worker must know has
+  // to ride in it, because the orchestrator will not be watching its prompt.
+  assert.ok(value.instruction.includes(DELEGATED_CLAIM), 'the instruction restates the claim')
+  assert.ok(value.instruction.includes(DELEGATED_ACCEPTANCE), 'the instruction restates the acceptance')
+  assert.ok(value.instruction.includes('task-1'), 'the instruction names the taskId to submit against')
+  assert.ok(value.instruction.includes('proof_baseline'), '…points the worker at proof_baseline first')
+  assert.ok(value.instruction.includes('proof_verify'), '…tells the worker to prove before submitting')
+  assert.ok(value.instruction.includes('proof_bundle'), '…tells the worker to export an APP bundle')
+  assert.ok(value.instruction.includes('proof_delegate_submit'), '…tells the worker how to submit it back')
+  assert.ok(value.instruction.includes('precondition'),
+    '…states it plainly: the worker\'s proven is the precondition of the parent\'s')
+})
+
+test('proof_task before any submission: the overview lists the DAG, the parent composes stale', async () => {
+  // The orchestrator nests the worker's obligation under its own: task-1 is
+  // the parent (from the test above), task-2 the child that must discharge it.
+  const child = await callTool('proof_delegate', {
+    claim: 'write the audit-report section to spec',
+    parentTaskId: 'task-1',
+  })
+  assert.equal(child.isError, undefined, `child delegate errored: ${child.content[0]?.text}`)
+  assert.equal((child.structuredContent as { taskId: string }).taskId, 'task-2',
+    'the second delegation numbers task-2')
+
+  const overview = await callTool('proof_task', {})
+  assert.equal(overview.isError, undefined, `overview errored: ${overview.content[0]?.text}`)
+  const tasks = (overview.structuredContent as {
+    tasks: { taskId: string; parentTaskId: string | null; claim: string; submitted: boolean }[]
+  }).tasks
+  const parent = tasks.find(t => t.taskId === 'task-1')
+  const worker = tasks.find(t => t.taskId === 'task-2')
+  assert.ok(parent !== undefined && worker !== undefined, 'the whole-graph overview lists both tasks')
+  assert.equal(parent.parentTaskId, null, 'task-1 is a root obligation')
+  assert.equal(worker.parentTaskId, 'task-1', 'the overview shows the nesting edge')
+  assert.equal(worker.claim, 'write the audit-report section to spec')
+  assert.ok(worker.claim.length <= 80, 'the overview summary is capped at 80 characters')
+  assert.equal(parent.submitted, false, 'nothing has been submitted yet')
+  assert.equal(worker.submitted, false, 'nothing has been submitted yet')
+
+  // The parent's composed verdict while its obligation is unmet: stale, with
+  // the unsubmitted child named — the orchestrator's honest stop-light.
+  const detail = await callTool('proof_task', { taskId: 'task-1' })
+  assert.equal(detail.isError, undefined, `detail errored: ${detail.content[0]?.text}`)
+  const detailValue = detail.structuredContent as {
+    taskId: string
+    composed: { grade?: string; unprovenChildren?: string[] }
+    nodes: unknown[]
+    cycles: string[]
+  }
+  assert.equal(detailValue.taskId, 'task-1')
+  assert.equal(detailValue.composed.grade, 'stale', 'an unmet obligation keeps the composed verdict stale')
+  assert.ok(detailValue.composed.unprovenChildren?.includes('task-2'),
+    'the unsubmitted child is named, not just counted')
+  assert.equal(detailValue.nodes.length, 2, 'the full verdict carries the whole node set')
+  assert.deepEqual(detailValue.cycles, [], 'an honest chain has no cycles')
+})
+
+test('proof_delegate_submit with an honestly minted worker bundle composes the obligation proven', async () => {
+  const bundle = await mintWorkerBundle()
+  assert.equal(bundle.manifest.protocol, 'APP/1.2', 'the worker exports the current dialect')
+
+  // The child submits: a green baseline+verify chain minted into a bundle,
+  // with no grade claimed — the derivation must earn 'proven' on its own.
+  const result = await callTool('proof_delegate_submit', { taskId: 'task-2', bundle: { ...bundle, files: { ...bundle.files } } })
+  assert.equal(result.isError, undefined, `submit errored: ${result.content[0]?.text}`)
+  const value = result.structuredContent as {
+    submission: { claimedGrade?: string; artifactVerified?: boolean }
+    composed: { grade?: string; forgedChildren?: string[] }
+  }
+  assert.equal(value.submission.claimedGrade, 'proven',
+    'an omitted claim over a green bundle with a baseline derives proven — the default is earned, not assumed')
+  assert.equal(value.submission.artifactVerified, true, 'the untampered artifact verifies')
+  assert.equal(value.composed.grade, 'proven', 'an honest bundle composes the submitting task proven')
+  assert.deepEqual(value.composed.forgedChildren, [], 'an honest bundle forges nothing')
+
+  // And the PARENT flips with it: the child's proven is the parent's
+  // precondition, so the parent's composed verdict is no longer stale.
+  const parent = await callTool('proof_task', { taskId: 'task-1' })
+  assert.equal(parent.isError, undefined, `parent detail errored: ${parent.content[0]?.text}`)
+  const parentValue = parent.structuredContent as {
+    composed: { grade?: string; unprovenChildren?: string[] }
+  }
+  assert.equal(parentValue.composed.grade, 'proven', 'the parent is proven exactly when its obligation is discharged')
+  assert.deepEqual(parentValue.composed.unprovenChildren, [])
+
+  // The overview the orchestrator polls sees the submission land.
+  const overview = await callTool('proof_task', {})
+  const tasks = (overview.structuredContent as { tasks: { taskId: string; submitted: boolean }[] }).tasks
+  assert.equal(tasks.find(t => t.taskId === 'task-2')?.submitted, true, 'the overview sees the submission land')
+  assert.equal(tasks.find(t => t.taskId === 'task-1')?.submitted, false, 'the parent obligation itself never submitted')
+})
+
+test('a forged worker bundle is attributed, not absorbed — composed regressed with forgedChildren', async () => {
+  // A second worker under the same parent, and this one lies: it CLAIMS
+  // proven while shipping a bundle whose evidence log was rewritten after
+  // the manifest was packed (one appended space) — the content no longer
+  // digests to what the manifest claims.
+  const second = await callTool('proof_delegate', { claim: 'deliver the performance-budget section', parentTaskId: 'task-1' })
+  assert.equal(second.isError, undefined, `delegate errored: ${second.content[0]?.text}`)
+  const secondTaskId = (second.structuredContent as { taskId: string }).taskId
+  assert.equal(secondTaskId, 'task-3', 'the third delegation numbers task-3')
+
+  const honest = await mintWorkerBundle()
+  const forgedFiles: Record<string, string> = { ...honest.files }
+  forgedFiles['evidence.jsonl'] = `${forgedFiles['evidence.jsonl'] ?? ''} `
+  const forged = { manifest: honest.manifest, files: forgedFiles }
+
+  const result = await callTool('proof_delegate_submit', { taskId: secondTaskId, bundle: forged, claimedGrade: 'proven' })
+  assert.equal(result.isError, undefined, `submit errored: ${result.content[0]?.text}`)
+  const value = result.structuredContent as {
+    submission: { claimedGrade?: string; artifactVerified?: boolean }
+    composed: { grade?: string }
+  }
+  assert.equal(value.submission.claimedGrade, 'proven', 'the lie is recorded verbatim — the claim the worker made')
+  assert.equal(value.submission.artifactVerified, false, 'the recomputed digests catch the rewrite')
+  assert.equal(value.composed.grade, 'regressed', 'a proven claim the artifact cannot back composes regressed')
+
+  // And the parent's composed verdict attributes the forgery by taskId —
+  // visible in forgedChildren, never silently absorbed into a lesser grade.
+  const parent = await callTool('proof_task', { taskId: 'task-1' })
+  assert.equal(parent.isError, undefined, `parent detail errored: ${parent.content[0]?.text}`)
+  const parentValue = parent.structuredContent as {
+    composed: { grade?: string; forgedChildren?: string[]; unprovenChildren?: string[] }
+  }
+  assert.equal(parentValue.composed.grade, 'regressed', 'one forged child regresses the parent')
+  assert.ok(parentValue.composed.forgedChildren?.includes(secondTaskId),
+    `forgedChildren attributes the forgery to ${secondTaskId}`)
+  assert.ok(!parentValue.composed.forgedChildren?.includes('task-2'),
+    'the honest sibling is not smeared by the forged one')
+})
+
+// ---------------------------------------------------------------------------
 // error paths
 // ---------------------------------------------------------------------------
 
@@ -455,6 +662,27 @@ test('proof_claim with a bogus kind errors loudly instead of silently downgradin
   assert.match(text, /kind/, 'the error names the offending argument')
   assert.match(text, /bogus/, 'the error echoes the offending value')
   assert.ok(!text.includes('"proven"'), 'the answer must not read like a verification verdict')
+})
+
+test('the delegation tools refuse malformed usage loudly, never silently', async () => {
+  // A delegation without a claim is not a delegation.
+  const noClaim = await callTool('proof_delegate', {})
+  assert.equal(noClaim.isError, true)
+  assert.match(noClaim.content[0]!.text, /claim/, 'the missing claim is named')
+
+  // A submission without a bundle has nothing to adjudicate.
+  const noBundle = await callTool('proof_delegate_submit', { taskId: 'task-1' })
+  assert.equal(noBundle.isError, true)
+  assert.match(noBundle.content[0]!.text, /bundle/, 'the missing bundle is named')
+
+  // A grade the scale does not name is refused, not rounded into place —
+  // same loud-argument discipline as proof_claim's kind guard.
+  const bogusGrade = await callTool('proof_task', { taskId: 'task-1', ownGrade: 'over-the-moon' })
+  assert.equal(bogusGrade.isError, true)
+  const text = bogusGrade.content[0]!.text
+  assert.match(text, /ownGrade/, 'the error names the offending argument')
+  assert.match(text, /over-the-moon/, 'the error echoes the offending value')
+  assert.ok(!text.includes('"proven"'), 'the answer must not read like a verdict')
 })
 
 test('a malformed JSON line gets a -32700 JSON-RPC error response', async () => {

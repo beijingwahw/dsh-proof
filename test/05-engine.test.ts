@@ -7,10 +7,16 @@ import { join } from 'node:path'
 import { ProofEngine } from '../src/engine.ts'
 import { assembleProof } from '../src/core/report.ts'
 import { attributeChecks, proofNarrative } from '../src/core/regression.ts'
-import { makeEvidence, snapshotWorkspace } from '../src/core/evidence.ts'
+import { buildBaseline, EvidenceStore, makeEvidence, snapshotWorkspace } from '../src/core/evidence.ts'
+import type { ProofGrade } from '../src/core/evidence.ts'
 import { VerificationRunner } from '../src/core/runner.ts'
 import { claimIdOf } from '../src/core/attest.ts'
 import { SYNTHETIC_TEMPLATE } from '../src/core/synthetic.ts'
+// v0.19: the delegation verbs are exercised against REAL APP/1.1 bundles —
+// the same builders 22-bundle adjudicates — and against G1's DAG composer.
+import { bundleFingerprint } from '../src/core/obligations.ts'
+import { buildBundle } from '../src/app/bundle.ts'
+import type { ProofBundle } from '../src/app/bundle.ts'
 import { createProofTools, toVerifyValue } from '../src/dsh/tools.ts'
 import { deriveProofPaths, touchesEvidencePath } from '../src/adapters/shared/paths.ts'
 import { NodeCommandPort, NodeFsPort, SystemClock } from '../src/node-ports.ts'
@@ -2352,5 +2358,220 @@ test('v0.18: two checkpoints publish two leaves, and the tree provably extends i
   assert.equal(
     verifyInclusion(log.entries[0]!, 0, log.size, log.inclusionProof(0), publish2.root),
     true,
+  )
+})
+
+// -- v0.19: the responsibility DAG (delegation verbs) ---------------------------
+
+const CHILD_LOG = `${ROOT}/child/.proof/evidence.jsonl`
+const CHILD_BASE = `${ROOT}/child/.proof/baseline.json`
+const CHILD_AT = '2026-10-06T00:00:00.000Z'
+
+/** Workspace snapshot of the child a delegated bundle was minted under. */
+function childWs() {
+  return snapshotWorkspace('child-head', ['src/child.ts'])
+}
+
+/**
+ * An honest child bundle: a real `EvidenceStore` chain in memory (unsigned —
+ * an unsigned chain verifies clean), one decisively passing record, a
+ * checkpoint, and a self-addressed baseline — the same recipe 22-bundle's
+ * honest fixtures use, at the minimum the format demands. The submission
+ * path must accept exactly what the exchange format's own verifier calls
+ * clean, nothing looser.
+ */
+async function honestChildBundle(workspaceKey = 'child-ws'): Promise<ProofBundle> {
+  const fs = MemoryFs.of({})
+  const store = new EvidenceStore(fs, CHILD_LOG, CHILD_BASE, new FakeClock(), {
+    workspaceKey,
+    checkpointEvery: 1000,
+  })
+  const record = makeEvidence(
+    spec({ id: 'child-test' }),
+    { status: 'pass', exitCode: 0, durationMs: 5, output: 'ok\n' },
+    childWs(),
+    new FakeClock(),
+  )
+  await store.append(record)
+  await store.checkpoint()
+  const baseline = buildBaseline([record], childWs(), new FakeClock())
+  const log = await fs.readFile(CHILD_LOG)
+  assert.ok(typeof log === 'string', 'the child store wrote its log')
+  return buildBundle(
+    { evidenceLog: log, baselineJson: JSON.stringify(baseline, null, 2) },
+    workspaceKey,
+    CHILD_AT,
+  )
+}
+
+/** Tamper the evidence file WITHOUT touching the manifest — naive forgery. */
+function forgedFrom(honest: ProofBundle): ProofBundle {
+  const log = honest.files['evidence.jsonl'] ?? ''
+  return {
+    manifest: honest.manifest,
+    files: { ...honest.files, 'evidence.jsonl': `${log.slice(0, -3)}tampered\n` },
+  }
+}
+
+test('v0.19: delegate -> submit an honest bundle -> artifact verified, composed proven', async () => {
+  const fs = MemoryFs.of(project())
+  const engine = makeEngine(fs, new FakeCommands())
+
+  const { taskId, obligationId, obligation } = await engine.delegateTask({
+    claim: 'port the parser to WASM',
+    acceptance: 'benchmarks no slower than the JS parser',
+  })
+  assert.equal(taskId, 'task-1', 'the first delegation is task-1')
+  assert.equal(obligation.v, 1)
+  assert.equal(obligation.claim, 'port the parser to WASM')
+  assert.equal(obligation.acceptance, 'benchmarks no slower than the JS parser')
+  assert.equal(obligation.parentTaskId, undefined, 'a root delegation has no parent edge')
+  assert.equal(obligation.issuedByWorkspace, 'default', 'the issuer is the engine workspace key')
+  assert.ok(obligationId.length > 0, 'the obligation carries its content address')
+
+  const bundle = await honestChildBundle()
+  const { submission, composed } = await engine.submitDelegation({ taskId, bundle })
+  assert.equal(submission.childWorkspace, 'child-ws', 'the manifest names the child workspace')
+  assert.equal(submission.claimedGrade, 'proven', 'clean bundle + baseline derives proven')
+  assert.equal(submission.artifactVerified, true)
+  assert.equal(submission.problems, undefined, 'a clean bundle attaches no problems')
+  assert.equal(submission.bundleRoot, bundleFingerprint(bundle.manifest.files),
+    'the submission anchors to the manifest fingerprint')
+  assert.equal(composed.grade, 'proven', 'the parent composes proven over an honest submission')
+
+  // The graph round-trips: the marker payload reconstructs the obligation
+  // exactly, and a chain only this engine wrote to carries no cycles.
+  const verdict = await engine.taskVerdict({ taskId })
+  assert.deepEqual(verdict.cycles, [])
+  assert.equal(verdict.nodes.length, 1)
+  assert.deepEqual(verdict.nodes[0]?.obligation, obligation)
+})
+
+test('v0.19: a forged submission regresses, and a waiver cannot launder it', async () => {
+  const engine = makeEngine(MemoryFs.of(project()), new FakeCommands())
+  const { taskId } = await engine.delegateTask({ claim: 'fix the flaky retry loop' })
+
+  // One byte of evidence changed, manifest untouched: the exact tampering
+  // verifyBundle exists to catch (digest mismatch -> manifestOk false).
+  const { submission, composed } = await engine.submitDelegation({
+    taskId,
+    bundle: forgedFrom(await honestChildBundle()),
+    claimedGrade: 'proven',
+  })
+  assert.equal(submission.artifactVerified, false)
+  assert.ok((submission.problems ?? []).length > 0, 'verifyBundle problems ride the submission')
+  assert.equal(submission.claimedGrade, 'proven', 'the child still claims proven')
+  assert.equal(composed.grade, 'regressed', 'claiming proven over a broken artifact is regression')
+  assert.ok(composed.forgedChildren.includes(taskId), 'the task is named as forged')
+
+  // The waiver is recorded (the engine keeps the books) but the composition
+  // layer refuses it: risk acceptance is not evidence.
+  await engine.waiveDelegation({ taskId, by: 'tech-lead', reason: 'ship it anyway — risk accepted' })
+  const after = await engine.taskVerdict({ taskId })
+  assert.equal(after.composed.grade, 'regressed', 'a waiver does not lift a forgery')
+  const node = after.nodes.find(n => n.obligation.taskId === taskId)
+  assert.ok(node?.waiver, 'the waiver itself is on the books')
+  assert.equal(node?.waiver?.by, 'tech-lead')
+})
+
+test('v0.19: an unsubmitted child holds the parent stale; a waiver plus own evidence composes', async () => {
+  const engine = makeEngine(MemoryFs.of(project()), new FakeCommands())
+  await engine.delegateTask({ claim: 'own the migration' })
+  const second = await engine.delegateTask({ claim: 'port the schema', parentTaskId: 'task-1' })
+  assert.equal(second.taskId, 'task-2', 'sequence numbers count created markers')
+  assert.equal(second.obligation.parentTaskId, 'task-1')
+
+  const stale = await engine.taskVerdict({ taskId: 'task-1' })
+  assert.equal(stale.composed.grade, 'stale', 'a child that never submitted leaves the parent undecidable')
+
+  await engine.waiveDelegation({ taskId: 'task-2', by: 'tech-lead', reason: 'child dropped — risk accepted' })
+  const lifted = await engine.taskVerdict({ taskId: 'task-1', ownGrade: 'proven' })
+  assert.equal(lifted.composed.grade, 'proven',
+    'with the child waived and the parent own-proven, the verdict composes')
+})
+
+test('v0.19: parameter defenses — claim, unknown parent/task, malformed bundle, bogus grade', async () => {
+  const engine = makeEngine(MemoryFs.of(project()), new FakeCommands())
+  await engine.delegateTask({ claim: 'root task' })
+
+  await assert.rejects(() => engine.delegateTask({ claim: '' }), /claim must be a non-empty string/)
+  await assert.rejects(
+    () => engine.delegateTask({ claim: 42 as unknown as string }),
+    /claim must be a non-empty string/,
+  )
+  await assert.rejects(
+    () => engine.delegateTask({ claim: 'orphan work', parentTaskId: 'task-99' }),
+    /parentTaskId "task-99" does not exist/,
+  )
+  await assert.rejects(
+    () => engine.submitDelegation({ taskId: 'task-404', bundle: {} }),
+    /no delegation\/created marker for taskId task-404/,
+  )
+  await assert.rejects(
+    () => engine.submitDelegation({ taskId: 'task-1', bundle: 'not a bundle' }),
+    /bundle is malformed/,
+  )
+  await assert.rejects(
+    () => engine.submitDelegation({
+      taskId: 'task-1',
+      bundle: {} as unknown as ProofBundle,
+      claimedGrade: 'supreme' as unknown as ProofGrade,
+    }),
+    /claimedGrade must be one of/,
+  )
+  await assert.rejects(
+    () => engine.waiveDelegation({ taskId: 'task-1', by: '  ', reason: 'x' }),
+    /by must be a non-empty string/,
+  )
+  await assert.rejects(
+    () => engine.waiveDelegation({ taskId: 'task-9', by: 'lead', reason: 'x' }),
+    /no delegation\/created marker for taskId task-9/,
+  )
+  await assert.rejects(
+    () => engine.taskVerdict({ taskId: 'task-9' }),
+    /taskId task-9 does not exist on this chain/,
+  )
+})
+
+test('v0.19: a three-deep chain propagates a forged grandchild to the top parent', async () => {
+  const engine = makeEngine(MemoryFs.of(project()), new FakeCommands())
+  await engine.delegateTask({ claim: 'top: migrate the pipeline' })
+  await engine.delegateTask({ claim: 'mid: port the loaders', parentTaskId: 'task-1' })
+  await engine.delegateTask({ claim: 'leaf: port the yaml loader', parentTaskId: 'task-2' })
+
+  // The grandchild forges (tampered artifact, claimed proven); the middle
+  // child submits an honest bundle afterwards — honesty in the middle must
+  // not hide the forgery below it.
+  await engine.submitDelegation({ taskId: 'task-3', bundle: forgedFrom(await honestChildBundle()), claimedGrade: 'proven' })
+  await engine.submitDelegation({ taskId: 'task-2', bundle: await honestChildBundle('mid-child') })
+
+  const mid = await engine.taskVerdict({ taskId: 'task-2' })
+  assert.equal(mid.composed.grade, 'regressed', 'the forgery sits inside task-2 subtree')
+  const top = await engine.taskVerdict({ taskId: 'task-1' })
+  assert.equal(top.composed.grade, 'regressed', 'the grandchild forgery regresses the top parent')
+  assert.equal(top.nodes.length, 3, 'the whole three-node DAG rebuilt from the chain')
+})
+
+test('v0.19: the delegation markers are chain facts — payloads read back from the log', async () => {
+  const fs = MemoryFs.of(project())
+  const engine = makeEngine(fs, new FakeCommands())
+  const { obligation } = await engine.delegateTask({
+    claim: 'write the migration guide',
+    acceptance: 'reviewed by docs team',
+  })
+  await engine.submitDelegation({ taskId: 'task-1', bundle: await honestChildBundle('docs-child') })
+  await engine.waiveDelegation({ taskId: 'task-1', by: 'tech-lead', reason: 'docs shipped by another team' })
+
+  assert.ok(
+    fs.log.some(l => l.includes('"delegation/created"') && l.includes('task-1') && l.includes(obligation.claim)),
+    'the created marker carries the obligation',
+  )
+  assert.ok(
+    fs.log.some(l => l.includes('"delegation/verdict"') && l.includes('docs-child') && l.includes('"claimedGrade":"proven"')),
+    'the verdict marker carries the submission summary',
+  )
+  assert.ok(
+    fs.log.some(l => l.includes('"delegation/waive"') && l.includes('tech-lead') && l.includes('docs shipped by another team')),
+    'the waive marker carries by and reason',
   )
 })

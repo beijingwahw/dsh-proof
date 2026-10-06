@@ -1,0 +1,301 @@
+/**
+ * DSH-side bridge for the host's EXPERIMENTAL agent-team surface (v0.19).
+ *
+ * The responsibility DAG (delegateTask / submitDelegation / taskVerdict /
+ * waiveDelegation) is engine-side and settled; what is NOT settled is the
+ * host's event vocabulary for "an agent just delegated a subtask to another
+ * agent" — no released `@deepseek-ai/*` type declares it yet. The v0.15
+ * OpenCode precedent is therefore applied wholesale here: **runtime
+ * duck-typing + graceful degradation**.
+ *
+ *   - Every host event is narrowed from `unknown` (`normalizeTeamEvent`) —
+ *     the same defensive discipline as `adapters/opencode/vendor.ts`: failure
+ *     is `undefined`, never a throw, and a shape that cannot prove itself is
+ *     skipped, not guessed at.
+ *   - The bridge probes a short list of plausible event seams
+ *     (`TEAM_EVENT_SEAMS`), each subscription wrapped in its own try/catch —
+ *     cordis's behaviour for an undeclared event name is unknown, and one
+ *     refusing registration must not take the others down with it.
+ *   - A seam hit means the delegation is mirrored onto the chain as a signed
+ *     obligation (deps.delegate → engine delegateTask) and the worker's
+ *     handoff instruction is written back into the event's payload object
+ *     where the host can ship it to the child. No mutable payload channel →
+ *     one stderr line naming taskId + obligationId for manual wiring.
+ *   - NOTHING here ever throws into the host: a bridge failure degrades to a
+ *     stderr line, and the plugin's own tools (proof_delegate & friends) keep
+ *     working as the first-class path.
+ *
+ * The whole feature is opt-in (`agentTeamBridge`, default false) — an
+ * experimental seam must not surprise deployments that never asked for it.
+ *
+ * @module dsh-proof/dsh/agent-team
+ */
+
+// ---------------------------------------------------------------------------
+// The normalized event
+// ---------------------------------------------------------------------------
+
+/**
+ * What a host delegation event narrows down to. Every field except `kind` is
+ * optional and untyped on purpose: the host vocabulary is unknown, so the
+ * bridge records what it could prove (a text field, id fields, a mutable
+ * payload object) and narrows again at the point of use — never inventing a
+ * value the event did not carry.
+ */
+export interface TeamBridgeEvent {
+  kind: 'delegated'
+  /** The new (child) task's identity, as the host spelled it. */
+  taskId?: unknown
+  /** The delegation's parent task, when the host named one. */
+  parentTaskId?: unknown
+  /** The obligation text, when found under a `claim` key. */
+  claim?: unknown
+  /** The child's instructions, when found under `prompt`/`task`/`description`. */
+  prompt?: unknown
+  /** The event's mutable payload object — the write-back channel, when present. */
+  payload?: Record<string, unknown>
+}
+
+/** Keys whose string values can name the delegated work, in preference order. */
+const TEXT_KEYS = ['claim', 'prompt', 'task', 'description'] as const
+
+/** How deep into nested `toolInput`/`event`/`payload`/… objects to search. */
+const MAX_DEPTH = 4
+/** Hard cap on objects visited per event — a hostile payload cannot stall the walk. */
+const MAX_OBJECTS = 64
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** A non-empty (whitespace-trimmed) string, or nothing. Blank text is no text. */
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined
+}
+
+/**
+ * Narrow an untrusted host event into a {@link TeamBridgeEvent}.
+ *
+ * The walk descends through nested plain objects (any key — `toolInput`,
+ * `event`, `payload`, whatever the host's dialect calls the envelope) within
+ * a depth/object budget, collecting:
+ *
+ *   - the first string found under each of `claim` / `prompt` / `task` /
+ *     `description` — later resolved by precedence (claim wins; the rest ride
+ *     the `prompt` channel, which is what they are: the child's instructions);
+ *   - the first `taskId` / `parentTaskId` values, kept verbatim as `unknown`;
+ *   - the first plain object found under a `payload` key — the write-back
+ *     channel for the handoff instruction.
+ *
+ * An event with no locatable text is not a recognizable delegation:
+ * `undefined`, silently. Same for non-objects, null, primitives, cycles (a
+ * visited set guards them) — failure is always `undefined`, never a throw.
+ */
+export function normalizeTeamEvent(raw: unknown): TeamBridgeEvent | undefined {
+  if (!isPlainObject(raw)) return undefined
+  const texts = new Map<string, string>()
+  let taskId: unknown
+  let parentTaskId: unknown
+  let payload: Record<string, unknown> | undefined
+  const visited = new Set<unknown>()
+  let level: Record<string, unknown>[] = [raw]
+  for (let depth = 0; depth <= MAX_DEPTH && level.length > 0; depth += 1) {
+    const next: Record<string, unknown>[] = []
+    for (const obj of level) {
+      if (visited.has(obj)) continue
+      visited.add(obj)
+      if (visited.size > MAX_OBJECTS) break
+      for (const key of TEXT_KEYS) {
+        if (texts.has(key)) continue
+        const text = nonEmptyString(obj[key])
+        if (text !== undefined) texts.set(key, text)
+      }
+      if (taskId === undefined) {
+        const found = obj.taskId
+        if (found !== undefined) taskId = found
+      }
+      if (parentTaskId === undefined) {
+        const found = obj.parentTaskId
+        if (found !== undefined) parentTaskId = found
+      }
+      if (payload === undefined && isPlainObject(obj.payload)) payload = obj.payload
+      for (const value of Object.values(obj)) {
+        if (isPlainObject(value) && !visited.has(value)) next.push(value)
+      }
+    }
+    level = next
+  }
+  const claim = texts.get('claim')
+  const prompt = texts.get('prompt') ?? texts.get('task') ?? texts.get('description')
+  if (claim === undefined && prompt === undefined) return undefined
+  return {
+    kind: 'delegated',
+    ...(taskId !== undefined ? { taskId } : {}),
+    ...(parentTaskId !== undefined ? { parentTaskId } : {}),
+    ...(claim !== undefined ? { claim } : {}),
+    ...(prompt !== undefined ? { prompt } : {}),
+    ...(payload !== undefined ? { payload } : {}),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The bridge
+// ---------------------------------------------------------------------------
+
+/**
+ * What the bridge needs from its host. `delegate` is the engine's
+ * `delegateTask` (or a test double); `instructionOf` renders the worker's
+ * handoff text (index.ts's template, worded after the MCP `proof_delegate`
+ * face); `stderr` receives the degradation lines, one at a time.
+ */
+export interface TeamBridgeDeps {
+  delegate: (input: { claim: string; parentTaskId?: string; acceptance?: string }) => Promise<{
+    taskId: string
+    obligationId: string
+    obligation: unknown
+  }>
+  instructionOf: (taskId: string, obligationId: string, claim: string) => string
+  stderr?: (line: string) => void
+}
+
+/**
+ * The event names this bridge recognizes as "the host delegated a subtask" —
+ * the plausible spellings of a still-unreleased agent-team API. Probed in
+ * order; the first one the host accepts is enough.
+ */
+export const TEAM_EVENT_SEAMS = [
+  'agent/team:delegated', 'agent/delegation', 'team/task-created', 'agent/subtask',
+] as const
+
+/** A delegation claim is capped at 500 characters — an event prompt is not a spec. */
+const CLAIM_LIMIT = 500
+
+/**
+ * The claim text an event yields: its `claim` field, else its `prompt`
+ * (which is what a `task`/`description` field narrows to). Trimmed, and
+ * truncated to 500 characters so a whole child prompt cannot become the
+ * obligation's content address input.
+ */
+function claimOf(event: TeamBridgeEvent): string | undefined {
+  const raw = typeof event.claim === 'string'
+    ? event.claim
+    : typeof event.prompt === 'string' ? event.prompt : undefined
+  if (raw === undefined) return undefined
+  const text = raw.trim()
+  if (text.length === 0) return undefined
+  return text.length > CLAIM_LIMIT ? text.slice(0, CLAIM_LIMIT) : text
+}
+
+/**
+ * Build the bridge: `onEvent` accepts a raw host event (unnormalized), and
+ * `seams` carries the event names it expects to be fed from.
+ *
+ * `onEvent` never throws and never rejects: an unrecognizable event returns
+ * silently, a delegation failure degrades to a stderr line, and a frozen or
+ * absent payload channel degrades to a stderr handoff (taskId + obligationId)
+ * for manual wiring. The same event object delivered twice — a host fanning
+ * one delegation out to several subscribed seams — is deduped by identity, so
+ * one delegation is one obligation on the chain.
+ */
+export function createTeamBridge(deps: TeamBridgeDeps): {
+  onEvent: (raw: unknown) => Promise<void>
+  seams: string[]
+} {
+  const seen = new WeakSet<object>()
+  return {
+    seams: [...TEAM_EVENT_SEAMS],
+    onEvent: async (raw: unknown): Promise<void> => {
+      try {
+        if (typeof raw === 'object' && raw !== null) {
+          if (seen.has(raw)) return
+          seen.add(raw)
+        }
+        const event = normalizeTeamEvent(raw)
+        if (event === undefined) return
+        const claim = claimOf(event)
+        if (claim === undefined) return
+        const parentTaskId = typeof event.parentTaskId === 'string' && event.parentTaskId.length > 0
+          ? event.parentTaskId
+          : undefined
+        let minted: { taskId: string; obligationId: string; obligation: unknown }
+        try {
+          minted = await deps.delegate({ claim, ...(parentTaskId !== undefined ? { parentTaskId } : {}) })
+        } catch (error) {
+          deps.stderr?.(
+            `dsh-proof: agent-team bridge could not record the delegation "${claim.slice(0, 80)}" — `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          )
+          return
+        }
+        const instruction = deps.instructionOf(minted.taskId, minted.obligationId, claim)
+        const payload = event.payload
+        if (isPlainObject(payload)) {
+          try {
+            payload.proofObligation = instruction
+            if (typeof payload.instructions === 'string') payload.instructions = instruction
+            return
+          } catch {
+            // Frozen/sealed payload — fall through to the stderr handoff; the
+            // obligation exists on the chain and must not be silently orphaned.
+          }
+        }
+        deps.stderr?.(
+          `dsh-proof: agent-team delegation recorded as ${minted.taskId} `
+          + `(obligation ${minted.obligationId}) — the host event carried no mutable payload; `
+          + 'paste the proof_delegate instruction into the subtask manually',
+        )
+      } catch {
+        // Defense in depth: nothing the host handed us may ever throw out of here.
+      }
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The seam probe
+// ---------------------------------------------------------------------------
+
+/** The one-line degradation notice when no seam could be subscribed. */
+const NO_SEAM_MESSAGE = 'dsh-proof: no agent-team delegation seam found (experimental API) '
+  + '— use proof_delegate via MCP/engine directly'
+
+/**
+ * Subscribe the bridge to every seam the host will accept. Each registration
+ * is wrapped in its own try/catch — cordis's behaviour for an undeclared
+ * event name is unknown, and a single refusing registration must leave the
+ * others untouched. Returns true when at least one seam subscribed; false
+ * (with one stderr line, when a sink is given) otherwise. A `ctx` without a
+ * callable `on` is the same clean false.
+ */
+export function attachTeamBridge(
+  ctx: unknown,
+  bridge: { onEvent: (raw: unknown) => Promise<void>; seams: string[] },
+  stderr?: (line: string) => void,
+): boolean {
+  const candidate = (typeof ctx === 'object' || typeof ctx === 'function') && ctx !== null
+    ? (ctx as { on?: unknown })
+    : undefined
+  const on = candidate?.on
+  if (typeof on !== 'function') {
+    stderr?.(NO_SEAM_MESSAGE)
+    return false
+  }
+  const registrar = on as (event: string, handler: (raw: unknown) => unknown) => unknown
+  let attached = false
+  for (const seam of bridge.seams) {
+    try {
+      // The handler returns the bridge's promise (which never rejects); a
+      // host that ignores returned promises is equally fine — the delegation
+      // ride-along must never gate the host's own event dispatch.
+      registrar.call(ctx, seam, (raw: unknown) => bridge.onEvent(raw))
+      attached = true
+    } catch {
+      // This seam is not spoken here — try the next.
+    }
+  }
+  if (!attached) {
+    stderr?.(NO_SEAM_MESSAGE)
+    return false
+  }
+  return true
+}

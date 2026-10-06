@@ -16,6 +16,7 @@ import { join } from 'node:path'
 import * as plugin from '../src/index.ts'
 import { WorkspaceWatch } from '../src/dsh/observe.ts'
 import { createProofTools, toBaselineValue, toClaimValue, toStatusValue, toVerifyValue } from '../src/dsh/tools.ts'
+import { attachTeamBridge, createTeamBridge, normalizeTeamEvent, TEAM_EVENT_SEAMS } from '../src/dsh/agent-team.ts'
 import { ProofEngine } from '../src/engine.ts'
 import { NodeFsPort } from '../src/node-ports.ts'
 import { DEFAULT_TRUST_WEIGHTS, RUBRIC_V1, claimIdOf, juryPrompt } from '../src/core/attest.ts'
@@ -1943,4 +1944,231 @@ test('D3 wiring: proof_verify forwards a usable claim and proof_baseline forward
   assert.equal(baselineCalls[0]!.reason, 'fresh session after the flaky baseline')
   await tools.find(t => t.name === 'proof_baseline')!.execute({}, execution('proof_baseline', {}))
   assert.ok(!('reason' in baselineCalls[1]!))
+})
+
+// ---------------------------------------------------------------------------
+// v0.19: the experimental agent-team bridge — the DSH-side on-ramp for the
+// cross-agent responsibility DAG. The host's agent-team API is unreleased, so
+// everything here is runtime duck-typing over `unknown` with graceful
+// degradation, and the whole feature is opt-in (agentTeamBridge, default
+// false). Handler logic (normalize/create) is tested directly; the seam probe
+// (attach) against synthetic contexts; the opt-in red line through the real
+// apply() over the standard harness.
+// ---------------------------------------------------------------------------
+
+test('agent-team: normalizeTeamEvent narrows delegation events defensively', () => {
+  // The matrix: each recognizable spelling narrows; everything else is
+  // undefined — never a throw, never a guess.
+  const byClaim = normalizeTeamEvent({ claim: 'x' })
+  assert.equal(byClaim?.kind, 'delegated')
+  assert.equal(byClaim?.claim, 'x')
+
+  const byPrompt = normalizeTeamEvent({ prompt: 'do x' })
+  assert.equal(byPrompt?.prompt, 'do x')
+  assert.ok(!('claim' in byPrompt!), 'a prompt-only event narrows to the prompt channel')
+
+  // Nested envelopes — the host dialect is unknown, so the walk descends.
+  const nested = normalizeTeamEvent({ toolInput: { task: 'x' } })
+  assert.equal(nested?.prompt, 'x', 'a task field is the child instruction: the prompt channel')
+
+  const deep = normalizeTeamEvent({ event: { payload: { description: 'write the tests', taskId: 't-1' } } })
+  assert.equal(deep?.prompt, 'write the tests')
+  assert.equal(deep?.taskId, 't-1')
+  assert.equal(
+    (deep?.payload as Record<string, unknown> | undefined)?.description,
+    'write the tests',
+    'the nested payload object is located as the write-back channel',
+  )
+
+  const parent = normalizeTeamEvent({ claim: 'x', parentTaskId: 'task-2' })
+  assert.equal(parent?.parentTaskId, 'task-2', 'a parent edge the host named travels along')
+
+  // claim beats prompt when both are present (key precedence).
+  assert.equal(normalizeTeamEvent({ prompt: 'lesser', claim: 'greater' })?.claim, 'greater')
+
+  // Not recognizably a delegation: null, primitives, no text field, blank text.
+  assert.equal(normalizeTeamEvent(null), undefined)
+  assert.equal(normalizeTeamEvent(42), undefined)
+  assert.equal(normalizeTeamEvent('agent/delegation'), undefined)
+  assert.equal(normalizeTeamEvent({ foo: 'bar' }), undefined)
+  assert.equal(normalizeTeamEvent({ claim: '   ' }), undefined)
+  assert.equal(normalizeTeamEvent({ toolInput: { description: null } }), undefined)
+})
+
+test('agent-team: createTeamBridge delegates and injects the instruction into a mutable payload', async () => {
+  const delegated: Record<string, unknown>[] = []
+  let instruction = ''
+  const bridge = createTeamBridge({
+    delegate: async input => {
+      delegated.push(input)
+      return { taskId: 'task-7', obligationId: 'obl-1', obligation: {} }
+    },
+    instructionOf: (taskId, obligationId, claim) => {
+      instruction = `instruction:${taskId}:${obligationId}:${claim}`
+      return instruction
+    },
+  })
+
+  const event = { claim: 'build the parser', payload: {} as Record<string, unknown> }
+  await bridge.onEvent(event)
+  assert.equal(delegated.length, 1)
+  assert.equal(delegated[0]!.claim, 'build the parser')
+  assert.ok(!('parentTaskId' in delegated[0]!), 'an event with no parent edge delegates as a root obligation')
+  assert.equal(event.payload.proofObligation, instruction)
+  assert.match(String(event.payload.proofObligation), /task-7/)
+  assert.match(String(event.payload.proofObligation), /build the parser/)
+
+  // The same event object delivered twice (a host fanning one delegation out
+  // to several subscribed seams) is one obligation, not two.
+  await bridge.onEvent(event)
+  assert.equal(delegated.length, 1)
+
+  // A prompt-only event still yields a claim; the text is capped at 500 chars.
+  const calls: Record<string, unknown>[] = []
+  const capBridge = createTeamBridge({
+    delegate: async input => { calls.push(input); return { taskId: 't', obligationId: 'o', obligation: {} } },
+    instructionOf: () => 'x',
+  })
+  await capBridge.onEvent({ prompt: 'do x' })
+  assert.equal(calls[0]!.claim, 'do x')
+  await capBridge.onEvent({ claim: 'a'.repeat(600) })
+  assert.equal(String(calls[1]!.claim).length, 500, 'an event prompt is not a spec — the obligation claim is capped')
+
+  // An event with a parent edge forwards it (a string one only).
+  await capBridge.onEvent({ claim: 'child work', parentTaskId: 'task-1' })
+  assert.equal((calls[2]! as { parentTaskId?: unknown }).parentTaskId, 'task-1')
+  await capBridge.onEvent({ claim: 'bad parent', parentTaskId: 42 })
+  assert.ok(!('parentTaskId' in calls[3]!), 'a non-string parent id is dropped, not guessed at')
+
+  // An immutable event (no payload object) hands off over stderr instead:
+  // the obligation exists on the chain and must not be silently orphaned.
+  const lines: string[] = []
+  const bare = createTeamBridge({
+    delegate: async () => ({ taskId: 'task-8', obligationId: 'obl-2', obligation: {} }),
+    instructionOf: taskId => `instruction:${taskId}`,
+    stderr: line => { lines.push(line) },
+  })
+  await bare.onEvent({ claim: 'no payload channel' })
+  assert.equal(lines.length, 1)
+  assert.match(lines[0]!, /task-8/)
+  assert.match(lines[0]!, /obl-2/)
+  assert.match(lines[0]!, /manually/)
+
+  // Unrecognizable events are dropped silently — and a failing delegate call
+  // degrades to a stderr line, never a throw into the host.
+  await bare.onEvent({ unrelated: true })
+  await bare.onEvent(null)
+  assert.equal(lines.length, 1, 'an unrecognizable event warrants no complaint')
+  const failing = createTeamBridge({
+    delegate: async () => { throw new Error('chain unavailable') },
+    instructionOf: () => 'x',
+    stderr: line => { lines.push(line) },
+  })
+  await failing.onEvent({ claim: 'will not record' })
+  assert.equal(lines.length, 2)
+  assert.match(lines[1]!, /chain unavailable/)
+})
+
+test('agent-team: attachTeamBridge probes every seam and degrades without a usable on()', () => {
+  const quiet = createTeamBridge({
+    delegate: async () => ({ taskId: 't', obligationId: 'o', obligation: {} }),
+    instructionOf: () => 'x',
+  })
+
+  // A host that accepts everything: every seam attempted, result true.
+  const attempts: string[] = []
+  const counting = {
+    on: (event: string, handler: (raw: unknown) => unknown) => {
+      attempts.push(event)
+      assert.equal(typeof handler, 'function')
+      return () => undefined
+    },
+  }
+  assert.equal(attachTeamBridge(counting, quiet), true)
+  for (const seam of TEAM_EVENT_SEAMS) {
+    assert.ok(attempts.includes(seam), `the probe must attempt ${seam}`)
+  }
+
+  // A host that refuses everything: all four attempts throw, each caught —
+  // one stderr line, a clean false, and no exception in the host.
+  const lines: string[] = []
+  const refusing = { on: () => { throw new Error('undeclared event') } }
+  assert.equal(attachTeamBridge(refusing, quiet, line => { lines.push(line) }), false)
+  assert.equal(lines.length, 1)
+  assert.match(lines[0]!, /no agent-team delegation seam found/)
+  assert.match(lines[0]!, /proof_delegate/)
+
+  // A host where the first seam throws but the second accepts: a single
+  // refusing registration must not take the others down with it.
+  let nth = 0
+  const mixed = {
+    on: (event: string) => {
+      nth += 1
+      if (nth === 1) throw new Error('not this one')
+      void event
+      return () => undefined
+    },
+  }
+  assert.equal(attachTeamBridge(mixed, quiet), true)
+
+  // No callable on() at all: same clean false. (The null ctx passes no sink,
+  // so it stays mute — the two sink-carrying failures above are the two lines.)
+  assert.equal(attachTeamBridge({}, quiet, line => { lines.push(line) }), false)
+  assert.equal(attachTeamBridge(null, quiet), false)
+  assert.equal(lines.length, 2)
+})
+
+test('agent-team: the bridge is opt-in — default config subscribes to no team seam', async () => {
+  assert.equal(valueOf(Config({} as never)).agentTeamBridge, false, 'the experimental seam defaults to off')
+
+  // Red line: with the default config, apply() must leave zero team seams
+  // subscribed — every pre-existing case in this file runs through this path.
+  const harness = makeHarness()
+  process.env.DSH_PROOF_ROOT = ROOT
+  try {
+    plugin.apply(harness.ctx, config())
+  } finally {
+    delete process.env.DSH_PROOF_ROOT
+  }
+  for (const seam of TEAM_EVENT_SEAMS) {
+    assert.ok(!harness.listeners.has(seam), `${seam} must not be subscribed unless agentTeamBridge is set`)
+  }
+
+  // Opted in: the seams land on the host (the synthetic harness accepts every
+  // registration, so all four do), and a delegation event end-to-end mints a
+  // real obligation and injects the real handoff instruction into the payload.
+  const enabled = makeHarness()
+  try {
+    process.env.DSH_PROOF_ROOT = ROOT
+    plugin.apply(enabled.ctx, config({ agentTeamBridge: true }))
+  } finally {
+    delete process.env.DSH_PROOF_ROOT
+  }
+  const subscribed = [...enabled.listeners.keys()]
+    .filter(seam => (TEAM_EVENT_SEAMS as readonly string[]).includes(seam))
+  assert.equal(subscribed.length, TEAM_EVENT_SEAMS.length, 'a host accepting every seam gets all four wired')
+
+  const handler = enabled.listeners.get('agent/team:delegated')![0]! as (raw: unknown) => Promise<void>
+  const rootPayload: Record<string, unknown> = {}
+  await handler({ claim: 'build the parser, root', payload: rootPayload })
+  const text = String(rootPayload.proofObligation)
+  assert.match(text, /DELEGATED OBLIGATION task-\d+/, 'the engine minted a real task id')
+  assert.match(text, /build the parser, root/)
+  assert.match(text, /proof_baseline/)
+  assert.match(text, /proof_delegate_submit/)
+  assert.match(text, /precondition/)
+})
+
+test('agent-team: the handoff instruction carries the claim, the ids and the worker protocol', () => {
+  const text = plugin.teamHandoffInstruction('task-3', 'obl-9', 'build the parser end to end')
+  assert.ok(text.includes('build the parser end to end'), 'the claim rides verbatim')
+  assert.ok(text.includes('task-3'), 'the task id rides')
+  assert.ok(text.includes('obl-9'), 'the obligation id rides')
+  // The worker's half of the protocol, in order.
+  assert.match(text, /proof_baseline/)
+  assert.match(text, /proof_verify/)
+  assert.match(text, /proof_bundle/)
+  assert.match(text, /proof_delegate_submit \{ taskId: "task-3"/)
+  // The precondition sentence that makes the DAG legible to the child.
+  assert.match(text, /precondition/)
 })

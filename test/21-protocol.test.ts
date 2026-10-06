@@ -1,5 +1,5 @@
 /**
- * PROTOCOL — the APP/1.1 constants layer, pinned to the wire.
+ * PROTOCOL — the APP/1.2 constants layer, pinned to the wire.
  *
  * The vocabulary arrays in `src/app/protocol.ts` are the dialect two parties
  * agree on before anything else is interpreted, so they are pinned here
@@ -10,11 +10,13 @@
  * the constants claiming a value core can never emit, or core growing a
  * value the constants never pinned — must fail here, not in the field.
  *
- * v0.18: APP/1.0 → APP/1.1 is the §6 tool-surface expansion (the
- * transparency-log tools joining the MCP contract). The vocabularies are
- * unchanged; the version — which the fingerprint digests — moved, so every
- * APP/1.1 manifest is mutually unintelligible with every APP/1.0 one by
- * construction. The old fingerprint is pinned below as the change detector.
+ * v0.18: APP/1.0 → APP/1.1 was the §6 tool-surface expansion (the
+ * transparency-log tools joining the MCP contract); v0.19: APP/1.1 → APP/1.2
+ * is the SECOND expansion (7 → 10, the responsibility-DAG tools). The
+ * vocabularies are unchanged both times; the version — which the fingerprint
+ * digests — moved, so every APP/1.2 manifest is mutually unintelligible with
+ * every APP/1.1 one by construction. The old fingerprints are pinned below
+ * as the change detectors.
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -38,7 +40,7 @@ import { FakeClock, spec } from './helpers.ts'
 
 const WS = snapshotWorkspace('head1', ['src/a.ts'])
 
-test('the five vocabularies are pinned byte-for-byte (the APP/1.1 wire contract)', () => {
+test('the five vocabularies are pinned byte-for-byte (the APP/1.2 wire contract)', () => {
   assert.deepEqual(VERDICT_VALUES, [
     'still-passing', 'still-failing', 'regression', 'fixed',
     'new-failure', 'new-check', 'not-run', 'indeterminate',
@@ -51,7 +53,7 @@ test('the five vocabularies are pinned byte-for-byte (the APP/1.1 wire contract)
   assert.deepEqual(CHECK_STATUSES, ['pass', 'fail', 'error', 'timeout', 'aborted', 'skipped'])
 
   assert.equal(PROTOCOL_NAME, 'agent-proof-protocol')
-  assert.equal(PROTOCOL_VERSION, 'APP/1.1')
+  assert.equal(PROTOCOL_VERSION, 'APP/1.2')
   assert.equal(PROOF_MEDIA_TYPE, 'application/vnd.app.proof+json')
   assert.equal(BUNDLE_MEDIA_TYPE, 'application/vnd.app.proof-bundle+json')
 
@@ -75,7 +77,7 @@ test('appFingerprint is deterministic and recomputable from the vocabulary alone
   // five vocabularies plus one string per load-bearing rule.
   const manual = sha256(canonicalJson({
     name: 'agent-proof-protocol',
-    version: 'APP/1.1',
+    version: 'APP/1.2',
     verdict: ['still-passing', 'still-failing', 'regression', 'fixed', 'new-failure', 'new-check', 'not-run', 'indeterminate'],
     grade: ['proven', 'regressed', 'stale', 'unproven', 'no-baseline'],
     chainModes: ['legacy', 'unsigned', 'signed'],
@@ -90,20 +92,24 @@ test('appFingerprint is deterministic and recomputable from the vocabulary alone
 })
 
 /**
- * v0.18: the v0.17 (APP/1.0) fingerprint, recomputed from the pinned
- * vocabulary material with only the version rolled back. The §6 bump MUST
- * move the fingerprint — an APP/1.0 consumer that silently accepted an
- * APP/1.1 bundle would be guessing at a dialect it never agreed to.
+ * The two prior dialect fingerprints, recomputed from the pinned vocabulary
+ * material with only the version rolled back. Each bump MUST move the
+ * fingerprint — an APP/1.1 consumer that silently accepted an APP/1.2 bundle
+ * (or an APP/1.0 one an APP/1.1 bundle) would be guessing at a dialect it
+ * never agreed to. Both old values stay pinned: every past dialect remains
+ * refusable by literal, not by reconstruction.
  */
 const APP_1_0_FINGERPRINT = '01c9727ea94275365cd29cd193aea1a2b8c8d62efe2ccd60b31d48d717d3deb8'
+const APP_1_1_FINGERPRINT = '3464843dd251c2200ad31fb05f3323c7f57771e944117aedecd30a5abde085d2'
+const APP_1_2_FINGERPRINT = 'bc46bd21f127709dda7e3edeb9ca624d9cbc1182a854b5c9008858ff3f44d482'
 
-test('the APP/1.1 version bump moved the fingerprint — APP/1.0 dialects are refused, not guessed at', () => {
-  // The old material, verbatim from v0.17's implementation: everything
+test('the APP/1.2 version bump moved the fingerprint — APP/1.1 dialects are refused, not guessed at', () => {
+  // The old material, verbatim from v0.18's implementation: everything
   // identical except the version string. Recomputed here, so the pinned
   // literal below is cross-checked against live primitives, not trusted.
-  const app10 = sha256(canonicalJson({
+  const app11 = sha256(canonicalJson({
     name: 'agent-proof-protocol',
-    version: 'APP/1.0',
+    version: 'APP/1.1',
     verdict: ['still-passing', 'still-failing', 'regression', 'fixed', 'new-failure', 'new-check', 'not-run', 'indeterminate'],
     grade: ['proven', 'regressed', 'stale', 'unproven', 'no-baseline'],
     chainModes: ['legacy', 'unsigned', 'signed'],
@@ -113,15 +119,22 @@ test('the APP/1.1 version bump moved the fingerprint — APP/1.0 dialects are re
     chain: 'prev=sha256(prevLine)',
     signature: 'ed25519(canonicalJson(checkpointPayload))',
   }))
-  assert.equal(app10, APP_1_0_FINGERPRINT, 'the pinned old fingerprint matches the v0.17 material')
+  assert.equal(app11, APP_1_1_FINGERPRINT, 'the pinned v0.18 fingerprint matches the APP/1.1 material')
+  // The live fingerprint is pinned too — the recomputation above proves the
+  // pin, the pin proves every future run, so an accidental vocabulary edit
+  // fails HERE with the two digests side by side.
+  assert.equal(appFingerprint(), APP_1_2_FINGERPRINT, 'the live constants digest to the pinned APP/1.2 fingerprint')
+  assert.notEqual(appFingerprint(), APP_1_1_FINGERPRINT,
+    'APP/1.2 must not digest to the APP/1.1 fingerprint — the version is fingerprint material')
   assert.notEqual(appFingerprint(), APP_1_0_FINGERPRINT,
-    'APP/1.1 must not digest to the APP/1.0 fingerprint — the version is fingerprint material')
+    'APP/1.2 must not digest to the APP/1.0 fingerprint — every past dialect stays mutually unintelligible')
   // And the sensitivity is exactly the version byte, not incidental drift:
-  // swapping ONLY the version into the live material reproduces the digest,
-  // so the vocabularies and rules above are byte-identical to v0.17's.
+  // swapping ONLY the version into the live material reproduces the old
+  // digest, so the vocabularies and rules above are byte-identical to v0.18's
+  // — the bump is the only change, in both directions.
   const onlyVersionDiffers = sha256(canonicalJson({
     name: PROTOCOL_NAME,
-    version: 'APP/1.0',
+    version: 'APP/1.1',
     verdict: VERDICT_VALUES,
     grade: GRADE_VALUES,
     chainModes: CHAIN_MODES,
@@ -131,8 +144,8 @@ test('the APP/1.1 version bump moved the fingerprint — APP/1.0 dialects are re
     chain: 'prev=sha256(prevLine)',
     signature: 'ed25519(canonicalJson(checkpointPayload))',
   }))
-  assert.equal(onlyVersionDiffers, APP_1_0_FINGERPRINT,
-    'with the version restored, the live constants digest to the old fingerprint — the bump is the only change')
+  assert.equal(onlyVersionDiffers, APP_1_1_FINGERPRINT,
+    'with the version restored, the live constants digest to the v0.18 fingerprint — the bump is the only change')
 })
 
 test('the fingerprint is sensitive to the vocabulary and to the rules it names', () => {
@@ -159,7 +172,7 @@ test('the fingerprint is sensitive to the vocabulary and to the rules it names',
 
 test('protocolHeader stamps the manifest skeleton every bundle starts from', () => {
   const header = protocolHeader('ws-42', '2026-10-06T00:00:00.000Z')
-  assert.equal(header.protocol, 'APP/1.1')
+  assert.equal(header.protocol, 'APP/1.2')
   assert.equal(header.protocol, PROTOCOL_VERSION)
   assert.equal(header.appFingerprint, appFingerprint(), 'the skeleton carries the live fingerprint, not a cached one')
   assert.equal(header.workspaceKey, 'ws-42')

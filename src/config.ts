@@ -167,6 +167,17 @@ export interface Config {
    * - `off`: no injection, no gating, byte-identical to pre-υ behaviour.
    */
   coverage: 'observe' | 'require' | 'off'
+  /**
+   * v0.19 (experimental): bridge the host's agent-team delegation events onto
+   * the responsibility DAG. When the host emits a subtask delegation this
+   * plugin recognizes, the delegation is mirrored as a signed obligation
+   * (engine delegateTask) and the worker's proof handoff instruction is
+   * injected into the subtask context. The host's agent-team API is not yet
+   * released, so the bridge probes event seams at runtime and degrades to one
+   * stderr line when none is found. Default OFF — an experimental seam must
+   * not surprise deployments that never asked for it.
+   */
+  agentTeamBridge: boolean
   /** Emit plugin diagnostics to stdout. */
   verbose: boolean
 }
@@ -227,5 +238,8 @@ export const Config: Schema<Config> = Schema.object({
   // (fakes, non-Node toolchains) degrade visibly to basis 'none' instead of
   // being blocked on data they structurally cannot produce.
   coverage: Schema.union(['observe', 'require', 'off']).default('observe'),
+  // v0.19: experimental agent-team seam — runtime duck-typed, opt-in, default
+  // off (see the interface comment above).
+  agentTeamBridge: Schema.boolean().default(false),
   verbose: Schema.boolean().default(false),
 }) as unknown as Schema<Config>

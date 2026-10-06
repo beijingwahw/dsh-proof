@@ -8,11 +8,13 @@
  * directly unit-testable) and `runMcpServer` is the thin newline-delimited
  * stdio loop around it.
  *
- * APP/1.1 cross-agent contract: exactly seven tools — `MCP_TOOLS` below is
+ * APP/1.2 cross-agent contract: exactly ten tools — `MCP_TOOLS` below is
  * the frozen list every consumer agrees on. (APP/1.0 spoke five; the §6
- * transparency-log expansion added `proof_publish` and `proof_log_verify`,
- * and the version bump is what lets an APP/1.0 consumer refuse the wider
- * dialect instead of guessing at it.)
+ * transparency-log expansion took it to seven with `proof_publish` and
+ * `proof_log_verify`; the v0.19 responsibility-DAG expansion took it to ten
+ * with `proof_delegate`, `proof_delegate_submit` and `proof_task`. Each bump
+ * is what lets an older consumer refuse the wider dialect instead of
+ * guessing at it.)
  *
  * Transport note: MCP stdio is newline-delimited JSON (one JSON-RPC 2.0
  * message per line), NOT LSP-style Content-Length framing. Protocol-level
@@ -37,14 +39,21 @@ import {
 } from '../dsh/tools.ts'
 import type { ClaimContract, ClaimKind } from '../core/contract.ts'
 import { buildBundle } from './bundle.ts'
+// v0.19: the grade vocabulary backs `proof_task`'s ownGrade validation — the
+// five values a composed verdict can be asked to fold in.
+import { GRADE_VALUES } from './protocol.ts'
 
 // ---------------------------------------------------------------------------
-// The APP/1.1 contract — frozen with the other agents. Exactly seven tools.
+// The APP/1.2 contract — frozen with the other agents. Exactly ten tools.
 // ---------------------------------------------------------------------------
 
 export const MCP_TOOLS = [
   'proof_status', 'proof_baseline', 'proof_verify', 'proof_claim', 'proof_bundle',
   'proof_publish', 'proof_log_verify',
+  // v0.19: the responsibility DAG — delegation, child submission, composed
+  // task verdicts. Appended in order so an APP/1.1 consumer reading a list
+  // positionally still finds its seven tools where it left them.
+  'proof_delegate', 'proof_delegate_submit', 'proof_task',
 ] as const
 
 /** ζ: the five contract kinds `proof_claim` accepts — mirrors dsh/tools.ts's private list. */
@@ -93,7 +102,7 @@ export interface McpServerOptions extends McpEngineDeps {
 // ---------------------------------------------------------------------------
 
 export const MCP_SERVER_NAME = 'agent-proof-protocol'
-export const MCP_DEFAULT_VERSION = '0.18.0'
+export const MCP_DEFAULT_VERSION = '0.19.0'
 
 /**
  * Protocol versions this server speaks, newest first. A client asking for a
@@ -196,6 +205,33 @@ const LOG_VERIFY_DESCRIPTION =
   + 'tree — proof the history between the two sizes was not rewritten. Arguments combine; any failed check '
   + 'returns ok: false with the problems named.'
 
+const DELEGATE_DESCRIPTION =
+  'ORCHESTRATOR TOOL. Delegate a unit of work to a worker agent as a signed obligation on this workspace\'s '
+  + 'responsibility DAG: the claim that must become true, optional acceptance criteria the result will be judged '
+  + 'by, and optionally a parentTaskId to nest under an existing task. Returns the {taskId, obligationId, '
+  + 'obligation} AND a ready-to-paste `instruction` — the handoff text for the worker agent\'s initial prompt. '
+  + 'The worker proves the obligation in ITS OWN workspace (proof_baseline → work → proof_verify / proof_claim → '
+  + 'proof_bundle) and submits the exported APP bundle back with proof_delegate_submit. The delegation is a '
+  + 'precondition edge: until the worker\'s bundle verifies, the composed verdict of everything above it stays '
+  + 'exactly as stale as the unproven obligation.'
+
+const DELEGATE_SUBMIT_DESCRIPTION =
+  'WORKER TOOL. Submit your completed work for a delegated obligation: the APP bundle you exported with '
+  + 'proof_bundle in your own workspace, addressed to the taskId the orchestrator\'s proof_delegate returned. '
+  + 'The bundle is adjudicated from its own bytes — manifest digests recomputed, chain walked, nothing you assert '
+  + 'is trusted; `claimedGrade` (optional, one of the five grades) is what YOU claim and is checked against what '
+  + 'the artifacts actually support. Returns the recorded submission and the `composed` verdict the submission '
+  + 'produced: a forged or regressed bundle is attributed by taskId, never silently absorbed.'
+
+const TASK_DESCRIPTION =
+  'ORCHESTRATOR TOOL. Inspect the responsibility DAG. Without a taskId: the whole-task overview — every delegated '
+  + 'task with its parent, an 80-character claim summary and whether a submission has landed. With a taskId: the '
+  + 'full composed verdict for that task\'s subtree ({composed, nodes, cycles}) — own grade, forged/regressed/'
+  + 'unproven children, waived obligations and blockers. `ownGrade` (optional, one of the five grades) folds this '
+  + 'workspace\'s own local verdict into the composition. Roles in one line: the orchestrator speaks '
+  + 'proof_delegate and proof_task; the worker speaks proof_verify, proof_bundle and proof_delegate_submit; a '
+  + 'third-party auditor verifies the published log with proof_log_verify.'
+
 const MCP_TOOL_LIST: ToolDescriptor[] = [
   {
     name: 'proof_status',
@@ -295,6 +331,80 @@ const MCP_TOOL_LIST: ToolDescriptor[] = [
         publishedRoot: {
           type: 'string',
           description: 'The 64-character hex Merkle root you previously saw published at that size.',
+        },
+      },
+    },
+  },
+  {
+    name: 'proof_delegate',
+    description: DELEGATE_DESCRIPTION,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        claim: {
+          type: 'string',
+          description: 'The obligation as a completion claim — what must be TRUE when the worker is done, e.g. '
+            + '"add the audit-report section with evidence citations".',
+        },
+        parentTaskId: {
+          type: 'string',
+          description: 'Nest this delegation under an existing task (from an earlier proof_delegate) to build the '
+            + 'responsibility DAG. Omit for a root obligation.',
+        },
+        acceptance: {
+          type: 'string',
+          description: 'The acceptance criteria the submission will be judged by — shipped to the worker verbatim '
+            + 'in its handoff instruction and recorded on the obligation.',
+        },
+      },
+      required: ['claim'],
+    },
+  },
+  {
+    name: 'proof_delegate_submit',
+    description: DELEGATE_SUBMIT_DESCRIPTION,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: {
+          type: 'string',
+          description: 'The task the orchestrator\'s proof_delegate returned — the submission is addressed to it.',
+        },
+        bundle: {
+          type: 'object',
+          description: 'The APP bundle your proof_bundle export produced in YOUR workspace (manifest + files), '
+            + 'passed through unmodified.',
+        },
+        claimedGrade: {
+          type: 'string',
+          enum: ['proven', 'regressed', 'stale', 'unproven', 'no-baseline'],
+          description: 'Optional: the grade you claim for your own work. Checked against what the bundle\'s '
+            + 'artifacts actually support — claiming above the evidence is refused, not rounded down silently.',
+        },
+        byWorkspace: {
+          type: 'string',
+          description: 'Optional: your workspace\'s stable identity (e.g. its workspaceKey), recorded on the '
+            + 'submission for attribution.',
+        },
+      },
+      required: ['taskId', 'bundle'],
+    },
+  },
+  {
+    name: 'proof_task',
+    description: TASK_DESCRIPTION,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: {
+          type: 'string',
+          description: 'A specific delegated task (from proof_delegate). Omit to list the whole task graph.',
+        },
+        ownGrade: {
+          type: 'string',
+          enum: ['proven', 'regressed', 'stale', 'unproven', 'no-baseline'],
+          description: 'Optional: fold this workspace\'s own local grade into the composed verdict. One of the '
+            + 'five grades — anything else is refused loudly, never silently dropped.',
         },
       },
     },
@@ -692,6 +802,283 @@ async function callLogVerifyTool(deps: McpEngineDeps, args: Record<string, unkno
   })
 }
 
+// ---------------------------------------------------------------------------
+// v0.19: the responsibility-DAG tools (APP/1.2's 7 → 10 expansion)
+//
+// The verbs themselves live in the engine (delegateTask / submitDelegation /
+// taskVerdict; waiveDelegation stays engine-side for now). This face only
+// adjudicates untrusted ARGUMENTS, narrates the three-party protocol
+// (orchestrator delegates and inspects, worker proves and submits), and
+// passes engine value objects through verbatim — the composition semantics
+// are the engine's, so the MCP layer must never re-derive a grade.
+// ---------------------------------------------------------------------------
+
+/**
+ * The engine-side delegation contract, as frozen with the engine workstream.
+ * Declared HERE (not imported) because the engine grows into it in parallel;
+ * `delegationVerbs` narrows the live engine against it at runtime, so this
+ * server degrades to a clean capability error — never a crash — on a build
+ * whose engine has not landed the responsibility DAG yet.
+ */
+interface DelegationVerbs {
+  delegateTask(input: { claim: string; parentTaskId?: string; acceptance?: string }): Promise<{
+    taskId: string
+    obligationId: string
+    obligation: Record<string, unknown>
+  }>
+  submitDelegation(input: {
+    taskId: string
+    bundle: unknown
+    byWorkspace?: string
+    claimedGrade?: string
+  }): Promise<{ submission: Record<string, unknown>; composed: Record<string, unknown> }>
+  taskVerdict(input: { taskId: string; ownGrade?: string }): Promise<{
+    composed: Record<string, unknown>
+    nodes: unknown
+    cycles: unknown
+  }>
+}
+
+/**
+ * The live engine's delegation verbs, or undefined when this build's engine
+ * does not implement the responsibility DAG. Existence is checked per call —
+ * the seam is deliberately the only place the engine's newer surface is
+ * reached through a cast.
+ */
+function delegationVerbs(engine: ProofEngine): DelegationVerbs | undefined {
+  const candidate = engine as unknown as Partial<Record<keyof DelegationVerbs, unknown>>
+  return typeof candidate.delegateTask === 'function'
+    && typeof candidate.submitDelegation === 'function'
+    && typeof candidate.taskVerdict === 'function'
+    ? (candidate as DelegationVerbs)
+    : undefined
+}
+
+function delegationUnavailable(tool: string): McpToolResult {
+  return toolError({
+    error: `${tool}: this engine build does not implement the responsibility-DAG verbs `
+      + '(delegateTask / submitDelegation / taskVerdict) — the delegation tools cannot run',
+  })
+}
+
+/** ζ: the five grades `proof_task`/`proof_delegate_submit` accept — protocol.ts's scale. */
+const GRADES: readonly string[] = GRADE_VALUES
+
+function isGradeValue(value: unknown): value is string {
+  return typeof value === 'string' && GRADES.includes(value)
+}
+
+/**
+ * The handoff text for the worker agent, ready to paste into its initial
+ * prompt. It carries the obligation verbatim (claim + acceptance), the
+ * worker's half of the protocol (prove in YOUR workspace, then submit the
+ * exported bundle back), and the precondition sentence that makes the DAG
+ * legible: the parent's proven is built out of the child's.
+ */
+function handoffInstruction(task: {
+  taskId: string
+  claim: string
+  acceptance?: string
+  parentTaskId?: string
+}): string {
+  return [
+    `DELEGATED OBLIGATION ${task.taskId}`,
+    '',
+    'You are the worker agent for a delegated obligation on the agent-proof-protocol',
+    `responsibility DAG${task.parentTaskId !== undefined ? ` (nested under parent task ${task.parentTaskId})` : ''}.`,
+    'Make the claim below true IN YOUR OWN WORKSPACE, then prove it and submit the',
+    'proof back to the orchestrator that delegated it.',
+    '',
+    'CLAIM (what must become true):',
+    `  ${task.claim}`,
+    '',
+    'ACCEPTANCE (how your submission will be judged):',
+    `  ${task.acceptance ?? 'none recorded — the claim text above is the whole contract'}`,
+    '',
+    'YOUR PART OF THE PROTOCOL, in order:',
+    "  1. proof_baseline  — anchor your workspace's starting state before you change anything.",
+    '  2. Do the work that makes the claim true.',
+    '  3. proof_verify (or proof_claim carrying the claim text) — the affected checks must',
+    '     re-run, and your session must grade "proven" with zero regressions before you',
+    '     may submit.',
+    '  4. proof_bundle    — export the tamper-evident APP bundle of your evidence chain.',
+    `  5. Submit it back with proof_delegate_submit { taskId: ${JSON.stringify(task.taskId)}, bundle: <the bundle proof_bundle returned> }.`,
+    '',
+    'Your "proven" is the precondition of the parent task\'s "proven": until your bundle',
+    'verifies, everything above you in the task graph stays stale — and a forged or',
+    'regressed submission is attributed to you by taskId, never silently absorbed.',
+  ].join('\n')
+}
+
+async function callDelegateTool(deps: McpEngineDeps, args: Record<string, unknown>): Promise<McpToolResult> {
+  const claim = args.claim
+  if (typeof claim !== 'string' || claim.trim().length === 0) {
+    return toolError({ error: 'proof_delegate: claim is required — the obligation, phrased as a completion claim' })
+  }
+  // Same loud-argument discipline as proof_claim's kind guard: an optional
+  // parameter that arrived with the wrong TYPE is an error, never dropped.
+  if (args.parentTaskId !== undefined && typeof args.parentTaskId !== 'string') {
+    return toolError({ error: `proof_delegate: parentTaskId must be a string (got ${JSON.stringify(args.parentTaskId)})` })
+  }
+  if (args.acceptance !== undefined && typeof args.acceptance !== 'string') {
+    return toolError({ error: `proof_delegate: acceptance must be a string (got ${JSON.stringify(args.acceptance)})` })
+  }
+  const verbs = delegationVerbs(deps.engine)
+  if (verbs === undefined) return delegationUnavailable('proof_delegate')
+  const parentTaskId = args.parentTaskId as string | undefined
+  const acceptance = args.acceptance as string | undefined
+  // Semantic preconditions (unknown parentTaskId, a cyclic nest, …) are the
+  // ENGINE's to enforce; a clean throw rides the dispatcher's isError path.
+  const outcome = await verbs.delegateTask({
+    claim,
+    ...(parentTaskId !== undefined ? { parentTaskId } : {}),
+    ...(acceptance !== undefined ? { acceptance } : {}),
+  })
+  return toolResult({
+    taskId: outcome.taskId,
+    obligationId: outcome.obligationId,
+    obligation: outcome.obligation,
+    instruction: handoffInstruction({
+      taskId: outcome.taskId,
+      claim,
+      ...(parentTaskId !== undefined ? { parentTaskId } : {}),
+      ...(acceptance !== undefined ? { acceptance } : {}),
+    }),
+  })
+}
+
+async function callDelegateSubmitTool(deps: McpEngineDeps, args: Record<string, unknown>): Promise<McpToolResult> {
+  const taskId = args.taskId
+  if (typeof taskId !== 'string' || taskId.length === 0) {
+    return toolError({ error: 'proof_delegate_submit: taskId is required — the delegation being submitted for' })
+  }
+  const bundle = args.bundle
+  if (typeof bundle !== 'object' || bundle === null || Array.isArray(bundle)) {
+    return toolError({
+      error: 'proof_delegate_submit: bundle is required — the APP bundle object your proof_bundle export returned',
+    })
+  }
+  // A grade the scale does not name is refused loudly (a worker claiming an
+  // unintelligible grade must be told, not silently downgraded), mirroring
+  // proof_claim's kind guard.
+  if (args.claimedGrade !== undefined && !isGradeValue(args.claimedGrade)) {
+    return toolError({
+      error: `proof_delegate_submit: claimedGrade must be one of ${GRADES.join(' | ')} `
+        + `(got ${typeof args.claimedGrade === 'string' ? JSON.stringify(args.claimedGrade) : 'a non-string value'})`,
+    })
+  }
+  if (args.byWorkspace !== undefined && typeof args.byWorkspace !== 'string') {
+    return toolError({ error: `proof_delegate_submit: byWorkspace must be a string (got ${JSON.stringify(args.byWorkspace)})` })
+  }
+  const verbs = delegationVerbs(deps.engine)
+  if (verbs === undefined) return delegationUnavailable('proof_delegate_submit')
+  // The bundle's own bytes adjudicate everything from here (digests, chain,
+  // claimed vs supported grade); the engine's clean throws ride isError.
+  const outcome = await verbs.submitDelegation({
+    taskId,
+    bundle,
+    ...(typeof args.byWorkspace === 'string' ? { byWorkspace: args.byWorkspace } : {}),
+    ...(isGradeValue(args.claimedGrade) ? { claimedGrade: args.claimedGrade } : {}),
+  })
+  return toolResult({ submission: outcome.submission, composed: outcome.composed })
+}
+
+/**
+ * One delegated task as the overview lists it: identity, place in the DAG, a
+ * claim summary short enough to scan a whole graph at a glance, and whether a
+ * submission has landed against it.
+ */
+interface TaskOverviewEntry {
+  taskId: string
+  parentTaskId: string | null
+  claim: string
+  submitted: boolean
+}
+
+/** A claim folded to 80 characters — the overview is for scanning, not judging. */
+function summarizeClaim(claim: string): string {
+  return claim.length <= 80 ? claim : `${claim.slice(0, 77)}...`
+}
+
+/**
+ * The whole-task overview, read back off the evidence chain the way the DSH
+ * attestation tools read markers (dsh/tools.ts's markerPayloads precedent):
+ * parse each line, keep `delegation/` markers, and classify by label — the
+ * engine mints `delegation/created` when an obligation is opened and
+ * `delegation/verdict` when a submission lands (`delegation/waive` is a risk
+ * acceptance, NOT a submission, so it is deliberately not matched). Defensive
+ * by construction: an unreadable log degrades to an empty overview, never a
+ * throw, and any field with the wrong shape is skipped, not guessed at.
+ */
+async function taskOverview(deps: McpEngineDeps): Promise<TaskOverviewEntry[]> {
+  const tasks = new Map<string, TaskOverviewEntry>()
+  let lines: readonly string[]
+  try {
+    lines = await deps.engine.fsView.readLines(deps.evidenceLogPath)
+  } catch {
+    return []
+  }
+  for (const line of lines) {
+    let envelope: { kind?: unknown; payload?: unknown }
+    try {
+      envelope = JSON.parse(line) as { kind?: unknown; payload?: unknown }
+    } catch {
+      continue
+    }
+    if (envelope?.kind !== 'marker') continue
+    const payload = envelope.payload
+    if (typeof payload !== 'object' || payload === null) continue
+    const record = payload as Record<string, unknown>
+    const label = typeof record.label === 'string' ? record.label : ''
+    if (!label.startsWith('delegation/')) continue
+    const taskId = record.taskId
+    if (typeof taskId !== 'string') continue
+    if (label.includes('created')) {
+      const claim = record.claim
+      if (typeof claim !== 'string') continue
+      const parentTaskId = typeof record.parentTaskId === 'string' ? record.parentTaskId : null
+      tasks.set(taskId, { taskId, parentTaskId, claim: summarizeClaim(claim), submitted: false })
+    } else if ((label.includes('verdict') || label.includes('submit')) && tasks.has(taskId)) {
+      // A landed submission (`delegation/verdict` in the engine's dialect);
+      // 'submit' is matched too so a future engine renaming the label keeps
+      // the overview honest.
+      const entry = tasks.get(taskId)!
+      tasks.set(taskId, { ...entry, submitted: true })
+    }
+  }
+  return [...tasks.values()]
+}
+
+async function callTaskTool(deps: McpEngineDeps, args: Record<string, unknown>): Promise<McpToolResult> {
+  if (args.taskId !== undefined && typeof args.taskId !== 'string') {
+    return toolError({ error: `proof_task: taskId must be a string (got ${JSON.stringify(args.taskId)})` })
+  }
+  if (args.ownGrade !== undefined && !isGradeValue(args.ownGrade)) {
+    return toolError({
+      error: `proof_task: ownGrade must be one of ${GRADES.join(' | ')} `
+        + `(got ${typeof args.ownGrade === 'string' ? JSON.stringify(args.ownGrade) : 'a non-string value'}); `
+        + 'an unintelligible grade is refused, never silently dropped',
+    })
+  }
+  const verbs = delegationVerbs(deps.engine)
+  if (verbs === undefined) return delegationUnavailable('proof_task')
+  const taskId = args.taskId as string | undefined
+  if (taskId === undefined) {
+    const tasks = await taskOverview(deps)
+    return toolResult({
+      tasks,
+      ...(tasks.length === 0
+        ? { note: 'no delegations recorded on this chain yet — create one with proof_delegate' }
+        : {}),
+    })
+  }
+  const verdict = await verbs.taskVerdict({
+    taskId,
+    ...(isGradeValue(args.ownGrade) ? { ownGrade: args.ownGrade } : {}),
+  })
+  return toolResult({ taskId, composed: verdict.composed, nodes: verdict.nodes, cycles: verdict.cycles })
+}
+
 async function callTool(deps: McpEngineDeps, params: unknown): Promise<McpToolResult> {
   const name = typeof params === 'object' && params !== null
     ? (params as { name?: unknown }).name
@@ -706,6 +1093,9 @@ async function callTool(deps: McpEngineDeps, params: unknown): Promise<McpToolRe
       case 'proof_bundle': return await callBundleTool(deps)
       case 'proof_publish': return await callPublishTool(deps)
       case 'proof_log_verify': return await callLogVerifyTool(deps, args)
+      case 'proof_delegate': return await callDelegateTool(deps, args)
+      case 'proof_delegate_submit': return await callDelegateSubmitTool(deps, args)
+      case 'proof_task': return await callTaskTool(deps, args)
       default:
         // Unknown tool: MCP tool-error semantics (isError result), with the
         // name spelled out so a foreign agent can self-correct.

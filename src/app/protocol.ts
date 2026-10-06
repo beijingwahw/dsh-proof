@@ -1,5 +1,5 @@
 /**
- * Agent Proof Protocol (APP/1.1) — the protocol constants layer.
+ * Agent Proof Protocol (APP/1.2) — the protocol constants layer.
  *
  * Everything a producer emits and a consumer interprets is named here: the
  * wire vocabularies (verdicts, grades, check statuses, chain modes, claim
@@ -37,8 +37,18 @@ export const PROTOCOL_NAME = 'agent-proof-protocol' as const
  * and an APP/1.0 verifier refuses the new dialect instead of guessing at it.
  * Downgrading this constant back is a wire-compatibility break, not a cosmetic
  * edit: both directions are caught by the fingerprint, on purpose.
+ *
+ * v0.19: APP/1.1 → APP/1.2 — the second tool-surface expansion (7 → 10): the
+ * responsibility-DAG vocabulary joins the MCP contract (`proof_delegate`,
+ * `proof_delegate_submit`, `proof_task` — delegation obligations, child bundle
+ * submissions, composed task verdicts). Same principle as the first bump: the
+ * addressing, chaining and bundle formats are byte-for-byte unchanged, but a
+ * consumer that never agreed to speak about task graphs must be able to refuse
+ * a dialect that does — and because the version is fingerprint material, the
+ * refusal is automatic: every APP/1.2 manifest is unintelligible to every
+ * APP/1.1 verifier, in both directions, by construction.
  */
-export const PROTOCOL_VERSION = 'APP/1.1' as const
+export const PROTOCOL_VERSION = 'APP/1.2' as const
 
 /** Media type of a single proof document (a `ProofReport`-shaped value). */
 export const PROOF_MEDIA_TYPE = 'application/vnd.app.proof+json' as const
@@ -109,7 +119,7 @@ export const CHECK_STATUSES = ['pass', 'fail', 'error', 'timeout', 'aborted', 's
  * `protocolHeader` returns the empty skeleton.
  */
 export interface BundleManifest {
-  /** The protocol dialect, always `APP/1.1` for this module. */
+  /** The protocol dialect, always `APP/1.2` for this module. */
   protocol: typeof PROTOCOL_VERSION
   /** The producing implementation's vocabulary fingerprint (`appFingerprint()`). */
   appFingerprint: string
