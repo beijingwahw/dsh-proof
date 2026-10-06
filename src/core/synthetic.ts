@@ -220,7 +220,12 @@ export const FORBIDDEN_CAPABILITIES: readonly string[] = [
  * screen flags every statically decidable call shape of every name here —
  * direct `fetch(…)`, computed member `globalThis['fetch'](…)`, optional call
  * `fetch?.(…)`, indirect `(0, fetch)(…)` and the alias declaration
- * `const f = fetch` (see `screenScript`); a local helper that happens to be
+ * `const f = fetch` (see `screenScript`). V7-M3 extends the same net to the
+ * statically decidable VALUE shapes — the tagged template `` fetch`url` ``
+ * (a call), the destructuring rename `const { fetch: f } = globalThis`, the
+ * bare assignment alias `f = fetch` and `Reflect.apply(fetch, …)`; passing
+ * the global bare to an arbitrary higher-order callee stays a documented
+ * residual (not statically decidable). A local helper that happens to be
  * named `fetch` is over-reported, the deny-list's documented safe direction
  * (refuse the inert script, never run the live one).
  */
@@ -313,7 +318,10 @@ function forbiddenModuleOf(specifier: string): string | undefined {
  * or without the `node:` prefix — plus `process.env` reads in member and
  * computed-member form, and (H-31) the zero-import outbound globals named by
  * `FORBIDDEN_GLOBALS` in every statically decidable call shape (W15-M2:
- * direct, computed-member, optional-call, indirect-call and alias-binding).
+ * direct, computed-member, optional-call, indirect-call and alias-binding)
+ * and value shape (V7-M3: tagged-template, destructuring-alias,
+ * assignment-alias and Reflect.apply — a global used as a VALUE at a
+ * nameable site is as live as a call).
  * M11: all four import shapes accept backtick-quoted specifiers (an
  * uninterpolated template literal is statically decidable), and specifiers
  * are `\u`/`\x`-unescaped before the deny-list sees them, so
@@ -325,9 +333,11 @@ function forbiddenModuleOf(specifier: string): string | undefined {
  *
  * Admitted limits of static screening (this is a *screen*, not a sandbox):
  * computed specifiers (`import(buildName())`), runtime aliases that need no
- * literal (`eval`/`new Function` — the eval-tier escapes themselves) and
- * case-mangled specifiers that would simply fail at runtime are not caught —
- * text cannot see runtime values. (W15-M3 closed the two module DOORS to
+ * literal (`eval`/`new Function` — the eval-tier escapes themselves),
+ * case-mangled specifiers that would simply fail at runtime, and a global
+ * passed BARE as an argument to an arbitrary callee
+ * (`queueMicrotask(fetch, url)` — whether the callee invokes its argument is
+ * not a static fact) are not caught — text cannot see runtime values. (W15-M3 closed the two module DOORS to
  * eval-tier power: `node:vm` and `node:module` are denied by name, so the
  * escapes now need an actual computed specifier, not a clean import.) The
  * enforcement that actually bounds a runaway script is the sandbox cwd
@@ -377,10 +387,31 @@ export function screenScript(source: string): ScreenResult {
   //   optional call    `fetch?.(…)`
   //   indirect call    `(0, fetch)(…)`
   //   alias binding    `const f = fetch` / `const W = globalThis.WebSocket`
+  // V7-M3 (the value-reference family): a global used as a VALUE — not
+  // called at a recognizable site — is statically decidable in four more
+  // shapes, and each used to pass the screen clean while remaining live:
+  //   tagged template  `` fetch`https://…/${data}` `` — a tag call; the
+  //                    template's raw strings reach the network stack whole
+  //   destructuring    `const { fetch: f } = globalThis` — renames the global
+  //                    away from every name-anchored pattern
+  //   assignment       `let f; f = fetch` — the alias without a declaration
+  //                    keyword on the same line the alias-binding form needs
+  //   Reflect.apply    `Reflect.apply(fetch, undefined, [url])` — the
+  //                    call-everything primitive, statically nameable
   // An alias declaration is flagged on its own: the binding hand is
   // statically visible even though the eventual call site is not. Over-
   // reporting (a local helper genuinely named `fetch` bound then called)
   // stays the deny-list's documented safe direction.
+  //
+  // Admitted non-decidable boundary (text cannot see runtime values):
+  // passing the global BARE as an argument to an arbitrary higher-order
+  // callee (`queueMicrotask(fetch, url)`) is NOT flagged — whether that
+  // callee invokes its argument is not a static fact, so flagging every
+  // bare identifier occurrence would be noise rather than a screen; the
+  // aliases an intermediate variable washes out (`const g = globalThis;
+  // g.fetch(…)`) likewise. Those shapes stay bounded by the sandbox cwd,
+  // run timeout, output cap and ptc-runtime profile, exactly like the
+  // computed-specifier and eval-tier residuals recorded on `screenScript`.
   for (const globalName of FORBIDDEN_GLOBALS) {
     const shapes: readonly [pattern: RegExp, how: string][] = [
       [new RegExp(`\\b${globalName}\\s*\\(`), 'call form'],
@@ -388,6 +419,11 @@ export function screenScript(source: string): ScreenResult {
       [new RegExp(`\\b${globalName}\\s*\\?\\.\\s*\\(`), 'optional-call form'],
       [new RegExp(`\\(\\s*0\\s*,\\s*${globalName}\\s*\\)\\s*\\(`), 'indirect-call form'],
       [new RegExp(`\\b(?:const|let|var)\\s+[\\w$]+\\s*=\\s*(?:globalThis\\s*\\.\\s*)?${globalName}\\b`), 'alias-binding form'],
+      // V7-M3 — the value-reference family (see the block comment above).
+      [new RegExp(`\\b${globalName}\\s*\``), 'tagged-template form'],
+      [new RegExp(`\\b(?:const|let|var)\\s*\\{[^}]*\\b${globalName}\\s*:\\s*[\\w$]+[^}]*\\}`), 'destructuring-alias form'],
+      [new RegExp(`\\b[\\w$]+\\s*=(?!=)\\s*(?:globalThis\\s*\\.\\s*)?${globalName}\\b`), 'assignment-alias form'],
+      [new RegExp(`\\bReflect\\s*\\.\\s*apply\\s*\\(\\s*(?:globalThis\\s*\\.\\s*)?${globalName}\\b`), 'reflect-apply form'],
     ]
     for (const [pattern, how] of shapes) {
       if (pattern.test(source)) {

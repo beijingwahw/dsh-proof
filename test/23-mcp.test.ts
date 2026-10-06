@@ -16,6 +16,14 @@
  * (unknown tool, bogus claim kind, malformed JSON line). Nothing is stubbed —
  * this is the test that proves any foreign harness can drive the proof
  * protocol end to end.
+ *
+ * v0.24 batch (V4/V6/V9): the verified-view marker reader (blank-line domain
+ * + generational fallback, unit-pinned beside the twin-exclusion pin), the
+ * budgetMs ceiling (0/1e308 refused, 1e12 the boundary), SERVER_NOT_INITIALIZED
+ * (-32002) and its strip in runMcpServer, input-queue backpressure, the
+ * confined `..` rule, the blank-claim warning, uncertain=fail for an
+ * unadjudicable tree head, the PTL-inside-workspace startup warning, the
+ * confidence-anchored SLA copy, and MCP_DEFAULT_VERSION tracking the package.
  */
 
 import { test, before, after } from 'node:test'
@@ -36,8 +44,11 @@ import { buildBundle } from '../src/app/bundle.ts'
 // v0.23 (W8): the transport layer and the suspect-filtering marker reader are
 // pinned at the unit level too — a chunk boundary inside a code point and an
 // out-of-band marker twin are both invisible through the happy-path RPCs.
-import { markerPayloads, readCappedLines } from '../src/app/mcp-server.ts'
+// v0.24 (V6-M1/M2): the reader goes through the engine's verified view, so
+// the fake engine below carries a storeView over the same MemoryFs.
+import { markerPayloads, readCappedLines, runMcpServer } from '../src/app/mcp-server.ts'
 import type { McpEngineDeps } from '../src/app/mcp-server.ts'
+import { EvidenceStore } from '../src/core/evidence.ts'
 import type { ProofEngine } from '../src/engine.ts'
 import { lineDigest } from '../src/core/trust.ts'
 import { MemoryFs } from './helpers.ts'
@@ -223,7 +234,10 @@ test('initialize handshake answers with the server identity and a supported prot
     serverInfo: { name: string; version: string }
   }
   assert.equal(result.serverInfo.name, 'agent-proof-protocol')
-  assert.equal(result.serverInfo.version, '0.22.0')
+  // V6-L10 (v0.24): MCP_DEFAULT_VERSION tracks the package version — a
+  // v0.23 build answering "0.22.0" misjudged every version-negotiating
+  // client. DSH_PROOF_SERVER_VERSION still overrides on purpose.
+  assert.equal(result.serverInfo.version, '0.24.0')
   assert.equal(result.protocolVersion, '2025-06-18', 'a requested supported version is echoed back')
   assert.equal(result.capabilities.tools.listChanged, false)
 })
@@ -543,6 +557,58 @@ test('proof_log_verify audits the log: self-check, inclusion, consistency — an
     hostileValue.problems.some(p => p.toLowerCase().includes('consistency')),
     `the problems name the consistency failure: ${JSON.stringify(hostileValue.problems)}`,
   )
+})
+
+test('V4-M6: an unadjudicable tree head fails the audit — not-checked is a finding, not a pass (uncertain=fail)', async () => {
+  assert.ok(firstPublish !== undefined, 'the publish test ran first (state chains)')
+  // A copy of the published log WITHOUT any operator key anywhere near it:
+  // the tree itself is intact (the root recomputes, the head matches it),
+  // but nobody can adjudicate the head's signature. The CLI faces fail this
+  // state (self-verify exits 1; bundle-verify door 5 requires === true);
+  // this MCP face used to answer ok: true beside a 'not-checked' signature —
+  // a pass in disguise for any consumer keying on ok alone.
+  const keylessDir = join(WORKSPACE, 'dsh-home', 'ptl-keyless')
+  await fsp.mkdir(keylessDir, { recursive: true })
+  await fsp.copyFile(join(WORKSPACE, 'trust', 'ptl', 'ptl-entries.jsonl'), join(keylessDir, 'ptl-entries.jsonl'))
+  await fsp.copyFile(join(WORKSPACE, 'trust', 'ptl', 'sth.json'), join(keylessDir, 'sth.json'))
+  const ephemeral = spawn(process.execPath, ['--experimental-strip-types', ENTRY], {
+    cwd: WORKSPACE,
+    env: {
+      ...process.env,
+      DSH_PROOF_ROOT: WORKSPACE,
+      // A trust root with NO operator key material: the keyless copy of the
+      // log is the only PTL in sight.
+      DSH_PROOF_TRUST_DIR: join(WORKSPACE, 'trust-empty-v4m6'),
+      DSH_HOME: join(WORKSPACE, 'dsh-home'),
+      DSH_PROOF_PTL_DIR: keylessDir,
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  try {
+    const gate = new LineRpc(ephemeral)
+    const init = await gate.request('initialize', { protocolVersion: '2025-06-18' })
+    assert.equal(init.error, undefined, `initialize failed: ${JSON.stringify(init.error)}`)
+    const verified = await gate.request('tools/call', { name: 'proof_log_verify', arguments: {} }, 60_000)
+    assert.equal(verified.error, undefined, `log verify failed at the RPC layer: ${JSON.stringify(verified.error)}`)
+    const result = verified.result as ToolCallResponse
+    assert.equal(result.isError, undefined, 'an audit with findings is a normal result, not a tool error')
+    const value = result.structuredContent as {
+      ok: boolean
+      treeSize: number
+      treeHead?: { signature?: string; rootMatches?: boolean }
+      problems?: string[]
+    }
+    assert.equal(value.treeSize, 2, 'the copied log itself is intact')
+    assert.equal(value.treeHead?.rootMatches, true, 'the head still matches the recomputed root')
+    assert.equal(value.treeHead?.signature, 'not-checked (operator key absent)', 'the three-state still says WHY')
+    assert.equal(value.ok, false, 'uncertain FAILS the audit — the CLI faces\' rule, now this face\'s too')
+    assert.ok(
+      (value.problems ?? []).some(p => p.includes('NOT adjudicated')),
+      `the unchecked head rides problems: ${JSON.stringify(value.problems)}`,
+    )
+  } finally {
+    ephemeral.kill()
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -1117,6 +1183,35 @@ test('proof_claim refuses a non-finite budgetMs — 1e999 is not a budget (H-29 
   assert.match(text, /finite/, 'the error says exactly what was wrong: not a finite number')
 })
 
+test('V6-M3: budgetMs 0 and 1e308 are refused — the 1e12 ceiling is face-wide, not DSH-only', async () => {
+  // W13-M6 put the ceiling on the DSH face only; the MCP face is the one an
+  // UNTRUSTED foreign agent types at, so `budgetMs: 1e308` (finite, positive,
+  // vacuously satisfiable by any benchmark) must not pass here either, and
+  // `budgetMs: 0` (the old face text said ">= 0") must stop being a budget.
+  for (const budgetMs of [0, 1e308, 1e12 + 1]) {
+    const result = await callTool('proof_claim', {
+      claim: 'fast enough', kind: 'perf-budget', budgetMs,
+    }, 60_000)
+    assert.equal(result.isError, true, `budgetMs ${budgetMs} must be refused (V6-M3)`)
+    const text = result.content[0]!.text
+    assert.match(text, /budgetMs/, 'the error names the offending argument')
+    assert.match(text, /1e12/, 'the error names the ceiling the DSH face already had')
+  }
+  // 1e12 itself is the boundary, not beyond it: a legal (if absurd) budget
+  // passes the face gate — the ceiling is a ceiling, not a lower bar.
+  const legal = await callTool('proof_claim', {
+    claim: 'a very slow benchmark', kind: 'perf-budget', budgetMs: 1e12,
+  }, 60_000)
+  assert.notEqual(legal.isError, true, `1e12 is inside the bound: ${legal.content[0]?.text}`)
+
+  // And the schema says the same thing the gate enforces (tool-description
+  // changes ride with their pins): the bound is documented, not folklore.
+  const response = await client.request('tools/list', {})
+  const tools = (response.result as { tools: { name: string; inputSchema: { properties?: Record<string, { description?: string }> } }[] }).tools
+  const budgetDescription = tools.find(t => t.name === 'proof_claim')!.inputSchema.properties?.budgetMs?.description ?? ''
+  assert.match(budgetDescription, /1e12/, 'the budgetMs description names the ceiling')
+})
+
 test('proof_verify counts dropped non-string changed entries instead of narrowing silently', async () => {
   const result = await callTool('proof_verify', { changed: ['check.mjs', 42, null] }, 60_000)
   assert.equal(result.isError, undefined, `verify errored: ${result.content[0]?.text}`)
@@ -1184,7 +1279,10 @@ test('tools are refused before initialize — the handshake is mandatory (protoc
     const refused = await gate.request('tools/list', {})
     const error = refused.error as { code: number; message: string }
     assert.ok(error !== undefined, 'a pre-handshake tools request is refused')
-    assert.equal(error.code, -32600)
+    // V6-L/F9 (v0.24): the code is SERVER_NOT_INITIALIZED (-32002, the
+    // JSON-RPC server-error band), not INVALID_REQUEST — the request itself
+    // was well-formed JSON-RPC; the session state refused it.
+    assert.equal(error.code, -32002)
     assert.match(error.message, /initialize/, 'the refusal names the missing handshake')
     const init = await gate.request('initialize', { protocolVersion: '2025-06-18' })
     assert.equal(init.error, undefined)
@@ -1302,13 +1400,28 @@ test('proof_training_export confines `path` to the workspace — absolute, UNC a
 
   const escape = await callTool('proof_training_export', { path: 'deep/../../outside.jsonl' })
   assert.equal(escape.isError, true, 'a path that normalizes outside the root is refused')
-  assert.match(escape.content[0]!.text, /escapes the workspace root/)
+  // V6-L/F7 (v0.24): the refusal is on the ".." SEGMENT now — same rule as
+  // the engine's exportRelPath — not on where the pop-normalisation landed.
+  assert.match(escape.content[0]!.text, /segments are refused outright/, 'the error names the segment rule')
+
+  // And the engine-identical half: a dotdot that RE-ENTERS the workspace
+  // ('a/../b' normalizes to 'b', inside the root) is refused too — at this
+  // trust boundary the two shapes are indistinguishable, and the face gate
+  // now refuses exactly the set the engine's own gate refuses.
+  const reenter = await callTool('proof_training_export', { path: 'a/../reenter.jsonl' })
+  assert.equal(reenter.isError, true, 'a re-entering dotdot is refused — the face and the engine share one rule')
+  assert.match(reenter.content[0]!.text, /segments are refused outright/)
 
   // And none of the refused calls wrote anything outside the workspace.
   assert.equal(
     await fsp.stat(join(WORKSPACE, '..', 'escape.jsonl')).then(() => true, () => false),
     false,
     'the refused absolute destination must not exist',
+  )
+  assert.equal(
+    await fsp.stat(join(WORKSPACE, 'reenter.jsonl')).then(() => true, () => false),
+    false,
+    'the refused re-entering destination must not exist either (pop-normalisation is gone)',
   )
 })
 
@@ -1388,6 +1501,28 @@ test('W8-L7: a claim past the 200-character marker bound carries a truncation wa
   )
 })
 
+test('V6-L: a whitespace-only claim on proof_verify records nothing — and says so', async () => {
+  // proof_claim REFUSES a blank claim outright; proof_verify used to accept
+  // the string and then silently forward nothing (the `trim() !== ''` guard
+  // dropped it without a word) — a face-internal inconsistency the loud
+  // boundary discipline closes: record nothing, but say it.
+  const result = await callTool('proof_verify', { changed: ['check.mjs'], claim: '   \t ' }, 60_000)
+  assert.equal(result.isError, undefined, `verify errored: ${result.content[0]?.text}`)
+  const value = result.structuredContent as { warning?: string }
+  assert.match(
+    value.warning ?? '',
+    /blank/,
+    'the response says nothing was recorded for a whitespace-only claim',
+  )
+  // And the chain agrees: the LAST proof/verified marker carries no claim.
+  const log = await fsp.readFile(join(fixtureStoreDir(), 'evidence.jsonl'), 'utf8')
+  const markers = log.split('\n')
+    .filter(line => line.trim().length > 0)
+    .map(line => JSON.parse(line) as { kind?: unknown; payload?: { label?: unknown; claim?: unknown } })
+    .filter(entry => entry.kind === 'marker' && entry.payload?.label === 'proof/verified')
+  assert.equal(markers[markers.length - 1]?.payload?.claim, undefined, 'the boundary marker carries no claim text')
+})
+
 test('the SLA quote description states the anchoring gate the engine actually enforces (W8-M1)', async () => {
   const response = await client.request('tools/list', {})
   assert.equal(response.error, undefined)
@@ -1404,6 +1539,43 @@ test('the SLA quote description states the anchoring gate the engine actually en
   assert.ok(
     sla.description.includes('ERROR') || sla.description.includes('refused'),
     'the description says an unanchored grade is refused, not priced',
+  )
+  // V6-M4 (v0.24): the engine's SECOND anchor (v0.23) is in the copy too —
+  // the description used to promise free-form confidence while the engine
+  // already refused a proven quote above the best reached marker.
+  assert.ok(
+    sla.description.includes('no lower than the confidence you quote'),
+    'the description states the confidence anchor: the chain must cover the quoted confidence',
+  )
+  assert.ok(
+    sla.description.includes('quoting below is priced honestly'),
+    'the description says the honest direction too: a lower quote prices at the lower number',
+  )
+  // V6-M4 (v0.24): the confidence PARAMETER documents its anchor too — the
+  // caller reads the parameter description, not only the tool preamble.
+  const slaWithSchema = tools.find(t => t.name === 'proof_sla_quote') as unknown as {
+    inputSchema: { properties?: Record<string, { description?: string }> }
+  }
+  assert.match(
+    String(slaWithSchema.inputSchema.properties?.confidence?.description ?? ''),
+    /ANCHORED/,
+    'the confidence parameter says its value is anchored to the chain\'s reached markers',
+  )
+  // V6-M4 sibling: proof_log_verify's description now states uncertain=fail
+  // (a missing operator key fails the audit, matching the CLI faces).
+  assert.ok(
+    (tools.find(t => t.name === 'proof_log_verify')!.description).includes('uncertain-counts-as-failed'),
+    'the log-verify description says an unadjudicated head fails the audit',
+  )
+  // V6-L/F7 sibling: the training-export path parameter documents the ".."-
+  // segment rule the face gate now enforces (engine-identical).
+  const trainingWithSchema = tools.find(t => t.name === 'proof_training_export') as unknown as {
+    inputSchema: { properties?: Record<string, { description?: string }> }
+  }
+  assert.match(
+    String(trainingWithSchema.inputSchema.properties?.path?.description ?? ''),
+    /"\.\." segment|\.\.&#34; segment|dotdot/,
+    'the path parameter names the dotdot rule',
   )
 })
 
@@ -1479,6 +1651,101 @@ test('W8-F3: the transport cap is exact byte semantics — cap and cap+1 adjudic
   }
 })
 
+test('V6-F5: readCappedLines pauses its input at the queue high-water mark and resumes on drain', async () => {
+  const tick = async (): Promise<void> => new Promise(resolve => setImmediate(resolve))
+  let pauses = 0
+  let resumes = 0
+  // A PassThrough that RECORDS the transport signals: the queue bound is
+  // observable only through the pause/resume it triggers on the input.
+  class RecordingStream extends PassThrough {
+    override pause(): this {
+      pauses += 1
+      return super.pause()
+    }
+
+    override resume(): this {
+      resumes += 1
+      return super.resume()
+    }
+  }
+  const pt = new RecordingStream()
+  const iterator = readCappedLines(pt, 4096)[Symbol.asyncIterator]()
+  const total = 3000
+  // A client that keeps writing while nothing consumes: under the old shape
+  // the parsed-line queue grew without bound for as long as the client
+  // cared to write (the 4 MiB cap bounded each ENTRY, not the depth).
+  for (let i = 0; i < total; i += 1) {
+    pt.write(`{"n":${i}}\n`)
+    if (i % 97 === 0) await tick()
+  }
+  pt.end()
+  await tick()
+  assert.ok(pauses >= 1, `the queue high-water mark paused the transport (pauses: ${pauses})`)
+
+  // Then the consumer catches up: every line arrives, in order, and the
+  // transport is resumed as the queue drains below the low-water mark.
+  const seen: number[] = []
+  for (;;) {
+    const next = await iterator.next()
+    if (next.done) break
+    seen.push(JSON.parse((next.value as { text: string }).text).n)
+  }
+  assert.deepEqual(seen, Array.from({ length: total }, (_, i) => i), 'nothing is dropped or reordered by the pause/resume cycle')
+  assert.ok(resumes >= 1, 'draining the queue resumed the transport')
+})
+
+test('V6-L/F9: runMcpServer strips allowUninitializedTools — the stdio handshake is mandatory', async () => {
+  // A stray `allowUninitializedTools: true` in an embedding used to silently
+  // open the un-handshaked door over the stdio transport; the loop now
+  // strips the flag before building the handler (embedders that really want
+  // the gate gone drive createMcpHandler directly).
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const readOneLine = async (): Promise<string> => new Promise<string>((resolve) => {
+    let buffer = ''
+    const onData = (chunk: string): void => {
+      buffer += chunk
+      const index = buffer.indexOf('\n')
+      if (index >= 0) {
+        output.removeListener('data', onData)
+        resolve(buffer.slice(0, index))
+      }
+    }
+    output.setEncoding('utf8')
+    output.on('data', onData)
+  })
+  const server = runMcpServer({
+    engine: {} as unknown as ProofEngine,
+    evidenceLogPath: '/store/evidence.jsonl',
+    baselinePath: '/store/baseline.json',
+    anchorPath: '/trust/anchors/k/anchor.json',
+    workspaceKey: 'k',
+    serverVersion: 'test',
+    allowUninitializedTools: true, // the stray flag that must change nothing
+    input,
+    output,
+  })
+  try {
+    input.write('{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n')
+    const refusal = JSON.parse(await readOneLine()) as { id: number; error?: { code: number } }
+    assert.equal(refusal.id, 1)
+    assert.equal(refusal.error?.code, -32002, 'the un-handshaked request is refused DESPITE the flag')
+
+    // And the gate still opens the honest way: initialize, then serve.
+    input.write('{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}\n')
+    const ready = JSON.parse(await readOneLine()) as { id: number; result?: unknown; error?: unknown }
+    assert.equal(ready.id, 2)
+    assert.equal(ready.error, undefined)
+    input.write('{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}\n')
+    const listed = JSON.parse(await readOneLine()) as { id: number; error?: unknown }
+    assert.equal(listed.id, 3)
+    assert.equal(listed.error, undefined, 'after the handshake the surface answers')
+  } finally {
+    input.end()
+    await server
+  }
+})
+
 test('W8/G2: markerPayloads excludes suspect lines — an out-of-band marker twin is not chain fact', async () => {
   const evidence0 = JSON.stringify({ v: 1, kind: 'evidence', at: '2026-10-06T00:00:00.000Z', payload: { evidenceId: 'e0' } })
   const marker = (label: string, extra: Record<string, unknown>, prev: string, headRef: string) => JSON.stringify({
@@ -1491,26 +1758,108 @@ test('W8/G2: markerPayloads excludes suspect lines — an out-of-band marker twi
   // line that is NOT its physical predecessor — the position witness fails.
   const replayedTwin = marker('delegation/created', { taskId: 'task-2', claim: 'injected obligation' }, 'prev-x', lineDigest(evidence0))
   const log = [evidence0, honestCreated, honestVerdict, replayedTwin].join('\n') + '\n'
-  const deps = {
-    engine: { fsView: MemoryFs.of({ '/store/evidence.jsonl': log }) },
-    evidenceLogPath: '/store/evidence.jsonl',
-  } as unknown as McpEngineDeps
+  const deps = fakeMarkerDeps(log)
 
   const records = await markerPayloads(deps, new Set(['delegation/created', 'delegation/verdict']))
   assert.equal(records.length, 2, 'the honest pair survives; the replayed twin does not')
   assert.deepEqual(records.map(r => (r.payload as { taskId: string }).taskId), ['task-1', 'task-1'])
   assert.equal(records[0]?.at, '2026-10-06T00:00:00.000Z', 'the envelope timestamp rides along')
+  // V6-M2: a trusted-pool read carries NO degraded flag — the generational
+  // fallback never fired (honest markers exist, the twin is simply absent).
+  assert.equal(records.every(r => r.degraded === undefined), true, 'a trusted read is not degraded')
 
-  // Prefix matching (the economics replay's shape) with the same exclusion.
-  const injectedVerified = marker('proof/verified', { grade: 'proven', economics: { cost: 1 } }, 'prev-y', lineDigest(evidence0))
-  const log2 = [evidence0, honestCreated, injectedVerified].join('\n') + '\n'
-  const deps2 = {
-    engine: { fsView: MemoryFs.of({ '/store/evidence.jsonl': log2 }) },
+  // Prefix matching (the economics replay's shape) with the same exclusion:
+  // an honest proof/verified boundary carrier exists, the appended twin
+  // (headRef naming a line that is not its predecessor) does not ride.
+  const honestVerified = marker('proof/verified', { grade: 'proven', economics: { cost: 1 } }, 'prev-z', lineDigest(honestCreated))
+  const injectedVerified = marker('proof/verified', { grade: 'proven', economics: { cost: 999 } }, 'prev-y', lineDigest(evidence0))
+  const deps2 = fakeMarkerDeps([evidence0, honestCreated, honestVerified, injectedVerified].join('\n') + '\n')
+  const economics = await markerPayloads(deps2, new Set(), { labelPrefixes: ['proof/', 'claim/'] })
+  assert.equal(economics.length, 1, 'only the honest boundary marker rides the prefix read')
+  assert.equal((economics[0]?.payload as { economics?: { cost: number } }).economics?.cost, 1, 'the forged carrier never became the run')
+})
+
+test('V6-M1: a blank line no longer exiles honest markers — the witness domain is readLines', async () => {
+  const evidence0 = JSON.stringify({ v: 1, kind: 'evidence', at: '2026-10-06T00:00:00.000Z', payload: { evidenceId: 'e0' } })
+  const marker = (label: string, extra: Record<string, unknown>, prev: string, headRef: string) => JSON.stringify({
+    v: 2, kind: 'marker', at: '2026-10-06T00:00:00.000Z', prev,
+    payload: { label, ...extra, headRef },
+  })
+  const honestCreated = marker('delegation/created', { taskId: 'task-1', claim: 'honest obligation' }, 'prev-0', lineDigest(evidence0))
+  const honestVerdict = marker('delegation/verdict', { taskId: 'task-1' }, lineDigest(evidence0), lineDigest(honestCreated))
+  // One stray blank line (`echo >> evidence.jsonl` — no attacker required)
+  // between the honest records. The old raw split judged the post-blank
+  // marker's headRef against the BLANK line's digest and silently dropped
+  // every honest marker after it on this face, while the writer (and every
+  // readLines-domain reader — DSH face, engine, audit) chained to the
+  // previous NON-BLANK line and read them fine.
+  const log = [evidence0, '', honestCreated, '', honestVerdict].join('\n') + '\n'
+  const records = await markerPayloads(fakeMarkerDeps(log), new Set(['delegation/created', 'delegation/verdict']))
+  assert.equal(records.length, 2, 'honest markers survive blank lines on this face now (V6-M1)')
+  assert.deepEqual(records.map(r => (r.payload as { taskId: string }).taskId), ['task-1', 'task-1'])
+  assert.equal(records[0]?.at, '2026-10-06T00:00:00.000Z', 'the timestamp re-read indexes the blank-filtered domain')
+})
+
+test('V6-M1: the blank-line forgery carrier (headRef = digest of the empty line) is refused, not replayed', async () => {
+  const evidence0 = JSON.stringify({ v: 1, kind: 'evidence', at: '2026-10-06T00:00:00.000Z', payload: { evidenceId: 'e0' } })
+  const marker = (label: string, extra: Record<string, unknown>, prev: string, headRef: string) => JSON.stringify({
+    v: 2, kind: 'marker', at: '2026-10-06T00:00:00.000Z', prev,
+    payload: { label, ...extra, headRef },
+  })
+  const honestCreated = marker('delegation/created', { taskId: 'task-1', claim: 'honest obligation' }, 'prev-0', lineDigest(evidence0))
+  const honestVerified = marker('proof/verified', { grade: 'proven', economics: { cost: 1 } }, 'prev-z', lineDigest(honestCreated))
+  // The PoC's first segment: a forged carrier whose headRef is the digest of
+  // the EMPTY line, preceded by a blank line — in the raw view its physical
+  // predecessor WAS the blank, so the forged witness PASSED and the forged
+  // ledger replayed as a normal success on this face. In the readLines
+  // domain the blank is not a line: the carrier chains to the honest
+  // boundary before it and reads suspect, and the trusted pool (honest
+  // markers present) never consults it.
+  const forged = JSON.stringify({
+    v: 2, kind: 'marker', at: '2026-10-06T00:00:00.000Z', prev: 'prev-forged',
+    payload: { label: 'proof/verified', grade: 'proven', economics: { cost: 999999 }, headRef: lineDigest('') },
+  })
+  const log = [evidence0, honestCreated, honestVerified, '', forged].join('\n') + '\n'
+  const economics = await markerPayloads(fakeMarkerDeps(log), new Set(), { labelPrefixes: ['proof/'] })
+  assert.equal(economics.length, 1, 'only the honest boundary marker rides')
+  assert.equal((economics[0]?.payload as { economics?: { cost: number } }).economics?.cost, 1, 'the FORGED ledger is not the run this face replays')
+})
+
+test('V6-M2: a pre-witness legacy label reads degraded, not empty — engine parity (X-H-06)', async () => {
+  const evidence0 = JSON.stringify({ v: 1, kind: 'evidence', at: '2026-10-06T00:00:00.000Z', payload: { evidenceId: 'e0' } })
+  // Every marker of the label predates the headRef witness: the whole
+  // population is suspect, and the ENGINE's generational fallback reads it
+  // degraded instead of evaporating (an upgraded deployment keeps exactly
+  // the history it had). The MCP face used to read the same chain as an
+  // empty DAG ("no delegations recorded on this chain yet") while the
+  // engine still composed verdicts from it — the two faces now agree.
+  const legacy = JSON.stringify({
+    v: 2, kind: 'marker', at: '2025-01-01T00:00:00.000Z', prev: 'legacy-prev',
+    payload: { label: 'delegation/created', taskId: 'task-old', claim: 'pre-witness obligation' },
+  })
+  const log = [evidence0, legacy].join('\n') + '\n'
+  const records = await markerPayloads(fakeMarkerDeps(log), new Set(['delegation/created', 'delegation/verdict']))
+  assert.equal(records.length, 1, 'the legacy marker is read, not evaporated (V6-M2)')
+  assert.equal(records[0]?.degraded, true, 'and it is flagged degraded — the read says what it trusted')
+  assert.equal((records[0]?.payload as { taskId?: string }).taskId, 'task-old')
+})
+
+/**
+ * v0.24 (V6-M1/M2): the fake engine `markerPayloads` needs — the reader goes
+ * through the verified view over the engine's store, so the fixture carries
+ * a real `EvidenceStore` (reads only; no signer, no clock use) beside the
+ * MemoryFs the raw-path checks already used.
+ */
+function fakeMarkerDeps(log: string): McpEngineDeps {
+  const fs = MemoryFs.of({ '/store/evidence.jsonl': log })
+  return {
+    engine: {
+      fsView: fs,
+      storeView: new EvidenceStore(fs, '/store/evidence.jsonl', '/store/baseline.json', { now: () => 0 }),
+    },
     evidenceLogPath: '/store/evidence.jsonl',
   } as unknown as McpEngineDeps
-  const economics = await markerPayloads(deps2, new Set(), { labelPrefixes: ['proof/', 'claim/'] })
-  assert.equal(economics.length, 0, 'an injected proof/verified carrier is not a run')
-})
+}
 
 test('W8/G2 end to end: an injected delegation twin appended to the live log never reaches the task overview', async () => {
   const logPath = join(fixtureStoreDir(), 'evidence.jsonl')
@@ -1557,6 +1906,47 @@ test('a relative DSH_PROOF_PTL_DIR fails startup loudly (W10-M2)', async () => {
   assert.notEqual(code, 0)
   assert.match(stderr, /DSH_PROOF_PTL_DIR/)
   assert.match(stderr, /ABSOLUTE/)
+})
+
+test('V4-M7: a PTL dir inside the workspace warns at startup — never a silent self-reference', async () => {
+  // The absoluteness gate (above) passes an ABSOLUTE path pointing INTO the
+  // workspace — which reopens exactly the self-reference it exists to close:
+  // the operator-key candidates (<ptlDir>/ptl-operator-key, legacy
+  // <ptlDir>/operator-key) land in the agent-writable area. M-47's rule
+  // (warn + narrative, never silent), now applied to the PTL directory.
+  const ephemeral = spawn(process.execPath, ['--experimental-strip-types', ENTRY], {
+    cwd: WORKSPACE,
+    env: {
+      ...process.env,
+      DSH_PROOF_ROOT: WORKSPACE,
+      DSH_PROOF_TRUST_DIR: join(WORKSPACE, 'trust'),
+      DSH_HOME: join(WORKSPACE, 'dsh-home'),
+      DSH_PROOF_PTL_DIR: join(WORKSPACE, 'ptl-inside'),
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  try {
+    const warning = await new Promise<string>((resolve, reject) => {
+      let text = ''
+      const timer = setTimeout(() => reject(new Error(`no containment warning arrived (stderr so far: ${text})`)), 15_000)
+      ephemeral.stderr!.setEncoding('utf8')
+      ephemeral.stderr!.on('data', (chunk: string) => {
+        text += chunk
+        if (text.includes('INSIDE the workspace')) {
+          clearTimeout(timer)
+          resolve(text)
+        }
+      })
+      ephemeral.on('exit', () => {
+        clearTimeout(timer)
+        reject(new Error(`server exited before warning (stderr: ${text})`))
+      })
+    })
+    assert.match(warning, /ptl-inside/, 'the warning names the offending directory')
+    assert.match(warning, /operator/, 'the warning says WHY: the notarising key lands beside the log')
+  } finally {
+    ephemeral.kill()
+  }
 })
 
 test('a bundle past half the response limit is trimmed to manifest + file names (both wire copies counted)', async () => {

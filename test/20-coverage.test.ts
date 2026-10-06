@@ -129,6 +129,32 @@ test('parse: two-slash file:// and POSIX roots work; POSIX stays case-sensitive'
   assert.deepEqual(posix.executed, ['src/p.ts'])
 })
 
+test('V7-L4: a UNC workspace\'s two-slash coverage URLs resolve — the // prefix is modelled', () => {
+  // `file://server/share/…` is UNC; the pre-fix reader emitted the path
+  // WITHOUT its leading `//`, so it never matched a `\\server\share\ws` root
+  // and every changed file read "uncovered" — observe silently no-op'd (or
+  // require blocked everything) for the whole workspace.
+  const unc = parseV8CoverageReport(v8Report([
+    { url: 'file://build-server/share/ws/src/a.ts', counts: [1] },
+    { url: 'file://build-server/share/ws/src/b.ts', counts: [0] },
+    { url: 'file://other-server/share/ws/src/c.ts', counts: [1] }, // different host: outside
+  ]), '\\\\build-server\\share\\ws')
+  assert.ok(unc)
+  assert.deepEqual(unc.executed, ['src/a.ts'], 'same-host UNC URLs resolve under the backslashed root')
+  assert.deepEqual(unc.loadedNotExecuted, ['src/b.ts'])
+  // The forward-slashed UNC root spelling works identically.
+  const uncFwd = parseV8CoverageReport(v8Report([
+    { url: 'file://build-server/share/ws/src/a.ts', counts: [1] },
+  ]), '//build-server/share/ws')
+  assert.ok(uncFwd)
+  assert.deepEqual(uncFwd.executed, ['src/a.ts'])
+  // End to end: the changed file counts as executed, the τ gate does not block.
+  const summary = summarizeCoverage({ changed: ['src/a.ts'], executedSets: [unc.executed] })
+  assert.deepEqual(summary.changedUncovered, [], 'a UNC workspace no longer reads as fully uncovered')
+  // The drive-in-host spelling (`file://C:/ws/…`) is NOT UNC and keeps its
+  // pinned legacy reading — pinned above and unchanged by this fix.
+})
+
 test('parse: an entry without a functions array counts as loaded-not-executed', () => {
   const parsed = parseV8CoverageReport(JSON.stringify({
     result: [{ ScriptId: '9', url: 'file:///C:/ws/src/nofn.ts' }],

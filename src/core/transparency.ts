@@ -475,6 +475,60 @@ export function verifyConsistency(
 }
 
 // ---------------------------------------------------------------------------
+// The publish-face selection rule — ONE predicate for every publisher
+// ---------------------------------------------------------------------------
+
+/** The outcome of {@link selectPublishable}: what may enter the public log. */
+export interface PublishableSelection<T> {
+  /** The newest candidate whose `canVerify` returned `true`; `undefined` when none did. */
+  readonly chosen: T | undefined
+  /** Every candidate tried and failed verification, in scan order (newest first). */
+  readonly rejected: readonly T[]
+}
+
+/**
+ * The publish-face selection rule (v0.24, V4-M6): from candidates in LOG
+ * ORDER (oldest first, so the array's last element is the newest), scan
+ * newest → oldest and let the FIRST candidate whose `canVerify` callback
+ * returns `true` win.
+ *
+ * Why this shape is policy, not convenience. The positional-last candidate is
+ * the cheapest thing on the chain to forge (append one well-formed line
+ * claiming any keyId with a garbage signature), so a selection that notarises
+ * whatever is positionally last hands that line both a veto and a win:
+ * first-VERIFIABLE-wins refuses the forgery (it does not verify) while still
+ * publishing the newest checkpoint that does — fail-closed against forgeries,
+ * available against denial-of-service. A `canVerify` that returns `false` OR
+ * THROWS counts as a rejection: the selection never crashes on a forged
+ * candidate, exactly as the verifier functions above never do.
+ *
+ * `canVerify` owns the key material — this function performs no I/O of its
+ * own, so the same predicate serves every publisher face (the ptl CLI and
+ * the engine's publishCheckpoint) with each face's own signer wiring.
+ * Extracted from the CLI's inline loop (v0.23 W9-M5) precisely so the engine
+ * face stops carrying a positional-findLast twin of it — the split the
+ * v0.23 survey flagged as one face's fix never reaching the other.
+ */
+export async function selectPublishable<T>(
+  candidates: readonly T[],
+  canVerify: (candidate: T) => boolean | Promise<boolean>,
+): Promise<PublishableSelection<T>> {
+  const rejected: T[] = []
+  for (let i = candidates.length - 1; i >= 0; i -= 1) {
+    const candidate = candidates[i] as T
+    let holds = false
+    try {
+      holds = (await canVerify(candidate)) === true
+    } catch {
+      holds = false // a verifier that throws on a forgery has adjudicated it false
+    }
+    if (holds) return { chosen: candidate, rejected }
+    rejected.push(candidate)
+  }
+  return { chosen: undefined, rejected }
+}
+
+// ---------------------------------------------------------------------------
 // Storage — a thin JSONL + head-file layer over FsPort
 // ---------------------------------------------------------------------------
 
@@ -494,6 +548,64 @@ const HEAD_FILENAME = 'sth.json'
 
 function under(dir: string, name: string): string {
   return dir.endsWith('/') ? `${dir}${name}` : `${dir}/${name}`
+}
+
+/** What a caller loses by proceeding when the head's bytes did not arrive. */
+const HEAD_READ_CONSEQUENCE = 'treat an unreadable head as "no head on record" and sign over an unknown prior commitment.'
+  + ' Retry, or restore sth.json from an out-of-band pinned copy.'
+
+/** What a caller loses by proceeding when the entries' bytes did not arrive. */
+const ENTRIES_READ_CONSEQUENCE = 'rewrite the log from an unread snapshot: a read failure must never masquerade'
+  + ' as an empty log. Retry the publish, or restore the file from a known-good copy.'
+
+/**
+ * V4-L9 (v0.24): `readFile` answered `undefined` — adjudicate whether that
+ * means ABSENT (the caller may proceed as a cold start) or FAILED (refuse).
+ * `stat` alone cannot tell: `FsPort.stat` folds EVERY error — ENOENT and
+ * EACCES/EBUSY alike — into `undefined`, so an existing file locked in a way
+ * that fails BOTH its read and its stat used to be indistinguishable from a
+ * file that was never there, and the caller proceeded on "absent" evidence
+ * over a log it could not see. Absence is now proven POSITIVELY, through the
+ * directory listing, in three steps:
+ *
+ * 1. `stat` still sees the file → present, unreadable → refuse;
+ * 2. the directory LISTS: the file's name in it → present (read and stat
+ *    both failed under it) → refuse; name absent → proven absent → proceed;
+ * 3. the directory cannot be listed: if the directory itself is stat-able,
+ *    absence is UNKNOWABLE → refuse; a directory with no evidence of
+ *    existing at all is a fresh log directory (the write path creates it),
+ *    and that is the honest cold start.
+ *
+ * Read failure is never downgraded to "not there"; unknown is never accepted
+ * as absent.
+ */
+async function refuseWhenNotProvenAbsent(
+  fs: FsPort, dir: string, filename: string, path: string, consequence: string,
+): Promise<void> {
+  if ((await fs.stat(path)) !== undefined) {
+    throw new Error(
+      `${path} exists but could not be read (read failed; the file is present by stat) — refusing to ${consequence}`,
+    )
+  }
+  const listing = await fs.readDir(dir)
+  if (listing !== undefined) {
+    if (listing.includes(filename)) {
+      throw new Error(
+        `${path} exists but could not be read (the directory listing names ${filename} while its read and stat both failed)`
+        + ` — refusing to ${consequence}`,
+      )
+    }
+    return // the listing positively does not carry the file: genuinely absent
+  }
+  if ((await fs.stat(dir)) !== undefined) {
+    throw new Error(
+      `${path} cannot be proven absent: the directory ${dir} exists but cannot be listed, and the file's own read and stat failed`
+      + ` — refusing to ${consequence}`
+      + ' Unknown is not absent; retry, or restore from a known-good copy.',
+    )
+  }
+  // Nothing at this path can be shown to exist: a fresh log directory. The
+  // caller's write creates the directory; this is the cold start.
 }
 
 /** Parse one JSONL line into an entry; `undefined` when malformed. */
@@ -542,6 +654,47 @@ function parseSthFile(raw: string | undefined): SignedTreeHead | undefined {
     || typeof p.root !== 'string' || typeof p.at !== 'string' || typeof p.sig !== 'string'
   ) return undefined
   return { logId: p.logId, treeSize: p.treeSize, root: p.root, at: p.at, sig: p.sig }
+}
+
+/**
+ * Read the stored head with PUBLISHER discipline (v0.24). `loadPtl` reads
+ * leniently — a missing or malformed head loads as `undefined` because a
+ * VERIFIER must adjudicate, never crash. The publisher faces is the opposite
+ * side of that coin: it is about to reason from the stored head as its trust
+ * baseline and sign over what it anchors, so "the bytes are there but I
+ * cannot parse them" is a refusal on BOTH readable-damage axes:
+ *
+ * - present but UNREADABLE (W9-M8/V4-L9, through refuseWhenNotProvenAbsent's
+ *   positive-absence adjudication);
+ * - present but UNPARSEABLE (Y-H-06, v0.24): X-H-10 closed the
+ *   "shape-perfect planted head" — a stored head whose signature does not
+ *   verify — but a head reduced to garbage (`{oops`, a truncated write, an
+ *   empty file) still parsed to `undefined` and took the COLD-START branch:
+ *   the operator's next append minted a fresh, genuinely-signed STH over a
+ *   history whose prior commitment nobody could read. Unparseable is not
+ *   "no head on record"; it is a head on record that cannot be consulted.
+ *
+ * Returns `undefined` ONLY for a head proven absent (or a directory with no
+ * evidence of existing — the fresh-log cold start).
+ */
+async function readStoredHeadStrictly(fs: FsPort, dir: string): Promise<SignedTreeHead | undefined> {
+  const headPath = under(dir, HEAD_FILENAME)
+  const headRaw = await fs.readFile(headPath)
+  if (headRaw === undefined) {
+    await refuseWhenNotProvenAbsent(fs, dir, HEAD_FILENAME, headPath, HEAD_READ_CONSEQUENCE)
+    return undefined
+  }
+  const existing = parseSthFile(headRaw)
+  if (existing === undefined) {
+    throw new Error(
+      `${headPath} exists but is not a parseable signed tree head (sth.json)`
+      + ' — refusing to treat an unparseable head as "no head on record" (a cold start): planting unparseable bytes in sth.json'
+      + ' is the cheapest residual of the X-H-10 attack (Y-H-06), and signing the log\'s next head would vouch for whatever'
+      + ' commitment those bytes used to carry. Restore sth.json from an out-of-band pinned copy (a previously published STH),'
+      + ' or retire this log directory and start a new one',
+    )
+  }
+  return existing
 }
 
 /**
@@ -599,6 +752,24 @@ export async function loadPtl(
 const appendQueues = new Map<string, Promise<unknown>>()
 
 /**
+ * V4-L11 (v0.24): one queue per PHYSICAL log directory, not per spelling.
+ * `log`, `log/`, `log//` and `log\` are the same directory to the host; as raw
+ * map keys they were up to four queues, and two in-flight appends issued
+ * under two spellings interleaved exactly the read-modify-write cycle the
+ * queue exists to serialise (both read the same stale file, both wrote a
+ * whole-file snapshot, and one line silently lost). Separator-level fold only
+ * — backslashes fold to '/', repeated separators collapse, the trailing one
+ * drops: over-merging two distinct keys costs a little needless
+ * serialisation and is safe, under-merging two spellings of ONE directory is
+ * the race. Case is deliberately not folded here: case policy is identity
+ * policy (adapters' foldHostPath domain), and on a case-sensitive host two
+ * case-colliding paths really are two logs.
+ */
+function appendQueueKey(dir: string): string {
+  return dir.replace(/\\/g, '/').replace(/\/{2,}/g, '/').replace(/\/+$/, '')
+}
+
+/**
  * Append one entry to the log in `dir` (load, dedupe by leaf hash, write the
  * line only when it is genuinely new). The line written is
  * `canonicalJson(entry)` — the same bytes the leaf hash committed to, so
@@ -627,9 +798,10 @@ const appendQueues = new Map<string, Promise<unknown>>()
 export async function appendPtlEntry(
   fs: FsPort, dir: string, entry: PtlEntry,
 ): Promise<{ sequence: number; duplicate: boolean }> {
-  const previous = appendQueues.get(dir) ?? Promise.resolve()
+  const key = appendQueueKey(dir)
+  const previous = appendQueues.get(key) ?? Promise.resolve()
   const next = previous.then(() => appendPtlEntryInternal(fs, dir, entry))
-  appendQueues.set(dir, next.then(() => undefined, () => undefined))
+  appendQueues.set(key, next.then(() => undefined, () => undefined))
   return next
 }
 
@@ -641,21 +813,19 @@ async function appendPtlEntryInternal(
   const { sequence, duplicate } = log.append(entry)
   if (duplicate) return { sequence, duplicate }
   const raw = await fs.readFile(entriesPath)
-  // X-H-15b/W9-M8 (v0.23): "does not exist" and "could not be read" are
-  // different facts, and the write below can only tell them apart if we do.
-  // FsPort.readFile folds every read failure (EBUSY/EPERM from an AV scan,
-  // EISDIR, a transient lock) into `undefined` — the same answer it gives for
-  // a file that was never there. Writing `${''}${line}` behind a FAILED read
-  // would replace the whole log with one line: the exact destruction a
-  // transparency log exists to make impossible. So when the path exists
-  // (stat answers) but its bytes did not arrive, the append refuses loudly;
-  // the operator retries or restores, and the history survives.
-  if (raw === undefined && (await fs.stat(entriesPath)) !== undefined) {
-    throw new Error(
-      `${entriesPath} exists but could not be read (read failed; the file is present by stat)`
-      + ' — refusing to rewrite the log from an unread snapshot: a read failure must never masquerade as an empty log.'
-      + ' Retry the publish, or restore the file from a known-good copy.',
-    )
+  // X-H-15b/W9-M8 (v0.23) + V4-L9 (v0.24): "does not exist" and "could not be
+  // read" are different facts, and the write below can only tell them apart
+  // if we do. FsPort.readFile folds every read failure (EBUSY/EPERM from an AV
+  // scan, EISDIR, a transient lock) into `undefined` — the same answer it
+  // gives for a file that was never there. Writing `${''}${line}` behind a
+  // FAILED read would replace the whole log with one line: the exact
+  // destruction a transparency log exists to make impossible. Absence is
+  // therefore proven positively (stat, then the directory listing — see
+  // refuseWhenNotProvenAbsent); when the file is present in any channel
+  // while its bytes did not arrive, the append refuses loudly, and the
+  // operator retries or restores while the history survives.
+  if (raw === undefined) {
+    await refuseWhenNotProvenAbsent(fs, dir, ENTRIES_FILENAME, entriesPath, ENTRIES_READ_CONSEQUENCE)
   }
   if (raw !== undefined && raw.length > 0 && !raw.endsWith('\n')) {
     throw new Error(
@@ -712,6 +882,9 @@ export interface SavePtlHeadOptions {
  * - a stored head whose own signature does not verify under the caller's
  *   operator key — the planted-head forgery X-H-10 closes (see
  *   {@link SavePtlHeadOptions.verifyExistingHead});
+ * - a stored head that is present but UNPARSEABLE (Y-H-06, v0.24) —
+ *   `{oops` in sth.json is not a cold start; an operator who signs over
+ *   bytes nobody can read vouches for a commitment nobody can name;
  * - `treeSize` smaller than the stored one (a truncated log);
  * - same `treeSize` but a different `root` (a rewritten log);
  * - an `at` earlier than the stored one — timestamps are compared as
@@ -734,19 +907,12 @@ export async function savePtlHead(
   fs: FsPort, dir: string, sth: SignedTreeHead, options?: SavePtlHeadOptions,
 ): Promise<void> {
   const headPath = under(dir, HEAD_FILENAME)
-  const headRaw = await fs.readFile(headPath)
-  // Same read-failure discipline as the entries file (W9-M8): a head that is
-  // present but unreadable must not be folded into "no head on record" —
-  // cold-start semantics would then sign over a history whose prior
-  // commitment simply failed to load.
-  if (headRaw === undefined && (await fs.stat(headPath)) !== undefined) {
-    throw new Error(
-      `${headPath} exists but could not be read (read failed; the file is present by stat)`
-      + ' — refusing to treat an unreadable head as "no head on record" and sign over an unknown prior commitment.'
-      + ' Retry, or restore sth.json from an out-of-band pinned copy.',
-    )
-  }
-  const existing = parseSthFile(headRaw)
+  // Publisher discipline (W9-M8/V4-L9/Y-H-06): a head that is present but
+  // unreadable must not be folded into "no head on record", and one that is
+  // present but unparseable must not take the cold-start branch either —
+  // both would sign over an unknown prior commitment (see
+  // readStoredHeadStrictly).
+  const existing = await readStoredHeadStrictly(fs, dir)
   if (existing !== undefined) {
     if (sth.logId !== existing.logId) {
       throw new Error(
@@ -822,4 +988,37 @@ export async function savePtlHead(
     }
   }
   await fs.writeFile(headPath, canonicalJson(sth))
+}
+
+/**
+ * The PRE-MUTATION half of `savePtlHead`'s stored-head checks (v0.24,
+ * V4-M5): everything about the stored head that would refuse the coming head
+ * write, adjudicated BEFORE the caller appends anything, so a refusal cannot
+ * leave the half-published state — an entry on the public log with no signed
+ * head over it. `savePtlHead`'s rotation gate fires at head-write time, which
+ * used to be AFTER `appendPtlEntry` had landed the line; this function moves
+ * the readable-damage and operator-identity refusals to the other side of
+ * the mutation:
+ *
+ * - a stored head that is present but unreadable (read failure ≠ absence);
+ * - a stored head that is present but unparseable (Y-H-06: unparseable is
+ *   not cold start);
+ * - a stored head naming a DIFFERENT `logId` than the operator key about to
+ *   sign (`operatorKeyId`) — the rotation refusal savePtlHead still enforces
+ *   at write time as defence in depth.
+ *
+ * A log with no stored head (or one proven absent) passes: that publish
+ * mints the log's first head. The stored head's SIGNATURE is not adjudicated
+ * here — that check needs the key's verify capability, stays in
+ * `savePtlHead`'s options contract, and is the caller's write-time gate.
+ */
+export async function preflightPtlHead(fs: FsPort, dir: string, operatorKeyId: string): Promise<void> {
+  const existing = await readStoredHeadStrictly(fs, dir)
+  if (existing === undefined) return
+  if (existing.logId !== operatorKeyId) {
+    throw new Error(
+      `refusing to change the transparency log operator (logId ${JSON.stringify(existing.logId)} -> ${JSON.stringify(operatorKeyId)})`
+      + ' — checked BEFORE anything was appended: operator rotation requires explicitly retiring this log directory and starting a new one',
+    )
+  }
 }

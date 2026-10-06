@@ -431,7 +431,18 @@ const SITE_MULTILINE_FROM = /^\s*\}\s*from\s+(['"])([^'"]+)\1/d
 // H-24: Python `from <module> import <names>` — module in group 1, the raw
 // name list in group 2 (both for the `from pkg import mod` submodule edge,
 // where the *name* is the dependency, not the package).
-const SITE_PYTHON = /^from\s+([.\w][\w.]*)\s+import\s*([^#\n]*)/d
+// L (V7-L2): the module group is NON-GREEDY and the separator before the
+// `import` keyword is `\s*` (not `\s+`). `from .import x` — legal Python,
+// no space after the dot-run — used to fail entirely: the greedy group ate
+// `.import`, then required `\s+import` and backtracked into nothing, so the
+// whole site (module AND names) was lost. Non-greedy growth stops at the
+// first prefix after which the literal `import` follows, which for every
+// valid statement is exactly the module's true end (`from .import x` →
+// module `.`, `from pkg.mod import x` → module `pkg.mod`); a false early
+// stop is only possible on invalid text (`from ximport y`), where the
+// resulting spurious edge is the over-inclusion direction the constitution
+// allows. Greedy behaviour on all previously matching inputs is unchanged.
+const SITE_PYTHON = /^from\s+([.\w][\w.]*?)\s*import\s*([^#\n]*)/d
 // H-24: bare Python `import pkg.mod [as m][, pkg2.mod2 as m2 ...]`. No JS
 // statement has this shape (`import x from ...` needs `from`, side-effect
 // imports quote), so treating it as a Python site can only over-include.
@@ -455,6 +466,15 @@ export function extractImportSites(content: string): ImportSite[] {
   // optional trailing comma/closer — anything else cannot mend the list.
   const NAME_TAIL = /^([\w.]+)(?:\s+as\s+[\w.]+)?\s*,?\s*\)*\s*$/
   const CLOSER_TAIL = /^[),\s]*$/
+  // X-H-17(a)/Y-H-07: one concatenation for BOTH name-list readers (the
+  // single-line capture below and the bracket-continuation reader), so the
+  // dot-tail rule can never again be fixed on one path and forgotten on the
+  // other — the single-line fix shipped while the continuation reader (added
+  // the same version) kept minting `'.' + '.' + 'x'` = '..x', walking every
+  // `from . import (\n x,\n)` name to the PARENT package. A module prefix
+  // that already ends with the dot contributes no second dot.
+  const joinDotted = (module: string, name: string): string =>
+    module.endsWith('.') ? `${module}${name}` : `${module}.${name}`
   const parenDepth = (text: string): number => {
     const opens = text.match(/\(/g)?.length ?? 0
     const closes = text.match(/\)/g)?.length ?? 0
@@ -475,11 +495,18 @@ export function extractImportSites(content: string): ImportSite[] {
         if (segment.length > 0 && !CLOSER_TAIL.test(segment)) {
           const head = NAME_TAIL.exec(segment)
           if (head?.[1] !== undefined) {
+            // Y-H-07: the continuation reader mints its specifier through the
+            // SAME conditional join as the single-line path (joinDotted above)
+            // — `from . import (\n x,\n)` names the SIBLING pkg/x.py, never
+            // the parent package's x.py. Unconditional `'.'+'.'+'x'` here was
+            // the exact X-H-17(a) off-by-one resurrected on the one spelling
+            // (black/isort long name lists) that most needed the reader.
+            const specifier = joinDotted(state.module, head[1])
             out.push({
-              specifier: `${state.module}.${head[1]}`,
+              specifier,
               line: index,
               character: indent + cursor + (raw.length - raw.trimStart().length),
-              kind: kindOf(`${state.module}.${head[1]}`),
+              kind: kindOf(specifier),
             })
           }
         }
@@ -534,8 +561,9 @@ export function extractImportSites(content: string): ImportSite[] {
               // dot too many, which resolveSpecifier walked to the PARENT
               // package: `from . import x` (the highest-frequency Python
               // import form) resolved to the parent's x, never the sibling
-              // pkg/x.py the statement actually binds.
-              const specifier = module.endsWith('.') ? `${module}${name}` : `${module}.${name}`
+              // pkg/x.py the statement actually binds. Y-H-07: the join lives
+              // in joinDotted so the continuation reader shares it verbatim.
+              const specifier = joinDotted(module, name)
               out.push({
                 specifier,
                 line: index,
@@ -631,7 +659,18 @@ function resolveSpecifier(from: RelPath, specifier: string, known: ReadonlySet<R
   if (rest === '') {
     // A bare dot-run (`from . import x`'s module site) names the enclosing
     // package directory itself — its `__init__.py` (or index) candidates.
-    return firstKnown(candidatePaths(normalizePath(base)), known)
+    // V7-L1: EVERY existing candidate adds its own edge, per the X-H-17(b)
+    // doctrine five lines below ("every hit adds its own edge — the allowed
+    // direction is over-inclusion"). firstKnown returned only the first hit,
+    // so a mixed tree (`pkg.ts` AND `pkg/__init__.py` both on disk) connected
+    // just one of them — a missed edge, the direction the constitution
+    // forbids. Probe order is preserved, so single-hit trees are unchanged.
+    const pkgDir = normalizePath(base)
+    const out: RelPath[] = []
+    for (const candidate of candidatePaths(pkgDir)) {
+      if (known.has(candidate) && !out.includes(candidate)) out.push(candidate)
+    }
+    return out
   }
   const dotted = normalizePath(`${base}/${rest}`)
   const slashed = normalizePath(`${base}/${rest.replace(/\./g, '/')}`)
@@ -665,10 +704,9 @@ function candidatePaths(joined: string): readonly string[] {
   return candidates
 }
 
-function firstKnown(candidates: readonly string[], known: ReadonlySet<RelPath>): readonly RelPath[] {
-  for (const candidate of candidates) if (known.has(candidate)) return [candidate]
-  return []
-}
+// (V7-L1 removed `firstKnown`: the bare dot-run branch now returns every
+// existing candidate — the same "all hits" doctrine as the remainder branch
+// below — so there is no first-hit-only consumer left to serve.)
 
 /**
  * Python-style dotted import: `from pkg.mod import x` (absolute), bare

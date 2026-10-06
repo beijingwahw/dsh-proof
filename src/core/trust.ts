@@ -103,6 +103,11 @@ export interface WalkedCheckpoint {
    * survey found, not comparing at all. A legitimately-signed checkpoint
    * replayed or transplanted at another position is exactly the shape where
    * the signature verifies and only this flag says the position is a lie.
+   *
+   * Y-H-01 (v0.24): `EvidenceStore.latestSignedCheckpoint` /
+   * `lastWellFormedCheckpoint` and `createVerifiedView().bestCheckpoint` now
+   * EXCLUDE head-liars from selection outright — the publish predicate is
+   * enforced where the candidate is chosen, not advised at the consumer.
    */
   readonly headLiared: boolean
   /**
@@ -155,8 +160,20 @@ export interface ChainWalk {
  * Chain rule: each v2 line's `prev` must equal the digest of the physically
  * previous line (of any kind), so legacy v1 lines participate in the chain
  * once a v2 line follows them.
+ *
+ * V1-M8 (v0.24): the line-array contract is pinned here as the ONE
+ * convention every chain-side consumer derives from — the node-ports
+ * `readLines` semantics, blank lines removed. The v0.23 code trusted the
+ * caller to hand in a filtered array, so the store face (filtered) and the
+ * MCP face (a raw `split('\n')`) could disagree about whether a marker's
+ * physical predecessor was a blank line — the same log, two faces, two
+ * suspect verdicts. Normalising defensively at entry makes every caller
+ * converge: an honest writer never emits blank lines, so filtering them can
+ * never change an honest chain's walk, and all reported line indexes refer
+ * to the normalised array.
  */
-export function walkChain(lines: readonly string[]): ChainWalk {
+export function walkChain(input: readonly string[]): ChainWalk {
+  const lines = input.filter(line => line.trim().length > 0)
   let sawV1 = false
   let sawV2 = false
   let records = 0

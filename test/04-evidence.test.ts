@@ -6,7 +6,8 @@ import {
 } from '../src/core/evidence.ts'
 import { assembleProof } from '../src/core/report.ts'
 import { addressOf, sha256 } from '../src/core/hash.ts'
-import { lineDigest } from '../src/core/trust.ts'
+import { checkpointSignedData, lineDigest } from '../src/core/trust.ts'
+import type { SignerPort } from '../src/core/ports.ts'
 import { MemoryFs, FakeClock, FakeWorkspace, spec } from './helpers.ts'
 
 const WS = snapshotWorkspace('head1', ['src/a.ts'])
@@ -344,4 +345,125 @@ test('VerifiedChainView.markers: the sinceLine epoch window and the mixed-genera
   const afterTwin = await view.markers('proof/verified', { sinceLine: boundary })
   assert.deepEqual(afterTwin.records.map(r => r.payload.gen), [2], 'the twin stays out: a trusted generation excludes, never degrades')
   assert.equal(afterTwin.degraded, false)
+})
+
+// -- V1-M5/M6 (v0.24): the degraded pool only reaches DOWN to the anchor -------
+
+test('V1-M6: the generational fallback stops at the last verified checkpoint — a fresh headRef-less injection is not legacy history', async () => {
+  const fs = MemoryFs.of({})
+  const log = '/ws/.proof/evidence.jsonl'
+  // The v0.21 shape: protected markers written before the headRef witness
+  // existed (all suspect under the H-32 rule), and — like every real v0.21
+  // chain — a checkpoint. The v0.23 fallback pool was "every suspect marker
+  // of the label", which could not tell this history from a headRef-less
+  // line appended AFTER the anchor today.
+  const legacy = [
+    { label: 'delegation/created', taskId: 'task-1', parent: 'root' },
+    { label: 'delegation/created', taskId: 'task-2', parent: 'root' },
+  ]
+  let prev = '0000000000000000000000000000000000000000000000000000000000000000'
+  const lines = legacy.map(payload => {
+    const line = JSON.stringify({ v: 2, kind: 'marker', at: '2026-01-01T00:00:00.000Z', prev, payload })
+    prev = lineDigest(line)
+    return line
+  })
+  const checkpointPayload = { count: 2, head: prev, workspaceKey: null, at: '2026-01-02T00:00:00.000Z' }
+  const checkpoint = JSON.stringify({
+    v: 2, kind: 'checkpoint', at: '2026-01-02T00:00:00.000Z', prev,
+    payload: checkpointPayload,
+    sig: `sig:${sha256(checkpointSignedData(checkpointPayload))}`, keyId: 'fake-key',
+  })
+  prev = lineDigest(checkpoint)
+  fs.mutate(log, `${[...lines, checkpoint].join('\n')}\n`)
+
+  // THE ADVERSARY: a headRef-less `delegation/created` appended after the
+  // checkpoint — chained correctly (so the walk stays clean), shaped exactly
+  // like the legacy rows.
+  const injection = JSON.stringify({
+    v: 2, kind: 'marker', at: '2026-10-06T00:00:00.000Z', prev,
+    payload: { label: 'delegation/created', taskId: 'task-999', parent: 'root', obligation: 'forged-proven' },
+  })
+  fs.mutate(log, `${[...lines, checkpoint, injection].join('\n')}\n`)
+
+  const signer = new (class implements SignerPort {
+    readonly keyId = 'fake-key'
+    async sign(): Promise<string> { throw new Error('read-only signer') }
+    async verify(data: string, sig: string): Promise<boolean> { return sig === `sig:${sha256(data)}` }
+  })()
+  const store = new EvidenceStore(fs, log, '/ws/.proof/baseline.json', new FakeClock(), {
+    signer: async () => signer,
+  })
+  const view = createVerifiedView(store)
+  const seen = await view.markers('delegation/created')
+  assert.equal(seen.degraded, true, 'the legacy generation still reads — an upgraded deployment is never worse than before')
+  assert.deepEqual(
+    seen.records.map(r => r.payload.taskId),
+    ['task-1', 'task-2'],
+    'the fresh injection does not enter the degraded pool: a headRef-less line above the anchor is a forgery, not history',
+  )
+  assert.equal(seen.last?.payload.taskId, 'task-2', 'last-wins answers the legacy tail, never the injected task-999')
+
+  // Control: the same log WITHOUT a verifiable checkpoint has no epoch bound
+  // to defend with — the whole suspect population reads degraded as before
+  // (the keyless-view residual, deliberately not guessed around).
+  const keylessView = createVerifiedView(new EvidenceStore(fs, log, '/ws/.proof/baseline.json', new FakeClock()))
+  const keyless = await keylessView.markers('delegation/created')
+  assert.deepEqual(keyless.records.map(r => r.payload.taskId), ['task-1', 'task-2', 'task-999'])
+})
+
+// -- V1-M8 (v0.24): one line-array convention, both faces ----------------------
+
+test('V1-M8: a blank line cannot fork the store face — marker reads judge headRef in the readLines domain', async () => {
+  const fs = MemoryFs.of({})
+  const log = '/ws/.proof/evidence.jsonl'
+  const store = new EvidenceStore(fs, log, '/ws/.proof/baseline.json', new FakeClock())
+  await store.append(makeEvidence(spec({ id: 'c1' }), { status: 'pass', exitCode: 0, durationMs: 1, output: 'ok' }, WS, new FakeClock()))
+  await store.mark('attest/human', { claimId: 'claim-1', decision: 'endorse' })
+
+  // THE ADVERSARY: insert a blank line between the marker and its physical
+  // predecessor. The writer stamped headRef against the last NON-BLANK line
+  // (the store's tail); a face that judged the witness against the raw
+  // previous line saw a blank and read the honest marker as suspect.
+  const lines = (await fs.readFile(log) as string).split('\n').filter(l => l.length > 0)
+  lines.splice(1, 0, '')
+  fs.mutate(log, `${lines.join('\n')}\n`)
+
+  const seen = await store.markersWith('attest/human')
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0]?.suspect, false, 'the witness names the previous non-blank line — the readLines domain, on every face')
+  const view = createVerifiedView(store)
+  const trusted = await view.markers('attest/human')
+  assert.equal(trusted.degraded, false)
+  assert.equal(trusted.records.length, 1, 'the view (same domain) still admits the honest marker')
+})
+
+// -- V1-L11 (v0.24): twin evidence rows cannot win last-wins -------------------
+
+test('V1-L11: an out-of-band twin evidence row (same id, doctored payload) is dropped at read time', async () => {
+  const fs = MemoryFs.of({})
+  const clock = new FakeClock()
+  const log = '/ws/.proof/evidence.jsonl'
+  const store = new EvidenceStore(fs, log, '/ws/.proof/baseline.json', clock)
+  const honest = makeEvidence(spec({ id: 'c1' }), { status: 'pass', exitCode: 0, durationMs: 1, output: 'ok' }, WS, clock)
+  await store.append(honest)
+
+  // THE ADVERSARY: append a chained line re-using the honest row's id over a
+  // doctored payload. It parses, chains, and self-reports the same id — but
+  // it no longer addresses itself, which is the only identity an evidence
+  // row ever has.
+  const lines = await fs.readLines(log)
+  const prev = lineDigest(lines[lines.length - 1] as string)
+  const { evidenceId, ...rest } = honest
+  const doctored = { ...rest, status: 'fail' as const }
+  const twin = JSON.stringify({ v: 2, kind: 'evidence', at: '2026-10-06T00:00:00.000Z', prev, payload: { ...doctored, evidenceId } })
+  fs.mutate(log, `${[...lines, twin].join('\n')}\n`)
+
+  const all = await store.all()
+  assert.equal(all.length, 1, 'the twin does not exist for the read surface')
+  assert.equal((await store.latest()).get('c1')?.status, 'pass', 'last-wins cannot be hijacked by a row that cannot derive its own id')
+  // The audit still SEES the bad row and charges it — visibility is the
+  // charge's job, read trust is all()'s.
+  const audit = await store.audit()
+  assert.equal(audit.ok, false)
+  assert.deepEqual(audit.corrupt, ['c1'])
 })

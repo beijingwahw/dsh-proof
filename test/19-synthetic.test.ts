@@ -266,6 +266,57 @@ test('W15-M2: statically decidable global-call shapes are screened, not only the
   }
 })
 
+test('V7-M3: the value-reference family — a global used as a VALUE at a nameable site is screened too', () => {
+  // Five of the six shapes below screened CLEAN before V7-M3 while being
+  // live outbound channels (the PoC's exact set): the alias forms rename the
+  // global away from every name-anchored pattern, the tagged template IS a
+  // call, and Reflect.apply calls anything it is handed. Each is statically
+  // decidable — no runtime value needed — so each belongs in the net.
+  const shapes = [
+    ['const { fetch: f } = globalThis\nconst r = f(url)', 'destructuring alias'],
+    ['const { fetch } = globalThis\nconst r = fetch(url)', 'plain destructure (call form also fires)'],
+    ['let f\nf = fetch\nconst r = f(url)', 'assignment alias, no declaration keyword'],
+    ['const r = fetch`https://example.test/${secret}`', 'tagged template call'],
+    ['const r = Reflect.apply(fetch, undefined, [url])', 'Reflect.apply form'],
+    ['const r = Reflect.apply(globalThis.fetch, undefined, [url])', 'Reflect.apply, dotted globalThis'],
+    ['const { WebSocket: W } = globalThis', 'destructuring alias, WebSocket'],
+    ['let W\nW = WebSocket', 'assignment alias, WebSocket'],
+  ] as const
+  for (const [source, how] of shapes) {
+    const { ok, findings } = screenScript(source)
+    assert.equal(ok, false, `${how}: ${source}`)
+    assert.ok(findings.some(f => f.includes('global')), `${how}: ${findings.join('; ')}`)
+  }
+  // The how-labels are part of the contract (the finding names the shape so
+  // the author can see exactly which spelling tripped).
+  const tagged = screenScript('const r = fetch`https://x.test`')
+  assert.ok(tagged.findings.some(f => f.includes('tagged-template form')), tagged.findings.join('; '))
+  const destructure = screenScript('const { fetch: f } = globalThis')
+  assert.ok(destructure.findings.some(f => f.includes('destructuring-alias form')), destructure.findings.join('; '))
+  const assign = screenScript('let f\nf = fetch')
+  assert.ok(assign.findings.some(f => f.includes('assignment-alias form')), assign.findings.join('; '))
+  const reflect = screenScript('Reflect.apply(fetch, undefined, [url])')
+  assert.ok(reflect.findings.some(f => f.includes('reflect-apply form')), reflect.findings.join('; '))
+  // Boundary precision, both directions, for the new family:
+  // - `===`/`==` comparisons AGAINST the global as the right operand invoke
+  //   nothing and the assignment-alias pattern's `=(?!=)` guard rightly
+  //   ignores them; `fetch` as the RIGHT side of a plain `=` DOES alias
+  //   (`const eq = fetch == fn` — the binding hand is visible, the
+  //   documented over-report direction);
+  // - values that merely RESEMBLE the name stay allowed.
+  assert.equal(screenScript('const same = fn === fetch').ok, true, 'a comparison never invokes; `=(?!=)` ignores ==/>=')
+  assert.equal(screenScript('const eq = fetch == fn').ok, false, 'fetch as the RHS of a binding `=` is an alias hand (over-report, documented)')
+  assert.equal(screenScript('const opts = { mode: "fetch" }').ok, true, 'the string "fetch" in an object literal is not a binding')
+  assert.equal(screenScript('const g = refetchAll\nconst h = prefetchInto').ok, true, 'lookalike identifiers stay allowed')
+  // The scaffold itself stays clean — its prose names the globals in a
+  // comment, and no new pattern anchors on that.
+  assert.equal(screenScript(SYNTHETIC_TEMPLATE).ok, true, 'the template must keep screening clean')
+  // Documented non-decidable boundary (kept OUT of the net on purpose):
+  // passing the global bare to an arbitrary higher-order callee is not a
+  // static call fact — queueMicrotask may or may not invoke its argument.
+  assert.equal(screenScript('queueMicrotask(fetch, url)').ok, true, 'bare value-passing is a documented residual, bounded by the sandbox regime')
+})
+
 test('screenScript: static imports are caught, with and without the node: prefix', () => {
   for (const source of [
     "import { exec } from 'child_process'",

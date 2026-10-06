@@ -24,14 +24,17 @@ import { ProofEngine } from './engine.ts'
 import { createProofTools } from './dsh/tools.ts'
 import {
   WorkspaceWatch, driftNarrative, isMutationToolName, shellCommandMentionsPath,
-  sweepToolInputStrings, toWorkspaceRelative,
+  sweepToolInputStrings,
 } from './dsh/observe.ts'
-import { absoluteInside, workspaceKeyPair } from './adapters/shared/paths.ts'
+import {
+  absoluteInside, deriveProofPaths, foldHostPath, guardedTargets, isAbsoluteHostPath, touchesEvidencePath, workspaceKeyPair,
+} from './adapters/shared/paths.ts'
 import { buildPolicySection } from './dsh/prompt.ts'
 import { createLspResolver } from './dsh/lsp-impact.ts'
 import { attachTeamBridge, createTeamBridge } from './dsh/agent-team.ts'
-import { sha256 } from './core/hash.ts'
-import { readMarkers } from './core/evidence.ts'
+// v0.24 (Y-H-03): the bare `readMarkers` export is gone — the underscore
+// primitive is the one escape hatch; trust reads belong on the store/view.
+import { _readMarkers } from './core/evidence.ts'
 import { NodeFsPort } from './node-ports.ts'
 import type { FsPort } from './core/ports.ts'
 import type {
@@ -92,7 +95,23 @@ export function apply(ctx: Context, config: Config): void {
   const trustRoot = (config.trustDir && config.trustDir.length > 0 ? config.trustDir : undefined)
     ?? process.env.DSH_PROOF_TRUST_DIR
     ?? nodePath.join(dshHome(), 'proof')
-  const workspaceKey = sha256(root).slice(0, 16)
+  // Y-H-14 (v0.24): the workspace identity comes from the ONE shared
+  // derivation (paths.ts deriveProofPaths — normalised root spelling, legacy
+  // on-disk fallback probe, containment warn), the same rule mcp-entry.ts and
+  // the adapter hooks use. Pre-v0.24 this face minted a RAW sha256(root) —
+  // the legacy key unconditionally — so a Windows-flavoured root spelled this
+  // face's engine store and anchors under one key while the MCP server and
+  // the hooks derived another: one workspace, two stores, neither
+  // authoritative. X-H-15 rides along for free: a RELATIVE trust root now
+  // fails loudly here too (deriveProofPaths asserts), instead of resolving
+  // against the agent-writable CWD.
+  const derivedPaths = deriveProofPaths({
+    root,
+    trustRoot,
+    evidenceStore: config.evidenceStore,
+    evidenceDir: config.evidenceDir,
+  })
+  const workspaceKey = derivedPaths.workspaceKey
   const evidenceDir = config.evidenceStore === 'workspace'
     ? config.evidenceDir
     : nodePath.join(trustRoot, 'workspaces', workspaceKey)
@@ -190,31 +209,24 @@ export function apply(ctx: Context, config: Config): void {
   // below; host mode adds the structured deny the gates' host branch already
   // answers with.
   //
-  // Both sides of every comparison are lowercased and forward-slashed (H10).
-  // Case: Windows describes one directory as `.proof`, `.PROOF` or `.Proof`
-  // — a case-sensitive compare let the agent write the evidence log by
-  // changing one letter's case (toWorkspaceRelative preserves the case the
-  // tool sent). The price is that on a genuinely case-sensitive filesystem
-  // a sibling `.PROOF` directory also matches — acceptable: it gates at
-  // worst one extra write through user approval. The adapter layer guards
-  // with the same fold (src/adapters/shared/paths.ts `touchesEvidencePath`);
-  // keep the two in lockstep. Backslashes: a Windows config `'.\proof'`
-  // names the same directory as `./proof` — normalize before collapsing,
-  // as the candidate side (toWorkspaceRelative) already does.
-  const evidenceSegment = collapseSegments(
-    config.evidenceDir.replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/\/+$/, ''),
-  ).toLowerCase()
-  const touchesEvidence = (candidate: string): boolean => {
-    // The guard must reason in one path space. A candidate is first projected
-    // onto the workspace's relative space (absolute host-style paths, either
-    // slash flavour, drive case and all) and its `.`/`..` detours collapsed;
-    // otherwise "can the agent write the evidence log" degenerates into a
-    // string-matching puzzle the agent can simply walk around.
-    const rel = toWorkspaceRelative(candidate, root)
-    if (rel === undefined) return false
-    const target = collapseSegments(rel).toLowerCase()
-    return target === evidenceSegment || target.startsWith(`${evidenceSegment}/`)
-  }
+  // Y-H-12 (v0.24): the workspace-mode structural guard compares through
+  // paths.ts `touchesEvidencePath` — the ONE fold, the same rule the adapter
+  // gates run. Pre-v0.24 this face chained observe.ts's `toWorkspaceRelative`
+  // + a local collapseSegments + its own lowercasing (the H10 case fold):
+  // no `\\?\` device-prefix strip, no drive-relative projection
+  // (`C:.proof/…` resolves by the OS straight into the store while comparing
+  // as a relative stranger), no per-segment Win32 trailing-dot fold — the
+  // exact spellings X-H-12's lockstep rule promised would move in the same
+  // batch on both faces, and only the adapter face moved. The fold's
+  // documented price is unchanged: on a genuinely case-sensitive filesystem
+  // a sibling `.PROOF` directory also matches — one extra approval beats one
+  // rewritten log. The derivation is pure (no identity probe): the key is
+  // never read on this path.
+  const workspaceGuardPaths = deriveProofPaths(
+    { root, evidenceStore: 'workspace', evidenceDir: config.evidenceDir },
+    { pure: true },
+  )
+  const touchesEvidence = (candidate: string): boolean => touchesEvidencePath(candidate, workspaceGuardPaths)
   // X-H-16: host mode denies ABSOLUTE candidates into the host-side store —
   // `${trustRoot}/workspaces/<key>` for BOTH identity spellings, the same
   // storeDir set the adapter gates' host branch sweeps. The fold comparison
@@ -225,34 +237,32 @@ export function apply(ctx: Context, config: Config): void {
   // nothing of its own here. A workspace-relative path cannot reach a store
   // that lives outside the workspace; an absolute one is exactly the H-26
   // write this branch exists to refuse.
-  const trustFolded = trustRoot.replace(/\\/g, '/').replace(/\/+$/, '')
+  const trustFolded = foldHostPath(trustRoot)
   const identityPair = workspaceKeyPair(root)
   const identityKeys = identityPair.normalized === identityPair.legacy
     ? [identityPair.normalized]
     : [identityPair.normalized, identityPair.legacy]
   const hostStoreDirs = identityKeys.map(key => `${trustFolded}/workspaces/${key}`)
-  // The value-sweep target set. Workspace mode lists the store segment and
-  // its two artifact files under their store-qualified spellings; BOTH modes
-  // list the trust-side artifacts (the anchor dirs and the host-mode store
-  // files), mirroring gates.ts `guardedShellTargets`: keys and anchors are
-  // never legitimately agent-writable in either mode. X-H-13 (v0.23): the
+  // V5-M1/Y-H-11 (v0.24): the value-sweep target set is the ONE shared
+  // constructor — paths.ts `guardedTargets`, the same list the adapter gates
+  // sweep. Pre-v0.24 this face hand-rolled its own list and the two forked in
+  // exactly the places the audit drove commands through: this face listed the
+  // bare store DIRECTORY and the signing-key file names the adapter face
+  // missed; that face listed the root-anchored store spellings this face
+  // missed; neither listed the `~`/`$DSH_HOME` spellings of the default
+  // trust root (`rm -rf ~/.dsh/proof` erased keys, anchors, stores and
+  // session ledgers on BOTH faces measured). X-H-13 (v0.23) still holds: the
   // BARE artifact file names (`evidence.jsonl`, …) are deliberately NOT
-  // sweep targets any more — the sweep now reads every string value of every
-  // call, and a bare name would deny any string that so much as names such a
-  // file under ANY directory (a differently-named store's sibling, a
-  // deployment's own anchor.json). The signing-key pair stays bare: no
-  // legitimate workspace file carries those names, so a mention of either is
-  // worth refusing wherever it points.
-  const shellGuardTargets = [...new Set([
-    ...(config.evidenceStore === 'workspace'
-      ? [evidenceSegment, `${evidenceSegment}/evidence.jsonl`, `${evidenceSegment}/baseline.json`]
-      : []),
-    ...SIGNING_KEY_FILE_NAMES,
-    ...hostStoreDirs,
-    ...hostStoreDirs.map(dir => `${dir}/evidence.jsonl`),
-    ...hostStoreDirs.map(dir => `${dir}/baseline.json`),
-    ...identityKeys.map(key => `${trustFolded}/anchors/${key}`),
-  ])].filter(target => target.length > 0)
+  // sweep targets — the sweep reads every string value of every call, and a
+  // bare name would deny any string that so much as names such a file under
+  // ANY directory. The signing-key pair stays bare: no legitimate workspace
+  // file carries those names, so a mention of either is worth refusing
+  // wherever it points.
+  const shellGuardTargets = guardedTargets(root, {
+    evidenceStore: config.evidenceStore,
+    evidenceDir: config.evidenceDir,
+    trustRoot,
+  })
   host.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
     // X-H-13 (v0.23): VALUE SWEEP. The old guard read one command string out
     // of three key spellings and only on mutation-class names —
@@ -497,7 +507,7 @@ export function apply(ctx: Context, config: Config): void {
       // forgetting them and re-minting the children as roots.
       mappings: async () => {
         try {
-          return readMarkers(await engine.fsView.readLines(evidenceLogPath), {
+          return _readMarkers(await engine.fsView.readLines(evidenceLogPath), {
             label: 'agent-team/delegated',
             excludeSuspect: true,
           })
@@ -638,43 +648,11 @@ function hostLogger(ctx: Context): (message: string) => void {
 }
 
 /**
- * Windows drive letter or leading slash — engine.ts's private absolute-path
- * test, mirrored here so `evidenceLogPath` derives from exactly the same rule
- * the engine used for its own copy. If engine.ts's rule ever moves, this
- * mirror must move with it. Pinned by test/08 ('the evidenceLogPath mirror
- * stays glued to the engine's own derivation'), which drives proof_jury →
- * proof_jury_submit through the applied tools: the submit only succeeds by
- * reading markers back through this exact path.
+ * H-02/X-H-13: the Ed25519 signing-key pair's file names — MOVED (Y-H-11,
+ * v0.24) to paths.ts `SIGNING_KEY_FILE_NAMES` so both guard faces refuse the
+ * same names; see there. This face and the adapter gates both consume the
+ * shared export through `guardedTargets` now.
  */
-function isAbsoluteHostPath(p: string): boolean {
-  return /^([A-Za-z]:[\\/]|\/)/.test(p)
-}
-
-/**
- * H-02/X-H-13: the Ed25519 signing-key pair's file names (node-ports'
- * spellings). A string value naming either is worth refusing wherever it
- * points — the key pair IS the trust fabric, and no legitimate workspace
- * file carries these names. Matched as segment-boundaried substrings after
- * separator/case folding by `shellCommandMentionsPath`.
- */
-const SIGNING_KEY_FILE_NAMES: readonly string[] = [
-  'proof-signing-key.pem', 'proof-signing-key.pub.pem',
-]
-
-/**
- * Collapse `.` and `..` segments in a workspace-relative path (`a/../b` ->
- * `b`). A leading `..` that would escape the root is kept, so paths that
- * leave the workspace never come out looking like they are inside it.
- */
-function collapseSegments(rel: string): string {
-  const out: string[] = []
-  for (const segment of rel.split('/')) {
-    if (segment === '' || segment === '.') continue
-    if (segment === '..' && out.length > 0 && out[out.length - 1] !== '..') out.pop()
-    else out.push(segment)
-  }
-  return out.join('/')
-}
 
 export { ProofEngine }
 export type { ProofReport, ProofGrade } from './core/evidence.ts'

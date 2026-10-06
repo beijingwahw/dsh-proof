@@ -72,8 +72,8 @@ import { deriveProofPaths } from '../adapters/shared/paths.ts'
 import { checkpointSignedData, parseAnchorEx, walkChain } from '../core/trust.ts'
 import type { WalkedCheckpoint } from '../core/trust.ts'
 import {
-  appendPtlEntry, loadPtl, ptlLeafHash, savePtlHead, sthSignedData, verifyInclusion,
-  verifyConsistency, verifyTreeHead,
+  appendPtlEntry, loadPtl, preflightPtlHead, ptlLeafHash, savePtlHead, selectPublishable,
+  sthSignedData, verifyInclusion, verifyConsistency, verifyTreeHead,
 } from '../core/transparency.ts'
 import type { PtlEntry, SignedTreeHead } from '../core/transparency.ts'
 import { NodeEd25519Signer, NodeFsPort } from '../node-ports.ts'
@@ -110,6 +110,7 @@ function parseArgs(argv: readonly string[]): { args: CliArgs } | { error: string
   let log: string | undefined
   let bundle: string | undefined
   let operatorKeyDir: string | undefined
+  const seen = new Set<string>()
   for (let i = 0; i < rest.length; i++) {
     const flag = rest[i]
     if (flag === '--log' || flag === '--bundle' || flag === '--operator-key') {
@@ -117,6 +118,16 @@ function parseArgs(argv: readonly string[]): { args: CliArgs } | { error: string
       if (value === undefined || value.startsWith('--')) {
         return { error: `${flag} requires a value` }
       }
+      // V4-L12 (v0.24): a repeated flag is a usage error, not a silent
+      // last-wins. Two --log values used to leave the FIRST log directory
+      // quietly unread and the second one published to — a typo'd wrapper
+      // script pointed the publish wherever the duplicate named, and no
+      // output ever said so. Loud beats forgiving on a command whose whole
+      // job is to commit public state.
+      if (seen.has(flag)) {
+        return { error: `duplicate flag: ${flag} given more than once — pass each flag once (repeats used to silently keep only the LAST value)` }
+      }
+      seen.add(flag)
       i += 1
       if (flag === '--log') log = value
       else if (flag === '--bundle') bundle = value
@@ -213,7 +224,10 @@ async function headSignatureHolds(
  * keep well-formed checkpoints (one whose self-reported `count` the walk
  * itself refutes is a lying checkpoint, and a lying checkpoint is never
  * worth publishing even when it is signed) that carry a non-empty `sig` and
- * `keyId`, then:
+ * `keyId`, exclude every checkpoint whose self-declared `head` the walk
+ * contradicts at its physical position (`headLiared`, v0.24 Y-H-01 — the
+ * publish predicate is verified AND honestly positioned, the rule
+ * core/evidence documents and no face implemented until now), then:
  *
  * - With an out-of-band anchor on record naming a key: the candidates are
  *   the checkpoints signed by that very key — never a positionally-later
@@ -236,12 +250,14 @@ async function headSignatureHolds(
  *   refusal naming exactly what to provide — publishing bytes nobody can
  *   verify is the notarising of forgeries.
  *
- * Order of operations (v0.23, W9-M6): every read-side refusal happens
- * first, then the operator key is loaded, and only then is the log touched.
- * A key-directory typo or a locked key used to leave an appended entry with
- * no head over it — the half-published state the engine face promises
- * never to produce; now the CLI cannot produce it either. And the leaf's
- * workspace identity must agree with the identity the CHECKPOINT SIGNATURE
+ * Order of operations (v0.23, W9-M6 + v0.24 V4-M5): every read-side refusal
+ * happens first, then the operator key is loaded, then the STORED head is
+ * preflighted (rotation/unreadable/unparseable refusals fire before the log
+ * is touched — V4-M5), and only then is the log mutated. A key-directory
+ * typo, a locked key, or a log whose stored head this operator cannot
+ * honestly extend used to leave an appended entry with no head over it — the
+ * half-published state the engine face promises never to produce; now the
+ * CLI cannot produce it either. And the leaf's workspace identity must agree with the identity the CHECKPOINT SIGNATURE
  * covers (`payload.workspaceKey`, v0.23 W9-M5): a chain copied into a
  * foreign workspace is refused instead of laundered into the log under the
  * new workspace's key.
@@ -256,6 +272,24 @@ async function runAppend(fs: NodeFsPort, logDir: string, operatorKeyDir: string)
   )
   if (signed.length === 0) {
     return fail('no signed checkpoint to publish — run proof_baseline/proof_verify first（checkpoint 由引擎签名）')
+  }
+  // Y-H-01 (v0.24): the publish predicate is verified AND !headLiared. A
+  // checkpoint whose self-declared `head` the walk contradicts at its
+  // physical position is a POSITION forgery even when its signature is
+  // genuine — a real signature replayed onto, or transplanted to, a chain
+  // position it was never computed for (the walk's `expectedHead` is
+  // derived, not self-declared, so this is the one lie the signer's own key
+  // cannot cover). Such candidates never enter the selection pool: before
+  // this filter, a transplanted tail wearing a genuinely-verified signature
+  // won the newest-first scan and was notarised into the public log.
+  const honest = signed.filter(cp => !cp.headLiared)
+  if (honest.length === 0) {
+    return fail(
+      'refusing to publish: every signed checkpoint on this chain swears a chain head its own position contradicts'
+      + ` (head-liars at log lines ${signed.filter(cp => cp.headLiared).map(cp => cp.index).join(', ')})`
+      + ' — a genuine signature over a lying position is a forgery of position, not a publishable checkpoint;'
+      + ' re-establish the baseline so an honestly-positioned checkpoint exists',
+    )
   }
   // W9-M4 (v0.23): the anchor is adjudicated through parseAnchorEx — a file
   // that exists but cannot be consulted (unparseable) or that sits in a
@@ -290,7 +324,7 @@ async function runAppend(fs: NodeFsPort, logDir: string, operatorKeyDir: string)
   let candidates: readonly WalkedCheckpoint[]
   let verifier: { keyId: string; verify: (data: string, sig: string) => Promise<boolean> } | undefined
   if (anchor !== undefined) {
-    candidates = signed.filter(cp => cp.keyId === anchor.keyId)
+    candidates = honest.filter(cp => cp.keyId === anchor.keyId)
     if (candidates.length === 0) {
       return fail(
         `no checkpoint signed by the anchored key ${JSON.stringify(anchor.keyId)} on this chain`
@@ -314,7 +348,7 @@ async function runAppend(fs: NodeFsPort, logDir: string, operatorKeyDir: string)
       )
     }
   } else if (engineSigner !== undefined) {
-    candidates = signed.filter(cp => cp.keyId === engineSigner.keyId)
+    candidates = honest.filter(cp => cp.keyId === engineSigner.keyId)
     if (candidates.length === 0) {
       return fail(
         `no anchor on record and no checkpoint signed by the local engine key (${engineSigner.keyId})`
@@ -332,31 +366,22 @@ async function runAppend(fs: NodeFsPort, logDir: string, operatorKeyDir: string)
   }
 
   // -- the selection itself: newest-first, first signature that VERIFIES ---
-  // W9-M5 (v0.23): scanning back for the first verifiable candidate means an
-  // attacker's appended garbage-signature twin (positional last under the
-  // anchored/local keyId) can no longer veto publication while an earlier
-  // verifiable checkpoint exists — fail-closed against forgeries, available
-  // against DoS.
-  const rejected: string[] = []
-  let chosen: WalkedCheckpoint | undefined
-  for (let i = candidates.length - 1; i >= 0; i -= 1) {
-    const cp = candidates[i] as WalkedCheckpoint
-    let holds = false
-    try {
-      holds = await verifier.verify(checkpointSignedData(cp.payload), cp.sig as string)
-    } catch {
-      holds = false
-    }
-    if (holds) {
-      chosen = cp
-      break
-    }
-    rejected.push(`log line ${cp.index} (count ${cp.payload.count})`)
-  }
+  // W9-M5 (v0.23) + V4-M6 (v0.24): the scan-back rule now lives in
+  // core/transparency as `selectPublishable` — the ONE predicate every
+  // publisher face selects through. The engine face kept a positional
+  // findLast twin of the CLI's inline loop through all of v0.23 (one
+  // appended garbage twin = a publication veto it never suffered here);
+  // sharing the export is the only shape in which the two faces cannot
+  // drift apart again.
+  const candidateVerifier = verifier
+  const { chosen, rejected } = await selectPublishable(
+    candidates,
+    cp => candidateVerifier.verify(checkpointSignedData(cp.payload), cp.sig as string),
+  )
   if (chosen === undefined) {
     return fail(
       `refusing to publish: every candidate checkpoint under the ${anchor !== undefined ? 'anchored' : 'local engine'} key (${verifier.keyId})`
-      + ` failed signature verification — rejected: ${rejected.join(', ')}.`
+      + ` failed signature verification — rejected: ${rejected.map(cp => `log line ${cp.index} (count ${cp.payload.count})`).join(', ')}.`
       + ' A checkpoint whose signature does not verify under the key it names is a forgery, and the log is a notary, not a laundering service',
     )
   }
@@ -386,6 +411,17 @@ async function runAppend(fs: NodeFsPort, logDir: string, operatorKeyDir: string)
   // (an entry on the public log with no signed head over it) the engine
   // face already refuses to produce.
   const operator = await NodeEd25519Signer.load(operatorKeyDir)
+
+  // V4-M5 (v0.24): everything about the STORED head that would refuse the
+  // coming head write is adjudicated here, before appendPtlEntry touches the
+  // log. savePtlHead's own gates (logId rotation above all) fire at
+  // head-write time — which is AFTER the entry has landed, the exact
+  // half-published state (an entry on the public log with no signed head
+  // over it) the fronting order promises never to produce. A stored head
+  // that is unreadable, unparseable (Y-H-06), or signed by a DIFFERENT
+  // operator identity now refuses the publish before a line is written; the
+  // write-time checks stay as defence in depth.
+  await preflightPtlHead(fs, logDir, operator.keyId)
 
   // The published leaf is the checkpoint itself, re-committed under the
   // workspace identity the log indexes by: count/head/at from the signed
@@ -476,6 +512,14 @@ async function runSelfVerify(fs: NodeFsPort, logDir: string, operatorKeyDir: str
     notes.push(`sth.json promises ${sth.treeSize} entries but the log holds ${log.size} — head and log are disconnected`)
   } else if (sth === undefined && log.size > 0) {
     notes.push(`no signed head on record (sth.json missing or unreadable) while the log holds ${log.size} entries`)
+  } else if (sth === undefined && log.size === 0) {
+    // V4-L10 (v0.24): an empty log fails the self-check with a bare
+    // rootMatch:false and no word of explanation — an operator pointing the
+    // CLI at a fresh (or mis-typed, or not-yet-published) log directory got
+    // a failure that read like tampering. Name the state: nothing has been
+    // published here yet, so there is no commitment to check. The verdict
+    // stays a failure — a self-check of nothing is not a pass.
+    notes.push('the log holds no entries and no signed head is on record — nothing has been published to this log yet, so there is no commitment to check (verify cannot pass on an empty log; run append first)')
   }
   if (badLines > 0) {
     notes.push(

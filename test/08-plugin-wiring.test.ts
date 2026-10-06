@@ -16,6 +16,7 @@ import { join } from 'node:path'
 
 import * as plugin from '../src/index.ts'
 import { WorkspaceWatch } from '../src/dsh/observe.ts'
+import { workspaceKeyPair } from '../src/adapters/shared/paths.ts'
 import { createProofTools, toBaselineValue, toClaimValue, toStatusValue, toVerifyValue } from '../src/dsh/tools.ts'
 import { attachTeamBridge, createTeamBridge, normalizeTeamEvent, TEAM_EVENT_SEAMS } from '../src/dsh/agent-team.ts'
 import { ProofEngine } from '../src/engine.ts'
@@ -192,6 +193,56 @@ test('workspace mode cannot be bypassed with absolute paths or dotted detours', 
     assert.equal(denied.kind, 'deny', `a write naming the evidence store must be denied, whatever path shape it uses: ${forged}`)
     assert.match(denied.reason ?? '', /evidence/i)
   }
+})
+
+test('Y-H-12 wiring: the workspace-mode STRUCTURAL guard runs on the ONE fold — device/deformed spellings asked even from the sweep\'s middle window', async () => {
+  // The audit's composite: bury the store path among 81 strings so the value
+  // sweep's double-ended window misses it (position 41 — between the first 32
+  // and the last 32), then spell it in one of the three shapes the pre-v0.24
+  // workspace branch's local fold could not see (`\\?\` device prefix, Win32
+  // trailing-dot deformation, case variant). The branch now compares through
+  // paths.ts touchesEvidencePath — the same fold the adapter gates run — and
+  // ASKS instead of waving the write through.
+  const harness = makeHarness()
+  process.env.DSH_PROOF_ROOT = ROOT
+  try {
+    plugin.apply(harness.ctx, config({ evidenceStore: 'workspace', requireBaseline: 'off' }))
+  } finally {
+    delete process.env.DSH_PROOF_ROOT
+  }
+  const gate = harness.listeners.get('tools/pre-execute')![0] as (
+    exec: unknown, next: () => Promise<unknown>,
+  ) => Promise<{ kind: string; reason?: string }>
+
+  const spellings = [
+    `\\\\?\\${ROOT.replace(/\//g, '\\')}\\.proof\\evidence.jsonl`, // device-prefixed, verbatim to CreateFile
+    `${ROOT.replace(/\\/g, '/')}/.proof./evidence.jsonl`, // Win32 trailing-dot deformation
+    `${ROOT.replace(/\\/g, '/').toUpperCase()}/.PROOF/evidence.jsonl`, // case variant
+  ]
+  for (const file_path of spellings) {
+    const args: Record<string, string> = {}
+    for (let i = 0; i < 40; i++) args[`a${i}`] = `clean-${i}`
+    args.file_path = file_path
+    for (let i = 0; i < 40; i++) args[`z${i}`] = `clean-${i}`
+    const verdict = await gate(
+      { name: 'write', arguments: args, signal: new AbortController().signal },
+      async () => ({ kind: 'allow' }),
+    )
+    assert.equal(verdict.kind, 'ask',
+      `the structural fold asks on the buried store spelling (the textual middle window hid it): ${file_path}`)
+    assert.match(verdict.reason ?? '', /evidence store/i)
+  }
+  // The same buried shape with an innocent path passes: the middle window is
+  // not an excuse to over-ask ordinary writes.
+  const innocent: Record<string, string> = {}
+  for (let i = 0; i < 40; i++) innocent[`a${i}`] = `clean-${i}`
+  innocent.file_path = 'src/a.ts'
+  for (let i = 0; i < 40; i++) innocent[`z${i}`] = `clean-${i}`
+  const plain = await gate(
+    { name: 'write', arguments: innocent, signal: new AbortController().signal },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(plain.kind, 'allow')
 })
 
 test('workspace mode gates moves whose source key carries the evidence log out', async () => {
@@ -682,6 +733,14 @@ test('a pre-existing baseline on disk reaches the prompt section after the prewa
     fs: new NodeFsPort(),
     commands: new FakeCommands(),
     workspace: new FakeWorkspace(dir),
+    // v0.24 (Y-H-09/Y-H-14): loadBaseline judges the baseline/saved marker's
+    // authorship against checkpoints signed by the reading host's key, under
+    // the reading host's workspace identity — both of which the applied
+    // plugin below derives from DSH_PROOF_TRUST_DIR and the root. The minter
+    // must carry the SAME pair, or its honest marker reads back as someone
+    // else's (a default-identity mint used to be readable by anyone).
+    trustDir: process.env.DSH_PROOF_TRUST_DIR,
+    workspaceKey: workspaceKeyPair(dir).normalized,
   })
   const { baseline } = await minter.establishBaseline()
   assert.equal(baseline.checks.length, 1, 'fixture setup: one discovered check anchored')
@@ -2532,6 +2591,62 @@ test('the evidenceLogPath mirror stays glued to the engine own derivation (M-65)
   assert.equal(verdict.recorded, true, 'a drifted mirror degrades to refusal — success pins the derivation')
   assert.equal(verdict.claimId, request.claimId)
   assert.equal(verdict.gen, 0)
+})
+
+// ---------------------------------------------------------------------------
+// Y-H-14 (v0.24): the plugin face derives the workspace identity through the
+// ONE shared derivation (paths.ts deriveProofPaths — normalised spelling,
+// legacy on-disk fallback probe), the same rule the MCP entry and the adapter
+// hooks use. Pre-v0.24 this face minted a raw sha256(root) — the LEGACY key
+// unconditionally — so a Windows-flavoured root split one workspace into two
+// stores (this face's engine under the legacy key, the MCP server and hooks
+// under the normalised one). Pinned end-to-end: a tool call through the
+// APPLIED plugin must land its evidence under the derived (normalised) key.
+// ---------------------------------------------------------------------------
+
+test('Y-H-14 wiring: the plugin face\'s engine store lands under the DERIVED workspace identity (no raw-hash legacy minting)', async () => {
+  const ws = join(WORKSPACE, '.openclaw', 'tmp', `proof-identity-${process.pid}`)
+  await fsp.rm(ws, { recursive: true, force: true })
+  await fsp.mkdir(ws, { recursive: true })
+  await fsp.writeFile(join(ws, 'package.json'), JSON.stringify({
+    name: 'identity-fixture',
+    scripts: { test: 'node -e "process.exit(0)"' },
+  }))
+
+  const harness = makeHarness()
+  process.env.DSH_PROOF_ROOT = ws
+  try {
+    plugin.apply(harness.ctx, config({ requireBaseline: 'off' }))
+  } finally {
+    delete process.env.DSH_PROOF_ROOT
+  }
+  // One marker through the applied tools: the append lands in the engine's
+  // storeDir, which this face hands the engine from its derived workspaceKey.
+  const jury = harness.registered.find(t => t.name === 'proof_jury')!
+  await jury.execute(
+    { claim: 'identity pin: the store must land under the derived key' },
+    execution('proof_jury', {}),
+  )
+
+  const pair = workspaceKeyPair(ws)
+  const trust = process.env.DSH_PROOF_TRUST_DIR!
+  const storeFile = async (key: string): Promise<boolean> => {
+    try {
+      await fsp.readFile(join(trust, 'workspaces', key, 'evidence.jsonl'), 'utf8')
+      return true
+    } catch {
+      return false
+    }
+  }
+  assert.equal(await storeFile(pair.normalized), true,
+    `the applied plugin's engine appended under the DERIVED identity (${pair.normalized})`)
+  if (pair.normalized !== pair.legacy) {
+    // A Windows-flavoured root really has two spellings — the raw-hash legacy
+    // store must NOT have been minted by this face.
+    assert.equal(await storeFile(pair.legacy), false,
+      `no second store under the pre-normalisation key (${pair.legacy}) — one workspace, one identity`)
+  }
+  await fsp.rm(ws, { recursive: true, force: true })
 })
 
 // ---------------------------------------------------------------------------

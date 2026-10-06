@@ -26,7 +26,7 @@ import {
   type HumanAttestation, type JuryAttestation,
 } from '../core/attest.ts'
 import { SYNTHETIC_DIR_DEFAULT } from '../core/synthetic.ts'
-import { readMarkers } from '../core/evidence.ts'
+import { _readMarkers } from '../core/evidence.ts'
 import { sha256 } from '../core/hash.ts'
 
 // ---------------------------------------------------------------------------
@@ -1481,8 +1481,9 @@ function escapeRegExp(value: string): string {
 /**
  * Marker payloads under the given labels, in log order (newest last).
  *
- * W13/X-H-05 (v0.23): the read is now VERIFIED — `readMarkers` (core/
- * evidence.ts, the one chain-side rule) flags every protected marker whose
+ * W13/X-H-05 (v0.23): the read is now VERIFIED — the marker pass
+ * (core/evidence.ts's `_readMarkers`, the one chain-side rule) flags every
+ * protected marker whose
  * `headRef` contradicts its physical position, and this read excludes them.
  * The old raw `JSON.parse` loop read last-wins over ALL lines, so a marker
  * appended out of band (the audited agent's shell echo-ing a forged
@@ -1499,7 +1500,7 @@ async function markerPayloads(
   if (logPath === undefined) return []
   try {
     const lines = await engine.fsView.readLines(logPath)
-    return readMarkers(lines, { excludeSuspect: true })
+    return _readMarkers(lines, { excludeSuspect: true })
       .filter(marker => labels.has(marker.label))
       .map(marker => marker.payload)
   } catch {

@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 
 import {
   MUTATION_TOOL_NAMES, MUTATION_TOOL_RE, READ_ONLY_TOOL_NAMES, SHELL_TOOL_NAMES, SHELL_TOOL_RE,
-  WorkspaceWatch, driftNarrative, isMutationToolName, shellCommandMentionsPath, toWorkspaceRelative,
+  WorkspaceWatch, driftNarrative, isMutationToolName, shellCommandMentionsPath, sweepToolInputStrings,
+  toWorkspaceRelative,
 } from '../src/dsh/observe.ts'
 import { MemoryFs } from './helpers.ts'
 
@@ -31,6 +32,118 @@ test('pathsIn extracts file arguments from nested shapes', () => {
 test('pathsIn ignores values that cannot be paths', () => {
   assert.deepEqual(WorkspaceWatch.pathsIn({ note: 'hello world', count: 3 }), [])
   assert.deepEqual(WorkspaceWatch.pathsIn(null), [])
+})
+
+// ---------------------------------------------------------------------------
+// V5-M2 (v0.24): the key-name fold is case AND separator aware, and the key
+// roster carries directory/folder/uri (the X2 plan's list, finally complete).
+// Pre-v0.24 `{File-Name: '.proof/evidence.jsonl'}` and `{directory: '.proof'}`
+// extracted nothing — the value sweep still caught the strings, but the
+// watcher's attribution and the guards' STRUCTURAL half never saw the path.
+// ---------------------------------------------------------------------------
+
+test('V5-M2: key names fold case AND separators — File-Name, file_name, fileName are one key', () => {
+  for (const key of ['File-Name', 'file_name', 'fileName', 'FILE NAME', 'FilePath', 'file-path']) {
+    assert.deepEqual(
+      WorkspaceWatch.pathsIn({ [key]: 'src/a.ts' }),
+      ['src/a.ts'],
+      `${key} is a path key after the separator fold`,
+    )
+  }
+  // Array keys fold the same way.
+  assert.deepEqual(
+    WorkspaceWatch.pathsIn({ GLOBS: ['src/a.ts'] }),
+    ['src/a.ts'],
+    'array keys fold case',
+  )
+  assert.deepEqual(
+    WorkspaceWatch.pathsIn({ 'Notebook-Path': 'notebooks/a.ipynb' }),
+    ['notebooks/a.ipynb'],
+    'a hyphenated notebook_path folds onto the roster entry',
+  )
+  // The fold must not START matching non-path keys: content stays content.
+  assert.deepEqual(WorkspaceWatch.pathsIn({ 'my-content': 'src/old/text' }), [])
+})
+
+test('V5-M2: directory/folder/uri join the path-key roster (X2 plan complete)', () => {
+  assert.deepEqual(WorkspaceWatch.pathsIn({ directory: 'src' }), ['src'])
+  assert.deepEqual(WorkspaceWatch.pathsIn({ folder: 'src/lib' }), ['src/lib'])
+  assert.deepEqual(WorkspaceWatch.pathsIn({ uri: 'notebooks/a.ipynb' }), ['notebooks/a.ipynb'])
+  assert.deepEqual(
+    WorkspaceWatch.pathsIn({ directories: ['src', 'test'] }).sort(),
+    ['src', 'test'],
+  )
+  assert.deepEqual(WorkspaceWatch.pathsIn({ folders: ['src/lib'] }), ['src/lib'])
+  assert.deepEqual(WorkspaceWatch.pathsIn({ uris: ['a.ipynb', 'b.ipynb'] }), ['a.ipynb', 'b.ipynb'])
+})
+
+// ---------------------------------------------------------------------------
+// Y-H-10 (v0.24): the ONE sweep's bounds are double-ended with tail
+// preference. Direct unit pins — the guard-level pins in test/24 drive the
+// same semantics through decidePreToolUse on both faces.
+// ---------------------------------------------------------------------------
+
+test('Y-H-10: sweepToolInputStrings keeps the FIRST 32 and the LAST 32 strings — pads-first cannot climb past the bound', () => {
+  // ≤64 strings: everything is swept, in order.
+  const small: Record<string, string> = {}
+  for (let i = 0; i < 10; i++) small[`k${i}`] = `s${i}`
+  assert.deepEqual(sweepToolInputStrings(small).length, 10)
+  // 64 pads AHEAD of the needle: the needle is last, the tail window keeps it.
+  const padsFirst: Record<string, string> = {}
+  for (let i = 0; i < 64; i++) padsFirst[`k${i}`] = `pad-${i}`
+  padsFirst.cmd = 'echo x > .proof/evidence.jsonl'
+  const swept = sweepToolInputStrings(padsFirst)
+  assert.equal(swept.length, 64, 'the window holds 64 strings, not 64 FIRST strings')
+  assert.ok(swept.includes('echo x > .proof/evidence.jsonl'),
+    'the LAST string is in the window (the pre-v0.24 first-64 ladder is dead)')
+  assert.ok(swept.includes('pad-0') && swept.includes('pad-63'),
+    'the window spans both ends of the insertion order')
+  // The middle residual: padding on both sides buries a string between windows.
+  const middle: Record<string, string> = {}
+  for (let i = 0; i < 40; i++) middle[`a${i}`] = `pad-${i}`
+  middle.cmd = 'buried'
+  for (let i = 0; i < 40; i++) middle[`z${i}`] = `pad-${i}`
+  assert.ok(!sweepToolInputStrings(middle).includes('buried'),
+    'a string buried between the two window halves is the documented residual')
+})
+
+test('Y-H-10: an over-budget string keeps BOTH end windows (双端保窗) — redirect targets live at either end', () => {
+  const needle = 'echo x > .proof/evidence.jsonl'
+  // Padding AHEAD of the write used to drop the whole string (gates copy) or
+  // keep only the head (observe copy); the shared sweep keeps the last 8192.
+  const tailKept = sweepToolInputStrings({ commandLine: `${'x'.repeat(9_000)} ${needle}` })
+  assert.equal(tailKept.length, 2, 'over-budget strings contribute both windows')
+  assert.ok(tailKept[1]!.endsWith(needle), 'the tail window ends with the needle')
+  assert.equal(tailKept[1]!.length, 8192, 'the per-string window is exactly 8192 chars')
+  // The head residual: a needle pushed off the FRONT is not swept — pinned as
+  // the documented price of the bound.
+  // v0.24: oversize strings keep BOTH end windows — a needle that OPENS the
+  // string is as live as one that closes it; only the strict middle of a
+  // >2x-budget string is outside every window (the documented residual).
+  const headKept = sweepToolInputStrings({ commandLine: `${needle} && ${'x'.repeat(9_000)}` })
+  assert.equal(headKept.length, 2, 'an over-budget string contributes a head window and a tail window')
+  assert.ok(headKept[0]!.startsWith(needle), 'the head window starts with the needle')
+  assert.ok(headKept[0]!.length === 8192 && headKept[1]!.length === 8192, 'both windows are exactly 8192 chars')
+})
+
+test('Y-H-10/V5-M5: argv joins ONLY after measuring — a giant argv never allocates before the bound is consulted', () => {
+  // A fitting argv is ONE command-line string (split needles reunite).
+  const fitting = sweepToolInputStrings({ command: ['echo', 'x', '>', '.proof/evid', 'ence.jsonl'] })
+  assert.deepEqual(fitting, ['echo x > .proof/evid ence.jsonl'], 'fitting argv joins into one line')
+  // An over-budget argv sweeps its elements individually, each tail-capped —
+  // the join is skipped rather than performed and discarded.
+  const giant = ['node', '-e', `${'x'.repeat(9_000)} echo x > .proof/evidence.jsonl`]
+  const swept = sweepToolInputStrings({ command: giant })
+  assert.ok(swept.includes('node') && swept.includes('-e'), 'small elements sweep individually')
+  assert.ok(swept.some(s => s.endsWith('echo x > .proof/evidence.jsonl')),
+    'the big element keeps its tail window')
+  // Mixed argv (the X-H-13 PoC shape): string elements still join/reach the
+  // sweep; the number never breaks it.
+  assert.ok(
+    sweepToolInputStrings({ command: ['node', '-e', 'writeFileSync(".proof/evidence.jsonl")', 0] })
+      .some(s => s.includes('.proof/evidence.jsonl')),
+    'mixed argv reaches the needle',
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -219,6 +332,29 @@ test('driftNarrative names stale reads first and tells the model what to do', ()
   assert.match(text ?? '', /src\/a\.ts/)
   assert.match(text ?? '', /src\/b\.ts/)
   assert.match(text ?? '', /proof_verify/)
+})
+
+test('driftNarrative marks truncation — a wide drift shows its true size (V5-L4)', () => {
+  // Pre-v0.24 the lists sliced to ten with no marker: a shell-shaped drift
+  // over 25 files showed the model 10 of them with "re-read these" pointing
+  // at an incomplete list and nothing saying anything was missing.
+  const drifted = Array.from({ length: 25 }, (_, i) => `src/f${i}.ts`)
+  const text = driftNarrative({ drifted, touched: [], staleReads: [], scanned: 25 })
+  assert.ok(text)
+  assert.match(text, /…and 15 more/, 'the overflow line names what the slice hid')
+  assert.match(text, /src\/f0\.ts/, 'the first ten still lead')
+  assert.ok(!text.includes('src/f10.ts'), 'past the cap, only the count speaks')
+  // Both lists overflow independently: staleReads AND plain drift each get
+  // their own marker.
+  const staleReads = drifted.slice(0, 12)
+  const both = driftNarrative({ drifted, touched: [], staleReads, scanned: 25 })
+  assert.ok(both)
+  assert.match(both, /…and 2 more/, 'the stale-read list carries its own overflow marker')
+  assert.match(both, /…and 3 more/, 'the drift-only list carries its own overflow marker')
+  // Ten or fewer: no marker — the lists were always complete.
+  const exact = driftNarrative({ drifted: drifted.slice(0, 10), touched: [], staleReads: [], scanned: 10 })
+  assert.ok(exact)
+  assert.ok(!exact.includes('more'), 'a complete list has no overflow line')
 })
 
 // ---------------------------------------------------------------------------

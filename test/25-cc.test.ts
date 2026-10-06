@@ -31,18 +31,23 @@ import { ccAdapterEnv, handlePostToolUse, handlePreToolUse, handleSessionStart, 
 import type { CcAdapterEnv, CcHookPayload } from '../src/adapters/claude-code/hooks.ts'
 import { loadSession } from '../src/adapters/shared/session.ts'
 import { MCP_TOOLS } from '../src/app/mcp-server.ts'
-import { addressOf, merkleRoot } from '../src/core/hash.ts'
+import { addressOf, merkleRoot, sha256 } from '../src/core/hash.ts'
+import { GENESIS_PREV } from '../src/core/trust.ts'
 
 /**
  * A self-addressing baseline.json — the only shape hasBaselineOnDisk accepts
  * since H-20. Built exactly the way buildBaseline mints one: the merkle root
  * over the check evidence addresses, id = address of that material. A bare
  * `{"baselineId":"x"}` is a forgery and must not release any gate.
+ * `variant` mints a SECOND, equally self-consistent document (different
+ * evidence address → different bytes) for the Y-H-13 chain-binding tests:
+ * the point there is that self-consistency alone stops being enough the
+ * moment the chain remembers other bytes.
  */
-function realBaselineJson(): string {
-  const checks = [{ checkId: 'package.json:test', evidenceId: 'e1', status: 'pass' }]
+function realBaselineJson(variant = 0): string {
+  const checks = [{ checkId: 'package.json:test', evidenceId: `e${variant + 1}`, status: 'pass' }]
   const workspace = { head: null, dirty: [], dirtDigest: merkleRoot([]) }
-  const createdAt = '2026-10-06T10:00:00.000Z'
+  const createdAt = variant === 0 ? '2026-10-06T10:00:00.000Z' : '2026-10-06T11:00:00.000Z'
   const root = merkleRoot(checks.map(c => c.evidenceId))
   return JSON.stringify({
     baselineId: addressOf({ createdAt, workspace, checkIds: checks.map(c => c.checkId), root }),
@@ -50,6 +55,26 @@ function realBaselineJson(): string {
     workspace,
     checks,
     root,
+  })
+}
+
+/**
+ * A store-shaped `baseline/saved` marker line — the envelope the engine's own
+ * `mark()` writes (v2, kind 'marker', headRef witness chained to the line's
+ * physical predecessor) — for chain fixtures. `digest` is what the chain
+ * REMEMBERS for the baseline file bytes. The third parameter names the
+ * witness: defaulted, it chains honestly to `prev` (the non-suspect shape);
+ * an explicit different value is the out-of-band twin (reads back suspect
+ * under the H-32 position test); `null` omits the witness entirely — the
+ * pre-witness legacy shape, suspect by the same rule.
+ */
+function savedMarker(digest: string, prev: string, headRef: string | null = prev): string {
+  return JSON.stringify({
+    v: 2,
+    kind: 'marker',
+    at: '2026-10-06T10:00:01.000Z',
+    prev,
+    payload: { label: 'baseline/saved', digest, bytes: 4096, ...(headRef !== null ? { headRef } : {}) },
   })
 }
 
@@ -65,6 +90,7 @@ const ROOT_GATES = join(WORKSPACE, 'gates')
 const ROOT_DRIFT = join(WORKSPACE, 'drift')
 const ROOT_NOTICE = join(WORKSPACE, 'notice')
 const ROOT_START = join(WORKSPACE, 'start')
+const ROOT_CHAIN = join(WORKSPACE, 'chain')
 const ROOT_E2E = join(WORKSPACE, 'e2e')
 const TRUST = join(WORKSPACE, 'trust')
 
@@ -93,7 +119,7 @@ async function writeFile(root: string, rel: string, contents: string): Promise<v
 
 before(async () => {
   await fsp.rm(WORKSPACE, { recursive: true, force: true })
-  for (const root of [ROOT_GATES, ROOT_DRIFT, ROOT_NOTICE, ROOT_START, ROOT_E2E]) {
+  for (const root of [ROOT_GATES, ROOT_DRIFT, ROOT_NOTICE, ROOT_START, ROOT_CHAIN, ROOT_E2E]) {
     await fsp.mkdir(join(root, 'src'), { recursive: true })
   }
   // The drift family isolates drift from the baseline reminder: a REAL
@@ -218,6 +244,117 @@ test('PreToolUse: Bash redirecting into the evidence store is denied — the H-0
   }, gatesEnv)
   assert.equal((forgeBaseline?.hookSpecificOutput as { permissionDecision?: string })?.permissionDecision, 'deny',
     'the self-forged-baseline route through Bash is closed too (H-20\'s write side)')
+})
+
+// ---------------------------------------------------------------------------
+// Y-H-13 — the chain binding the probe's third argument always wanted
+// ---------------------------------------------------------------------------
+
+/** Seed the chain family: a self-consistent baseline file + a log remembering `remembered`. */
+async function seedChainFamily(baseline: string, logLines: string[]): Promise<CcAdapterEnv> {
+  const env = unitEnv(ROOT_CHAIN, { DSH_PROOF_REQUIRE_BASELINE: 'ask' })
+  await fsp.mkdir(dirname(env.paths.logPath), { recursive: true })
+  await fsp.writeFile(env.paths.baselinePath, baseline)
+  await fsp.writeFile(env.paths.logPath, `${logLines.join('\n')}\n`)
+  return env
+}
+
+test('PreToolUse: a self-consistent baseline the chain does NOT remember re-arms the ask gate (Y-H-13)', async () => {
+  // The audit's PoC shape, closed: the file is minted with the package's own
+  // public addressOf/merkleRoot (perfectly self-addressing — the W11-M4 floor
+  // cannot refuse it, it has one check and a real createdAt), but the chain's
+  // non-suspect baseline/saved marker remembers OTHER bytes. v0.23 shipped
+  // that third argument and never fed it; feeding it is what turns this from
+  // an allow into an ask.
+  const env = await seedChainFamily(
+    realBaselineJson(),
+    [savedMarker(sha256('the bytes an honest saveBaseline actually wrote'), GENESIS_PREV)],
+  )
+  const out = await handlePreToolUse({
+    session_id: 'y-h-13', hook_event_name: 'PreToolUse', tool_name: 'Edit',
+    tool_input: { file_path: 'src/a.ts', old_string: 'a', new_string: 'b' }, cwd: ROOT_CHAIN,
+  }, env)
+  assert.ok(out !== undefined, 'a baseline the chain cannot vouch for is no baseline — the ladder stays armed')
+  const hso = out.hookSpecificOutput as { permissionDecision?: string; permissionDecisionReason?: string }
+  assert.equal(hso.permissionDecision, 'ask')
+  assert.match(hso.permissionDecisionReason ?? '', /baseline/i)
+})
+
+test('PreToolUse: a baseline whose bytes the chain DOES remember releases the ask gate (Y-H-13 control)', async () => {
+  const baseline = realBaselineJson()
+  const env = await seedChainFamily(baseline, [savedMarker(sha256(baseline), GENESIS_PREV)])
+  const out = await handlePreToolUse({
+    session_id: 'y-h-13-ok', hook_event_name: 'PreToolUse', tool_name: 'Edit',
+    tool_input: { file_path: 'src/a.ts', old_string: 'a', new_string: 'b' }, cwd: ROOT_CHAIN,
+  }, env)
+  assert.equal(out, undefined, 'self-consistent AND chain-remembered: the honest path through the new binding')
+})
+
+test('PreToolUse: an out-of-band baseline/saved twin is suspect and does not get to answer (Y-H-13, H-32 half)', async () => {
+  // The honest marker (non-suspect, physically first, correctly witnessed)
+  // remembers the REAL bytes. The file is then swapped for a different
+  // self-consistent document and a twin marker is appended out of band with
+  // the swapped file's digest — but its headRef names a predecessor that is
+  // not the line physically before it, the exact shape the position test
+  // exists for. The twin must not re-answer for the chain.
+  const real = realBaselineJson()
+  const forged = realBaselineJson(1)
+  const env = await seedChainFamily(forged, [
+    savedMarker(sha256(real), GENESIS_PREV),
+    savedMarker(sha256(forged), GENESIS_PREV, sha256('a predecessor this twin was not appended after')),
+  ])
+  const out = await handlePreToolUse({
+    session_id: 'y-h-13-twin', hook_event_name: 'PreToolUse', tool_name: 'Edit',
+    tool_input: { file_path: 'src/a.ts', old_string: 'a', new_string: 'b' }, cwd: ROOT_CHAIN,
+  }, env)
+  const hso = out?.hookSpecificOutput as { permissionDecision?: string } | undefined
+  assert.equal(hso?.permissionDecision, 'ask',
+    'the suspect twin is excluded from the pool, the honest marker still answers, and the swapped file fails the bind')
+})
+
+test('PreToolUse: a pre-witness (all-suspect) marker still speaks — upgraded deployments never lose detection (Y-H-13)', async () => {
+  // A marker with no headRef at all (a log written before the witness
+  // existed) reads back suspect; lastBaselineDigest's rule lets the LAST such
+  // marker answer anyway. Here it remembers other bytes, so the binding still
+  // refutes the file — exactly the detection such a deployment had before,
+  // never less. (If the pool were wrongly trusted-only, the digest would come
+  // back undefined, the no-chain floor would pass the file, and this test
+  // would see an allow.)
+  const env = await seedChainFamily(
+    realBaselineJson(),
+    [savedMarker(sha256('what the legacy chain remembers'), GENESIS_PREV, null)],
+  )
+  const out = await handlePreToolUse({
+    session_id: 'y-h-13-legacy', hook_event_name: 'PreToolUse', tool_name: 'Edit',
+    tool_input: { file_path: 'src/a.ts', old_string: 'a', new_string: 'b' }, cwd: ROOT_CHAIN,
+  }, env)
+  const hso = out?.hookSpecificOutput as { permissionDecision?: string } | undefined
+  assert.equal(hso?.permissionDecision, 'ask', 'the all-suspect fallback pool still binds the file')
+})
+
+test('Stop + SessionStart: the chained probe feeds the turn-end and context call sites too (Y-H-13)', async () => {
+  // handleStop (facts.hasBaseline) and handleSessionStart (policy context)
+  // go through the same chained door as PreToolUse — a baseline the chain
+  // refutes must read as "no baseline" at BOTH remaining call sites, or the
+  // binding is one face deep.
+  const env = await seedChainFamily(
+    realBaselineJson(),
+    [savedMarker(sha256('other bytes'), GENESIS_PREV)],
+  )
+  // warn mode for the Stop leg: the one-shot baseline notice owes its fire to
+  // hasBaseline === false.
+  const warnEnv = { ...env, gate: { ...env.gate, requireBaseline: 'warn' as const } }
+  await handlePostToolUse({
+    session_id: 'y-h-13-stop', hook_event_name: 'PostToolUse', tool_name: 'Write',
+    tool_input: { file_path: 'src/w.ts', content: 'w' }, cwd: ROOT_CHAIN,
+  }, warnEnv)
+  const stop = await handleStop({ session_id: 'y-h-13-stop', hook_event_name: 'Stop', cwd: ROOT_CHAIN }, warnEnv)
+  assert.ok(stop !== undefined, 'touched>0 with a chain-refuted baseline blocks the turn end')
+  assert.match(String((stop as { reason?: string }).reason), /baseline/i)
+
+  const start = await handleSessionStart({ session_id: 'y-h-13-start', hook_event_name: 'SessionStart', cwd: ROOT_CHAIN }, env)
+  const context = (((start ?? {}).hookSpecificOutput ?? {}) as { additionalContext?: string }).additionalContext ?? ''
+  assert.match(context, /No baseline is established/, 'the policy context speaks the chained verdict, not the file shape')
 })
 
 // ---------------------------------------------------------------------------
@@ -442,7 +579,7 @@ test('SessionStart: seeds the session file, and never wipes an existing one', as
 
 interface RunResult { code: number | null; stdout: string; stderr: string }
 
-function runHook(event: string, stdinText: string, root: string): Promise<RunResult> {
+function runHook(event: string, stdinText: string, root: string, extraEnv: Record<string, string> = {}): Promise<RunResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ['--experimental-strip-types', ENTRY, event], {
       cwd: root,
@@ -454,6 +591,10 @@ function runHook(event: string, stdinText: string, root: string): Promise<RunRes
         DSH_PROOF_REQUIRE_BASELINE: '', // the default (warn) — cleared of the ambient environment
         DSH_PROOF_DRIFT: '',
         DSH_PROOF_ENFORCE_TURN_END: '',
+        // Applied LAST so a test can clear a fixed variable ('' parses as
+        // unset in resolveAdapterEnv) — the cwd-precedence tests below need
+        // DSH_PROOF_ROOT absent to drive the payload.cwd branch at all.
+        ...extraEnv,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     })
@@ -579,6 +720,40 @@ test('e2e session-start: answers the context and seeds the session file', async 
   const context = hso.additionalContext ?? ''
   assert.match(context, /proof:policy/)
   for (const tool of PROOF_TOOLS) assert.ok(context.includes(tool))
+})
+
+test('e2e cwd: with DSH_PROOF_ROOT unset, payload.cwd IS the workspace root (the precedence branch the fixed-env harness never drove)', async () => {
+  // The runHook harness always sets DSH_PROOF_ROOT, so the payload.cwd →
+  // ccAdapterEnv branch (entry.ts: "trust the payload, fall back to the
+  // process") was unreachable in every e2e to date. Clear the variable
+  // ('' parses as unset), spawn from a DIFFERENT process cwd, and name
+  // payload.cwd = ROOT_E2E: only if the adapter really derives its root from
+  // the payload can it recognize an absolute write into ROOT_E2E's store —
+  // had it fallen back to the process cwd (WORKSPACE), that path is not in
+  // any guarded set and the write would sail through.
+  const { code, stdout } = await runHook('pre-tool-use', JSON.stringify({
+    session_id: 'e2e-cwd', hook_event_name: 'PreToolUse', tool_name: 'Write',
+    tool_input: { file_path: join(ROOT_E2E, '.proof', 'evidence.jsonl'), content: 'tamper' },
+    cwd: ROOT_E2E,
+  }), WORKSPACE, { DSH_PROOF_ROOT: '' })
+  assert.equal(code, 0)
+  const hso = (singleLineJson(stdout).hookSpecificOutput ?? {}) as { permissionDecision?: string }
+  assert.equal(hso.permissionDecision, 'deny',
+    'the store under payload.cwd was guarded — the root came from the payload, not the process')
+})
+
+test('e2e cwd: no payload cwd and no DSH_PROOF_ROOT falls back to the process cwd', async () => {
+  const procRoot = join(WORKSPACE, 'e2e-proc')
+  await fsp.mkdir(procRoot, { recursive: true })
+  const { code, stdout } = await runHook('pre-tool-use', JSON.stringify({
+    session_id: 'e2e-cwd-fallback', hook_event_name: 'PreToolUse', tool_name: 'Write',
+    tool_input: { file_path: join(procRoot, '.proof', 'evidence.jsonl'), content: 'tamper' },
+    // no cwd field at all: the only remaining root source is process.cwd()
+  }), procRoot, { DSH_PROOF_ROOT: '' })
+  assert.equal(code, 0)
+  const hso = (singleLineJson(stdout).hookSpecificOutput ?? {}) as { permissionDecision?: string }
+  assert.equal(hso.permissionDecision, 'deny',
+    'the store under the spawn cwd was guarded — the fallback branch derives the root from the process')
 })
 
 // ---------------------------------------------------------------------------

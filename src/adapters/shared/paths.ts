@@ -64,17 +64,23 @@ export interface ProofPaths {
 }
 
 /**
- * Windows drive letter, drive-letter path, or either UNC slash flavour
- * (`\\server\share` and `//server/share`) — engine.ts's private
- * absolute-path test plus the UNC spellings that test used to miss (H-25:
- * a backslashed UNC used to read as "relative", silently parking the store
- * INSIDE the workspace the operator asked to keep it out of). Mirrored by
- * src/index.ts and app/mcp-entry.ts; the store-dir derivation must agree
- * with the engine's or adapters would read a different log than the one the
- * engine appends to.
+ * Windows drive letter, drive-letter path, backslash-UNC, or any leading
+ * slash — ENGINE.TS's private absolute-path test VERBATIM (`[A-Za-z]:[\/]`,
+ * `\\\\`, `\/`), plus the forward-slash UNC spelling that test folds through
+ * its `\/` arm anyway (H-25: a backslashed UNC used to read as "relative",
+ * silently parking the store INSIDE the workspace the operator asked to keep
+ * it out of). The store-dir derivation must agree with the engine's or
+ * adapters would read a different log than the one the engine appends to.
+ *
+ * V5-M6 (v0.24): exported, and src/index.ts's private third mirror RETIRED
+ * onto it — that mirror lacked the backslash-UNC arm (`\\server\share\store`
+ * read as a relative segment and was glued onto the workspace root), so a
+ * UNC evidenceDir silently produced a garbage evidenceLogPath. One rule, one
+ * spelling of the rule, consumed by both faces; if engine.ts's rule ever
+ * moves, this mirror must move with it (M-65's glue, now literal).
  */
-function isAbsoluteHostPath(p: string): boolean {
-  return /^([A-Za-z]:[\\/]|[\\/]{2})/.test(p)
+export function isAbsoluteHostPath(p: string): boolean {
+  return /^([A-Za-z]:[\\/]|[\\/]{2}|\/)/.test(p)
 }
 
 /** Fold backslashes to '/' — ProofPaths speaks one separator style everywhere. */
@@ -271,9 +277,14 @@ export function deriveProofPaths(
   }
 
   // The segment form used by the guard's comparisons: strip a './' prefix and
-  // trailing slashes (index.ts:168's normalisation). An absolute evidenceDir is
-  // left as-is here — the guard then simply never matches it, which is honest:
-  // an absolute store is by construction not an agent-relative path.
+  // trailing slashes (index.ts:168's normalisation). A DRIVE-absolute
+  // evidenceDir is rejected by config.ts's schema since V5-M3 (the same
+  // `(?![A-Za-z]:)` arm syntheticDir has) — the runtime here leaves an
+  // absolute spelling as-is and the workspace-mode guard then honestly never
+  // matches it: an absolute store is not an agent-relative path. (The schema
+  // still admits a backslash-UNC spelling — `(?!\/)` only rejects the
+  // forward slash — and the same honesty applies to it; the loud first line
+  // is the schema, this is the defence-in-depth underneath.)
   const configured = env.evidenceDir !== undefined && env.evidenceDir.length > 0 ? env.evidenceDir : '.proof'
   const stripped = toPosix(configured).replace(/^\.\/+/, '').replace(/\/+$/, '')
   // '.' / './' collapse to the empty segment (the store IS the workspace
@@ -437,6 +448,18 @@ function foldSegments(path: string): string {
  * No length cap, deliberately: the pre-fold guards blanked out on candidates
  * over 4096 bytes exactly when the `\\?\` prefix made such paths writable —
  * the cap and the attack were the same feature.
+ *
+ * RESIDUAL, comment-pinned (V5-L1 / W11-L-F): Win32 8.3 short names
+ * (`EVIDEN~1.JSO`) are NOT folded. Expanding one is a filesystem QUERY, not
+ * a lexical rule — the fold is pure by contract (every consumer compares
+ * strings, several in synchronous gates), and Node exposes no
+ * GetShortPathName. Pinned by test on a Windows volume where short-name
+ * generation is off (the modern default): `dir /x` shows no alias for
+ * `evidence.jsonl`, so the attack requires a volume with 8.3 creation
+ * enabled AND the short spelling of an artifact — at which point the textual
+ * sweep's bare-name needles are equally blind and the structured guard is
+ * the only honest layer left. If a future fold learns short names, it must
+ * do so for BOTH sides of every comparison in the same batch.
  */
 export function foldHostPath(p: string): string {
   if (p.length === 0) return ''
@@ -545,6 +568,127 @@ export function touchesEvidencePath(candidate: string, paths: ProofPaths): boole
     return ARTIFACT_FILE_NAMES.includes(target)
   }
   return target === evidence || target.startsWith(`${evidence}/`)
+}
+
+// ---------------------------------------------------------------------------
+// The shared guard-target set (Y-H-11 / V5-M1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Y-H-11 (v0.24): the Ed25519 signing-key pair's file names (node-ports'
+ * spellings — the signer loads them from `<trustRoot>/keys`). A string value
+ * naming either is worth refusing wherever it points — the key pair IS the
+ * trust fabric (whoever holds the private half can forge every checkpoint
+ * signature), and no legitimate workspace file carries these names. Exported
+ * here so BOTH guard faces (gates.ts and src/index.ts) refuse the same names:
+ * pre-v0.24 only the DSH plugin face listed them, and
+ * `cp <trust>/keys/proof-signing-key.pem x` sailed through the adapter hooks
+ * measured. Matched as segment-boundaried substrings after separator/case
+ * folding by `shellCommandMentionsPath`; if node-ports ever renames a key
+ * file, this list must move with it (grep-anchored there).
+ */
+export const SIGNING_KEY_FILE_NAMES: readonly string[] = [
+  'proof-signing-key.pem', 'proof-signing-key.pub.pem',
+]
+
+/** What {@link guardedTargets} needs: where the store is, and where trust lives. */
+export interface GuardedTargetOptions {
+  readonly evidenceStore: 'host' | 'workspace'
+  readonly evidenceDir: string
+  /**
+   * The host trust root, when the caller knows it — adds the trust-side
+   * artifacts (host-mode store, anchors, session ledgers, signing keys) to
+   * the target set. Optional for callers that only reproduce the historical
+   * workspace-store contract.
+   */
+  readonly trustRoot?: string
+}
+
+/**
+ * Every spelling of the store and trust artifacts a shell command must not
+ * name — THE one target-set constructor both guard faces consume (V5-M1,
+ * v0.24). Pre-v0.24 gates.ts and index.ts each hand-rolled this list and it
+ * forked three ways the audit could drive a command through: the adapter
+ * face missed the bare `<trust>/workspaces/<key>` DIRECTORY (`rm -rf` of the
+ * whole store passed), BOTH faces missed the signing-key file names (Y-H-11)
+ * and every `~`/env spelling of the default trust root (`rm -rf ~/.dsh/proof`
+ * passed everywhere — no absolute needle matches a variable). One function,
+ * consumed by both faces, so the two nets cannot drift apart again.
+ *
+ * Targets are FOLDED spellings (`foldHostPath`): `shellCommandMentionsPath`
+ * folds the haystack the same way, so one spelling per target is enough
+ * (`.proof/evidence.jsonl` also catches `.PROOF\EVIDENCE.JSONL`). The set:
+ * - workspace mode: the store segment, its two artifact files, and the
+ *   root-anchored spellings an absolute command would use (a degenerate
+ *   segment — M-48 — narrows to the artifact file names themselves);
+ * - trust side (either store mode, when `trustRoot` is known): the host-mode
+ *   store DIRECTORY and files under BOTH identity keys (a migrated
+ *   deployment still holds state under the legacy one), the anchor dirs, the
+ *   adapter session ledgers, the `keys` directory, and — always — the two
+ *   bare signing-key file names (Y-H-11: the names themselves are refused
+ *   wherever they point);
+ * - when the trust root IS the default `$DSH_HOME/proof` (DSH_HOME itself
+ *   defaulting to `~/.dsh`), the `~`/`$DSH_HOME`/`$HOME` spellings of it:
+ *   the textual sweep does no variable expansion, so the literal forms are
+ *   listed (zero false positives in the default deployment — no legitimate
+ *   command writes there; a custom trust root keeps its absolute needle).
+ */
+export function guardedTargets(root: string, options: GuardedTargetOptions): string[] {
+  const targets: string[] = []
+  if (options.evidenceStore === 'workspace') {
+    const dir = foldHostPath(options.evidenceDir)
+    if (dir !== '') {
+      // The bare store directory, the artifacts inside it, and the
+      // root-anchored spellings an absolute command would use.
+      targets.push(dir, `${dir}/evidence.jsonl`, `${dir}/baseline.json`)
+    } else {
+      // Degenerate segment (M-48): the store IS the workspace root; guard the
+      // artifact file names themselves.
+      targets.push('evidence.jsonl', 'baseline.json')
+    }
+    const anchored = foldHostPath(`${root.replace(/\/+$/, '')}/${options.evidenceDir}`)
+    targets.push(anchored, `${anchored}/evidence.jsonl`, `${anchored}/baseline.json`)
+  }
+  if (options.trustRoot !== undefined && options.trustRoot.length > 0) {
+    // Trust-side artifacts are never legitimately agent-writable in EITHER
+    // store mode: the anchor mirrors every checkpoint, the host-mode store
+    // lives here, the adapter session ledgers record the shellUsed/firedNotices
+    // facts the drift narrative speaks with (W11-M3), and the signing keys
+    // under `keys/` are the trust fabric itself (Y-H-11). Both identity keys
+    // are listed: a migrated deployment still holds state under the legacy one.
+    const trust = foldHostPath(options.trustRoot)
+    if (trust !== '') {
+      const pair = workspaceKeyPair(root)
+      for (const key of pair.normalized === pair.legacy ? [pair.normalized] : [pair.normalized, pair.legacy]) {
+        targets.push(
+          // V5-M1: the BARE store directory joins the two files — `rm -rf`
+          // of the whole store names no file inside it.
+          `${trust}/workspaces/${key}`,
+          `${trust}/workspaces/${key}/evidence.jsonl`,
+          `${trust}/workspaces/${key}/baseline.json`,
+          `${trust}/anchors/${key}`,
+          `${trust}/adapter-sessions/${key}`,
+        )
+      }
+      // The engine's default signer directory (engine.ts loads Ed25519 from
+      // `<trustDir>/keys`; the standalone MCP entry assembles the same path).
+      targets.push(`${trust}/keys`)
+      // V5-M1: the variable spellings of the DEFAULT trust root. The textual
+      // sweep expands nothing, so `rm -rf ~/.dsh/proof` — which erases keys,
+      // anchors, stores and session ledgers in one command — needs its
+      // literals listed. Armed only when the configured trust root IS the
+      // default; a custom root keeps its absolute needle (and its operator
+      // knows its own spelling).
+      if (trust === foldHostPath(`${dshHome()}/proof`)) {
+        targets.push('~/.dsh/proof', '$dsh_home/proof', '${dsh_home}/proof', '$home/.dsh/proof')
+      }
+    }
+  }
+  // Y-H-11: the bare signing-key file names guard every mode and every trust
+  // spelling — no legitimate workspace file carries these names, so a mention
+  // of either is worth refusing wherever it points.
+  targets.push(...SIGNING_KEY_FILE_NAMES)
+  return [...new Set(targets)].filter(t => t.length > 0)
 }
 
 // ---------------------------------------------------------------------------

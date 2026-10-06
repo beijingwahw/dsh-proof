@@ -1153,6 +1153,10 @@ test('X-H-08: a between-sessions baseline/saved absorption is refused, not notar
   await session2.checkpoint() // no second refusal: the tail's newest claim is self-authored now
   const recovered = await session2.audit()
   assert.equal(recovered.chain.refusedToSign!.length, 1, 'exactly one refusal — recovery does not loop')
+  assert.deepEqual(recovered.chain.refusedToSignPardoned, recovered.chain.refusedToSign,
+    'Y-H-02: the refusal is visible history whose generation recovered — signed again over a re-anchored chain')
+  assert.equal(recovered.ok, true,
+    'Y-H-02: v0.23 billed this refusal forever, so the documented recovery never actually recovered (the X-H-09 consumers capped every later grade at stale); the generational slice makes re-anchor mean it')
   assert.notEqual(await fs.readFile(ANCHOR), anchorBefore, 'the anchor lifts again over the re-anchored, honest tail')
   assert.equal(recovered.chain.checkpoints, 4, 'signed checkpoints resumed after the refusal and the re-anchor')
 })
@@ -1200,6 +1204,7 @@ test('X-H-08: a foreign baseline/established tail marker is refused too (and sup
   const recovered = await session2.audit()
   assert.equal(recovered.chain.refusedToSign!.length, 1, 'no second refusal: the newest claim of the label is self-authored')
   assert.equal(recovered.chain.checkpoints, 3)
+  assert.equal(recovered.ok, true, 'Y-H-02: the re-anchor recovered the refusal\'s generation — visible scar, green audit')
 })
 
 // -- X-H-03: headLiared on the walk (v0.23) ---------------------------------------
@@ -1337,8 +1342,13 @@ test('createVerifiedView.bestCheckpoint: verified / refuted / unverifiable / non
   assert.notEqual(unverifiable.checkpoint, undefined)
   assert.equal(typeof unverifiable.checkpoint?.sig, 'string')
 
-  // The X-H-03 mirror on the selection: replay the (honestly signed) checkpoint
-  // at the tail — signature verifies, position is a lie, and the view says BOTH.
+  // The X-H-03 mirror ON THE SELECTION (Y-H-01, v0.24): replay the
+  // (honestly signed) checkpoint at the tail — signature verifies, position
+  // is a lie. The v0.23 view selected it and advised `headLiared: true`,
+  // leaving every consumer to remember the second half of the predicate;
+  // the liar is now excluded from the candidate pool at selection, so the
+  // view answers with the HONEST original (verified, corroborated) and no
+  // publish path can notarise a transplant even by forgetting to check.
   const fs2 = MemoryFs.of({})
   const s2 = trustedStore(fs2).store
   await s2.append(evidence('c1'))
@@ -1348,11 +1358,224 @@ test('createVerifiedView.bestCheckpoint: verified / refuted / unverifiable / non
   const cp = JSON.parse(l2[2] as string) as Record<string, unknown>
   fs2.mutate(LOG, `${[...l2, JSON.stringify({ ...cp, prev: lineDigest(l2[2] as string) })].join('\n')}\n`)
   const replayed = await createVerifiedView(s2).bestCheckpoint()
-  assert.equal(replayed.signature, 'verified', 'the signature is honest — over a payload lying about WHERE')
-  assert.equal(replayed.headLiared, true, 'and only the head-liar mirror says so: publish predicates need both checks')
+  assert.equal(replayed.signature, 'verified', 'the honest original is selected — the signature is honest and so is its position')
+  assert.equal(replayed.headLiared, false)
+  assert.equal(replayed.checkpoint?.index, 2, 'the tail replay is not a candidate at all: selection enforces the publish predicate')
+  // ...and when a rewrite leaves ONLY the transplanted liar on the chain,
+  // there is nothing publishable — the transplant does not stand in.
+  const rebuilt = await rewriteHidingFailures(fs2)
+  let prevR = lineDigest(rebuilt[rebuilt.length - 1] as string)
+  const transplanted = JSON.stringify({ ...cp, prev: prevR })
+  prevR = lineDigest(transplanted)
+  const honestTail = evidence('c3')
+  fs2.mutate(LOG, `${[...rebuilt, transplanted, JSON.stringify({ v: 2, kind: 'evidence', at: '2026-10-05T00:00:00.000Z', prev: prevR, payload: honestTail })].join('\n')}\n`)
+  assert.equal(await s2.latestSignedCheckpoint(), undefined, 'a log whose only signed checkpoint lies about its position has nothing publishable')
+  assert.equal((await createVerifiedView(s2).bestCheckpoint()).signature, 'none')
+  // The walk's own charge still names the liar (audit red is the tamper
+  // verdict; selection merely refuses to publish it).
+  assert.ok((await s2.audit()).chain.headMismatches.includes(2), 'the audit charges the transplant even though selection will not publish it')
 
   // Passthrough: the view's audit is the store's audit, not a second opinion.
   const byView = await createVerifiedView(s2).audit()
   assert.equal(byView.ok, (await s2.audit()).ok)
-  assert.equal(byView.total, 2)
+})
+
+// -- Y-H-09 (v0.24): absorption is refused at READ time ------------------------
+
+test('Y-H-09: a pseudo-absorbed baseline is refused at read time — no signing boundary required', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1', 'fail'))
+  const honest = buildBaseline([evidence('c1', 'fail')], WS, new FakeClock())
+  await store.saveBaseline(honest)
+
+  // Control: a fresh signer-holding session over the HONEST chain still
+  // loads — session 1's marker sits below its own signed checkpoint, which
+  // is exactly what "vouched" means.
+  const control = trustedStore(fs).store
+  assert.notEqual(await control.loadBaseline(), undefined, 'an inherited, checkpoint-covered baseline marker is authorised history')
+
+  // THE ADVERSARY (the X-H-08 shape, canonical document included): a
+  // correctly chained, headRef-exact `baseline/saved` twin remembering the
+  // digest of a doctored-but-canonical baseline. v0.23's only defence was
+  // the NEXT signing boundary's refusal — verdicts minted against the
+  // poisoned bytes first, and a keyless deployment never detected anything.
+  const forged = buildBaseline([evidence('c1', 'pass')], WS, new FakeClock())
+  const forgedBytes = JSON.stringify(forged, null, 2)
+  fs.mutate(BASE, forgedBytes)
+  const lines = await fs.readLines(LOG)
+  let prev = lineDigest(lines[lines.length - 1] as string)
+  const twinMarker = JSON.stringify({
+    v: 2, kind: 'marker', at: '2026-10-06T00:00:00.000Z', prev,
+    payload: { label: 'baseline/saved', digest: sha256(forgedBytes), bytes: forgedBytes.length, headRef: prev },
+  })
+  fs.mutate(LOG, `${[...lines, twinMarker].join('\n')}\n`)
+
+  // The read path: no checkpoint is called, no boundary is crossed. The
+  // absorption is already a verdict for every consumer of loadBaseline/audit.
+  const session2 = trustedStore(fs).store
+  assert.equal(await session2.loadBaseline(), undefined,
+    'the poisoned document is not a baseline to verify against — the verdict path cannot mint grades over it before a refusal lands')
+  const audit = await session2.audit()
+  assert.equal(audit.chain.baselineTampered, true, 'the un-authored, un-vouched newest baseline claim is a tamper verdict at read time')
+  assert.equal(audit.ok, false)
+  assert.deepEqual(audit.chain.refusedToSign, [], 'and it did not take a refusal row to say so')
+
+  // Scope control (the three-state rule): a host holding a DIFFERENT key
+  // than every signed checkpoint is a borrowed pair of eyes — the vouch
+  // demand is scoped to the key that owns the log, so the absorption stays
+  // invisible to THIS host's digest/canonical rules (they bind what they
+  // can see: the bytes match the newest marker's digest exactly). Charging
+  // a capability gap would invert the burden of proof; the keyed host is
+  // where the charge lives.
+  const foreignKey: SignerPort = { keyId: 'another-key', sign: async () => 'x', verify: async () => false }
+  const foreign = new EvidenceStore(fs, LOG, BASE, new FakeClock(), { signer: async () => foreignKey, anchorPath: ANCHOR })
+  const foreignAudit = await foreign.audit()
+  assert.equal(foreignAudit.chain.baselineTampered, false, 'the authorship demand does not ride a foreign key — a capability gap is not an accusation')
+})
+
+// -- Y-H-02 (v0.24): signer adoption end to end --------------------------------
+
+test('Y-H-02: signer adoption — the unsigned era is a generation, not a life sentence (engine E2E)', async () => {
+  // ONE physical workspace across both eras: era 2's engine must see era 1's
+  // log, baseline and markers — that is what "adoption" means.
+  const fs = MemoryFs.of({
+    '/ws/package.json': JSON.stringify({ name: 'demo', scripts: { test: 'vitest run', build: 'tsc -b' } }),
+    '/ws/src/a.ts': 'export const a = 1\n',
+    '/ws/src/b.ts': "import { a } from './a'\nexport const b = a + 1\n",
+    '/ws/test/a.test.ts': "import { a } from '../src/a'\nvoid a\n",
+  })
+  // Era 1: no trustDir, no signer — the deployment runs unsigned.
+  const keyless = new ProofEngine({
+    root: '/ws',
+    fs,
+    commands: new FakeCommands(),
+    workspace: new FakeWorkspace('/ws'),
+    clock: new FakeClock(),
+    impactGraphLimit: 1_000,
+  })
+  await keyless.establishBaseline()
+  const unsigned = await keyless.audit()
+  assert.equal(unsigned.chain.mode, 'unsigned')
+  assert.equal(unsigned.ok, true, 'the keyless era is green on its own terms')
+
+  // Era 2: the operator installs a trust directory over the same workspace.
+  // Before the re-anchor the adoption gap is red (the keyless era's baseline
+  // claims are authored by no key this host holds) — then the documented
+  // recovery runs: re-anchor.
+  const engine = new ProofEngine({
+    root: '/ws',
+    fs,
+    commands: new FakeCommands(),
+    workspace: new FakeWorkspace('/ws'),
+    clock: new FakeClock(),
+    signer: async () => new FakeSigner(),
+    trustDir: '/trust',
+    workspaceKey: 'wskey',
+    impactGraphLimit: 1_000,
+  })
+  const mid = await engine.audit()
+  assert.equal(mid.ok, false, 'before the re-anchor, the un-vouched keyless-era baseline claims keep the audit red')
+  await engine.establishBaseline({ reason: 'signer adoption' })
+
+  const audit = await engine.audit()
+  assert.deepEqual(audit.chain.refusedToSign, [],
+    'v0.24 writes the established marker before saveBaseline\'s checkpoint, so even the design-anticipated first-boundary refusal never happens: every baseline-family newest is self-authored before the first signing boundary')
+  assert.ok((audit.chain.unsignedEraCheckpoints?.length ?? 0) >= 2,
+    'the keyless era\'s naked boundaries stay visible on their own channel')
+  assert.deepEqual(audit.chain.unsignedCheckpoints, [], 'and they are not a charge — the era is a generation, not a life sentence')
+  assert.equal(audit.ok, true,
+    'v0.23 billed the keyless era\'s naked checkpoints forever: adoption was a one-way door to a permanent red, and every later grade was capped at stale by X-H-09')
+
+  // X-H-09 consumer side: a recovered audit means grades are grades again.
+  const outcome = await engine.verify({ changed: ['src/a.ts'] })
+  assert.equal(outcome.report.grade, 'proven', 'the adoption recovered — the workspace can still prove work')
+  assert.equal(outcome.auditFailed, undefined)
+})
+
+// -- V1-M7 (v0.24): the one-line DoS charges the line, not the deployment ------
+
+test('V1-M7: an unknown-kind line is a red, not a permanent signing ban — surgery plus re-anchor recovers', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1'))
+  await store.checkpoint()
+
+  // THE ADVERSARY: one appended `ghost` line, chained correctly. v0.23: the
+  // line is malformed forever, every later checkpoint REFUSES forever (the
+  // refusal rows themselves piling up), and no documented recovery exists.
+  const lines = await fs.readLines(LOG)
+  const prev = lineDigest(lines[lines.length - 1] as string)
+  const ghost = JSON.stringify({ v: 2, kind: 'ghost', at: '2026-10-06T00:00:00.000Z', prev, payload: { note: 'no honest writer emits me' } })
+  fs.mutate(LOG, `${[...lines, ghost].join('\n')}\n`)
+  await store.checkpoint()
+
+  const attacked = await store.audit()
+  assert.deepEqual(attacked.chain.malformedCheckpoints, [2], 'the smuggled line is named on the loud channel')
+  assert.equal(attacked.chain.refusedToSign!.length, 1, 'the boundary refused to lend the key over it')
+  assert.equal(attacked.ok, false, 'the attack itself is correctly red — that charge stays')
+
+  // Operator surgery: remove ONLY the ghost line and re-chain the honest tail.
+  // The refusal rows are honest history and stay on the chain.
+  const after = await fs.readLines(LOG)
+  const kept = after.filter(l => l !== ghost)
+  const ghostAt = after.indexOf(ghost)
+  const healed: string[] = [...kept]
+  for (let i = ghostAt; i < healed.length; i++) {
+    const prevDigest = i === 0 ? GENESIS_PREV : lineDigest(healed[i - 1] as string)
+    const envelope = JSON.parse(healed[i] as string) as { prev: string; payload?: { head?: string } }
+    envelope.prev = prevDigest
+    if (envelope.payload?.head !== undefined) envelope.payload.head = prevDigest
+    healed[i] = JSON.stringify(envelope)
+  }
+  fs.mutate(LOG, `${healed.join('\n')}\n`)
+
+  // The next boundary signs again, and the OLD refusal — whose cause is gone
+  // — is pardoned by the generational slice instead of billing forever.
+  const session2 = trustedStore(fs).store
+  await session2.checkpoint()
+  const recovered = await session2.audit()
+  assert.deepEqual(recovered.chain.malformedCheckpoints, [])
+  assert.equal(recovered.chain.refusedToSign!.length, 1, 'the scar stays visible')
+  assert.deepEqual(recovered.chain.refusedToSignPardoned, [recovered.chain.refusedToSign![0]], 'Y-H-02/V1-M7: recovered generation, no longer a charge')
+  assert.equal(recovered.ok, true, 'surgery plus re-anchor is a real recovery — the DoS does not outlive its cause')
+})
+
+// -- V1-M9 (v0.24): the adopted trust labels carry the witness ------------------
+
+test('V1-M9: agent-team/economics/claim/synthetic labels carry headRef — injected twins are excluded by the reads that claim to filter', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.mark('agent-team/delegated', { hostTaskId: 'h1', engineTaskId: 'e1' })
+  await store.mark('economics/quote', { quoteId: 'q1' })
+  await store.mark('claim/jury', { claimId: 'c1', verdict: 'uphold' })
+  await store.mark('synthetic/requested', { claimId: 's1', entry: 'x' })
+  const labels = ['agent-team/delegated', 'economics/quote', 'claim/jury', 'synthetic/requested'] as const
+  for (const label of labels) {
+    const honest = await store.markersWith(label)
+    assert.equal(honest[0]?.suspect, false, `${label}: the honest write reads clean`)
+    assert.equal(typeof honest[0]?.payload.headRef, 'string', `${label}: the write stamps the position witness`)
+  }
+
+  // THE ADVERSARY: headRef-less twins appended out of band under the same
+  // labels — the exact shape that made every `excludeSuspect` read of these
+  // labels a dead channel in v0.23 (the labels were not protected, so
+  // `suspect` was structurally false and the filter never fired).
+  const lines = await fs.readLines(LOG)
+  let prev = lineDigest(lines[lines.length - 1] as string)
+  const twins = labels.map(label => {
+    const line = JSON.stringify({ v: 2, kind: 'marker', at: '2026-10-06T00:00:00.000Z', prev, payload: { label, forged: true } })
+    prev = lineDigest(line)
+    return line
+  })
+  fs.mutate(LOG, `${[...lines, ...twins].join('\n')}\n`)
+
+  for (const label of labels) {
+    const trusted = await store.markersWith(label, { excludeSuspect: true })
+    assert.equal(trusted.length, 1, `${label}: only the honest line survives the suspect filter`)
+    assert.notEqual(trusted[0]?.payload.forged, true)
+    const view = await createVerifiedView(store).markers(label)
+    assert.equal(view.degraded, false)
+    assert.equal(view.records.length, 1, `${label}: the verified view keeps the twin out of the trusted pool`)
+  }
 })

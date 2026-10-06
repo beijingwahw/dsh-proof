@@ -68,6 +68,7 @@ import type { AdapterSession } from '../shared/session.ts'
 import { applyObservation, computeDrift, emptySession, loadSession, saveSession, windowStart } from '../shared/session.ts'
 import type { DriftResult, GateOptions, StopFacts } from '../shared/gates.ts'
 import { decidePreToolUse, evaluateStop, hasBaselineOnDisk } from '../shared/gates.ts'
+import { _readMarkers } from '../../core/evidence.ts'
 import { buildPolicySection } from '../../dsh/prompt.ts'
 import { MCP_TOOLS } from '../../app/mcp-server.ts'
 
@@ -200,6 +201,67 @@ export function sanitizeBlockForModel(text: string): string {
 }
 
 /**
+ * Y-H-13 (v0.24): the digest the evidence chain remembers for the baseline
+ * FILE BYTES — the binding argument `hasBaselineOnDisk`'s W11-M4 contract
+ * shipped in v0.23 and then never received: every adapter call site invoked
+ * the probe two-argument, so the chain floor never engaged and a five-line
+ * self-consistent baseline minted with the package's own public
+ * `addressOf`/`merkleRoot` walked the ask ladder exactly like a genuine one
+ * (the audit's PoC). This read is that third argument.
+ *
+ * The rule is the ENGINE's, mirrored verbatim — core/evidence.ts's private
+ * `lastBaselineDigest`, the same selection `loadBaseline()` and `audit()`
+ * bind by: last-wins among `baseline/saved` markers whose `headRef` can vouch
+ * for their physical position; when EVERY such marker is suspect (a log
+ * written before the headRef witness existed), the last one still speaks, so
+ * an upgraded deployment keeps exactly the detection it had, never less. No
+ * marker the chain remembers means `undefined`, and `hasBaselineOnDisk` then
+ * falls to its own no-chain floor instead of to an accusation — the same
+ * degradation `loadBaseline` grants a baseline placed by a flow that never
+ * recorded a save.
+ *
+ * Line discipline: the store's `readLines` (node-ports) splits on '\n' and
+ * drops blank lines; the suspect test hashes each marker's PHYSICAL
+ * predecessor, so this split must produce the same snapshot the engine's own
+ * walk sees, or the two faces would disagree about who is suspect.
+ *
+ * Cost (deliberately uncached): a gate evaluation now reads TWO files
+ * (baseline + log) where it read one. On this host that is one extra bounded
+ * read per hook PROCESS (Claude Code spawns a process per event), and an
+ * mtime-keyed digest cache was considered and rejected anyway: it would open
+ * a staleness window exactly where freshness IS the security property (a
+ * swapped baseline must fail the very next gate call, not the first call
+ * after the log's mtime moves), and it would need a stat seam the
+ * readFile-only env contract does not carry.
+ *
+ * Mirrored in adapters/opencode/plugin.ts — keep the two in lockstep (the
+ * sanitizeBlockForModel rule).
+ */
+async function savedBaselineDigest(
+  logPath: string,
+  readFile: (abs: string) => Promise<string | undefined>,
+): Promise<string | undefined> {
+  const raw = await readFile(logPath)
+  if (raw === undefined) return undefined
+  const lines = raw.split('\n').filter(line => line.trim().length > 0)
+  const markers = _readMarkers(lines, { label: 'baseline/saved' })
+    .filter(marker => typeof marker.payload.digest === 'string')
+  const trusted = markers.filter(marker => !marker.suspect)
+  const pool = trusted.length > 0 ? trusted : markers
+  const last = pool[pool.length - 1]
+  return last === undefined ? undefined : last.payload.digest as string
+}
+
+/**
+ * The chained baseline probe every handler here uses: `hasBaselineOnDisk`
+ * bound to the digest the chain remembers, so the Y-H-13 binding runs at
+ * every call site this file owns instead of at none of them.
+ */
+async function chainedHasBaselineOnDisk(env: CcAdapterEnv): Promise<boolean> {
+  return hasBaselineOnDisk(env.paths, env.readFile, await savedBaselineDigest(env.paths.logPath, env.readFile))
+}
+
+/**
  * PreToolUse — evidence-store guard + baseline gate as a permission decision.
  *
  * `allow` is returned as undefined: Claude Code treats exit 0 with no output as
@@ -208,7 +270,7 @@ export function sanitizeBlockForModel(text: string): string {
  */
 export async function handlePreToolUse(payload: CcHookPayload, env: CcAdapterEnv): Promise<Record<string, unknown> | undefined> {
   const toolName = typeof payload.tool_name === 'string' ? payload.tool_name : ''
-  const hasBaseline = await hasBaselineOnDisk(env.paths, env.readFile)
+  const hasBaseline = await chainedHasBaselineOnDisk(env)
   const decision = decidePreToolUse(toolName, payload.tool_input ?? {}, env.paths.root, env.gate, hasBaseline)
   if (decision.action === 'allow') return undefined
   return preToolUseResponse(decision.action, decision.reason)
@@ -269,7 +331,7 @@ export async function handleStop(payload: CcHookPayload, env: CcAdapterEnv): Pro
     const facts: StopFacts = {
       drift,
       touchedCount: session.touched.length,
-      hasBaseline: await hasBaselineOnDisk(env.paths, env.readFile),
+      hasBaseline: await chainedHasBaselineOnDisk(env),
       requireBaseline: env.gate.requireBaseline,
       enforceOnTurnEnd: env.enforceOnTurnEnd,
       driftDetection: env.driftDetection,
@@ -363,7 +425,7 @@ export async function handleSessionStart(payload: CcHookPayload, env: CcAdapterE
       // precondition — PostToolUse seeds too when the file is missing.
     }
   }
-  const hasBaseline = await hasBaselineOnDisk(env.paths, env.readFile)
+  const hasBaseline = await chainedHasBaselineOnDisk(env)
   const additionalContext = `${buildPolicySection({
     discovered: [],
     hasBaseline,

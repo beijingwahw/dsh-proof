@@ -30,7 +30,7 @@ import { EvidenceStore, makeEvidence, snapshotWorkspace } from '../src/core/evid
 import type { SignerPort } from '../src/core/ports.ts'
 import { canonicalJson } from '../src/core/hash.ts'
 import { GENESIS_PREV, checkpointSignedData, lineDigest, walkChain } from '../src/core/trust.ts'
-import { TransparencyLog, loadPtl, ptlLeafHash } from '../src/core/transparency.ts'
+import { TransparencyLog, loadPtl, ptlLeafHash, sthSignedData } from '../src/core/transparency.ts'
 import type { PtlEntry, SignedTreeHead } from '../src/core/transparency.ts'
 import { NodeEd25519Signer, NodeFsPort } from '../src/node-ports.ts'
 import { FakeClock, spec } from './helpers.ts'
@@ -733,7 +733,10 @@ test('W9-M5: a checkpoint signed for a FOREIGN workspace identity is refused, no
   await fsp.mkdir(wsRoot, { recursive: true })
   const cPaths = deriveProofPaths({ root: wsRoot, trustRoot, evidenceStore: 'host' })
   const key = await NodeEd25519Signer.load(join(trustRoot, 'keys'))
-  const payload = { count: 0, head: sha256Hex('cross-head'), workspaceKey: 'ws-somewhere-else', at: AT }
+  // v0.24 (Y-H-01): the fixture's head is now the HONEST genesis digest — the
+  // position must not lie, or the head-liar filter (a different, earlier
+  // refusal) answers instead of the workspace cross-check under test.
+  const payload = { count: 0, head: GENESIS_PREV, workspaceKey: 'ws-somewhere-else', at: AT }
   const envelope = {
     v: 2,
     kind: 'checkpoint',
@@ -803,5 +806,159 @@ test('W9-M9: malformed lines in the entries file are surfaced and fail the self-
   assert.equal(out.badLines, 1, 'the damage is counted in the output')
   assert.equal(out.checks.rootMatch, true, 'the readable prefix still agrees with the head — the damage is named, not smeared')
   assert.ok(out.notes.some(n => n.includes('malformed')), JSON.stringify(out.notes))
+})
+
+// ---------------------------------------------------------------------------
+// v0.24 fix batch — Y-H-01 (a genuinely-signed checkpoint at a lying chain
+// position is never publishable: the CLI half of the publish predicate
+// `verified && !headLiared`), V4-M5 (the stored-head refusals fire BEFORE
+// the log is touched: rotation and unparseable bytes never leave a
+// half-published entry), V4-L10 (an empty log's self-check failure names
+// the state), V4-L12 (a repeated flag is a loud usage error, not a silent
+// last-wins).
+// ---------------------------------------------------------------------------
+
+test('Y-H-01: a genuinely-signed checkpoint transplanted to a lying position is never published', async () => {
+  // The transplant: a REAL engine-key signature over a payload whose `head`
+  // was computed for another position (or nothing at all). The count is
+  // honest for the tail and `prev` chains correctly, so the walk calls the
+  // line well-formed — only the head-field lies about where the chain is.
+  // The signature VERIFIES (it is real), so the newest-first scan used to
+  // pick it: a position forgery wearing a genuine key into the public log.
+  const logPath = paths.logPath
+  const lines = (await fsp.readFile(logPath, 'utf8')).split('\n').filter(l => l.trim().length > 0)
+  const walk0 = walkChain(lines)
+  const lastLine = lines[lines.length - 1] as string
+  const key = await NodeEd25519Signer.load(join(TRUST_DIR, 'keys'))
+  const payload = { count: walk0.records, head: sha256Hex('transplanted-head'), workspaceKey: paths.workspaceKey, at: AT }
+  const transplant = JSON.stringify({
+    v: 2,
+    kind: 'checkpoint',
+    at: AT,
+    prev: lineDigest(lastLine),
+    payload,
+    sig: await key.sign(checkpointSignedData(payload)), // genuinely signed
+    keyId: key.keyId,
+  })
+  await fsp.writeFile(logPath, `${[...lines, transplant].join('\n')}\n`, 'utf8')
+  try {
+    const dir = join(TMP, 'ptl-transplant')
+    const { code, stdout, stderr } = await runCli(['append', '--log', dir])
+    assert.equal(code, 0, `the earlier honestly-positioned checkpoint still publishes: ${stderr}`)
+    const out = parseSingleLine(stdout) as { sequence: number; treeSize: number }
+    assert.equal(out.treeSize, 1)
+    const published = JSON.parse(
+      (await fsp.readFile(join(dir, 'ptl-entries.jsonl'), 'utf8')).split('\n')[0] as string,
+    ) as { keyId: string; head: string; count: number }
+    assert.equal(published.keyId, engineKeyId)
+    assert.notEqual(published.head, sha256Hex('transplanted-head'), 'the position liar never entered the public log')
+    const honest = walk0.checkpoints.findLast(cp => cp.keyId === engineKeyId && !cp.headLiared)
+    assert.ok(honest !== undefined, 'fixture: an honestly-positioned checkpoint exists under the engine key')
+    assert.equal(published.head, honest.payload.head, 'the newest HONESTLY-POSITIONED checkpoint is the publication')
+    assert.equal(published.count, honest.payload.count)
+  } finally {
+    // Restore the honest tail so later tests see the pristine log.
+    await fsp.writeFile(logPath, `${lines.join('\n')}\n`, 'utf8')
+  }
+})
+
+test('Y-H-01: a chain whose ONLY checkpoint is positionally lying is a loud refusal, never a publish', async () => {
+  const wsRoot = join(TMP, 'ws-liar-only')
+  const trustRoot = join(TMP, 'trust-liar-only')
+  await fsp.mkdir(wsRoot, { recursive: true })
+  const key = await NodeEd25519Signer.load(join(trustRoot, 'keys'))
+  const lPaths = deriveProofPaths({ root: wsRoot, trustRoot, evidenceStore: 'host' })
+  // One checkpoint at genesis: count honest (0 records), signature genuine,
+  // `head` a lie about what the chain's first position hashes to.
+  const payload = { count: 0, head: sha256Hex('genesis-lie'), workspaceKey: lPaths.workspaceKey, at: AT }
+  const envelope = {
+    v: 2,
+    kind: 'checkpoint',
+    at: AT,
+    prev: GENESIS_PREV,
+    payload,
+    sig: await key.sign(checkpointSignedData(payload)),
+    keyId: key.keyId,
+  }
+  await fsp.mkdir(join(lPaths.logPath, '..'), { recursive: true })
+  await fsp.writeFile(lPaths.logPath, `${JSON.stringify(envelope)}\n`, 'utf8')
+  const { code, stdout, stderr } = await runCli(
+    ['append', '--log', join(TMP, 'ptl-liar-only')],
+    { DSH_PROOF_ROOT: wsRoot, DSH_PROOF_TRUST_DIR: trustRoot },
+  )
+  assert.equal(code, 1, 'a genuine signature over a lying position is a forgery of position')
+  assert.equal(stdout.trim().length, 0)
+  assert.ok(stderr.includes('swears a chain head its own position contradicts'), `names the position forgery: ${stderr}`)
+  assert.ok(!stderr.includes('    at '), 'no stack traces, ever')
+})
+
+test('V4-M5: logId rotation is refused BEFORE the log is touched — no half-published entry', async () => {
+  // A log whose stored head names a DIFFERENT operator (a re-keyed or
+  // foreign-run directory). savePtlHead's rotation gate fires at head-write
+  // time — which is AFTER the append — so without the preflight the entry
+  // landed on the public log with no valid head over it: the exact
+  // half-published state the fronting order promises never to produce.
+  const rotated = join(TMP, 'ptl-rotated')
+  await fsp.mkdir(rotated, { recursive: true })
+  const otherOperator = await NodeEd25519Signer.load(join(TMP, 'other-operator-key'))
+  const otherUnsigned = { logId: otherOperator.keyId, treeSize: 1, root: sha256Hex('any-root'), at: AT }
+  await fsp.writeFile(
+    join(rotated, 'sth.json'),
+    JSON.stringify({ ...otherUnsigned, sig: await otherOperator.sign(sthSignedData(otherUnsigned)) }),
+    'utf8',
+  )
+
+  const { code, stdout, stderr } = await runCli(['append', '--log', rotated])
+  assert.equal(code, 1, 'the operator identity auditors pin may not flip mid-log')
+  assert.equal(stdout.trim().length, 0)
+  assert.ok(stderr.includes('refusing to change the transparency log operator'), `names the rotation: ${stderr}`)
+  assert.ok(stderr.includes('BEFORE anything was appended'), `the pre-mutation side of the gate speaks: ${stderr}`)
+  await assert.rejects(fsp.stat(join(rotated, 'ptl-entries.jsonl')), 'no entry was appended — the half-published state is unreachable')
+})
+
+test('Y-H-06 (CLI): unparseable bytes planted in sth.json refuse the publish BEFORE any entry lands', async () => {
+  const garbage = join(TMP, 'ptl-garbage-head')
+  await fsp.mkdir(garbage, { recursive: true })
+  await fsp.writeFile(join(garbage, 'sth.json'), '{oops', 'utf8')
+  const { code, stdout, stderr } = await runCli(['append', '--log', garbage])
+  assert.equal(code, 1, 'unparseable is not "no head on record" (cold start)')
+  assert.equal(stdout.trim().length, 0)
+  assert.ok(stderr.includes('not a parseable signed tree head'), `names the unreadable commitment: ${stderr}`)
+  await assert.rejects(fsp.stat(join(garbage, 'ptl-entries.jsonl')), 'no entry was appended behind an unreadable prior commitment')
+})
+
+test('V4-L10: self-verify on an empty log names the state instead of failing wordlessly', async () => {
+  const emptyLog = join(TMP, 'ptl-empty-note')
+  await fsp.mkdir(emptyLog, { recursive: true })
+  const { code, stdout } = await runCli(['verify', '--log', emptyLog])
+  assert.equal(code, 1, 'a self-check of nothing is not a pass')
+  const out = parseSingleLine(stdout) as {
+    ok: boolean
+    treeSize: number
+    checks: { rootMatch: boolean }
+    notes: string[]
+  }
+  assert.equal(out.ok, false)
+  assert.equal(out.treeSize, 0)
+  assert.equal(out.checks.rootMatch, false)
+  assert.ok(
+    out.notes.some(n => n.includes('nothing has been published to this log yet')),
+    `the empty state is named, not smeared: ${JSON.stringify(out.notes)}`,
+  )
+})
+
+test('V4-L12: a repeated flag is a loud usage error, not a silent last-wins', async () => {
+  const firstLog = join(TMP, 'ptl-dup-first')
+  const secondLog = join(TMP, 'ptl-dup-second')
+  const dup = await runCli(['append', '--log', firstLog, '--log', secondLog])
+  assert.equal(dup.code, 2)
+  assert.ok(dup.stderr.includes('duplicate flag: --log'), `names the duplicate: ${dup.stderr}`)
+  assert.equal(dup.stdout.trim().length, 0)
+  await assert.rejects(fsp.stat(join(firstLog, 'ptl-entries.jsonl')), 'the first spelling was never published to')
+  await assert.rejects(fsp.stat(join(secondLog, 'ptl-entries.jsonl')), 'the last spelling never silently won either')
+  // The verify face refuses duplicates the same way.
+  const dupBundle = await runCli(['verify', '--log', PTL_DIR, '--bundle', 'a.json', '--bundle', 'b.json'])
+  assert.equal(dupBundle.code, 2)
+  assert.ok(dupBundle.stderr.includes('duplicate flag: --bundle'))
 })
 

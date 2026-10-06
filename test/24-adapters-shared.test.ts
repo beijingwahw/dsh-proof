@@ -19,8 +19,8 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 import {
-  assertAbsoluteTrustRoot, deriveProofPaths, foldHostPath, normalizeWorkspaceRoot, resolveAdapterEnv,
-  touchesEvidencePath, workspaceKeyPair,
+  assertAbsoluteTrustRoot, deriveProofPaths, foldHostPath, guardedTargets, isAbsoluteHostPath,
+  normalizeWorkspaceRoot, resolveAdapterEnv, SIGNING_KEY_FILE_NAMES, touchesEvidencePath, workspaceKeyPair,
 } from '../src/adapters/shared/paths.ts'
 import {
   applyObservation, computeDrift, emptySession, loadSession, saveSession, sessionPath, windowStart,
@@ -623,13 +623,31 @@ test('a corrupt, foreign or absent session file reads as "start over", never as 
   const dir = `${SESSION_TMP}/broken`
   await fsp.mkdir(dir, { recursive: true })
   await fsp.writeFile(join(dir, 'garbage.json'), '{not json at all', 'utf8')
+  await fsp.writeFile(join(dir, 'scalar.json'), '42', 'utf8')
   await fsp.writeFile(join(dir, 'foreign.json'), JSON.stringify({ hello: 'world' }), 'utf8')
   await fsp.writeFile(join(dir, 'half.json'), JSON.stringify({ touched: 'not-an-array' }), 'utf8')
 
-  assert.equal(await loadSession(dir, 'garbage.json'), undefined, 'unparsable bytes')
-  assert.equal(await loadSession(dir, 'foreign.json'), undefined, 'valid JSON that is not a session')
-  assert.equal(await loadSession(dir, 'half.json'), undefined, 'a session shape with a rotten field')
-  assert.equal(await loadSession(dir, 'missing'), undefined, 'never written')
+  // V5-L2: ALL damage routes announce, not just the digest mismatch — the
+  // cheap forgeries (garbage bytes, a foreign object) must not be the QUIET
+  // ones while the expensive one is loud. An ABSENT file stays silent: a
+  // first run is not damage. (Ids carry no '.json' suffix: sessionPath adds
+  // it, and the pre-v0.24 spelling of this test read 'garbage.json.json' —
+  // silently pinning the ABSENT route while claiming to pin the parse one.)
+  const complaints: string[] = []
+  const sink = (line: string): void => { complaints.push(line) }
+  assert.equal(await loadSession(dir, 'garbage', sink), undefined, 'unparsable bytes')
+  assert.equal(await loadSession(dir, 'scalar', sink), undefined, 'valid JSON that is not an object')
+  assert.equal(await loadSession(dir, 'foreign', sink), undefined, 'valid JSON that is not a session')
+  assert.equal(await loadSession(dir, 'half', sink), undefined, 'a session shape with a rotten field')
+  assert.equal(complaints.length, 4, `every damaged route announces exactly once: ${complaints.join(' | ')}`)
+  assert.ok(complaints[0]!.includes('not parsable JSON'), 'the parse failure names its damage')
+  assert.ok(complaints[1]!.includes('not a session object'), 'the non-object failure names its damage')
+  assert.ok(complaints[2]!.includes('not shaped like a session'), 'the foreign-object failure names its damage')
+  assert.ok(complaints[3]!.includes('not shaped like a session'), 'the shape failure names its damage')
+
+  const absent: string[] = []
+  assert.equal(await loadSession(dir, 'missing', line => absent.push(line)), undefined, 'never written')
+  assert.deepEqual(absent, [], 'an absent snapshot is a first run, not damage — no announcement')
 })
 
 test('a hostile session id becomes a filename, never a path', async () => {
@@ -955,7 +973,7 @@ test('decidePreToolUse: X-H-13 — the command sweep reads VALUES, not key names
   )
 })
 
-test('decidePreToolUse: X-H-13 bounds — depth ≤ 3, single string ≤ 8k, at most 64 strings', () => {
+test('decidePreToolUse: X-H-13/Y-H-10 — depth ≤ 3, and a DOUBLE-ENDED sweep window no ladder climbs', () => {
   const gates = { ...WS_GATES, trustRoot: '/trust' }
   const needle = 'echo x > .proof/evidence.jsonl'
   // Depth: a command nested three levels down is reachable…
@@ -972,29 +990,113 @@ test('decidePreToolUse: X-H-13 bounds — depth ≤ 3, single string ≤ 8k, at 
     'allow',
     'past depth 3 the sweep stops (bound pinned deliberately)',
   )
-  // 8k: a longer command string is not swept (same trade).
+  // >8k string: the TAIL is kept (截头保尾) — redirect targets and trailing
+  // commands live at the END of real shell strings. Pre-v0.24 the two sweep
+  // copies forked here exactly: the gates' local copy dropped the whole
+  // string, the observe copy kept only its head — 8k of padding ahead of the
+  // store write hid it from one face and 8k after it hid it from the other.
   assert.equal(
     decidePreToolUse('run', { commandLine: `${'x'.repeat(9_000)} ${needle}` }, ROOT, gates, true).action,
-    'allow',
-    'a >8k string is past the bound',
+    'deny',
+    'a >8k string keeps its last 8192 chars — a TAIL needle lands (head padding no longer hides it)',
+  )
+  // v0.24: oversize strings keep BOTH end windows — a needle at the head is
+  // swept too; only the strict middle of a >2x-budget string is outside
+  // every window (the documented residual).
+  assert.equal(
+    decidePreToolUse('run', { commandLine: `${needle} && ${'x'.repeat(9_000)}` }, ROOT, gates, true).action,
+    'deny',
+    'a HEAD needle of an over-budget string lands in the head window (trailing padding no longer hides it)',
   )
   assert.equal(
     decidePreToolUse('run', { commandLine: `${'x'.repeat(1_000)} ${needle}` }, ROOT, gates, true).action,
     'deny',
-    'a ≤8k string carrying the needle is swept',
+    'a ≤8k string carrying the needle is swept whole',
   )
-  // 64 strings: with 63 clean values the needle lands inside the bound…
+  // 64 strings: with 63 clean values the needle lands inside the window…
   const within: Record<string, string> = {}
   for (let i = 0; i < 63; i++) within[`k${i}`] = `clean-${i}`
   within.cmd = needle
   assert.equal(decidePreToolUse('run', within, ROOT, gates, true).action, 'deny', 'within 64 strings the needle lands')
-  // …with 64 clean values first, the needle is the 65th string and is not
-  // swept — the bound is pinned deliberately (see the sweep's doc).
-  const past: Record<string, string> = {}
-  for (let i = 0; i < 64; i++) past[`k${i}`] = `clean-${i}`
-  past.cmd = needle
-  assert.equal(decidePreToolUse('run', past, ROOT, gates, true).action, 'allow',
-    'past 64 strings the sweep stops (bound pinned deliberately)')
+  // …and the pads-first ladder is DEAD: 64 clean values ahead of the needle
+  // used to make it the unswept 65th string (insertion-order first-64); the
+  // window now keeps the FIRST 32 and the LAST 32, and the real command —
+  // the last string — is always inside.
+  const padsFirst: Record<string, string> = {}
+  for (let i = 0; i < 64; i++) padsFirst[`k${i}`] = `clean-${i}`
+  padsFirst.cmd = needle
+  assert.equal(decidePreToolUse('run', padsFirst, ROOT, gates, true).action, 'deny',
+    'the LAST string is always swept (Y-H-10: pads-first no longer climbs past the bound)')
+  // The middle residual: padding on BOTH sides buries the needle between the
+  // first 32 and the last 32 — the deliberate price of a bounded sweep, and
+  // the reason the STRUCTURAL path guard (next test) stays load-bearing: a
+  // path-KEYED value the textual middle window hides is still folded and
+  // compared by the store guard.
+  const middle: Record<string, string> = {}
+  for (let i = 0; i < 40; i++) middle[`a${i}`] = `clean-${i}`
+  middle.cmd = needle
+  for (let i = 0; i < 40; i++) middle[`z${i}`] = `clean-${i}`
+  assert.equal(decidePreToolUse('run', middle, ROOT, gates, true).action, 'allow',
+    'a needle buried between the two window halves is the documented middle residual')
+})
+
+test('decidePreToolUse: Y-H-10 — the textual middle window cannot smuggle a PATH-KEYED store write past the STRUCTURAL guard', () => {
+  // The audit's composite PoC: 64 pads ahead of `file_path` used to beat the
+  // first-64 textual window, and the workspace branch's old local fold was
+  // blind to the device-prefix / trailing-dot spellings — the two failures
+  // stacked into an unasked direct write. Both halves are fixed; this pin
+  // drives the STACK through the gates: the needle sits in the textual
+  // middle residual (81 strings, position 41) and must still DENY through
+  // the structured touchesEvidencePath fold (Y-H-12's fold, shared).
+  const gates = { ...WS_GATES, requireBaseline: 'off' as const }
+  const spellings = [
+    String.raw`\\?\C:\ws\.proof\evidence.jsonl`, // device-prefixed: verbatim passthrough to CreateFile
+    '.proof./evidence.jsonl', // Win32 trailing-dot deformation
+    `${'C:/ws'.toUpperCase()}/.PROOF/EVIDENCE.jsonl`, // case-folded absolute
+  ]
+  for (const file_path of spellings) {
+    const args: Record<string, string> = {}
+    for (let i = 0; i < 40; i++) args[`a${i}`] = `clean-${i}`
+    args.file_path = file_path
+    for (let i = 0; i < 40; i++) args[`z${i}`] = `clean-${i}`
+    const verdict = decidePreToolUse('write', args, 'C:\\ws', gates, true)
+    assert.equal(verdict.action, 'deny',
+      'a path-keyed store spelling in the textual middle window still hits the structural fold')
+    if (verdict.action === 'deny') assert.match(verdict.reason, /evidence store/)
+  }
+  // Same construction, innocent path: allow — the middle window is not an
+  // excuse to over-deny ordinary writes.
+  const innocent: Record<string, string> = {}
+  for (let i = 0; i < 40; i++) innocent[`a${i}`] = `clean-${i}`
+  innocent.file_path = 'src/a.ts'
+  for (let i = 0; i < 40; i++) innocent[`z${i}`] = `clean-${i}`
+  assert.equal(decidePreToolUse('write', innocent, 'C:\\ws', gates, true).action, 'allow')
+})
+
+test('decidePreToolUse: Y-H-10/Y-H-12 — the drive-relative spelling rides the same stack (per-drive CWD = workspace root)', async () => {
+  // The hook contract puts the workspace at the process CWD; `C:.proof/x`
+  // names `<CWD>/.proof/x` on the CWD's own drive. Drive-relative projection
+  // is only faithful from inside that world, so this test chdirs (the X-H-12
+  // devpath test's discipline). Non-Windows has no per-drive CWD.
+  if (process.platform !== 'win32') return
+  const wsRoot = `${SESSION_TMP}/midwin-ws`
+  await fsp.mkdir(wsRoot, { recursive: true })
+  const gates = { evidenceStore: 'workspace' as const, evidenceDir: '.proof', requireBaseline: 'off' as const }
+  const previousCwd = process.cwd()
+  process.chdir(wsRoot)
+  try {
+    const drive = wsRoot[0]
+    const args: Record<string, string> = {}
+    for (let i = 0; i < 40; i++) args[`a${i}`] = `clean-${i}`
+    args.file_path = `${drive}:.proof/evidence.jsonl`
+    for (let i = 0; i < 40; i++) args[`z${i}`] = `clean-${i}`
+    const verdict = decidePreToolUse('write', args, wsRoot.replace(/\//g, '\\'), gates, true)
+    assert.equal(verdict.action, 'deny',
+      'the drive-relative store spelling, buried mid-window from the textual sweep, hits the structural fold')
+    if (verdict.action === 'deny') assert.match(verdict.reason, /evidence store/)
+  } finally {
+    process.chdir(previousCwd)
+  }
 })
 
 test('decidePreToolUse: X-H-14 consumer side — unknown or case-variant PATH KEYS cannot smuggle the store', () => {
@@ -1014,6 +1116,144 @@ test('decidePreToolUse: X-H-14 consumer side — unknown or case-variant PATH KE
       'deny',
       `the gate denies the store under any key spelling: ${JSON.stringify(input)}`,
     )
+  }
+})
+
+test('decidePreToolUse: Y-H-11 — signing-key exfiltration is denied on the ADAPTER face too (textual and structural)', () => {
+  const TRUST = '/trust/proof-home'
+  const gates = { ...HOST_GATES, trustRoot: TRUST }
+  // The audit's PoC: `cp <trust>/keys/proof-signing-key.pem <tmp>` used to
+  // ALLOW here — the target set had neither the file names nor the keys dir,
+  // and the private key is the ability to forge every checkpoint signature.
+  // Textual half: the bare file name is a target in every mode.
+  for (const command of [
+    `cp ${TRUST}/keys/proof-signing-key.pem /tmp/stolen.pem`,
+    `cat ${TRUST}\\keys\\proof-signing-key.pub.pem`,
+    'cp proof-signing-key.pem .',
+  ]) {
+    assert.equal(
+      decidePreToolUse('bash', { command }, ROOT, gates, true).action,
+      'deny',
+      `a command naming a signing key is refused: ${command}`,
+    )
+  }
+  // Structural half: an absolute write into the keys directory folds into the
+  // trust-side guardedDirs (a file-level addition — not the whole trust root).
+  for (const target of [`${TRUST}/keys/proof-signing-key.pem`, `${TRUST}/keys/proof-signing-key.pub.pem`]) {
+    const verdict = decidePreToolUse('write', { file_path: target }, ROOT, gates, true)
+    assert.equal(verdict.action, 'deny', `an absolute write into ${target} is denied`)
+    if (verdict.action === 'deny') assert.match(verdict.reason, /absolute/)
+  }
+  // The names stay bare in the workspace-mode target set too — a mention of a
+  // key file is worth refusing wherever it points.
+  assert.equal(
+    decidePreToolUse('bash', { command: 'cp proof-signing-key.pem .' }, ROOT, WS_GATES, true).action,
+    'deny',
+    'workspace mode guards the bare key file names as well',
+  )
+})
+
+test('decidePreToolUse + guardedTargets: V5-M1 — the bare store DIRECTORY and the default trust root\'s ~/$ spellings are targets on BOTH faces', () => {
+  // Whole-tree deletions name no file inside the tree: `rm -rf <store-dir>`
+  // used to pass the adapter face (only the two FILES were listed) and
+  // `rm -rf ~/.dsh/proof` passed BOTH faces (no absolute needle matches a
+  // variable). The shared constructor lists both.
+  const TRUST = '/trust/proof-home'
+  const pair = workspaceKeyPair(ROOT)
+  const key = pair.normalized === pair.legacy ? pair.normalized : pair.legacy
+  const hostGates = { ...HOST_GATES, trustRoot: TRUST }
+  for (const command of [
+    `rm -rf ${TRUST}/workspaces/${key}`, // bare store directory, legacy identity spelling
+    `rm -rf ${TRUST}/workspaces/${pair.normalized}`, // …and the canonical one
+    `rm -rf ${TRUST}/adapter-sessions/${key}`,
+  ]) {
+    assert.equal(
+      decidePreToolUse('bash', { command }, ROOT, hostGates, true).action,
+      'deny',
+      `whole-tree deletions of trust-side state are refused: ${command}`,
+    )
+  }
+
+  // The tilde/env spellings fire only for the DEFAULT trust root. Isolate
+  // DSH_HOME so the default is deterministic, then arm both spellings.
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = '/xdsh'
+  try {
+    const defaultGates = { ...HOST_GATES, trustRoot: '/xdsh/proof' }
+    for (const command of [
+      'rm -rf ~/.dsh/proof',
+      'rm -rf $dsh_home/proof',
+      'rm -rf ${dsh_home}/proof',
+      'rm -rf $HOME/.dsh/proof',
+      'rm -rf ~\\.dsh\\proof', // separator variant folds the same way
+    ]) {
+      assert.equal(
+        decidePreToolUse('bash', { command }, ROOT, defaultGates, true).action,
+        'deny',
+        `a variable spelling of the default trust root is refused: ${command}`,
+      )
+    }
+    // A CUSTOM trust root does not arm the literals (its own absolute needle
+    // covers it) — `~/.dsh/proof` names a directory this deployment does not
+    // use, and the historical allow must not regress into noise.
+    const customGates = { ...HOST_GATES, trustRoot: TRUST }
+    assert.equal(
+      decidePreToolUse('bash', { command: 'ls ~/.dsh/proof' }, ROOT, customGates, true).action,
+      'allow',
+      'the tilde literals are armed only for the default trust root',
+    )
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+  }
+})
+
+test('guardedTargets: the ONE target-set constructor both faces consume (contract)', () => {
+  const pair = workspaceKeyPair(ROOT)
+  const keys = pair.normalized === pair.legacy ? [pair.normalized] : [pair.normalized, pair.legacy]
+  const targets = guardedTargets(ROOT, { evidenceStore: 'host', evidenceDir: '.proof', trustRoot: '/trust' })
+  // Host mode: every identity's store directory AND files, the anchors, the
+  // session ledgers, the keys dir, and the bare signing-key names.
+  for (const key of keys) {
+    for (const expected of [
+      `/trust/workspaces/${key}`,
+      `/trust/workspaces/${key}/evidence.jsonl`,
+      `/trust/workspaces/${key}/baseline.json`,
+      `/trust/anchors/${key}`,
+      `/trust/adapter-sessions/${key}`,
+    ]) {
+      assert.ok(targets.includes(expected), `host-mode target set lists ${expected}`)
+    }
+  }
+  assert.ok(targets.includes('/trust/keys'), 'the signing-key directory is a target')
+  assert.ok(targets.includes('/trust/proof-signing-key.pem') === false,
+    'the under-trust key spelling rides the bare name, not a trust-qualified duplicate')
+  for (const name of SIGNING_KEY_FILE_NAMES) {
+    assert.ok(targets.includes(name), `the bare signing-key name ${name} guards every mode`)
+  }
+  // Workspace mode adds the store segment spellings and keeps everything else.
+  const wsTargets = guardedTargets(ROOT, { evidenceStore: 'workspace', evidenceDir: '.proof', trustRoot: '/trust' })
+  for (const expected of ['.proof', '.proof/evidence.jsonl', '.proof/baseline.json', '/ws/.proof']) {
+    assert.ok(wsTargets.includes(expected), `workspace-mode target set lists ${expected}`)
+  }
+  for (const target of targets) {
+    assert.ok(wsTargets.includes(target), `workspace mode guards everything host mode does: ${target}`)
+  }
+  // No trust root: the historical contract — store segment only, plus the
+  // bare key names (Y-H-11 guards them even bare).
+  const bare = guardedTargets(ROOT, { evidenceStore: 'workspace', evidenceDir: '.proof' })
+  assert.deepEqual(bare, ['.proof', '.proof/evidence.jsonl', '.proof/baseline.json', '/ws/.proof', '/ws/.proof/evidence.jsonl', '/ws/.proof/baseline.json', ...SIGNING_KEY_FILE_NAMES])
+})
+
+test('isAbsoluteHostPath: the ONE absolute-path rule, UNC arms included (V5-M6)', () => {
+  // index.ts's retired third mirror lacked the backslash-UNC arm; the shared
+  // export carries it, so a UNC evidenceDir derives an absolute log path on
+  // every face.
+  for (const absolute of ['C:/x', 'C:\\x', '\\\\server\\share\\x', '//server/share/x', '/x']) {
+    assert.equal(isAbsoluteHostPath(absolute), true, `${absolute} is absolute`)
+  }
+  for (const relative of ['rel/x', '.\\proof', 'C:rel', 'proof']) {
+    assert.equal(isAbsoluteHostPath(relative), false, `${relative} is relative`)
   }
 })
 
@@ -1371,8 +1611,8 @@ test('Config schema: syntheticDir keeps the conjure sandbox inside the workspace
   assert.equal((Config({ syntheticDir: '.proof-synthetic' } as never) as { syntheticDir: string }).syntheticDir, '.proof-synthetic')
 })
 
-test('Config schema: evidenceDir rejects runtime-collapsing segments (W11-L-H) and degenerate ones (M-48)', () => {
-  for (const bad of ['.', './', '', '/abs', 'a/..', 'a\\..', 'a/../b']) {
+test('Config schema: evidenceDir rejects runtime-collapsing segments (W11-L-H), degenerate ones (M-48) and drive-absolute spellings (V5-M3)', () => {
+  for (const bad of ['.', './', '', '/abs', 'a/..', 'a\\..', 'a/../b', 'C:/abs', 'C:\\abs', 'D:rel']) {
     assert.throws(() => Config({ evidenceDir: bad } as never), /match regexp/,
       `evidenceDir ${JSON.stringify(bad)} is rejected`)
   }
@@ -1396,6 +1636,23 @@ test('Config schema: the κ/certify knobs live on the OPEN interval (0,1) (W6-F2
   assert.equal(defaults.certifyTarget, 0.97)
   assert.equal(defaults.classBTrust, 0.7)
   assert.equal(defaults.classCTrust, 0.9)
+})
+
+test('Config schema: ζ and β join the open interval — the last two closed-percent knobs (V5-M4)', () => {
+  // ζ=1 (juryConfidenceCap) removes the docs-only confidence ceiling entirely;
+  // β=0 (syntheticFalsePass) prices an interested party's own conjured test
+  // at "cannot falsely pass", cancelling the synthetic-weaker-than-organic
+  // premise the π contract rests on. Both ends clamp like their three
+  // siblings; the defaults are unchanged.
+  for (const knob of ['juryConfidenceCap', 'syntheticFalsePass'] as const) {
+    assert.throws(() => Config({ [knob]: 0 } as never), /expected number >= 0\.01/, `${knob}: 0 is out of domain`)
+    assert.throws(() => Config({ [knob]: 1 } as never), /expected number <= 0\.99/, `${knob}: 1 is out of domain`)
+    const inside = Config({ [knob]: 0.5 } as never) as unknown as Record<string, number>
+    assert.equal(inside[knob], 0.5, `${knob}: mid-band values pass`)
+  }
+  const defaults = Config({} as never) as unknown as Record<string, number>
+  assert.equal(defaults.juryConfidenceCap, 0.8)
+  assert.equal(defaults.syntheticFalsePass, 0.15)
 })
 
 test('Config schema: impactGraphLimit and lspQueryBudget keep positive domains (W11-L-E)', () => {

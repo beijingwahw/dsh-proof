@@ -32,19 +32,24 @@ import { sha256 } from '../core/hash.ts'
  * the false charge. Callers that must not miss (the evidence guard) pass
  * `{contentKeys: true}` to re-admit the key.
  */
-const PATH_KEYS = ['path', 'file', 'file_path', 'filePath', 'target', 'filename', 'dest', 'destination', 'notebook_path', 'dir']
-const PATH_ARRAY_KEYS = ['paths', 'files', 'targets', 'globs', 'patterns']
+const PATH_KEYS = ['path', 'file', 'file_path', 'filePath', 'target', 'filename', 'dest', 'destination', 'notebook_path', 'dir', 'directory', 'folder', 'uri']
+const PATH_ARRAY_KEYS = ['paths', 'files', 'targets', 'globs', 'patterns', 'directories', 'folders', 'uris']
 
 /**
- * X-H-14 (v0.23): key matching is CASE-INSENSITIVE. Hosts spell the same key
- * as `FileName`, `FILE_PATH` or `Path` — the case-sensitive `includes` used to
- * extract nothing from `{FileName: '.proof/evidence.jsonl'}`, so even the
- * guard's over-detecting `contentKeys` view could not see a store write the
- * tool named under one capital letter. Values keep their case (only the ROOT
- * comparison folds); keys fold here, once, into the sets `pathsIn` consults.
+ * X-H-14 (v0.23) / V5-M2 (v0.24): key matching folds CASE and SEPARATORS.
+ * Hosts spell the same key as `FileName`, `FILE_PATH`, `File-Name` or
+ * `file name` — the pre-v0.23 case-sensitive `includes` extracted nothing
+ * from `{FileName: '.proof/evidence.jsonl'}`, and the v0.23 case-only fold
+ * still missed every separator variant (`file-name` ≠ `file_name` ≠
+ * `filename` after lowercasing alone). The fold here strips spaces,
+ * underscores and hyphens after lowercasing, so every spelling of a name
+ * lands on one form; values keep their case (only the ROOT comparison
+ * folds). The X2 plan named `directory`/`folder`/`uri` alongside — all
+ * three (and their array forms) are in the lists above since v0.24.
  */
-const PATH_KEY_SET = new Set(PATH_KEYS.map(key => key.toLowerCase()))
-const PATH_ARRAY_KEY_SET = new Set(PATH_ARRAY_KEYS.map(key => key.toLowerCase()))
+const foldKey = (key: string): string => key.toLowerCase().replace(/[\s_-]/g, '')
+const PATH_KEY_SET = new Set(PATH_KEYS.map(foldKey))
+const PATH_ARRAY_KEY_SET = new Set(PATH_ARRAY_KEYS.map(foldKey))
 
 /**
  * Tool-name classification — the single source both adapter layers consult
@@ -206,54 +211,130 @@ export function shellCommandMentionsPath(command: string, targets: readonly stri
 }
 
 /**
- * X-H-13 (v0.23): every string value in a tool call's arguments, collected
- * for the guard's value sweep — the death of the key-name whitelist.
+ * X-H-13 (v0.23), Y-H-10 (v0.24): every string value in a tool call's
+ * arguments, collected for the guard's value sweep — the death of the
+ * key-name whitelist, and now THE one sweep both guard faces consume
+ * (src/index.ts and adapters/shared/gates.ts; the gates' pre-v0.24 local
+ * copy is retired onto this export — two copies had already forked on the
+ * >8k handling, drop-here vs truncate-there, and the fork was exactly the
+ * seam the audit walked a 9000-character command through).
  *
  * The pre-v0.23 command sweep read exactly three keys (`command`/`cmd`/
  * `script`), so `{commandLine: …}`, `{code: …}` and mixed argv vectors
  * carried store-writing commands straight through every gate; before that,
  * the shell TOOL-NAME list was the hole. Names and keys are both attacker
  * spellings — this sweep enumerates NEITHER: it walks the argument object's
- * values (arrays contribute their elements individually; nested objects
- * recurse) and hands back every string it finds, and the guard refuses any
- * call whose ANY string value mentions a protected path.
+ * values (arrays contribute their string elements as ONE joined command
+ * line when the join fits the per-string budget — measured BEFORE joining,
+ * V5-M5, so a hostile megabyte argv cannot make the sweep allocate one
+ * before any bound is consulted; over budget, the elements sweep
+ * individually, each capped on its own; nested objects recurse) and hands
+ * back every string it finds, and the guard refuses any call whose ANY
+ * returned string mentions a protected path.
  *
- * Bounds, so a hostile payload cannot turn the sweep into a cost attack:
- * depth ≤ 3, at most 64 strings, each swept up to its first 8192 characters
- * (a longer string contributes its head — skipping it wholesale would make
- * `command: ' '.repeat(9000) + 'rm .proof'` a length-shaped bypass, while
- * the tail beyond the cap is the same blind spot every bounded sweep has).
- * Cycles are guarded by a visited set. The deliberate false-positive surface:
- * a read-only tool naming the store (`grep {pattern: 'evidence.jsonl'}`, a
- * Read of the log) is denied too — 宁误拦, one denied call with a reason
- * beats one rewritten chain, and the plugin's own proof_* tools read the log
- * through the engine's port, not through host tool calls.
+ * Bounds, so a hostile payload cannot turn the sweep into a cost attack —
+ * and (Y-H-10) so the bounds themselves cannot be climbed like ladders.
+ * The pre-v0.24 windows were deterministic and attacker-steerable: the
+ * first 64 strings in insertion order (pad 64 filler values ahead of the
+ * real command and it is the 65th — never swept) and the HEAD 8192
+ * characters of a long string (put 8k of comment ahead of the redirect —
+ * never swept; the gates copy dropped >8k strings whole). Both windows are
+ * now DOUBLE-ENDED with tail preference:
+ * - at most {@link SWEEP_MAX_STRINGS} strings are returned: the FIRST 32
+ *   and the LAST 32 (insertion order). A pads-first attack now lands its
+ *   needle in the tail window; the residual blind spot is the MIDDLE of a
+ *   >64-string payload — an attacker who pads on BOTH sides can still bury
+ *   a string between the windows. That middle window is the deliberate
+ *   price of a bound (a sweep without one is the CPU sink the bound exists
+ *   to prevent), and the structural path guard still sees path-KEYED
+ *   values the middle window hides from the textual sweep.
+ * - each string contributes its LAST 8192 characters (`截头保尾`): redirect
+ *   targets and trailing commands — where a store path hides in real shell
+ *   strings — are at the END, so the head is the cheaper half to drop. The
+ *   head of a >8k string is the residual window (a needle buried at
+ *   position 0 of a 16k command is not swept), pinned by test as a
+ *   documented price, not a promise.
+ *
+ * Cycles are guarded by a visited set; depth ≤ 3. The deliberate
+ * false-positive surface: a read-only tool naming the store
+ * (`grep {pattern: 'evidence.jsonl'}`, a Read of the log) is denied too —
+ * 宁误拦, one denied call with a reason beats one rewritten chain, and the
+ * plugin's own proof_* tools read the log through the engine's port, not
+ * through host tool calls.
  */
 const SWEEP_MAX_DEPTH = 3
 const SWEEP_MAX_STRINGS = 64
+/** Each END of the double-ended string window: first 32 + last 32 = the 64 bound. */
+const SWEEP_EDGE_STRINGS = SWEEP_MAX_STRINGS / 2
 const SWEEP_MAX_STRING = 8192
 
 export function sweepToolInputStrings(toolInput: unknown): string[] {
-  const out: string[] = []
+  const head: string[] = []
+  const tail: string[] = []
   const visited = new Set<unknown>()
-  const full = (): boolean => out.length >= SWEEP_MAX_STRINGS
+  // Oversize strings keep BOTH end windows, not the tail alone: a command
+  // that OPENS with the store path and pads after it (path-at-head) is just
+  // as live as the pads-first shape, and a tail-only keep was blind to
+  // exactly that half. The residual is the strict middle of a >2x-budget
+  // string — bounded, documented, and requires the needle to sit >8k from
+  // both ends.
+  const capEnds = (value: string): string[] =>
+    value.length > SWEEP_MAX_STRING
+      ? [value.slice(0, SWEEP_MAX_STRING), value.slice(value.length - SWEEP_MAX_STRING)]
+      : [value]
+  const add = (value: string): void => {
+    if (value.length === 0) return
+    for (const piece of capEnds(value)) {
+      if (head.length < SWEEP_EDGE_STRINGS) head.push(piece)
+      else if (tail.length < SWEEP_EDGE_STRINGS) tail.push(piece)
+      else {
+        // Window full on both ends: evict the OLDEST tail entry — the tail
+        // tracks the last strings seen, so a pads-first payload's needle (the
+        // final, real command) stays inside the window.
+        tail.shift()
+        tail.push(piece)
+      }
+    }
+  }
   const visit = (value: unknown, depth: number): void => {
-    if (full()) return
     if (typeof value === 'string') {
-      if (value.length > 0) out.push(value.slice(0, SWEEP_MAX_STRING))
+      add(value)
       return
     }
     if (value === null || typeof value !== 'object') return
     if (depth > SWEEP_MAX_DEPTH) return
     if (visited.has(value)) return
     visited.add(value)
-    for (const item of Array.isArray(value) ? value : Object.values(value as Record<string, unknown>)) {
-      visit(item, depth + 1)
-      if (full()) return
+    if (Array.isArray(value)) {
+      // Argv-shaped: the elements are ONE command line semantically, and a
+      // needle split across elements (`['echo','x','>','.proof/evid','ence.jsonl']`)
+      // only reads as a path once joined. V5-M5: measure the total FIRST and
+      // join only when the joined form fits the per-string budget — the old
+      // gates copy joined unconditionally, so a hundred-megabyte argv made
+      // the sweep allocate the same hundred megabytes before any bound was
+      // consulted. Over budget, the elements sweep individually instead
+      // (each capped to its own tail window); object elements recurse one
+      // level deeper either way.
+      const strings = value.filter(item => typeof item === 'string') as string[]
+      if (strings.length > 0) {
+        let total = strings.length - 1 // the joins' spaces
+        for (const s of strings) total += s.length
+        if (total <= SWEEP_MAX_STRING) add(strings.join(' '))
+        else for (const s of strings) add(s)
+      }
+      for (const item of value) {
+        if (typeof item === 'object' && item !== null) visit(item, depth + 1)
+      }
+      return
+    }
+    for (const child of Object.values(value as Record<string, unknown>)) {
+      visit(child, depth + 1)
     }
   }
   visit(toolInput, 0)
-  return out
+  // With ≤64 strings this is all of them, in order; past 64 it is the first
+  // 32 plus the last 32 — either way, ≤64 capped strings leave the function.
+  return [...head, ...tail]
 }
 
 export interface DriftReport {
@@ -339,8 +420,9 @@ export class WorkspaceWatch {
         return
       }
       for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
-        // X-H-14: the key comparison folds case on both sides.
-        const isPathKey = keys.has(key.toLowerCase()) || arrayKeys.has(key.toLowerCase())
+        // X-H-14/V5-M2: the key comparison folds case AND separators on both
+        // sides — 'File-Name', 'file_name' and 'filename' are one key.
+        const isPathKey = keys.has(foldKey(key)) || arrayKeys.has(foldKey(key))
         if (typeof val === 'string') {
           if (isPathKey) out.add(val)
         } else {
@@ -555,6 +637,21 @@ function foldRelativeSegments(rel: string): string {
  * known ("outside your file tools; a shell ran — yours or an external
  * editor's, indistinguishable here") while the remedy line stays.
  */
+/** How many files each narrative list names before the overflow line (V5-L4). */
+const NARRATIVE_MAX_FILES = 10
+
+/** One narrative list: the first N names, then an honest overflow count. */
+function narrativeList(files: readonly string[]): string[] {
+  const lines = files.slice(0, NARRATIVE_MAX_FILES).map(f => `  · ${f}`)
+  if (files.length > NARRATIVE_MAX_FILES) {
+    // V5-L4: the slice used to truncate silently — a wide shell-shaped drift
+    // showed the model a fraction of the moved surface with "re-read these"
+    // pointing at an incomplete list and no marker that anything was missing.
+    lines.push(`  · …and ${files.length - NARRATIVE_MAX_FILES} more`)
+  }
+  return lines
+}
+
 export function driftNarrative(report: DriftReport, options: { shellUsed?: boolean } = {}): string | undefined {
   if (report.drifted.length === 0 && report.staleReads.length === 0) return undefined
   const shell = options.shellUsed === true
@@ -563,13 +660,14 @@ export function driftNarrative(report: DriftReport, options: { shellUsed?: boole
     lines.push(shell
       ? '⚠️ Files you already read have changed outside your file tools — a shell ran this session, so these may be your own shell edits or an external editor\'s (indistinguishable here). Your in-context copies are stale:'
       : '⚠️ Files you already read have changed outside your tool calls. Your in-context copies are stale:')
-    for (const f of report.staleReads.slice(0, 10)) lines.push(`  · ${f}`)
+    lines.push(...narrativeList(report.staleReads))
   }
-  if (report.drifted.length > 0 && report.staleReads.length !== report.drifted.length) {
+  const driftOnly = report.drifted.filter(f => !report.staleReads.includes(f))
+  if (driftOnly.length > 0) {
     lines.push(shell
       ? '⚠️ Workspace changes not made through your file tools (a shell ran this session — shell edits and external edits cannot be told apart here):'
       : '⚠️ Workspace changes not made through your tools:')
-    for (const f of report.drifted.filter(f => !report.staleReads.includes(f)).slice(0, 10)) lines.push(`  · ${f}`)
+    lines.push(...narrativeList(driftOnly))
   }
   lines.push('Re-read these before relying on them, then re-run proof_verify.')
   return lines.join('\n')

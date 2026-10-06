@@ -41,7 +41,15 @@ import type { FsPort, SignerPort } from '../core/ports.ts'
 // the H-32 position witness, so an injected or replayed `delegation/*` /
 // `proof/verified` line rode the overview and the economics replay as if the
 // chain had corroborated it.
-import { readMarkers } from '../core/evidence.ts'
+// v0.24 (V6-M1/M2): the read now goes through the verified view — the same
+// surface the engine's trust decisions use — instead of this face parsing raw
+// lines itself. Two divergences died with that switch: (1) the raw split kept
+// BLANK lines, but the writer's headRef witness names the previous NON-BLANK
+// line (readLines domain), so one blank line made the two views disagree in
+// both directions; (2) the read had no X-H-06 generational fallback, so a
+// legacy (pre-witness) chain's protected labels read as empty here while the
+// engine still composed verdicts from them.
+import { createVerifiedView } from '../core/evidence.ts'
 // v0.18 (§6): the transparency-log domain — leaf hashing, Merkle proofs and
 // tree-head verification, all recomputed from the log's own bytes.
 import { loadPtl, ptlLeafHash, verifyConsistency, verifyInclusion, verifyTreeHead } from '../core/transparency.ts'
@@ -111,7 +119,10 @@ export interface McpEngineDeps {
   /**
    * v0.22: opt-out of the initialize-before-tools gate for embedders that
    * drive `createMcpHandler` directly (unit tests, in-process hosts). The
-   * stdio server itself never sets it — there the handshake is mandatory.
+   * stdio server NEVER honours this flag (v0.24, V6-L/F9): `runMcpServer`
+   * strips it before building the handler — over a real transport the
+   * handshake is mandatory, and an environment variable or embedding mistake
+   * that flipped the flag used to silently open the un-handshaked door.
    */
   allowUninitializedTools?: boolean
   /**
@@ -136,7 +147,15 @@ export interface McpServerOptions extends McpEngineDeps {
 // ---------------------------------------------------------------------------
 
 export const MCP_SERVER_NAME = 'agent-proof-protocol'
-export const MCP_DEFAULT_VERSION = '0.22.0'
+/**
+ * v0.24 (V6-L10): the version this build reports as serverInfo.version when
+ * DSH_PROOF_SERVER_VERSION is unset. The constant tracks the package version
+ * — a v0.23 build answering "0.22.0" made every version-negotiating or
+ * reconciliation-minded client misjudge the dialect it was speaking for no
+ * reason. Bump it with package.json (an operator who needs to pin the string
+ * still can, via DSH_PROOF_SERVER_VERSION).
+ */
+export const MCP_DEFAULT_VERSION = '0.24.0'
 
 /**
  * Protocol versions this server speaks, newest first. A client asking for a
@@ -151,6 +170,17 @@ const PARSE_ERROR = -32700
 const INVALID_REQUEST = -32600
 const METHOD_NOT_FOUND = -32601
 const INVALID_PARAMS = -32602
+/**
+ * v0.24 (V6-L/F9): the server-error code for a request that arrived before
+ * the `initialize` handshake completed. The JSON-RPC 2.0 spec reserves
+ * -32000..-32099 for implementation-defined server errors; -32600
+ * ("invalid request") claimed the caller SPOKE malformed JSON-RPC, when what
+ * actually happened is this server's session state refused them — a client
+ * keying on the spec-level codes could not tell a broken request from a
+ * skipped handshake, and the remedy text (send initialize first) was the
+ * only distinguisher.
+ */
+const SERVER_NOT_INITIALIZED = -32002
 
 /** A serialized bundle at or above this size is trimmed to manifest + names. */
 const BUNDLE_INLINE_LIMIT_BYTES = 256 * 1024
@@ -243,7 +273,8 @@ const LOG_VERIFY_DESCRIPTION =
   'Audit the public transparency log — every verdict is recomputed from the log\'s own bytes, nothing the caller '
   + 'asserts is trusted. With no arguments: recompute the Merkle root from the published entries and check the '
   + 'latest signed tree head against it (its signature is adjudicated when the operator key is present; a missing '
-  + 'key is reported as not-checked, never as valid). With {sequence, leafHash}: re-derive the entry\'s leaf hash '
+  + 'key is reported as not-checked, never as valid — and it FAILS the audit: ok is false with the reason in '
+  + 'problems, the same uncertain-counts-as-failed rule the CLI faces apply). With {sequence, leafHash}: re-derive the entry\'s leaf hash '
   + 'from the log and verify its inclusion proof against the recomputed root. With {publishedTreeSize, '
   + 'publishedRoot} (they go together): verify the current tree CONSISTENTLY EXTENDS that previously published '
   + 'tree — proof the history between the two sizes was not rewritten. Arguments combine; any failed check '
@@ -310,11 +341,17 @@ const ECONOMICS_DESCRIPTION =
 
 const SLA_QUOTE_DESCRIPTION =
   'Price a service-level agreement over a verification grade — the INSURANCE reading of what proof leaves '
-  + 'undetected. ANCHORED PRICING (v0.22 engine semantics): a quote is written only for a grade the evidence '
+  + 'undetected. ANCHORED PRICING, TWICE (v0.23 engine semantics): a quote is written only for a grade the evidence '
   + 'chain has actually REACHED — the engine requires a proof/verified marker carrying that grade before '
   + 'anything is priced (an SLA prices evidence the chain reached, never a grade the caller asserts). Ask for '
   + 'a grade no verification ever produced and the answer is an ERROR naming the anchoring rule, not a quote '
-  + '— never a silent downgrade to an offer. Within the anchored grades, the premium is pure risk pricing: '
+  + '— never a silent downgrade to an offer. And on the one grade whose quotes confidence PRICES (`proven`: '
+  + 'the premium shrinks as confidence grows), the confidence you quote is anchored too when you give one '
+  + 'explicitly: the chain must carry a proof/verified marker of that grade whose recorded confidence is no '
+  + 'lower than the confidence you quote — quoting ABOVE the best reached marker is refused with an error '
+  + '(never a silent repricing), quoting below is priced honestly at the lower number you named; the '
+  + 'denied/manual doors are grade-anchored only, because their confidence never moves the premium. Within '
+  + 'the anchored grades, the premium is pure risk pricing: '
   + 'premium = coverageAmount × (1 − confidence), the expected '
   + 'loss the run\'s residual risk (`pUndetected` = 1 − confidence) leaves open; the offer carries the '
   + 'deductible and coverage amount verbatim. Honest underwriting, three doors: a `proven` grade earns an '
@@ -383,7 +420,13 @@ const MCP_TOOL_LIST: ToolDescriptor[] = [
             + '(with review); a subjective claim machines cannot measure → llm-jury. Omit to verify without a '
             + 'contract.',
         },
-        budgetMs: { type: 'number', description: 'perf-budget only: benchmark checks must stay within this many milliseconds.' },
+        budgetMs: {
+          type: 'number',
+          description: 'perf-budget only: benchmark checks must stay within this many milliseconds — a finite '
+            + 'positive number no greater than 1e12 (≈ 11.6 days). Anything else is refused loudly: an infinite, '
+            + 'zero or absurdly large "budget" can never be exceeded and is not a budget at all (same rule as the '
+            + 'DSH face).',
+        },
         review: {
           type: 'string',
           description: 'docs-only only: the self-review that jury evidence carries — what a human reviewer should double-check.',
@@ -548,8 +591,10 @@ const MCP_TOOL_LIST: ToolDescriptor[] = [
         path: {
           type: 'string',
           description: 'Write the samples to this path as JSONL instead of holding them in memory only. Must be '
-            + 'WORKSPACE-RELATIVE: absolute paths (including UNC) and any path that escapes the workspace root '
-            + 'are refused loudly — this face never hands a foreign caller an arbitrary host write. When given, '
+            + 'WORKSPACE-RELATIVE: absolute paths (including UNC) and any path carrying a ".." segment are '
+            + 'refused loudly (a dotdot that re-enters the workspace is indistinguishable here from one that '
+            + 'escapes it — same rule as the engine\'s own export gate) — this face never hands a foreign '
+            + 'caller an arbitrary host write. When given, '
             + 'the engine writes under the workspace and the response carries the absolute `writtenTo` — the '
             + 'samples still never ride the response itself.',
         },
@@ -606,7 +651,11 @@ const MCP_TOOL_LIST: ToolDescriptor[] = [
           minimum: 0,
           maximum: 1,
           description: 'The run\'s confidence you are buying cover for, in [0, 1]. The premium prices exactly '
-            + 'the residual: coverageAmount × (1 − confidence).',
+            + 'the residual: coverageAmount × (1 − confidence). ANCHORED on the proven door (engine v0.23): '
+            + 'when you quote a confidence explicitly, the chain must carry a proof/verified marker of that '
+            + 'grade whose recorded confidence is NO LOWER than the one you quote — ask above the best '
+            + 'reached marker and the answer is an error naming the anchor, never a near-zero premium; ask '
+            + 'below and the price is honestly computed at the lower number you named.',
         },
         currency: {
           type: 'string',
@@ -800,6 +849,17 @@ async function callVerifyTool(deps: McpEngineDeps, args: Record<string, unknown>
   )
   const warnings: string[] = []
   if (changed.droppedNonString > 0) warnings.push(droppedWarning('proof_verify', 'changed', changed.droppedNonString))
+  // v0.24 (V6-L, W8-L11 half): a string claim that is only whitespace is NOT
+  // forwarded (the engine records no claim text for it) — that used to happen
+  // silently, the exact face-internal inconsistency the loud-boundary
+  // discipline exists to close: proof_claim REFUSES a blank claim outright,
+  // so proof_verify must at least say it recorded nothing.
+  if (typeof args.claim === 'string' && args.claim.trim() === '') {
+    warnings.push(
+      'proof_verify: the claim text is blank (whitespace only) — nothing was recorded on the boundary marker; '
+        + 'proof_claim refuses a blank claim outright, and this face will not silently pretend it recorded one',
+    )
+  }
   if (typeof args.claim === 'string' && args.claim.trim().length > 200) {
     warnings.push(
       `proof_verify: the claim is recorded on the chain truncated to its first 200 characters (${args.claim.trim().length} given)`
@@ -833,11 +893,17 @@ async function callClaimTool(deps: McpEngineDeps, args: Record<string, unknown>)
   // number, and a within-budget obligation compared against Infinity is
   // satisfied by any benchmark whatsoever. Every numeric argument on this
   // face is finite-checked; budgetMs joins them.
+  // v0.24 (V6-M3): the DSH face's W13-M6 ceiling applies here too — this
+  // face is the one an UNTRUSTED foreign agent types at, so a budget of
+  // 1e308 (finite, positive, vacuously satisfiable) must not pass just
+  // because it is spelled as a number. Same rule as dsh/tools.ts: finite,
+  // positive, and no more than 1e12 ms (≈ 11.6 days).
   if (args.budgetMs !== undefined
-    && (typeof args.budgetMs !== 'number' || !Number.isFinite(args.budgetMs) || args.budgetMs < 0)) {
+    && (typeof args.budgetMs !== 'number' || !Number.isFinite(args.budgetMs)
+      || args.budgetMs <= 0 || args.budgetMs > 1e12)) {
     return toolError({
-      error: `proof_claim: budgetMs must be a finite number >= 0 (got ${typeof args.budgetMs === 'number' ? String(args.budgetMs) : JSON.stringify(args.budgetMs) ?? 'a non-number value'}) `
-        + '— an infinite budget satisfies any benchmark and is therefore not a budget',
+      error: `proof_claim: budgetMs must be a finite positive number of milliseconds, at most 1e12 (got ${typeof args.budgetMs === 'number' ? String(args.budgetMs) : JSON.stringify(args.budgetMs) ?? 'a non-number value'}) `
+        + '— an infinite, NaN, zero, negative or absurd (>1e12) budget can never be exceeded, which is not a budget at all',
     })
   }
   if (args.review !== undefined && typeof args.review !== 'string') {
@@ -1115,7 +1181,18 @@ async function callLogVerifyTool(deps: McpEngineDeps, args: Record<string, unkno
     const operator = await operatorSignerFor(fs, deps.ptlDir, deps.trustRoot)
     let signature: 'verified' | 'invalid' | 'not-checked (operator key absent)'
     if (operator === undefined) {
+      // V4-M6 (v0.24): uncertain FAILS this audit, exactly like the CLI faces
+      // (self-verify's `headSignature === true`, bundle-verify's door ⑤) — a
+      // head nobody adjudicated is a head nobody vouched for, and `ok: true`
+      // beside a `not-checked` signature used to read as "the log verified"
+      // to any consumer keying on ok alone. The finding rides `problems` so
+      // the aggregate verdict says it; the three-state string stays for the
+      // auditor who wants the reason.
       signature = 'not-checked (operator key absent)'
+      problems.push(
+        'tree head signature NOT adjudicated — no operator key was present to verify it; an unverified head '
+          + 'is not a passing audit (uncertain counts as failed, the CLI faces\' rule)',
+      )
     } else {
       signature = await verifyTreeHead(head, (data, sig) => operator.verify(data, sig))
         ? 'verified'
@@ -1403,12 +1480,36 @@ function summarizeClaim(claim: string): string {
 
 /**
  * One marker record as this face reads it back: the label, the envelope
- * timestamp, and the payload verbatim.
+ * timestamp, the payload verbatim, and (v0.24) the degraded flag when the
+ * record was admitted by the generational fallback.
  */
 export interface McpMarkerRecord {
   readonly label: string
   readonly at: string | null
   readonly payload: Record<string, unknown>
+  /**
+   * X-H-06 (v0.24, V6-M2): present exactly when this record was admitted by
+   * the generational fallback — EVERY marker under its label is suspect, the
+   * shape of a log written before the headRef witness existed. The engine
+   * reads such labels degraded rather than as empty; this face now does the
+   * same (through the same view), so an upgraded deployment's old
+   * `delegation/*` DAG and ledgers survive the read instead of evaporating
+   * only on this face.
+   */
+  readonly degraded?: true
+}
+
+/**
+ * The envelope timestamp of the line at `index`, read defensively out of the
+ * caller's own blank-filtered snapshot (any parse failure is "no timestamp").
+ */
+function envelopeAt(lines: readonly string[], index: number): string | null {
+  try {
+    const envelope = JSON.parse(lines[index] ?? '{}') as { at?: unknown }
+    return typeof envelope.at === 'string' ? envelope.at : null
+  } catch {
+    return null
+  }
 }
 
 /**
@@ -1425,43 +1526,80 @@ export interface McpMarkerRecord {
  * injected, and must not be read as chain fact: an out-of-band
  * `delegation/created` twin or a forged `proof/verified` economics carrier
  * would otherwise ride the overview and the ledger replay as if the chain
- * had corroborated it. The physical snapshot is read once (raw bytes, split
- * on the real line boundaries — `readLines` filters blank lines, which would
- * shift the positions the witness is judged against) and every derivation
- * comes from that one snapshot.
+ * had corroborated it.
+ *
+ * v0.24 (V6-M1): the witness is judged in the READLINES domain — blank lines
+ * filtered, exactly what `fsView.readLines` (and the store's own reads)
+ * produce. The writer stamps `headRef` with the digest of the last NON-BLANK
+ * line (the store's tail), so the raw split this face used judged honest
+ * markers against blank lines they never chained to: one stray blank line
+ * silently dropped every honest marker after it here, while a crafted
+ * `blank + headRef=sha256('')` pair made a forged carrier's witness PASS in
+ * the raw view and fail everywhere else. Both directions are gone now that
+ * all positions come from the one blank-filtered domain.
+ *
+ * v0.24 (V6-M2): suspect adjudication and the X-H-06 generational fallback
+ * come from `createVerifiedView` over the engine's own store — the same
+ * surface the engine's trust decisions read, so this face can no longer
+ * disagree with the engine about which markers exist. On any chain this
+ * build wrote, honest markers are never suspect and the fallback never
+ * fires; a label whose ENTIRE population is suspect (a pre-witness legacy
+ * log) reads degraded instead of empty — engine parity, not face divergence.
  *
  * Exported (not private) so the cross-face contract is greppable and
- * unit-pinnable: `markerPayloads` on this face mirrors dsh/tools.ts's
- * same-named reader, suspect filtering included.
+ * unit-pinnable: `markerPayloads` on this face mirrors the verified-read
+ * rule the engine applies, suspect filtering and generational fallback
+ * included.
  */
 export async function markerPayloads(
   deps: McpEngineDeps,
   labels: ReadonlySet<string>,
   options: { readonly labelPrefixes?: readonly string[] } = {},
 ): Promise<McpMarkerRecord[]> {
-  const raw = await deps.engine.fsView.readFile(deps.evidenceLogPath)
-  if (raw === undefined) return []
-  // One physical snapshot: `readMarkers` judges each marker's headRef witness
-  // against the line physically before it, so the lines handed to it are the
-  // raw split (blank lines included — their removal would shift positions),
-  // and the envelope timestamp is re-read from the same array by index.
-  const lines = raw.split('\n')
-  const found: McpMarkerRecord[] = []
-  for (const marker of readMarkers(lines)) {
-    // Suspect lines are skipped, never read: the position test is the
-    // cheapest corroboration this face has, and a line that cannot vouch
-    // for where it sits is not chain fact.
-    if (marker.suspect) continue
-    const labelMatches = labels.has(marker.label)
-      || (options.labelPrefixes?.some(prefix => marker.label.startsWith(prefix)) ?? false)
-    if (!labelMatches) continue
-    const envelope = JSON.parse(lines[marker.index] ?? '{}') as { at?: unknown }
-    found.push({
-      label: marker.label,
-      at: typeof envelope.at === 'string' ? envelope.at : null,
-      payload: marker.payload,
-    })
+  // One blank-filtered snapshot of this face's own: envelope timestamps are
+  // re-read from it by index, and label prefixes resolve against the labels
+  // physically present in it. The view takes its own snapshot internally —
+  // the log is append-only (indexes stable under growth), and a mid-read
+  // REWRITE is the audit's charge, not this read's (it fails every consumer
+  // alike, exactly as it did when there was one read).
+  const lines = await deps.engine.fsView.readLines(deps.evidenceLogPath)
+  const prefixes = options.labelPrefixes ?? []
+  const wanted = new Set(labels)
+  if (prefixes.length > 0) {
+    // The verified view speaks exact labels; a prefix is resolved against
+    // the marker labels this snapshot physically carries (shape peek only —
+    // which labels EXIST; every trust judgement below stays in the view).
+    for (const line of lines) {
+      let envelope: unknown
+      try {
+        envelope = JSON.parse(line)
+      } catch {
+        continue
+      }
+      if (envelope === null || typeof envelope !== 'object' || Array.isArray(envelope)) continue
+      const candidate = envelope as { kind?: unknown; payload?: { label?: unknown } }
+      if (candidate.kind !== 'marker') continue
+      const label = candidate.payload?.label
+      if (typeof label !== 'string') continue
+      if (prefixes.some(prefix => label.startsWith(prefix))) wanted.add(label)
+    }
   }
+  const view = createVerifiedView(deps.engine.storeView)
+  const found: (McpMarkerRecord & { readonly index: number })[] = []
+  for (const label of wanted) {
+    for (const marker of (await view.markers(label)).records) {
+      found.push({
+        index: marker.index,
+        label: marker.label,
+        at: envelopeAt(lines, marker.index),
+        payload: marker.payload,
+        ...(marker.degraded === true ? { degraded: true as const } : {}),
+      })
+    }
+  }
+  // Log order, whatever order the labels were collected in: `index` is the
+  // position in the blank-filtered domain both reads share.
+  found.sort((a, b) => a.index - b.index)
   return found
 }
 
@@ -1614,15 +1752,23 @@ function isProvenanceFilter(value: unknown): value is 'agent-only' | 'all' {
 
 /**
  * H-16 (v0.22, face-layer confinement — the engine's exportRelPath gate is
- * the second layer, and the two are aligned): `path` hands the engine a write
- * destination, and the engine's write goes through mkdirp + writeFile with
- * the fs port's full authority. An MCP caller is a foreign agent, so the
- * destination is confined to THIS workspace: absolute paths (drive-rooted,
- * slash-rooted, UNC — both `\\srv\share` and `//srv/share`) and any path
- * whose `.`/`..` segments normalize outside the root are refused loudly.
- * The returned `rel` is what the engine receives (its own contract is
- * workspace-relative, and IT anchors the write at the workspace root);
- * `abs` is the workspace-absolute destination reported back as `writtenTo`.
+ * the second layer): `path` hands the engine a write destination, and the
+ * engine's write goes through mkdirp + writeFile with the fs port's full
+ * authority. An MCP caller is a foreign agent, so the destination is
+ * confined to THIS workspace: absolute paths (drive-rooted, slash-rooted,
+ * UNC — both `\\srv\share` and `//srv/share`) and any path carrying a `..`
+ * segment are refused loudly. The returned `rel` is what the engine receives
+ * (its own contract is workspace-relative, and IT anchors the write at the
+ * workspace root); `abs` is the workspace-absolute destination reported back
+ * as `writtenTo`.
+ *
+ * v0.24 (V6-L / F7): every `..` segment is refused — the old pop-normalising
+ * form ("`deep/../x` is fine, `../x` is not") is GONE, by deliberate
+ * alignment with the engine's own exportRelPath rule: at this trust boundary
+ * a dotdot that happens to re-enter the workspace is indistinguishable from
+ * one that escapes it, and the caller can always name the direct spelling.
+ * The face and the engine now refuse the same set, so the "two layers"
+ * comment above is finally literal instead of aspirational.
  */
 function confinedExportPath(raw: string, root: string): { rel: string; abs: string } | Error {
   if (/^\\\\/.test(raw) || /^\/\//.test(raw)) {
@@ -1635,11 +1781,11 @@ function confinedExportPath(raw: string, root: string): { rel: string; abs: stri
   for (const segment of raw.replace(/\\/g, '/').split('/')) {
     if (segment === '' || segment === '.') continue
     if (segment === '..') {
-      if (segments.length === 0) {
-        return new Error('proof_training_export: path escapes the workspace root after normalization — the export valve writes inside this workspace only')
-      }
-      segments.pop()
-      continue
+      return new Error(
+        'proof_training_export: path must stay inside the workspace — ".." segments are refused outright '
+          + '(a dotdot that re-enters the workspace is indistinguishable here from one that escapes it); '
+          + 'name the workspace-relative path directly',
+      )
     }
     segments.push(segment)
   }
@@ -1990,9 +2136,9 @@ async function callTool(deps: McpEngineDeps, params: unknown): Promise<McpToolRe
 // nothing out. Never touches stdio; notifications (no id) never produce a
 // response. Two pieces of protocol edge (v0.22):
 //   * a tools/* request BEFORE `initialize` is answered with a JSON-RPC
-//     INVALID_REQUEST naming the missing handshake — not silently served
-//     (an un-handshaked client is exactly the foreign caller most likely to
-//     be speaking the wrong dialect);
+//     SERVER_NOT_INITIALIZED (-32002, v0.24) naming the missing handshake —
+//     not silently served (an un-handshaked client is exactly the foreign
+//     caller most likely to be speaking the wrong dialect);
 //   * a JSON-RPC 2.0 batch (an array of messages) is processed element by
 //     element and answered with an array of the responses, in order; a batch
 //     of only notifications produces no output at all.
@@ -2032,12 +2178,14 @@ export function createMcpHandler(
     }
     // The handshake gate: initialize, ping and notifications answer before
     // it; every other method — the whole tools/* surface — requires a
-    // completed initialize first.
+    // completed initialize first. v0.24 (V6-L/F9): the refusal is
+    // SERVER_NOT_INITIALIZED (-32002), not INVALID_REQUEST — the request
+    // itself was well-formed JSON-RPC; the session state refused it.
     if (method !== 'initialize' && method !== 'ping' && !deps.allowUninitializedTools && !initialized) {
       return {
         response: rpcError(
           id,
-          INVALID_REQUEST,
+          SERVER_NOT_INITIALIZED,
           `server not initialized — send an initialize request before ${method}`,
         ),
       }
@@ -2116,6 +2264,20 @@ export function createMcpHandler(
 type CappedLine = { text: string } | { oversized: true }
 
 /**
+ * v0.24 (V6-F5): the input-side backpressure bound. `readCappedLines` used
+ * to queue parsed lines without limit — a client that kept writing while a
+ * slow tool call held the consume loop (tool calls are sequential: one
+ * `await handleMessage` at a time) grew the queue for as long as the client
+ * cared to write, and the per-line 4 MiB cap only bounded each ENTRY, not
+ * the queue depth. At the high-water mark the input stream is PAUSED (on a
+ * real stdio pipe the OS propagates that back to the writer) and resumed at
+ * the low-water mark as the consumer drains — bounded server memory without
+ * dropping or refusing anything.
+ */
+const INPUT_QUEUE_HIGH_WATER = 1000
+const INPUT_QUEUE_LOW_WATER = 500
+
+/**
  * Read newline-delimited text from a stream with a hard per-line byte cap.
  * Bytes of an over-cap line are DISCARDED as they arrive (only the first
  * cap-crossing chunk is inspected), so neither a giant single line nor a
@@ -2130,6 +2292,11 @@ type CappedLine = { text: string } | { oversized: true }
  * continuation byte is never 0x0A, so a newline can never sit inside a code
  * point) and makes `capBytes` exact byte semantics for free. Exported for
  * the transport unit tests that pin the boundary-crossing behaviour.
+ *
+ * v0.24 (V6-F5): input-side backpressure — see {@link INPUT_QUEUE_HIGH_WATER}.
+ * A stream without `pause`/`resume` (not one this face is wired to, but the
+ * parameter type allows it) simply keeps flowing; nothing is dropped either
+ * way, the cap only bounds OUR buffer when the transport cooperates.
  */
 export function readCappedLines(input: NodeJS.ReadableStream, capBytes: number): AsyncIterable<CappedLine> {
   type Pending = { item: CappedLine | undefined; error?: Error }
@@ -2138,6 +2305,27 @@ export function readCappedLines(input: NodeJS.ReadableStream, capBytes: number):
   let finished = false
   let buffer = Buffer.alloc(0)
   let discarding = false
+  let paused = false
+
+  const pauseInput = (): void => {
+    if (paused) return
+    paused = true
+    try {
+      ;(input as { pause?: () => unknown }).pause?.()
+    } catch {
+      // A transport that cannot be paused keeps flowing; the queue grows to
+      // what it grows to. Nothing is dropped.
+    }
+  }
+  const resumeInput = (): void => {
+    if (!paused) return
+    paused = false
+    try {
+      ;(input as { resume?: () => unknown }).resume?.()
+    } catch {
+      // Already resumed or not pausable — nothing to redo.
+    }
+  }
 
   const push = (entry: Pending): void => {
     if (wake !== undefined) {
@@ -2146,6 +2334,11 @@ export function readCappedLines(input: NodeJS.ReadableStream, capBytes: number):
       waiter(entry)
     } else {
       queue.push(entry)
+      // High-water backpressure: entries handed straight to a waiting
+      // consumer never accumulate; queued ones do, and 1000 of them is the
+      // line-budget a slow consumer may cost the writer before the pipe
+      // closes.
+      if (queue.length >= INPUT_QUEUE_HIGH_WATER) pauseInput()
     }
   }
   const onChunk = (chunk: unknown): void => {
@@ -2203,6 +2396,10 @@ export function readCappedLines(input: NodeJS.ReadableStream, capBytes: number):
           const entry = queue.length > 0
             ? queue.shift()!
             : await new Promise<Pending>((resolve) => { wake = resolve })
+          // Low-water resume: hysteresis (pause at 1000, resume at 500) so a
+          // consumer draining one line at a time does not toggle the
+          // transport twice per line.
+          if (paused && queue.length <= INPUT_QUEUE_LOW_WATER) resumeInput()
           if (entry.error !== undefined) throw entry.error
           if (entry.item === undefined) return { done: true, value: undefined }
           return { done: false, value: entry.item }
@@ -2224,7 +2421,14 @@ export function readCappedLines(input: NodeJS.ReadableStream, capBytes: number):
 export async function runMcpServer(options: McpServerOptions): Promise<void> {
   const input = options.input ?? process.stdin
   const output = options.output ?? process.stdout
-  const handleMessage = createMcpHandler(options)
+  // v0.24 (V6-L/F9): the handshake opt-out is STRIPPED on this path — over a
+  // real transport the initialize gate is mandatory, and this face used to
+  // forward whatever the caller assembled, so a stray
+  // `allowUninitializedTools: true` in an embedding silently opened the
+  // un-handshaked door. Embedders that really want the gate gone drive
+  // `createMcpHandler` directly; the flag remains theirs.
+  const { input: _input, output: _output, allowUninitializedTools: _optOut, ...deps } = options
+  const handleMessage = createMcpHandler(deps)
   let outputBroken = false
   output.on('error', () => { outputBroken = true })
   const writeResponse = async (response: unknown): Promise<void> => {

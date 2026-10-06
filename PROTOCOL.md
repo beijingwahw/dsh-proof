@@ -7,7 +7,7 @@
 | Status | Draft |
 | Protocol name | `agent-proof-protocol` |
 | Version | `APP/1.4` |
-| Reference implementation | dsh-proof v0.22.0 |
+| Reference implementation | dsh-proof v0.24.0 |
 | Supersedes | `APP/1.3` (dsh-proof v0.20.0) — tool-surface expansion only, see §6/§8/§12 |
 | Proof media type | `application/vnd.app.proof+json` |
 | Bundle media type | `application/vnd.app.proof-bundle+json` |

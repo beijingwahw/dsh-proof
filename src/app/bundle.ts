@@ -196,15 +196,20 @@ export interface BundleVerification {
   /** Records appended after the last checkpoint (chain-covered, not checkpoint-covered). */
   readonly tailRecords: number
   /**
-   * Checkpoints whose self-declared `payload.head` disagrees with the chain
-   * digest the walk computed at their position (`expectedHead`), present and
-   * non-zero only when such checkpoints exist (v0.23, X-H-03). An honest
-   * writer always stamps the walked head, so a disagreement means the
-   * checkpoint was replayed from another chain position or chains onto a
-   * rewritten prefix — a keyless contradiction, named in `problems` whether
-   * or not a signer was at hand, and charged against `checkpointSignature`
+   * The COUNT (a plain `number`, v0.24 wording made explicit — this is NOT
+   * an array and never was) of checkpoints whose self-declared `payload.head`
+   * disagrees with the chain digest the walk computed at their position
+   * (`expectedHead`), present and non-zero only when such checkpoints exist
+   * (v0.23, X-H-03). An honest writer always stamps the walked head, so a
+   * disagreement means the checkpoint was replayed from another chain
+   * position or chains onto a rewritten prefix — a keyless contradiction,
+   * named in `problems` whether or not a signer was at hand (each lying
+   * checkpoint is named there individually, by line index — the line indexes
+   * live in `problems`, not here), and charged against `checkpointSignature`
    * when the lying checkpoint's signature itself verified (a genuine
    * signature over a planted position is a replay, not proof of this chain).
+   * Consumers must test `> 0` / truthiness — never `.length` or indexing,
+   * both of which silently read `undefined` off a count.
    */
   readonly headLiars?: number
   /** `legacy` / `unsigned` / `signed` / `signed-unverified` — see `BundleChainMode`. */
@@ -707,6 +712,10 @@ export async function verifyBundle(
     corruptLines: [...walk.corruptLines],
     malformedCheckpoints: [...walk.malformedCheckpoints],
     tailRecords: walk.tailRecords,
+    // V4-M1 (v0.24): the field is the COUNT of lying checkpoints (a number —
+    // see the interface doc); the individual line indexes are already named
+    // in `problems` above. Pinned as a count by test/22; the engine's
+    // consumption side must read `> 0`, never shape it into an array.
     ...(headLiars.length > 0 ? { headLiars: headLiars.length } : {}),
     chainMode,
     ...(anchor !== undefined ? { anchor } : {}),

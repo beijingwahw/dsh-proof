@@ -30,8 +30,8 @@ import { Buffer } from 'node:buffer'
 import { canonicalJson, sha256 } from '../src/core/hash.ts'
 import {
   type PtlEntry, type SignedTreeHead, TransparencyLog,
-  appendPtlEntry, loadPtl, ptlLeafHash, savePtlHead, sthSignedData,
-  verifyConsistency, verifyInclusion, verifyTreeHead,
+  appendPtlEntry, loadPtl, preflightPtlHead, ptlLeafHash, savePtlHead,
+  selectPublishable, sthSignedData, verifyConsistency, verifyInclusion, verifyTreeHead,
 } from '../src/core/transparency.ts'
 import { MemoryFs } from './helpers.ts'
 
@@ -915,4 +915,189 @@ test('W9-M8: an sth.json that exists but cannot be read is not a cold start', as
     /exists but could not be read.*unknown prior commitment/s,
     'an unreadable prior commitment must not be signed over as if there were none',
   )
+})
+
+// ---------------------------------------------------------------------------
+// v0.24 fix batch — Y-H-06 (unparseable head is not cold start), V4-L9 (a
+// lock that blinds read AND stat is still a present file: absence must be
+// proven POSITIVELY through the directory listing), V4-L11 (one queue per
+// physical directory, not per spelling), V4-M6 (selectPublishable: the one
+// publish-face predicate).
+// ---------------------------------------------------------------------------
+
+test('Y-H-06: unparseable bytes planted in sth.json are NOT a cold start — the operator never signs over them', async () => {
+  const fs = MemoryFs.of({})
+  const leaves = variedLeaves(2)
+  for (const e of leaves) await appendPtlEntry(fs, DIR, e)
+  // The cheapest residual of X-H-10: not a shape-perfect forged head, just
+  // garbage where the prior commitment lives. parseSthFile folds it to
+  // undefined, and the cold-start branch used to mint a fresh GENUINE
+  // operator signature over whatever history those bytes used to anchor.
+  for (const garbage of ['{oops', '', '   ']) {
+    fs.mutate(HEAD_PATH, garbage)
+    const advance = await mintSth((await loadPtl(fs, DIR)).log, '2026-10-06T02:00:00.000Z')
+    await assert.rejects(
+      () => savePtlHead(fs, DIR, advance, { verifyExistingHead: holdsUnderDefaultOperator }),
+      /exists but is not a parseable signed tree head.*cold start/s,
+      `unparseable head ${JSON.stringify(garbage)} must refuse, not take the first-head branch`,
+    )
+    assert.equal(fs.files.get(HEAD_PATH), garbage, 'the refusal wrote nothing over the planted bytes')
+  }
+  // The pre-mutation half (V4-M5) refuses the same state, so a preflighting
+  // publisher never even appends behind an unreadable commitment.
+  fs.mutate(HEAD_PATH, '{oops')
+  await assert.rejects(
+    () => preflightPtlHead(fs, DIR, 'log-operator'),
+    /not a parseable signed tree head/,
+  )
+  // Contrast: a head PROVEN absent (directory lists, name missing) is the
+  // honest cold start — the preflight passes and savePtlHead accepts the
+  // first head.
+  fs.files.delete(HEAD_PATH)
+  await preflightPtlHead(fs, DIR, 'log-operator')
+  await savePtlHead(fs, DIR, await mintSth((await loadPtl(fs, DIR)).log, '2026-10-06T03:00:00.000Z'))
+  assert.equal((await loadPtl(fs, DIR)).sth!.treeSize, 2)
+})
+
+test('Y-H-06: preflightPtlHead passes a proven-absent head and refuses a foreign operator identity', async () => {
+  const fs = MemoryFs.of({})
+  for (const e of variedLeaves(1)) await appendPtlEntry(fs, DIR, e)
+  // No stored head at all: the publish mints the log's first one.
+  await preflightPtlHead(fs, DIR, 'log-operator')
+  // A stored head naming a DIFFERENT operator: the rotation refusal, fired
+  // before any mutation (the write-time gate in savePtlHead stays as
+  // defence in depth).
+  const foreign = await mintSth((await loadPtl(fs, DIR)).log, '2026-10-06T01:00:00.000Z')
+  fs.mutate(HEAD_PATH, canonicalJson({ ...foreign, logId: 'someone-else' }))
+  await assert.rejects(
+    () => preflightPtlHead(fs, DIR, 'log-operator'),
+    /refusing to change the transparency log operator.*BEFORE anything was appended/s,
+  )
+  // And the matching identity passes.
+  await preflightPtlHead(fs, DIR, 'someone-else')
+})
+
+test('V4-L9: a file locked past BOTH read and stat is still present — the directory listing proves it and the append refuses', async () => {
+  // An AV-style lock can fail the metadata handle too. The old guard
+  // consulted stat ALONE: readFile undefined + stat undefined passed as
+  // "file not there", and the append rewrote the whole history as
+  // `${''}${line}`.
+  class StatBlindLock extends MemoryFs {
+    override async readFile(path: string): Promise<string | undefined> {
+      if (path === ENTRIES_PATH) return undefined
+      return super.readFile(path)
+    }
+    override async stat(path: string): Promise<{ kind: 'file' | 'dir' | 'other'; size: number; mtimeMs: number } | undefined> {
+      if (path === ENTRIES_PATH) return undefined // the lock blinds stat too
+      return super.stat(path)
+    }
+  }
+  const fs = new StatBlindLock()
+  const e0 = entry(0)
+  fs.files.set(ENTRIES_PATH, `${canonicalJson(e0)}\n`)
+  await assert.rejects(
+    () => appendPtlEntry(fs, DIR, entry(1)),
+    /exists but could not be read.*directory listing names/s,
+    'absence must be proven positively; stat-blind is not absent',
+  )
+  assert.equal(fs.files.get(ENTRIES_PATH), `${canonicalJson(e0)}\n`, 'the history is untouched')
+})
+
+test('V4-L9: a HEAD locked past read and stat is present by listing — not a cold start either', async () => {
+  class StatBlindHeadLock extends MemoryFs {
+    override async readFile(path: string): Promise<string | undefined> {
+      if (path === HEAD_PATH) return undefined
+      return super.readFile(path)
+    }
+    override async stat(path: string): Promise<{ kind: 'file' | 'dir' | 'other'; size: number; mtimeMs: number } | undefined> {
+      if (path === HEAD_PATH) return undefined
+      return super.stat(path)
+    }
+  }
+  const fs = new StatBlindHeadLock()
+  fs.files.set(HEAD_PATH, canonicalJson(await mintSth(new TransparencyLog(variedLeaves(2)), '2026-10-06T01:00:00.000Z')))
+  for (const e of variedLeaves(2)) await appendPtlEntry(fs, DIR, e)
+  const advance = await mintSth((await loadPtl(fs, DIR)).log, '2026-10-06T02:00:00.000Z')
+  await assert.rejects(
+    () => savePtlHead(fs, DIR, advance, { verifyExistingHead: holdsUnderDefaultOperator }),
+    /exists but could not be read.*directory listing names/s,
+  )
+})
+
+test('V4-L9: when the directory exists but cannot be listed, absence is UNKNOWABLE and the append refuses', async () => {
+  class OpaqueDir extends MemoryFs {
+    override async readFile(path: string): Promise<string | undefined> {
+      if (path === ENTRIES_PATH) return undefined
+      return super.readFile(path)
+    }
+    override async readDir(path: string): Promise<string[] | undefined> {
+      if (path === DIR) return undefined // e.g. EACCES on the directory itself
+      return super.readDir(path)
+    }
+    override async stat(path: string): Promise<{ kind: 'file' | 'dir' | 'other'; size: number; mtimeMs: number } | undefined> {
+      if (path === DIR) return { kind: 'dir', size: 0, mtimeMs: 0 } // the directory itself is stat-able
+      if (path === ENTRIES_PATH) return undefined
+      return super.stat(path)
+    }
+  }
+  const fs = new OpaqueDir()
+  const e0 = entry(0)
+  fs.files.set(ENTRIES_PATH, `${canonicalJson(e0)}\n`) // it may well hold a log
+  await assert.rejects(
+    () => appendPtlEntry(fs, DIR, entry(1)),
+    /cannot be proven absent.*Unknown is not absent/s,
+    'a stat-able directory that cannot be listed leaves absence unprovable — refuse, do not guess',
+  )
+  assert.equal(fs.files.get(ENTRIES_PATH), `${canonicalJson(e0)}\n`)
+})
+
+test('V4-L11: two SPELLINGS of one log directory share one append queue — no interleaved whole-file clobber', async () => {
+  const fs = MemoryFs.of({})
+  const dirA = '/ptl-fold'
+  const dirB = '/ptl-fold/' // same directory, trailing-separator spelling
+  const dirC = '\\ptl-fold' // same directory, backslash spelling
+  const outcomes = await Promise.all([
+    appendPtlEntry(fs, dirA, entry(0)),
+    appendPtlEntry(fs, dirB, entry(1)),
+    appendPtlEntry(fs, dirC, entry(2)),
+  ])
+  // Without the queue-key fold these were three queues over ONE physical
+  // file (every spelling addresses the same path), and the interleaved
+  // read-modify-write left whatever whole-file write landed last — two lines
+  // silently lost with three "successes" reported.
+  assert.deepEqual(outcomes.map(o => o.sequence), [0, 1, 2], 'submission order survives the shared queue')
+  const { log } = await loadPtl(fs, dirA)
+  assert.equal(log.size, 3, 'all three appends landed on the one physical directory')
+  assert.deepEqual(log.entries, [entry(0), entry(1), entry(2)])
+})
+
+test('V4-M6 selectPublishable: newest-first, first VERIFIABLE wins — a positional-last forgery neither wins nor vetoes', async () => {
+  const candidates = ['old-verifiable', 'mid-verifiable', 'tail-garbage'] as const
+  const probed: string[] = []
+  const { chosen, rejected } = await selectPublishable(candidates, async cp => {
+    probed.push(cp)
+    return cp !== 'tail-garbage'
+  })
+  assert.equal(chosen, 'mid-verifiable', 'the NEWEST verifiable candidate wins')
+  assert.deepEqual(probed, ['tail-garbage', 'mid-verifiable'], 'the scan starts at the newest and stops at the first verifiable')
+  assert.deepEqual(rejected, ['tail-garbage'], 'rejections are reported in scan order (newest first)')
+})
+
+test('V4-M6 selectPublishable: total refusal names every candidate; a THROWING verifier adjudicates false; empty stays empty', async () => {
+  const none = await selectPublishable([1, 2, 3], () => false)
+  assert.equal(none.chosen, undefined)
+  assert.deepEqual(none.rejected, [3, 2, 1], 'every candidate named, newest first')
+  const throwing = await selectPublishable([1, 2], cp => {
+    if (cp === 2) throw new Error('verifier exploded on the forgery')
+    return Promise.resolve(false)
+  })
+  assert.equal(throwing.chosen, undefined, 'the throw was contained — selection answers, never crashes')
+  assert.deepEqual(throwing.rejected, [2, 1])
+  const empty = await selectPublishable([], () => true)
+  assert.equal(empty.chosen, undefined)
+  assert.deepEqual(empty.rejected, [])
+  // Only strict `true` verifies — truthy garbage from a sloppy verifier is a rejection.
+  const truthy = await selectPublishable([1, 2], () => 'yes' as unknown as boolean)
+  assert.equal(truthy.chosen, undefined, 'a truthy non-true answer is a rejection, not a pass')
+  assert.deepEqual(truthy.rejected, [2, 1])
 })

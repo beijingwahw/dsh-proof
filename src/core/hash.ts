@@ -202,22 +202,32 @@ export function normalizeOutput(raw: string, opts: NormalizeOptions = {}): strin
 /**
  * A path and every spelling output may legitimately use for it: the
  * slash-flipped twin, so Windows output matches in both styles, plus — for a
- * drive-form path — the lowercased-drive twins, because Windows drives are
+ * drive-form path — the case-flipped drive twins, because Windows drives are
  * case-insensitive while tools routinely emit the *other* case from the
- * configured root (`c:\ws\src` vs root `C:/ws`). Variant generation is a pure
- * function of the path, so canonicalisation stays deterministic.
+ * configured root (`c:\ws\src` vs root `C:/ws`). V7-L5: the fold is
+ * BIDIRECTIONAL — both the lowercased AND the uppercased drive are emitted
+ * with their slash variants. The pre-fix list generated only the lowered
+ * twin, so a root configured as `c:/ws` never matched output spelled
+ * `C:\ws\src` (dedupe broke in the false-inequality direction; the uppercase
+ * root had the mirror-image hole until now). Variant generation stays a pure
+ * function of the path, and a variant only substitutes where it literally
+ * occurs, so honest outputs that spell the root one way digest byte-for-byte
+ * as before.
  */
 function pathVariants(path: string | undefined): string[] {
   if (path === undefined || path.length === 0) return []
   const out: string[] = []
   const add = (candidate: string) => { if (!out.includes(candidate)) out.push(candidate) }
+  const addDriveForms = (drivePath: string): void => {
+    add(drivePath)
+    add(drivePath.replace(/\\/g, '/'))
+    add(drivePath.replace(/\//g, '\\'))
+  }
   add(path)
   add(path.replace(/\\/g, '/'))
   if (isDriveForm(path)) {
-    const lowered = path.slice(0, 1).toLowerCase() + path.slice(1)
-    add(lowered)
-    add(lowered.replace(/\\/g, '/'))
-    add(lowered.replace(/\//g, '\\'))
+    addDriveForms(path.slice(0, 1).toLowerCase() + path.slice(1))
+    addDriveForms(path.slice(0, 1).toUpperCase() + path.slice(1))
   }
   return out
 }

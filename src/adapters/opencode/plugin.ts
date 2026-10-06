@@ -65,6 +65,7 @@ import type { ProofPaths } from '../shared/paths.ts'
 import { applyObservation, computeDrift, emptySession, loadSession, saveSession, windowStart } from '../shared/session.ts'
 import { decidePreToolUse, evaluateStop, hasBaselineOnDisk } from '../shared/gates.ts'
 import type { GateOptions, StopFacts } from '../shared/gates.ts'
+import { _readMarkers } from '../../core/evidence.ts'
 
 // ---------------------------------------------------------------------------
 // Options and the adapter environment
@@ -327,6 +328,71 @@ export function sanitizeBlockForModel(text: string): string {
 // Handlers — separated from registration so each is directly testable
 // ---------------------------------------------------------------------------
 
+/**
+ * Y-H-13 (v0.24): the digest the evidence chain remembers for the baseline
+ * FILE BYTES — the binding argument `hasBaselineOnDisk`'s W11-M4 contract
+ * shipped in v0.23 and then never received: every adapter call site invoked
+ * the probe two-argument, so the chain floor never engaged and a five-line
+ * self-consistent baseline minted with the package's own public
+ * `addressOf`/`merkleRoot` walked the ask ladder exactly like a genuine one
+ * (the audit's PoC). This read is that third argument.
+ *
+ * The rule is the ENGINE's, mirrored verbatim — core/evidence.ts's private
+ * `lastBaselineDigest`, the same selection `loadBaseline()` and `audit()`
+ * bind by: last-wins among `baseline/saved` markers whose `headRef` can vouch
+ * for their physical position; when EVERY such marker is suspect (a log
+ * written before the headRef witness existed), the last one still speaks, so
+ * an upgraded deployment keeps exactly the detection it had, never less. No
+ * marker the chain remembers means `undefined`, and `hasBaselineOnDisk` then
+ * falls to its own no-chain floor instead of to an accusation — the same
+ * degradation `loadBaseline` grants a baseline placed by a flow that never
+ * recorded a save.
+ *
+ * Line discipline: the store's `readLines` (node-ports) splits on '\n' and
+ * drops blank lines; the suspect test hashes each marker's PHYSICAL
+ * predecessor, so this split must produce the same snapshot the engine's own
+ * walk sees, or the two faces would disagree about who is suspect.
+ *
+ * Cost (deliberately uncached): a gate evaluation now reads TWO files
+ * (baseline + log) where it read one. Unlike the Claude Code face (one
+ * process per hook event), this plugin lives in the host process and pays
+ * the log read per gate call — and an mtime-keyed digest cache was
+ * considered and rejected: it would open a staleness window exactly where
+ * freshness IS the security property (a swapped baseline must fail the very
+ * next gate call, not the first call after the log's mtime moves), and the
+ * readFile-only env contract carries no stat seam to key it on. The
+ * neighboring drift check already re-walks workspace FILES per call, so this
+ * bounded read is not the expensive half of a gate evaluation.
+ *
+ * Mirrored in adapters/claude-code/hooks.ts — keep the two in lockstep (the
+ * sanitizeBlockForModel rule).
+ */
+async function savedBaselineDigest(
+  logPath: string,
+  readFile: (abs: string) => Promise<string | undefined>,
+): Promise<string | undefined> {
+  const raw = await readFile(logPath)
+  if (raw === undefined) return undefined
+  const lines = raw.split('\n').filter(line => line.trim().length > 0)
+  const markers = _readMarkers(lines, { label: 'baseline/saved' })
+    .filter(marker => typeof marker.payload.digest === 'string')
+  const trusted = markers.filter(marker => !marker.suspect)
+  const pool = trusted.length > 0 ? trusted : markers
+  const last = pool[pool.length - 1]
+  return last === undefined ? undefined : last.payload.digest as string
+}
+
+/**
+ * The chained refresh behind every `env.hasBaseline` assignment here: the
+ * cached flag is only truthful if it is `hasBaselineOnDisk` bound to the
+ * digest the chain remembers (Y-H-13), so all four refresh sites — the gate,
+ * the post-proof_* refresh, the turn-end handler and the plugin pre-warm —
+ * go through this one door.
+ */
+async function chainedHasBaselineOnDisk(env: OcAdapterEnv): Promise<boolean> {
+  return hasBaselineOnDisk(env.paths, env.readFile, await savedBaselineDigest(env.paths.logPath, env.readFile))
+}
+
 function driftKey(drift: { readonly drifted: readonly string[]; readonly staleReads: readonly string[] }): string {
   // W12-L6: staleReads join the fingerprint. staleReads ⊆ drifted, so the
   // same drifted set can evolve from stale=[] to stale≠[] — a MORE severe
@@ -443,7 +509,7 @@ export async function ocBeforeHandler(env: OcAdapterEnv, input: unknown): Promis
   if (call.tool !== undefined) {
     try {
       try {
-        env.hasBaseline = await hasBaselineOnDisk(env.paths, env.readFile)
+        env.hasBaseline = await chainedHasBaselineOnDisk(env)
       } catch {
         /* keep the cached flag; a failed stat is not a policy input */
       }
@@ -493,7 +559,7 @@ export async function ocAfterHandler(env: OcAdapterEnv, input: unknown): Promise
   // server writes it); refresh the cache so the next prompt render is honest.
   if (call.tool.startsWith('proof_')) {
     try {
-      env.hasBaseline = await hasBaselineOnDisk(env.paths, env.readFile)
+      env.hasBaseline = await chainedHasBaselineOnDisk(env)
     } catch {
       /* keep the cached flag */
     }
@@ -518,7 +584,7 @@ export async function ocTurnEndHandler(env: OcAdapterEnv, sessionId: string | un
       ? await computeDrift(session, env.paths.root, env.readFile)
       : undefined
     try {
-      env.hasBaseline = await hasBaselineOnDisk(env.paths, env.readFile)
+      env.hasBaseline = await chainedHasBaselineOnDisk(env)
     } catch {
       /* keep the cached flag */
     }
@@ -662,7 +728,7 @@ export function createOpencodePlugin(options: OcAdapterOptions = {}): (ctx: unkn
     // Pre-warm the baseline flag so the first prompt render tells the truth
     // about a workspace that already has one.
     try {
-      env.hasBaseline = await hasBaselineOnDisk(env.paths, env.readFile)
+      env.hasBaseline = await chainedHasBaselineOnDisk(env)
     } catch {
       /* cache stays false; first gate decision retries */
     }

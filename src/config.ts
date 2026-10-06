@@ -193,10 +193,14 @@ export const Config: Schema<Config> = Schema.object({
   // the log at the workspace root where the guard's prefix comparison can
   // never match, and `a/..` reaches the same collapse at RUNTIME while
   // passing a pure-dot pattern — any `..` SEGMENT (either separator flavour)
-  // is rejected here rather than silently disarming workspace mode. The
-  // runtime guards (paths.ts foldHostPath) still fold defensively; this is
-  // the loud first line.
-  evidenceDir: Schema.string().pattern(/^(?![./\\]+$)(?!\/)(?!.*(?:^|[\/\\])\.\.(?:[\/\\]|$)).+$/).default('.proof'),
+  // is rejected here rather than silently disarming workspace mode. V5-M3:
+  // a DRIVE-ABSOLUTE spelling ('C:/outside') gets syntheticDir's arm too —
+  // it walks past the `(?!\/)` leading-slash guard and parks the store
+  // outside the workspace while the workspace-mode guard keeps comparing as
+  // if it were inside (structural net self-dismantled by configuration).
+  // The runtime guards (paths.ts foldHostPath) still fold defensively; this
+  // is the loud first line.
+  evidenceDir: Schema.string().pattern(/^(?![./\\]+$)(?!\/)(?![A-Za-z]:)(?!.*(?:^|[\/\\])\.\.(?:[\/\\]|$)).+$/).default('.proof'),
   // "Must stay outside every agent-writable workspace" (see the interface
   // comment) is enforced as a loud containment warn at derivation time
   // (adapters/shared/paths.ts), where the workspace root is finally known —
@@ -247,7 +251,11 @@ export const Config: Schema<Config> = Schema.object({
   apiEntryPoints: Schema.array(Schema.string()).default([]),
   // ζ: docs-only self-attestation tops out below objective proof — the same
   // percent band as certifyTarget (0–1), defaulted to a deliberately humble 0.8.
-  juryConfidenceCap: Schema.percent().default(0.8),
+  // V5-M4: the OPEN interval, same as the κ knobs — ζ=1 removes the docs-only
+  // confidence ceiling entirely (jury self-attestation certifies at full
+  // confidence, the cap's whole reason to exist), so the domain is
+  // [0.01, 0.99] on the 0.01 grid like its three siblings.
+  juryConfidenceCap: Schema.percent().min(0.01).max(0.99).default(0.8),
   // κ: graded-evidence trust weights — log-odds exponents, so weak witnesses
   // can only weaken a claim (probability^weight < 1 whenever probability < 1).
   // W11-M5/W6-F2: that invariant is FALSE at κ=0 (p^0 = 1: jury and human
@@ -267,7 +275,10 @@ export const Config: Schema<Config> = Schema.object({
   // walks past the `(?!\/)` leading-slash guard entirely ('.' parks it AT the
   // root, also rejected: the sandbox must be a real subdirectory).
   syntheticDir: Schema.string().pattern(/^(?![./\\]+$)(?!\/)(?![A-Za-z]:)(?!.*(?:^|[\/\\])\.\.(?:[\/\\]|$)).+$/).default('.proof-synthetic'),
-  syntheticFalsePass: Schema.percent().default(0.15),
+  // V5-M4: β also lives on the OPEN interval — β=0 prices an interested
+  // party's own conjured test at "cannot falsely pass", quietly cancelling
+  // the synthetic-weaker-than-organic premise the whole π contract rests on.
+  syntheticFalsePass: Schema.percent().min(0.01).max(0.99).default(0.15),
   syntheticTimeoutMs: Schema.number().min(1).default(60_000),
   // υ: coverage-aware proof gating — observe by default so real Node check
   // processes get execution-coverage honesty while data-less environments

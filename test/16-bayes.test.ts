@@ -344,6 +344,25 @@ test('BAYES: a decisive observation from a reliable check actually moves the pos
   assert.ok(posteriorHealthy(pr, 'fail') < 0.15, '0.025/0.515 ≈ 0.049')
 })
 
+test('V7-L3: caller-constructed α and π outside [0,1] are refused — no sign-flipped posteriors', () => {
+  // β has been domain-gated since W6-F1; α and π arrive at the same boundary
+  // argument (callers construct CheckPrior by hand, the engine rewrites β in
+  // place). α outside [0,1] makes a likelihood term negative — α=1.2 on the
+  // pass branch is P(pass|healthy) = −0.2, and two negatives multiply back to
+  // a plausible-looking positive; π outside [0,1] breaks the mixture the same
+  // way. The refusal is loud, naming the knob.
+  for (const badAlpha of [-0.1, 1.2, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(() => posteriorHealthy(prior({ checkId: 'x', falseFail: badAlpha }), 'pass'), RangeError, `α=${badAlpha} must be refused`)
+    assert.throws(() => posteriorHealthy(prior({ checkId: 'x', falseFail: badAlpha }), 'fail'), RangeError, `α=${badAlpha} refused on the fail branch too`)
+  }
+  for (const badPi of [-0.5, 1.5, Number.NaN]) {
+    assert.throws(() => posteriorHealthy(prior({ checkId: 'x', priorHealthy: badPi }), 'pass'), RangeError, `π=${badPi} must be refused`)
+  }
+  // Endpoints are degenerate but well-defined channels — legal, not refused.
+  assert.doesNotThrow(() => posteriorHealthy(prior({ checkId: 'x', falseFail: 0, priorHealthy: 0 }), 'pass'), 'α=0 / π=0 are defined')
+  assert.equal(posteriorHealthy(prior({ checkId: 'x', falseFail: 1, priorHealthy: 1 }), 'fail'), 1, 'π=1 with α=1: the certain-flake fail proves health exactly')
+})
+
 // ---------------------------------------------------------------------------
 // 4. claimProbability
 // ---------------------------------------------------------------------------

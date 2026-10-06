@@ -39,13 +39,19 @@ import {
 import opencodePluginDefault from '../src/adapters/opencode/plugin.ts'
 import { loadSession } from '../src/adapters/shared/session.ts'
 import { MCP_TOOLS } from '../src/app/mcp-server.ts'
-import { addressOf, merkleRoot } from '../src/core/hash.ts'
+import { addressOf, merkleRoot, sha256 } from '../src/core/hash.ts'
+import { GENESIS_PREV } from '../src/core/trust.ts'
 
-/** A self-addressing baseline.json — the only shape hasBaselineOnDisk accepts (H-20). */
-function realBaselineJson(): string {
-  const checks = [{ checkId: 'package.json:test', evidenceId: 'e1', status: 'pass' }]
+/**
+ * A self-addressing baseline.json — the only shape hasBaselineOnDisk accepts
+ * (H-20). `variant` mints a SECOND, equally self-consistent document for the
+ * Y-H-13 chain-binding tests: self-consistency alone stops being enough the
+ * moment the chain remembers other bytes.
+ */
+function realBaselineJson(variant = 0): string {
+  const checks = [{ checkId: 'package.json:test', evidenceId: `e${variant + 1}`, status: 'pass' }]
   const workspace = { head: null, dirty: [], dirtDigest: merkleRoot([]) }
-  const createdAt = '2026-10-06T10:00:00.000Z'
+  const createdAt = variant === 0 ? '2026-10-06T10:00:00.000Z' : '2026-10-06T11:00:00.000Z'
   const root = merkleRoot(checks.map(c => c.evidenceId))
   return JSON.stringify({
     baselineId: addressOf({ createdAt, workspace, checkIds: checks.map(c => c.checkId), root }),
@@ -54,6 +60,32 @@ function realBaselineJson(): string {
     checks,
     root,
   })
+}
+
+/**
+ * A store-shaped `baseline/saved` marker line — the envelope the engine's own
+ * `mark()` writes — for chain fixtures. `digest` is what the chain REMEMBERS
+ * for the baseline file bytes. The third parameter names the witness:
+ * defaulted, it chains honestly to `prev` (the non-suspect shape); an explicit
+ * different value is the out-of-band twin (reads back suspect under the H-32
+ * position test); `null` omits the witness entirely (the pre-witness legacy
+ * shape, suspect by the same rule).
+ */
+function savedMarker(digest: string, prev: string, headRef: string | null = prev): string {
+  return JSON.stringify({
+    v: 2,
+    kind: 'marker',
+    at: '2026-10-06T10:00:01.000Z',
+    prev,
+    payload: { label: 'baseline/saved', digest, bytes: 4096, ...(headRef !== null ? { headRef } : {}) },
+  })
+}
+
+/** Seed a workspace with a baseline file and a chain log remembering `logLines`. */
+async function seedChain(env: ReturnType<typeof ocAdapterEnv>, baseline: string, logLines: string[]): Promise<void> {
+  await fsp.mkdir(env.paths.logDir, { recursive: true })
+  await fsp.writeFile(env.paths.baselinePath, baseline)
+  await fsp.writeFile(env.paths.logPath, `${logLines.join('\n')}\n`)
 }
 
 // The workspace root one level above the repo — the designated scratch area.
@@ -220,6 +252,103 @@ test('before: a forged 20-byte baseline does NOT release the ask gate (H-20)', a
   )
   assert.ok(decision !== undefined && decision.block !== undefined, 'the gate stays armed against a shape-only forgery')
   assert.match(decision.block, /baseline/i)
+})
+
+test('before: a self-consistent baseline the chain does NOT remember re-arms the ask ladder (Y-H-13)', async () => {
+  // The v0.23 residue on this face: hasBaselineOnDisk's chainDigest argument
+  // shipped and was never fed, so a five-line baseline minted with the
+  // package's public addressOf/merkleRoot (perfectly self-addressing — the
+  // no-chain floor cannot refuse it) held nothing back. The chain here
+  // remembers OTHER bytes, and the gate must take the chain's side.
+  const root = await freshWorkspace()
+  const { env } = makeEnv(root, { requireBaseline: 'ask' })
+  await seedChain(env, realBaselineJson(), [
+    savedMarker(sha256('the bytes an honest saveBaseline actually wrote'), GENESIS_PREV),
+  ])
+  const decision = await ocBeforeHandler(
+    env,
+    { tool: 'write', args: { file_path: 'src/a.ts' }, sessionID: 's1' },
+  )
+  assert.ok(decision !== undefined && decision.block !== undefined,
+    'a baseline the chain cannot vouch for is no baseline — the ladder stays armed')
+  assert.match(decision.block, /baseline/i)
+})
+
+test('before: a baseline whose bytes the chain DOES remember passes the ask ladder (Y-H-13 control)', async () => {
+  const root = await freshWorkspace()
+  const { env } = makeEnv(root, { requireBaseline: 'ask' })
+  const baseline = realBaselineJson()
+  await seedChain(env, baseline, [savedMarker(sha256(baseline), GENESIS_PREV)])
+  const decision = await ocBeforeHandler(
+    env,
+    { tool: 'write', args: { file_path: 'src/a.ts' }, sessionID: 's1' },
+  )
+  assert.equal(decision, undefined, 'self-consistent AND chain-remembered: the honest path through the new binding')
+})
+
+test('before: an out-of-band baseline/saved twin is suspect and does not get to answer (Y-H-13, H-32 half)', async () => {
+  // The honest marker remembers the REAL bytes; the file is then swapped for
+  // a different self-consistent document and a twin marker carrying the
+  // swapped bytes' digest is appended whose headRef names a predecessor that
+  // is not the line physically before it — the out-of-band shape. The twin
+  // must not re-answer for the chain; the honest marker still does; the
+  // swapped file fails the bind.
+  const root = await freshWorkspace()
+  const { env } = makeEnv(root, { requireBaseline: 'ask' })
+  const real = realBaselineJson()
+  const forged = realBaselineJson(1)
+  await seedChain(env, forged, [
+    savedMarker(sha256(real), GENESIS_PREV),
+    savedMarker(sha256(forged), GENESIS_PREV, sha256('a predecessor this twin was not appended after')),
+  ])
+  const decision = await ocBeforeHandler(
+    env,
+    { tool: 'write', args: { file_path: 'src/a.ts' }, sessionID: 's1' },
+  )
+  assert.ok(decision !== undefined && decision.block !== undefined,
+    'the suspect twin is excluded, the honest marker answers, the swapped file fails the bind')
+  assert.match(decision.block, /baseline/i)
+})
+
+test('after: a proof_* call refreshes hasBaseline THROUGH the chain binding — a stale-true cache does not survive it (Y-H-13)', async () => {
+  // The refresh site behind every proof_* tool call: the cache is only
+  // truthful if the refresh is the chained probe. Simulate the stale state
+  // (an honest baseline earlier in the session), swap in the audit's PoC
+  // (self-consistent file + a chain remembering other bytes), and let the
+  // after handler run the post-proof refresh: the flag must flip false.
+  const root = await freshWorkspace()
+  const { env } = makeEnv(root, { requireBaseline: 'ask' })
+  await seedChain(env, realBaselineJson(), [
+    savedMarker(sha256('other bytes'), GENESIS_PREV),
+  ])
+  env.hasBaseline = true // the stale truth from before the swap
+  await ocAfterHandler(env, { tool: 'proof_baseline', args: {}, sessionID: 'refresh' })
+  assert.equal(env.hasBaseline, false, 'the post-proof refresh takes the chain\'s side, not the file shape\'s')
+
+  // Control: the same refresh over bytes the chain remembers keeps true.
+  const root2 = await freshWorkspace()
+  const { env: okEnv } = makeEnv(root2, { requireBaseline: 'ask' })
+  const baseline = realBaselineJson()
+  await seedChain(okEnv, baseline, [savedMarker(sha256(baseline), GENESIS_PREV)])
+  okEnv.hasBaseline = false
+  await ocAfterHandler(okEnv, { tool: 'proof_baseline', args: {}, sessionID: 'refresh' })
+  assert.equal(okEnv.hasBaseline, true)
+})
+
+test('turn-end: the chained probe feeds the turn-end facts — a chain-refuted baseline blocks the mutating turn (Y-H-13)', async () => {
+  const root = await freshWorkspace()
+  // driftDetection off isolates the baseline notice from drift noise.
+  const { env } = makeEnv(root, { driftDetection: false })
+  await seedChain(env, realBaselineJson(), [
+    savedMarker(sha256('other bytes'), GENESIS_PREV),
+  ])
+  // A session with a mutation on record: the turn-end rule owes its baseline
+  // notice to hasBaseline === false.
+  await ocAfterHandler(env, { tool: 'write', args: { file_path: 'src/a.ts' }, sessionID: 'turn-end' })
+  const verdict = await ocTurnEndHandler(env, 'turn-end')
+  assert.ok(verdict !== undefined && verdict.block !== undefined,
+    'touched>0 with a chain-refuted baseline blocks the turn end')
+  assert.match(verdict.block, /baseline/i)
 })
 
 test('before: MultiEdit and Bash-redirect into the store are held (H-01/H-02 on this host)', async () => {
@@ -596,6 +725,27 @@ test('plugin: registers on a duck-typed context, holds evidence-store writes end
   assert.ok(Array.isArray(arrayParams.system))
   assert.ok((arrayParams.system as unknown[]).some(part => typeof part === 'string' && part.includes('proof:policy')))
 
+  handle.dispose()
+})
+
+test('plugin: the pre-warmed hasBaseline goes through the chain binding — the injected prompt speaks the chained verdict (Y-H-13)', async () => {
+  // The pre-warm site (createOpencodePlugin init): a self-consistent baseline
+  // file the chain refutes must pre-warm hasBaseline=false, so the very first
+  // prompt render tells the model the truth — no baseline — instead of the
+  // file shape's claim.
+  const root = await freshWorkspace()
+  const { env: seedEnv } = makeEnv(root, { requireBaseline: 'ask' })
+  await seedChain(seedEnv, realBaselineJson(), [
+    savedMarker(sha256('other bytes'), GENESIS_PREV),
+  ])
+  const stderrLines: string[] = []
+  const sinks = { before: [] as Hook[], after: [] as Hook[], params: [] as Hook[] }
+  const init = createOpencodePlugin({ stderr: line => stderrLines.push(line) })
+  const handle = await init(syntheticContext(root, sinks))
+  const params: { system?: unknown } = { system: 'You are a coding agent.' }
+  sinks.params[0]!({}, params)
+  assert.match(String(params.system), /No baseline is established/,
+    'the prompt says what the chain says, not what the swapped file claims')
   handle.dispose()
 })
 

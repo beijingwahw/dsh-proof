@@ -116,7 +116,11 @@ function anyRangeExecuted(fn: unknown): boolean {
  * routinely disagree with the host on drive-letter case while POSIX roots
  * stay case-sensitive. One deliberate divergence (W15-L8): this copy strips
  * a `?query`/`#fragment` suffix before comparing, because V8 coverage URLs
- * may carry a cache-bust query while LSP document URIs never do.
+ * may carry a cache-bust query while LSP document URIs never do. A second
+ * divergence (V7-L4): this copy models the two-slash UNC form
+ * (`file://server/share/…` → `//server/share/…`) — v0.23's host-path fold
+ * (adapters/shared/paths.ts) added UNC, and this mirror follows so a UNC
+ * workspace's coverage URLs resolve instead of silently missing the root.
  * Reimplemented here rather than imported because the core must not depend
  * on the DSH adapter layer (`core` never imports `dsh`).
  */
@@ -136,7 +140,20 @@ function fileUrlToRelative(url: string, root: string): string | null {
   if (bareUrl.startsWith('file:///')) {
     path = `/${decodeURIComponentSafe(bareUrl.slice('file:///'.length))}`
   } else if (bareUrl.startsWith('file://')) {
-    path = decodeURIComponentSafe(bareUrl.slice('file://'.length))
+    // Two-slash `file://host/…`: either a UNC share or the legacy Windows
+    // spelling with a drive letter riding in the host position.
+    // V7-L4: a UNC host (`file://server/share/ws/src/a.ts`) denotes
+    // `//server/share/ws/src/a.ts` — emitting it WITHOUT the leading `//`
+    // (the pre-fix behaviour) dropped the UNC prefix, so a UNC workspace's
+    // coverage URLs never matched its UNC root (`\\server\share\ws`, folded
+    // to `//server/share/ws` below) and every changed file read "uncovered"
+    // — the τ gate observe-no-op'd or required-everything for the whole
+    // workspace, silently. The drive-in-host spelling (`file://C:/ws/…`) is
+    // NOT UNC: `C:` is the drive, and the pre-existing reading (bare
+    // `C:/ws/…`, normalized by the drive folds below) is pinned by tests
+    // and unchanged.
+    const rest = decodeURIComponentSafe(bareUrl.slice('file://'.length))
+    path = /^[A-Za-z]:[\\/]/.test(rest) ? rest : `//${rest}`
   } else {
     return null
   }

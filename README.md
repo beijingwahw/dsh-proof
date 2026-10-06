@@ -385,6 +385,18 @@ The rest of the ledger, named where it lives: **bundle verification** mirrors th
 
 The gate for all of it: the third survey's own proof-of-concept attacks were re-run against this code — eight of nine now fail at the exact seam they used to walk through (the absorbed tail is refused a signature, the forged STH is refused an extension, the unsubmitted leaf composes `unproven`, the replayed checkpoint reports `invalid`), and the ninth is covered by the epoch tests its target's rewrite shipped with. Tests 857 → 951 (+94, the large majority adversarial or KAT). The honest boundary moved but did not vanish, and the list below says where: shape forensics still cannot stop a *properly-shaped* append on a writable log — only signature adjudication can, and v0.23's bet is that one verified door, always consulted, beats any number of walls that might not be.
 
+## Claims as contracts (v0.24.0): the promises now fail loudly when they stop being true
+
+The fourth survey read the v0.23 result line by line and found 17 highs — half of them *introduced by the fixes*, and the worst of them not bugs at all but **unfulfilled claims**: the verified view had zero production callers while three documents swore it was the one door; the Bayes knob validator was dead code while README, config comments and a test all said "validated at every boundary". The pattern had a name — document, code and test swearing the same untruth together — and no amount of wall-building touches it, because every wall shipped with its own certificate of existence.
+
+v0.24 closes all 17 and then does the structural thing: **`test/32-claims.test.ts` turns each architectural claim into a contract that fails the suite the moment it stops being true.** Ten claims, each citing the sentence it enforces: the verified view *has* production consumers (and the bare raw-read export is gone from `src/` imports — renamed into an internal escape hatch); the Bayes knobs throw at the *construction* boundary (`new ProofEngine({certifyTarget: 0})` is an error, not a silently-certifying engine); `foldHostPath` is the *one* fold — engine and DSH face carry no hand-rolled twins; the value sweep has exactly one implementation, imported; `MCP_DEFAULT_VERSION` and the PROTOCOL reference line must equal `package.json` (the version constant had been left at 0.22.0 *and pinned by a test*); the protected-marker roster covers every label a trust decision reads; the publish predicate never selects a head-liared checkpoint; a refused-to-sign generation is *forgiven* by the documented re-anchor (audit.ok returns to true); a self-deleted synthetic script records `error`, never a pass; and the store face and the MCP face agree on blank-line semantics — one log, one judgement. The fix agents worked *against* this file: four claims started red and turned green as the wiring landed, which is the file working exactly as designed.
+
+The wiring itself, briefly: the engine now reads every marker and checkpoint through `this.verified` (the view is consulted, not just exported), the drift epoch takes the *last* sighting in-generation (a replaced body no longer inherits its predecessor's re-earned history), `priorsFor` and the training slice stop at the last vouched checkpoint (forged evidence lines above the anchor no longer price anything), delegation that cannot be adjudicated is capped loudly instead of degrading to keyId-presence, the refusal ledger is billed per generation (an honest crash no longer bricks the workspace forever — and the recovery flow that used to mint a *second* refusal no longer does), unparseable STH bytes are a refusal rather than a cold start, an un-anchored signing key cannot be copied out through the adapter face (the target set is one shared constructor both faces import), `hasBaselineOnDisk` actually receives the chain digest its signature has been asking for at all seven call sites, the DSH face derives its workspace key through the same normalised derivation as everyone else, and oversize command strings keep *both* end windows in the sweep (a needle that opens the string is as live as one that closes it).
+
+Tests 951 → 1036 (+85, including the ten claims). The fourth survey's own PoCs were re-run against this code after a rebuild: the planted-head notarisation, the head-liar publication, the unsubmitted-leaf `proven` and the sweep ladders all die at their seams. The curve this version is built to break: fixes introducing 42% → 50% of the next survey's highs — not because walls got weaker, but because *nobody was checking whether the walls existed*. Now the suite checks. That is the whole trick, and it is the cheapest one in this README.
+
+## Architecture
+
 ## Architecture
 
 ```
@@ -404,7 +416,7 @@ The domain core is framework-free on purpose: it is fully unit-testable offline,
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit
-npm test              # 951 tests, node:test
+npm test              # 1036 tests, node:test
 npm run build
 npm run bundle:check  # packaging contract self-check
 ```

@@ -234,6 +234,36 @@ test('W15-M5: TrustWeights outside [0,1] are refused at the factor and fusion en
   }
 })
 
+test('V7-M2: humanProbability outside [0,1] is refused — a human REJECT is never silently erased', () => {
+  // The third knob of the same family: W15-M5's loud-gate rationale applies
+  // identically, and the pre-fix failure direction was the worst one — an
+  // out-of-domain humanProbability priced Class C as abstain (factor 1), so
+  // the human's DISPROOF vanished from the claim product instead of the
+  // configuration error surfacing.
+  for (const bad of [-0.5, 1.5, 5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(() => attestationFactor(human(), weights({ humanProbability: bad })), TypeError, `humanProbability=${bad} must be refused at the factor entry`)
+    assert.throws(() => fuseConfidence(0.94, human(), weights({ humanProbability: bad })), TypeError, `humanProbability=${bad} must be refused at fusion`)
+    assert.throws(() => attestationFactor(jury(), weights({ humanProbability: bad })), TypeError, 'the gate is on the WEIGHTS, so every entry refuses them')
+  }
+  // Endpoints are documented and legal (V7-M6 domain pin): 0 = humans always
+  // wrong, 1 = humans infallible — defined semantics, unlike the outside.
+  for (const endpoint of [0, 1]) {
+    assert.doesNotThrow(() => attestationFactor(human(), weights({ humanProbability: endpoint })), `humanProbability=${endpoint} is a documented endpoint`)
+    assert.doesNotThrow(() => fuseConfidence(0.94, human(), weights({ humanProbability: endpoint })), `humanProbability=${endpoint} is legal at fusion`)
+  }
+  // The reject testimony the old silent path erased now always prices in:
+  // at 0.95 a reject discounts hard; at ANY legal weight it moves the number.
+  const reject = human({ decision: 'reject' })
+  const factor = attestationFactor(reject, DEFAULT_TRUST_WEIGHTS)
+  assert.ok(factor < 0.068, `a trusted human's reject is a heavy discount, got ${factor}`)
+  for (const hp of [0.5, 0.9, 0.95, 1]) {
+    const f = attestationFactor(reject, weights({ humanProbability: hp }))
+    const expected = (1 - hp) ** DEFAULT_TRUST_WEIGHTS.classC
+    assert.ok(Math.abs(f - expected) < 1e-12, `reject at humanProbability=${hp} prices exactly (1−hp)^classC`)
+    assert.ok(f < 1, 'a reject at any legal humanProbability is never neutral')
+  }
+})
+
 // ---------------------------------------------------------------------------
 // attestationFactor — Class C
 // ---------------------------------------------------------------------------

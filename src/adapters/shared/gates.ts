@@ -17,9 +17,11 @@
  */
 
 import {
-  WorkspaceWatch, driftNarrative, isMutationToolName, shellCommandMentionsPath,
+  WorkspaceWatch, driftNarrative, isMutationToolName, shellCommandMentionsPath, sweepToolInputStrings,
 } from '../../dsh/observe.ts'
-import { absoluteInside, deriveProofPaths, foldHostPath, touchesEvidencePath, workspaceKeyPair } from './paths.ts'
+import {
+  absoluteInside, deriveProofPaths, foldHostPath, guardedTargets, touchesEvidencePath, workspaceKeyPair,
+} from './paths.ts'
 import type { ProofPaths } from './paths.ts'
 import type { AdapterSession, DriftResult } from './session.ts'
 import { addressOf, merkleRoot, sha256 } from '../../core/hash.ts'
@@ -37,9 +39,11 @@ export interface GateOptions {
   readonly requireBaseline: 'off' | 'warn' | 'ask'
   /**
    * The host trust root, when the caller knows it — names the trust-side
-   * artifacts (anchors, host-mode store) a shell command must not touch
-   * either. Optional for callers that only reproduce the historical
-   * workspace-store contract.
+   * artifacts (anchors, host-mode store, adapter sessions, signing keys) a
+   * shell command must not touch either. Optional for callers that only
+   * reproduce the historical workspace-store contract — but see the
+   * unarmed-host-store warning below: host mode without it disarms BOTH
+   * store sweeps.
    */
   readonly trustRoot?: string
 }
@@ -55,130 +59,49 @@ export type GateDecision =
   | { readonly action: 'deny'; readonly reason: string }
 
 /**
- * X-H-13 bounds for the value sweep (part of the cross-face contract, see
- * {@link sweepToolInputStrings}): deep enough to reach argv-in-object shapes,
- * small enough that a hostile megabyte-blob input cannot make every gate call
- * a regex party.
+ * V5-L5: host mode with NO trustRoot disarms both store sweeps at once (the
+ * structural branch has no store to compare against; the textual branch has
+ * no targets to mention). The real host adapters always pass a trust root —
+ * a library caller that does not must at least be TOLD the guard is off,
+ * once per process, instead of sailing silently. Never throws: a diagnostics
+ * gap must not become a denial.
  */
-const SWEEP_MAX_DEPTH = 3
-const SWEEP_MAX_STRING = 8_192
-const SWEEP_MAX_STRINGS = 64
-
-/**
- * Every string a tool call's input carries — VALUES, not keys (X-H-13).
- *
- * The N-1 fix enumerated command keys (`command`/`cmd`/`script`), and the
- * audit walked around it with the fourth spelling (`{commandLine: …}`,
- * `{code: …}`, `{cmdline: …}`), mixed argv (`['node','-e','…',0]` failed
- * `every(string)` and vanished entirely) and nested objects
- * (`{command:{cmd:'…'}}`) — a key-name list is a list, and lists recur the
- * disease they were meant to cure. This sweep cannot be walked by renaming a
- * key: any string under any key (to depth 3, each ≤ 8k, at most 64 strings)
- * is returned; a string ARRAY under any key is argv-shaped and joins into one
- * string (its string elements only — object elements recurse one level
- * deeper); a mixed array joins its string elements and still reaches the
- * needle inside them.
- *
- * The price, deliberately paid (宁误拦 — rather over-block than miss): a
- * mutation call whose CONTENT legitimately mentions the store
- * (`write {content: 'see .proof/evidence.jsonl'}`) is denied once, with a
- * reason saying exactly why; a string over 8k or past the 64th is NOT swept
- * (documented under-deny window — the bounds exist so a hostile input blob
- * cannot turn the gate into a CPU sink, and no real command string observed
- * in the wild carries a store path past 8k).
- *
- * CROSS-FACE CONTRACT (the "one sweep" rule, mirroring foldHostPath's):
- * dsh/observe.ts exports `sweepToolInputStrings` with exactly these
- * semantics and src/index.ts consumes it, so the adapter gates and the DSH
- * plugin face cannot drift into the two-sides-split pattern this codebase's
- * audit history keeps re-finding (X-H-16's lesson in the reverse direction).
- * This local definition is that contract verbatim; it retires into an import
- * from observe.ts the moment that export lands (grep-confirmed absent while
- * this batch was written) — semantics MUST move in lockstep from then on.
- */
-function sweepToolInputStrings(toolInput: unknown): string[] {
-  const out: string[] = []
-  const push = (value: string): void => {
-    if (out.length < SWEEP_MAX_STRINGS && value.length > 0 && value.length <= SWEEP_MAX_STRING) {
-      out.push(value)
-    }
+let warnedUnarmedHostStore = false
+function warnUnarmedHostStore(): void {
+  if (warnedUnarmedHostStore) return
+  warnedUnarmedHostStore = true
+  try {
+    process.stderr.write(
+      'dsh-proof: GateOptions.evidenceStore=\'host\' without a trustRoot disarms BOTH evidence-store sweeps '
+      + '(structural and textual) — no guard is running for the host-side store. Pass trustRoot (the host '
+      + 'adapters always do); this is the historical no-trust contract, announced rather than silent.\n',
+    )
+  } catch {
+    /* a closed stderr cannot stop the gate either */
   }
-  const visit = (value: unknown, depth: number): void => {
-    if (out.length >= SWEEP_MAX_STRINGS || depth > SWEEP_MAX_DEPTH) return
-    if (typeof value === 'string') {
-      push(value)
-      return
-    }
-    if (value === null || typeof value !== 'object') return
-    if (Array.isArray(value)) {
-      const strings = value.filter(item => typeof item === 'string') as string[]
-      if (strings.length > 0) push(strings.join(' '))
-      for (const item of value) {
-        if (typeof item === 'object' && item !== null) visit(item, depth + 1)
-      }
-      return
-    }
-    for (const child of Object.values(value as Record<string, unknown>)) {
-      if (typeof child === 'string') push(child)
-      else visit(child, depth + 1)
-    }
-  }
-  visit(toolInput, 0)
-  return out
 }
 
 /**
  * Every spelling of the store and trust artifacts a shell command must not
- * name. `shellCommandMentionsPath` folds case and separators on both sides,
- * so one spelling per target is enough (`.proof/evidence.jsonl` also catches
- * `.PROOF\EVIDENCE.JSONL`). Since X-H-12 the segments and roots here go
- * through `foldHostPath` — the ONE fold — so a configured `evidenceDir` like
- * `a/..` collapses to the degenerate root case in the TEXTUAL sweep exactly
- * like it already did in the structural one (W11-L-H: the two sweeps used to
- * disagree about what the store is, and `echo x > evidence.jsonl` slipped
- * between them). Substring semantics are the conservative direction on
- * purpose — `cd .proof && …`, `> .proof/evidence.jsonl` and
- * `rm -rf <trustRoot>/anchors/<key>` must all land; the price is an
- * occasional over-denied call whose reason says exactly why.
+ * name — the ONE target-set constructor both guard faces consume since
+ * v0.24: paths.ts `guardedTargets` (Y-H-10/V5-M1/Y-H-11). It lists the
+ * workspace store segment and its artifacts (folded through `foldHostPath`,
+ * the ONE fold — a configured `evidenceDir` like `a/..` collapses to the
+ * degenerate root case in the TEXTUAL sweep exactly like it already did in
+ * the structural one), the trust-side store DIRECTORY and files under both
+ * identity keys, the anchors, the adapter session ledgers, the `keys`
+ * directory and the bare signing-key file names, and — for the default
+ * trust root — the `~`/`$DSH_HOME`/`$HOME` spellings `rm -rf ~/.dsh/proof`
+ * walks in through. Pre-v0.24 this list was hand-rolled here and in
+ * src/index.ts and the two forks disagreed in exactly the places the audit
+ * drove commands through; `shellCommandMentionsPath` folds case and
+ * separators on both sides, so one spelling per target is enough
+ * (`.proof/evidence.jsonl` also catches `.PROOF\EVIDENCE.JSONL`).
+ * Substring semantics are the conservative direction on purpose —
+ * `cd .proof && …`, `> .proof/evidence.jsonl` and `rm -rf <trust>/anchors/<key>`
+ * must all land; the price is an occasional over-denied call whose reason
+ * says exactly why.
  */
-function guardedShellTargets(root: string, options: GateOptions): string[] {
-  const targets: string[] = []
-  if (options.evidenceStore === 'workspace') {
-    const dir = foldHostPath(options.evidenceDir)
-    if (dir !== '') {
-      // The bare store directory, the artifacts inside it, and the
-      // root-anchored spellings an absolute command would use.
-      targets.push(dir, `${dir}/evidence.jsonl`, `${dir}/baseline.json`)
-    } else {
-      // Degenerate segment (M-48): the store IS the workspace root; guard the
-      // artifact file names themselves.
-      targets.push('evidence.jsonl', 'baseline.json')
-    }
-    const anchored = foldHostPath(`${root.replace(/\/+$/, '')}/${options.evidenceDir}`)
-    targets.push(anchored, `${anchored}/evidence.jsonl`, `${anchored}/baseline.json`)
-  }
-  if (options.trustRoot !== undefined && options.trustRoot.length > 0) {
-    // Trust-side artifacts are never legitimately agent-writable in EITHER
-    // store mode: the anchor mirrors every checkpoint, the host-mode store
-    // lives here, and (W11-M3) the adapter session ledgers record the
-    // shellUsed/firedNotices facts the drift narrative speaks with — deleting
-    // or forging one must not be a command away. Both identity keys are
-    // listed: a migrated deployment still holds state under the legacy one.
-    const trust = foldHostPath(options.trustRoot)
-    if (trust !== '') {
-      const pair = workspaceKeyPair(root)
-      for (const key of pair.normalized === pair.legacy ? [pair.normalized] : [pair.normalized, pair.legacy]) {
-        targets.push(
-          `${trust}/anchors/${key}`,
-          `${trust}/workspaces/${key}/evidence.jsonl`,
-          `${trust}/workspaces/${key}/baseline.json`,
-          `${trust}/adapter-sessions/${key}`,
-        )
-      }
-    }
-  }
-  return [...new Set(targets)].filter(t => t.length > 0)
-}
 
 /**
  * Decide one tool call before the host executes it.
@@ -232,8 +155,15 @@ export function decidePreToolUse(
   options: GateOptions,
   hasBaseline: boolean | undefined,
 ): GateDecision {
+  // V5-L5: announce the disarmed combination instead of running silent —
+  // host mode without a trustRoot has no store to guard and no targets to
+  // mention; the historical contract, but a loud one.
+  if (options.evidenceStore === 'host'
+    && (options.trustRoot === undefined || options.trustRoot.length === 0)) {
+    warnUnarmedHostStore()
+  }
   const mutation = isMutationToolName(toolName)
-  const targets = guardedShellTargets(root, options)
+  const targets = guardedTargets(root, options)
   if (mutation && (options.evidenceStore === 'workspace' || options.trustRoot !== undefined)) {
     const candidates = WorkspaceWatch.pathsIn(toolInput, { contentKeys: true })
     let verdict: 'store' | 'trust' | undefined
@@ -254,7 +184,10 @@ export function decidePreToolUse(
       // this guard exists to refuse, in workspace mode just as much as in
       // host mode (only the store's location differs). Both identity
       // spellings are swept (a migrated deployment may still hold its state
-      // under the legacy key), the same pair the shell rule lists.
+      // under the legacy key), the same pair the shell rule lists; Y-H-11
+      // adds the `keys` directory — the Ed25519 pair the checkpoint chain's
+      // signatures live and die by, a file-level addition rather than the
+      // whole trust root (over-deny stops where nothing sensitive lives).
       const trust = foldHostPath(options.trustRoot)
       const pair = workspaceKeyPair(root)
       const keys = pair.normalized === pair.legacy ? [pair.normalized] : [pair.normalized, pair.legacy]
@@ -262,6 +195,7 @@ export function decidePreToolUse(
         `${trust}/workspaces/${key}`,
         `${trust}/anchors/${key}`,
         `${trust}/adapter-sessions/${key}`,
+        `${trust}/keys`,
       ])
       if (candidates.some(candidate => guardedDirs.some(dir => absoluteInside(candidate, dir)))) verdict = 'trust'
     }

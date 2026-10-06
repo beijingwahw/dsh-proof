@@ -215,7 +215,9 @@ export interface TrustWeights {
    * choice, not a measurement: Class C's seam is binary, and this constant
    * stands in for the confidence the seam declines to elicit. It is 0.95,
    * not 1 — an endorsement that could never be wrong would make every
-   * endorsed claim unfalsifiable.
+   * endorsed claim unfalsifiable. Domain: finite [0,1] (assertTrustWeights
+   * refuses the outside loudly — V7-M2); the endpoints are defined, not
+   * nonsense: 0 prices humans as always wrong, 1 as infallible.
    */
   readonly humanProbability: number
 }
@@ -223,23 +225,42 @@ export interface TrustWeights {
 export const DEFAULT_TRUST_WEIGHTS: TrustWeights = { classB: 0.7, classC: 0.9, humanProbability: 0.95 }
 
 /**
- * W15-M5: `TrustWeights.classB`/`classC` must lie in the CLOSED interval
+ * W15-M5/V7-M2: every TrustWeights number must lie in the CLOSED interval
  * [0,1] (0 = "no trust, no evidence" and 1 = "testify at full weight" are
  * both documented, meaningful endpoints — only the outside is nonsense).
- * The module's own invariant ("testimony can only weaken": p^w ≤ 1, and the
- * fusion mixture never overshooting either endpoint) depends on it — a
- * negative w AMPLIFIES the claim product above 1, w > 1 extrapolates the
- * `(1−w)·current + w·p` mixture past both of its endpoints. The plugin
- * config path already bounds these (`Schema.percent()`), but this module's
- * API takes bare numbers, so it guards its own door: refuse loudly at the
- * factor and fusion entries instead of trusting every upstream forever.
+ * The module's own invariants depend on it — a negative exponent AMPLIFIES
+ * the claim product above 1, a weight above 1 extrapolates the
+ * `(1−w)·current + w·p` mixture past both of its endpoints, and for
+ * `humanProbability` specifically an out-of-domain value used to silently
+ * erase testimony: `attestationFactor` priced an unreadable probability as
+ * abstain (factor 1), so a human REJECT registered at humanProbability=5
+ * contributed NOTHING — the disproof vanished from the claim product instead
+ * of the configuration error surfacing. The plugin config path already
+ * bounds the exponents (`Schema.percent()`), but this module's API takes
+ * bare numbers, so it guards its own door: refuse loudly at the factor and
+ * fusion entries instead of trusting every upstream forever.
+ *
+ * V7-M6 (domain pin, two-face split): this closed interval IS the module's
+ * documented semantics — the endpoints are legal for classB/classC (and for
+ * humanProbability: 0 = "humans are always wrong", 1 = "humans are
+ * infallible" — discouraged by the default's own comment, but defined, not
+ * nonsense). The host config schema is expected to align to this SAME
+ * closed interval; a config layer rejecting values the core documents as
+ * meaningful gives one domain two answers.
  */
 function assertTrustWeights(weights: TrustWeights): void {
-  for (const [name, value] of [['classB', weights.classB], ['classC', weights.classC]] as const) {
+  for (
+    const [name, value] of [
+      ['classB', weights.classB],
+      ['classC', weights.classC],
+      ['humanProbability', weights.humanProbability],
+    ] as const
+  ) {
     if (!Number.isFinite(value) || value < 0 || value > 1) {
       throw new TypeError(
         `TrustWeights.${name} must lie in [0,1] — got ${value}. Outside it testimony can only forge: `
-        + 'a negative exponent amplifies the claim product, a weight above 1 extrapolates the fusion past both endpoints.',
+        + 'a negative exponent amplifies the claim product, a weight above 1 extrapolates the fusion past both endpoints, '
+        + 'and an out-of-domain humanProbability silently erases the testimony it was supposed to price.',
       )
     }
   }
@@ -291,7 +312,11 @@ export function attestationFactor(att: Attestation, weights: TrustWeights): numb
   // Class C: endorse testifies "true" with probability humanProbability;
   // reject testifies "true" only with the human's error probability
   // 1 − humanProbability — a trusted human's rejection is a heavy discount,
-  // which is the entire point of registering a human at Class C.
+  // which is the entire point of registering a human at Class C. (The
+  // readability check below is now a belt-and-suspenders no-op: the weights
+  // were domain-asserted at entry (V7-M2), so an out-of-domain
+  // humanProbability THROWS there instead of degrading to factor 1 here —
+  // the old silent path is exactly how a human's reject testimony vanished.)
   if (!isUsableProbability(weights.humanProbability)) return 1
   const p = att.decision === 'endorse' ? weights.humanProbability : 1 - weights.humanProbability
   return Math.pow(p, weights.classC)

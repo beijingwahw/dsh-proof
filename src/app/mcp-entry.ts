@@ -31,7 +31,12 @@
  *                             proof_log_verify (default <trustRoot>/ptl). When
  *                             set explicitly it MUST be absolute (v0.23,
  *                             W10-M2) — same rule, same reason as the trust
- *                             root above
+ *                             root above — and when the RESOLVED directory
+ *                             sits inside the workspace the server warns on
+ *                             stderr at startup (v0.24, V4-M7: the operator
+ *                             key candidates under it land in the
+ *                             agent-writable area; the warning is the
+ *                             M-47 containment rule, never a silent pass)
  *   DSH_PROOF_SERVER_VERSION  serverInfo.version override (default
  *                             MCP_DEFAULT_VERSION from mcp-server.ts)
  *   DSH_HOME                  harness home used by the trust-root default
@@ -52,7 +57,7 @@ import { ProofEngine } from '../engine.ts'
 import {
   GitWorkspace, NodeCommandPort, NodeEd25519Signer, NodeFsPort, SystemClock,
 } from '../node-ports.ts'
-import { deriveProofPaths, resolveAdapterEnv } from '../adapters/shared/paths.ts'
+import { deriveProofPaths, foldHostPath, resolveAdapterEnv } from '../adapters/shared/paths.ts'
 import { MCP_DEFAULT_VERSION, runMcpServer } from './mcp-server.ts'
 
 /**
@@ -101,6 +106,44 @@ export function assertAbsoluteTrustRoot(value: string, name: string): string {
   return value
 }
 
+/**
+ * The ONE parse of DSH_PROOF_PTL_DIR (v0.24, V4-L4). `resolveAdapterEnv` is
+ * the shared ONE-parse for every DSH_PROOF_* variable the adapter hooks also
+ * consume; this variable has exactly one consumer (this entry — the engine
+ * receives the resolved directory, never the string), so until the shared
+ * resolver grows the field (paths.ts is the adapters' file, not this one),
+ * the same value semantics live HERE, once, next to the only reader:
+ * a non-empty string or absent — no second parse, no drift between the
+ * read below and anything else in this process.
+ */
+function ptlDirFromEnv(env: NodeJS.ProcessEnv): string | undefined {
+  const value = env.DSH_PROOF_PTL_DIR
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+/**
+ * v0.24 (V4-M7): warn when the resolved PTL directory sits INSIDE the
+ * workspace root — the containment half of the trust-boundary claim, using
+ * the same host-fold comparison the trust root's M-47 check applies
+ * (device-prefixed and backslash spellings of the same directory must not
+ * slip the check by spelling themselves differently on each side).
+ */
+function warnIfPtlInsideWorkspace(ptlDir: string, root: string): void {
+  const foldedPtl = foldHostPath(ptlDir)
+  const foldedRoot = foldHostPath(root)
+  if (foldedPtl === foldedRoot || foldedPtl.startsWith(`${foldedRoot}/`)) {
+    process.stderr.write(
+      '[agent-proof-protocol] warning: the transparency-log directory ' + ptlDir
+      + ' is INSIDE the workspace ' + root
+      + ' — the published log AND the operator-key candidates (<ptlDir>/ptl-operator-key, legacy'
+      + ' <ptlDir>/operator-key) resolve in the agent-writable area the trust boundary exists to exclude:'
+      + ' a writer who can touch the log can rewrite it together with the key that notarises it.'
+      + ' Move the PTL directory outside the workspace (DSH_PROOF_PTL_DIR);'
+      + ' treating this deployment as untrusted.\n',
+    )
+  }
+}
+
 async function main(): Promise<void> {
   // H-21 (v0.22): the DSH_PROOF_* contract is parsed by the shared resolver
   // — the same function the Claude Code hooks and the OpenCode plugin use —
@@ -140,11 +183,24 @@ async function main(): Promise<void> {
   // a relative spelling resolved per-CWD, escaping every trust-boundary
   // check (an explicit PTL dir inside the workspace would put the published
   // log AND the bootstrapped operator key in the agent-writable area).
+  // v0.24 (V4-M7): the RESOLVED directory is additionally checked for
+  // containment — an ABSOLUTE DSH_PROOF_PTL_DIR pointing INTO the workspace
+  // passed the absoluteness gate while reopening exactly the self-reference
+  // the gate exists to close (the operator-key candidates
+  // <ptlDir>/ptl-operator-key and the legacy <ptlDir>/operator-key resolve
+  // inside the agent-writable area, and the key that notarises the log can
+  // be rewritten together with it — H-07c via one environment variable).
+  // Warn + narrative on stderr, the M-47 rule the trust root already follows
+  // (a deployment may legitimately choose this; it must never happen in
+  // silence).
   const ptlDir = (() => {
-    const explicit = process.env.DSH_PROOF_PTL_DIR
-    if (typeof explicit !== 'string' || explicit.length === 0) return nodePath.join(trustRoot, 'ptl')
+    const explicit = ptlDirFromEnv(process.env)
+    if (explicit === undefined) return nodePath.join(trustRoot, 'ptl')
     return assertAbsoluteTrustRoot(explicit, 'DSH_PROOF_PTL_DIR')
   })()
+  // V4-M7 (v0.24): containment — absolute-into-workspace is a warning, not a
+  // refusal (same calculus as the trust root's M-47 rule), but never silent.
+  warnIfPtlInsideWorkspace(ptlDir, root)
   // M-39/H-21 (MCP half): the workspace identity is derived through the SAME
   // derivation the adapters use — normalised root spelling, legacy-key
   // fallback probe included — instead of a raw sha256(root) that spelled the

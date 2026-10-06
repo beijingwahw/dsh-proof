@@ -336,6 +336,31 @@ test('GRADE_VALUES is exactly the set a graded run can produce (pessimistic by c
   assert.deepEqual([...grades].sort(), [...GRADE_VALUES].sort(), 'the grade vocabulary is the lattice, no more, no less')
 })
 
+test('Y-H-04 (report side): a certify target outside (0,1) is refused at the grade gate, not silently honored', () => {
+  // The engine/config construction boundaries validate their knobs; this
+  // pins the report's OWN door — decideGrade consumes the target wired
+  // through ConfidenceInput, and target 0 makes `proven` a tautology while
+  // target 1 makes it unreachable. Both are configuration errors, not
+  // policy choices (validateBayesKnobs doctrine), and a direct assembleProof
+  // caller must not be able to smuggle one past an unvalidating engine.
+  const clock = new FakeClock()
+  const s = spec({ id: 'c1' })
+  const pass = makeEvidence(s, { status: 'pass', exitCode: 0, durationMs: 1, output: 'pass' }, WS, clock)
+  const base = buildBaseline([pass], WS, clock)
+  const withTarget = (target: number) => assembleProof({
+    specs: [s], baseline: base, records: [pass], changed: ['src/a.ts'],
+    workspace: WS, clock, requireFullCoverage: false,
+    confidence: { target, factors: new Map([[s.id, 0.99]]), runCheckIds: new Set([s.id]), skippedByPlan: [] },
+  })
+  for (const bad of [0, 1, -0.5, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(() => withTarget(bad), RangeError, `certifyTarget=${bad} must be refused at the grade gate`)
+  }
+  // The open interior stays legal, including both edges of the practical
+  // band: a reachable target certifies, an unreachable one degrades honestly.
+  assert.equal(withTarget(0.9).report.grade, 'proven', '0.99 ≥ 0.9 certifies')
+  assert.equal(withTarget(0.999).report.grade, 'stale', '0.99 < 0.999 degrades to stale — a legal, unreachable target')
+})
+
 test('CHECK_STATUSES matches the runner vocabulary; only pass and fail are decisive', () => {
   assert.equal(isDecisiveStatus('pass'), true)
   assert.equal(isDecisiveStatus('fail'), true)

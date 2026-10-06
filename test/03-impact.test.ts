@@ -274,6 +274,98 @@ test('W14-M5: multi-line parenthesised `from pkg import (…)` name lists carry 
   assert.ok(impactClosure(g2, ['pkg/mod.py']).has('app.py'), 'comment lines inside the list do not eat the names')
 })
 
+// ---------------------------------------------------------------------------
+// Y-H-07 — X-H-17(a) resurrected on the continuation reader. The dot-tail
+// conditional join was fixed ONLY on the single-line name-list path; the
+// bracket-continuation reader added the same version kept the unconditional
+// `'.'+'.'+'x'` join, so `from . import (\n x,\n)` — black/isort's standard
+// formatting for a long name list, i.e. the exact spelling the reader exists
+// for — minted '..x' and walked every name to the PARENT package.
+// ---------------------------------------------------------------------------
+
+test('Y-H-07: `from . import (x, y)` continuation names bind the SIBLINGS, not the parent package', async () => {
+  const files = {
+    '/ws/pkg/__init__.py': '',
+    '/ws/pkg/main.py': 'from . import (\n    x,\n    y,\n)\n',
+    '/ws/pkg/x.py': 'X = 1\n',
+    '/ws/pkg/y.py': 'Y = 1\n',
+    '/ws/x.py': 'PARENT = 1\n',
+    '/ws/y.py': 'PARENT = 1\n',
+  }
+  const fs = MemoryFs.of(files)
+  const graph = await buildDependencyGraph(fs, '/ws', Object.keys(files).map(stripRoot))
+  // Both sibling edges survive (the pre-fix reader dropped them all).
+  assert.ok(impactClosure(graph, ['pkg/x.py']).has('pkg/main.py'), 'continuation name x binds pkg/x.py, not the parent')
+  assert.ok(impactClosure(graph, ['pkg/y.py']).has('pkg/main.py'), 'continuation name y binds pkg/y.py, not the parent')
+  // Reverse pin: the parent-package files gain NO edge — the pre-fix '..x'
+  // join manufactured exactly these pseudo-edges.
+  assert.ok(!impactClosure(graph, ['x.py']).has('pkg/main.py'), 'no parent-package x.py edge from the continuation reader')
+  assert.ok(!impactClosure(graph, ['y.py']).has('pkg/main.py'), 'no parent-package y.py edge from the continuation reader')
+  // The package's own edge survives as always.
+  assert.ok(impactClosure(graph, ['pkg/__init__.py']).has('pkg/main.py'), 'the module site binds the package __init__')
+  // Site-level KAT of the specifiers actually minted (the off-by-one itself):
+  // each continuation name is '.x'/'.y' — never '..x'/'..y'.
+  const sites = extractImportSites('from . import (\n    x,\n    y,\n)\n')
+  assert.deepEqual(sites.map(s => s.specifier), ['.', '.x', '.y'], 'module site "." + name sites ".x"/".y" — never "..x"/"..y"')
+})
+
+// ---------------------------------------------------------------------------
+// V7-L1/L2 — the two Python shapes the X-H-17(b) doctrine and the no-space
+// spelling exposed. (L1) a bare dot-run's module site took the FIRST
+// candidate only, so a mixed tree (`pkg.ts` AND `pkg/__init__.py`) connected
+// one file; the doctrine five lines below it is "every hit adds its own
+// edge". (L2) `from .import x` — legal Python, no space after the dot-run —
+// lost the whole site to greedy regex backtracking.
+// ---------------------------------------------------------------------------
+
+test('V7-L1: a bare dot-run module site connects EVERY existing candidate in a mixed tree', async () => {
+  const files = {
+    // Both readings exist on disk: the TS module and the Python package.
+    '/ws/pkg.ts': 'export const p = 1\n',
+    '/ws/pkg/__init__.py': 'P = 1\n',
+    '/ws/pkg/main.py': 'from . import x\n',
+    '/ws/pkg/x.py': 'X = 1\n',
+  }
+  const fs = MemoryFs.of(files)
+  const graph = await buildDependencyGraph(fs, '/ws', Object.keys(files).map(stripRoot))
+  assert.ok(impactClosure(graph, ['pkg/__init__.py']).has('pkg/main.py'), 'the package __init__ keeps its edge (probe order first)')
+  assert.ok(impactClosure(graph, ['pkg.ts']).has('pkg/main.py'), 'the mixed-tree pkg.ts keeps its edge too (firstKnown used to drop it)')
+  // Single-hit trees are unchanged: still exactly the one candidate.
+  const solo = {
+    '/ws/solo/__init__.py': '',
+    '/ws/solo/main.py': 'from . import x\n',
+    '/ws/solo/x.py': 'X = 1\n',
+  }
+  const g2 = await buildDependencyGraph(MemoryFs.of(solo), '/ws', Object.keys(solo).map(stripRoot))
+  assert.ok(impactClosure(g2, ['solo/__init__.py']).has('solo/main.py'), 'single-hit resolution is untouched')
+})
+
+test('V7-L2: `from .import x` (no space after the dot-run) carries the same edges as the spaced form', async () => {
+  const files = {
+    '/ws/pkg/__init__.py': '',
+    '/ws/pkg/main.py': 'from .import x\n',
+    '/ws/pkg/x.py': 'X = 1\n',
+    '/ws/x.py': 'PARENT = 1\n',
+  }
+  const fs = MemoryFs.of(files)
+  const graph = await buildDependencyGraph(fs, '/ws', Object.keys(files).map(stripRoot))
+  assert.ok(impactClosure(graph, ['pkg/x.py']).has('pkg/main.py'), 'the no-space form binds the sibling pkg/x.py')
+  assert.ok(impactClosure(graph, ['pkg/__init__.py']).has('pkg/main.py'), 'the module site still binds the package')
+  assert.ok(!impactClosure(graph, ['x.py']).has('pkg/main.py'), 'and still never the parent package')
+  // Multi-dot no-space form climbs the right number of levels.
+  const files2 = {
+    '/ws/pkg/__init__.py': '',
+    '/ws/pkg/sub/__init__.py': '',
+    '/ws/pkg/sub/deep.py': 'from ..import x\n',
+    '/ws/pkg/x.py': 'X = 1\n',
+  }
+  const g2 = await buildDependencyGraph(MemoryFs.of(files2), '/ws', Object.keys(files2).map(stripRoot))
+  assert.ok(impactClosure(g2, ['pkg/x.py']).has('pkg/sub/deep.py'), 'from ..import x climbs exactly one level out of the subpackage')
+  // Site-level: the specifier is the dot-run, not a mangled module name.
+  const sites = extractImportSites('from .import x\n')
+  assert.deepEqual(sites.map(s => s.specifier), ['.', '.x'], 'module site "." + name site ".x" — the greedy-eaten site is back')
+})
+
 test('H-24/M-28: two imports on one line both carry edges — the second is not invisible', async () => {
   const files = {
     '/ws/a.ts': 'export const a = 1\n',

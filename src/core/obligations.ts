@@ -444,25 +444,47 @@ export function detectCycles(obligations: readonly TaskObligation[]): string[] {
   const visiting = new Set<string>() // tasks on the current walk's stack
   const stack: string[] = []
 
-  const walkFrom = (id: string): void => {
-    if (settled.has(id)) return
-    if (visiting.has(id)) {
-      // Closed a loop: the stack slice from the earlier visitation is the
-      // cycle, in parent-pointer order.
-      recordCycle(stack.slice(stack.indexOf(id)), found)
-      return
+  // V7-M4: the walk is ITERATIVE (explicit frame stack), not recursive. The
+  // obligations come from chain markers an adversary can shape; a cycle-free
+  // but DEEP parent chain (50k tasks, one edge each) used to blow the JS
+  // call stack with RangeError before composeTaskVerdict could deliver its
+  // graceful "responsibility cycle detected"-style refusal — a crash where
+  // the module's contract promises a verdict. The frame discipline mirrors
+  // the old recursion exactly (same parent order, same visiting/settled
+  // transitions, same cycle recording), so outputs are bit-identical; only
+  // the depth ceiling is gone (heap frames, not call frames).
+  type Frame = { id: string; parents: readonly string[]; next: number }
+  for (const o of obligations) {
+    if (settled.has(o.taskId)) continue
+    const frames: Frame[] = []
+    const enter = (id: string): void => {
+      visiting.add(id)
+      stack.push(id)
+      frames.push({ id, parents: parentEdges.get(id) ?? [], next: 0 })
     }
-    visiting.add(id)
-    stack.push(id)
-    for (const parent of parentEdges.get(id) ?? []) {
-      if (known.has(parent)) walkFrom(parent) // dangling parents end the walk
+    enter(o.taskId)
+    while (frames.length > 0) {
+      const frame = frames[frames.length - 1] as Frame
+      if (frame.next < frame.parents.length) {
+        const parent = frame.parents[frame.next] as string
+        frame.next += 1
+        if (!known.has(parent)) continue // dangling parents end the walk
+        if (settled.has(parent)) continue
+        if (visiting.has(parent)) {
+          // Closed a loop: the stack slice from the earlier visitation is the
+          // cycle, in parent-pointer order.
+          recordCycle(stack.slice(stack.indexOf(parent)), found)
+          continue
+        }
+        enter(parent)
+      } else {
+        frames.pop()
+        stack.pop()
+        visiting.delete(frame.id)
+        settled.add(frame.id)
+      }
     }
-    stack.pop()
-    visiting.delete(id)
-    settled.add(id)
   }
-
-  for (const o of obligations) walkFrom(o.taskId)
   return [...found.keys()].sort().map(k => found.get(k) as string)
 }
 
@@ -591,9 +613,10 @@ export function composeTaskVerdict(
     }
   }
 
-  const effectiveOf = (id: string): EffectiveState => {
-    const cached = memo.get(id)
-    if (cached !== undefined) return cached
+  // The per-node fold, factored out of the recursion below: identical logic
+  // to the pre-V7-M4 `effectiveOf` body, computing one node's EffectiveState
+  // from its own submission/measurement and its (already memoised) kids.
+  const computeEffective = (id: string): EffectiveState => {
     const node = nodeByTask.get(id) as DagNode
     const kids = byParent.get(id) ?? []
     const sub = node.submission
@@ -602,31 +625,54 @@ export function composeTaskVerdict(
     // the cross-agent channel) or, failing that, by what the engine measured
     // of that workspace (ownGrades). Neither means nobody proved the claim.
     const measured: ProofGrade | undefined = ownGrades.has(id) ? ownGrades.get(id) : undefined
-    let result: EffectiveState
     if (kids.length === 0) {
       // Leaf: the submission is the whole story.
-      result = sub !== undefined
+      return sub !== undefined
         ? { forged, effective: forged ? 'regressed' : sub.claimedGrade }
         : measured !== undefined
           ? { forged: false, effective: measured }
           : { forged: false, effective: 'unsubmitted' }
-    } else {
-      // Interior: composed from below, with the child's own claim (or the
-      // engine's measurement of it) as its own-grade input. Forgery and
-      // subtree regression both land on 'regressed'; otherwise a child with
-      // neither submission nor measurement stays *unsubmitted* at this level
-      // even over a green subtree — nobody proved its claim.
-      const ownForCompose: ProofGrade | undefined =
-        sub !== undefined ? (forged ? 'regressed' : sub.claimedGrade) : measured
-      const composed = composeFromFacts(kids.map(k => factsOf(k.taskId)), ownForCompose).grade
-      const effective: ChildEffective =
-        forged || composed === 'regressed'
-          ? 'regressed'
-          : sub === undefined && measured === undefined ? 'unsubmitted' : composed
-      result = { forged, effective }
     }
-    memo.set(id, result)
-    return result
+    // Interior: composed from below, with the child's own claim (or the
+    // engine's measurement of it) as its own-grade input. Forgery and
+    // subtree regression both land on 'regressed'; otherwise a child with
+    // neither submission nor measurement stays *unsubmitted* at this level
+    // even over a green subtree — nobody proved its claim.
+    const ownForCompose: ProofGrade | undefined =
+      sub !== undefined ? (forged ? 'regressed' : sub.claimedGrade) : measured
+    const composed = composeFromFacts(kids.map(k => factsOf(k.taskId)), ownForCompose).grade
+    const effective: ChildEffective =
+      forged || composed === 'regressed'
+        ? 'regressed'
+        : sub === undefined && measured === undefined ? 'unsubmitted' : composed
+    return { forged, effective }
+  }
+
+  // V7-M4 (fold half): `effectiveOf` used to recurse through `factsOf`
+  // (effectiveOf → composeFromFacts → factsOf → effectiveOf), so the SAME
+  // deep, acyclic parent chain that blew `detectCycles` blew the fold the
+  // moment the query sat at the chain's deep end — a RangeError where the
+  // contract promises a verdict. Post-order with an explicit work stack
+  // instead; every unmemoised kid is stacked before its parent computes, so
+  // `computeEffective` only ever reads memoised kid states. The memo
+  // discipline and the byParent iteration order are unchanged, so outputs
+  // are bit-identical — only the depth ceiling is gone. (Termination rests
+  // on the cycle refusal above: the kid graph is exactly the parent graph
+  // `detectCycles` proved acyclic, reversed.)
+  const effectiveOf = (rootId: string): EffectiveState => {
+    const work: string[] = [rootId]
+    while (work.length > 0) {
+      const id = work[work.length - 1] as string
+      if (memo.has(id)) { work.pop(); continue }
+      let pending = false
+      for (const k of byParent.get(id) ?? []) {
+        if (!memo.has(k.taskId)) { work.push(k.taskId); pending = true }
+      }
+      if (pending) continue
+      memo.set(id, computeEffective(id))
+      work.pop()
+    }
+    return memo.get(rootId) as EffectiveState
   }
 
   const kidFacts = (byParent.get(taskId) ?? []).map(k => factsOf(k.taskId))

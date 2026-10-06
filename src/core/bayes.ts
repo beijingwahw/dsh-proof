@@ -580,12 +580,13 @@ function matchesByBarePrefix(file: RelPath, pattern: string): boolean {
  *     P(h|obs) = π·P(obs|h) / [π·P(obs|h) + (1−π)·P(obs|broken)]
  *
  * with P(pass|h) = 1−α, P(pass|broken) = β, P(fail|h) = α, P(fail|broken) = 1−β.
- * All four terms are strictly positive over the parameter domain — β is
- * domain-gated at every entry (`assertFalsePassDomain`: open interval (0,1),
- * non-finite refused), including here for caller-constructed priors — so the
- * result is always in (0,1), no degenerate zeros to guard. Plain floating
- * point; π ∈ [0.05, 0.999] keeps every numerator and denominator comfortably
- * away from underflow.
+ * All four terms are non-negative over the parameter domain — every knob is
+ * domain-gated at this entry for caller-constructed priors (β via
+ * `assertFalsePassDomain`: open interval (0,1), non-finite refused; α and π
+ * via the closed [0,1] checks of V7-L3), so the result is always in [0,1],
+ * no degenerate zeros or sign reversals to guard. Plain floating point;
+ * π ∈ [0.05, 0.999] (the computePriors clamp) keeps every numerator and
+ * denominator comfortably away from underflow.
  */
 export function posteriorHealthy(prior: CheckPrior, observed: 'pass' | 'fail'): number {
   // W6-F1, last line of defence: priors are constructed by callers too (the
@@ -594,6 +595,28 @@ export function posteriorHealthy(prior: CheckPrior, observed: 'pass' | 'fail'): 
   // failure was not an exception but a SILENT reversal (β=0 ⇒ pass posterior
   // exactly 1; β=1 ⇒ fail posterior exactly 1; β<0 ⇒ posteriors above 1).
   assertFalsePassDomain(prior.falsePass, 'CheckPrior.falsePass')
+  // V7-L3: the other two parameters are caller-constructed on the same
+  // boundary argument, and each has its own reversal. α outside [0,1] flips
+  // the sign of a likelihood term (α=1.2 makes P(fail|healthy)=1.2; α>1 on
+  // the pass branch makes P(pass|healthy)=1−α NEGATIVE, and two negatives
+  // multiply back to a plausible-looking positive posterior — the failure
+  // is a wrong number wearing the right sign). π outside [0,1] breaks the
+  // mixture the same way (1−π negative). Endpoints stay legal: α=1 / π=0
+  // and π=1 are degenerate but well-defined channels (posterior 0 or π),
+  // exactly like the closed endpoints computePriors' clamps can never emit
+  // but a hand-built prior might legitimately state.
+  if (!Number.isFinite(prior.falseFail) || prior.falseFail < 0 || prior.falseFail > 1) {
+    throw new RangeError(
+      `CheckPrior.falseFail must lie in [0,1] — got ${prior.falseFail}. Outside it the `
+      + 'binary channel\'s likelihood terms go negative and the posterior reverses meaning. Refusing (V7-L3).',
+    )
+  }
+  if (!Number.isFinite(prior.priorHealthy) || prior.priorHealthy < 0 || prior.priorHealthy > 1) {
+    throw new RangeError(
+      `CheckPrior.priorHealthy must lie in [0,1] — got ${prior.priorHealthy}. A prior is a `
+      + 'probability; outside [0,1] the Bayes mixture is not one. Refusing (V7-L3).',
+    )
+  }
   const pi = prior.priorHealthy
   const givenHealthy = observed === 'pass' ? 1 - prior.falseFail : prior.falseFail
   const givenBroken = observed === 'pass' ? prior.falsePass : 1 - prior.falsePass

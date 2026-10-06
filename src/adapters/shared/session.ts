@@ -249,7 +249,12 @@ function defaultAnnounce(line: string): void {
  * never crash on a half-written, foreign or forged file, it must just start
  * over (an empty session re-learns the workspace in one turn of observation),
  * with the reset ANNOUNCED so a tampered ledger cannot pass silently as a
- * working one.
+ * working one. V5-L2 (v0.24): ALL THREE damage routes announce — unparsable
+ * bytes and wrong-shaped bodies used to reset silently while only the digest
+ * mismatch was loud, so the CHEAPER forgeries (overwriting the file with
+ * garbage, splicing a foreign object) were the quiet ones, exactly backwards
+ * from H-19's "tamper cannot pass silently" promise. An ABSENT file stays
+ * silent on purpose: a first run is not damage.
  */
 export async function loadSession(
   dir: string,
@@ -257,9 +262,10 @@ export async function loadSession(
   onDamaged?: (line: string) => void,
 ): Promise<AdapterSession | undefined> {
   const announce = onDamaged ?? defaultAnnounce
+  const at = sessionPath(dir, sessionId)
   let raw: string | undefined
   try {
-    raw = await fsp.readFile(sessionPath(dir, sessionId), 'utf8')
+    raw = await fsp.readFile(at, 'utf8')
   } catch {
     return undefined
   }
@@ -267,14 +273,24 @@ export async function loadSession(
   try {
     parsed = JSON.parse(raw)
   } catch {
+    announce(`dsh-proof: session snapshot ${at} is not parsable JSON (torn write or hand damage); `
+      + `resetting the observation ledger — one-time notices will re-fire and drift re-learns in one turn of observation.`)
     return undefined
   }
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    announce(`dsh-proof: session snapshot ${at} holds valid JSON that is not a session object; `
+      + `resetting the observation ledger — one-time notices will re-fire and drift re-learns in one turn of observation.`)
+    return undefined
+  }
   const record = parsed as Record<string, unknown>
   const { digest, ...body } = record
-  if (!isAdapterSession(body)) return undefined
+  if (!isAdapterSession(body)) {
+    announce(`dsh-proof: session snapshot ${at} is not shaped like a session (missing or rotten fields); `
+      + `resetting the observation ledger — one-time notices will re-fire and drift re-learns in one turn of observation.`)
+    return undefined
+  }
   if (typeof digest !== 'string' || digest !== sessionDigest(sessionId, body)) {
-    announce(`dsh-proof: session snapshot ${sessionPath(dir, sessionId)} failed its integrity check `
+    announce(`dsh-proof: session snapshot ${at} failed its integrity check `
       + `(hand-edited, forged, or written by a pre-v0.23 build); resetting the observation ledger — `
       + `one-time notices will re-fire and drift re-learns in one turn of observation.`)
     return undefined

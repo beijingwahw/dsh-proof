@@ -668,6 +668,32 @@ test('detectCycles: self-loops, disjoint cycles, dangling parents, and clean for
   assert.deepEqual(detectCycles([]), [])
 })
 
+test('V7-M4: a 50k-deep adversarial parent chain gets a verdict, not a RangeError', () => {
+  // Obligations come from chain markers an adversary can shape; a cycle-free
+  // but DEEP chain used to blow the JS call stack twice — once in
+  // detectCycles's recursive DFS, once in the composition fold's mutual
+  // effectiveOf/factsOf recursion (when the query sat at the chain's deep
+  // end) — before any graceful refusal or verdict could be delivered. Both
+  // walks are iterative now; this pins the depth they must survive.
+  const depth = 50_000
+  const chain: TaskObligation[] = Array.from({ length: depth }, (_, i) =>
+    obligation(i + 1, { parentTaskId: `task-${i + 2}` }))
+  assert.deepEqual(detectCycles(chain), [], 'deep and acyclic: no cycle, no crash')
+  // Query from EITHER end: the leaf side (subtree = itself)…
+  const leaf = composeTaskVerdict('task-1', chain.map(o => ({ obligation: o })), new Map())
+  assert.equal(leaf.grade, 'unproven', 'an unsubmitted leaf-side task composes, not crashes')
+  // …and the deep root (the fold traverses all 50k levels).
+  const root = composeTaskVerdict(`task-${depth}`, chain.map(o => ({ obligation: o })), new Map())
+  assert.notEqual(root.grade, undefined, 'the deep-root fold returns a verdict, not a stack overflow')
+  // And cycle behaviour at depth is unchanged: a self-loop 50k tasks down is
+  // still detected and still refuses the whole composition.
+  const selfLoop = [...chain.slice(0, depth - 1), obligation(depth, { taskId: `task-${depth}`, parentTaskId: `task-${depth}` })]
+  assert.deepEqual(detectCycles(selfLoop), [`task-${depth} -> task-${depth}`])
+  const refused = composeTaskVerdict('task-1', selfLoop.map(o => ({ obligation: o })), new Map())
+  assert.equal(refused.grade, 'unproven')
+  assert.equal(refused.blockers[0], 'responsibility cycle detected')
+})
+
 test('W7-5: a duplicate taskId whose later copy self-parents is a detected cycle, not an unbounded fold', () => {
   // task-2 was minted under task-1, then a second record re-registered
   // task-2 under ITSELF. The old first-wins walk saw only the first record's

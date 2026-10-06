@@ -138,6 +138,20 @@ test('normalizeOutput folds drive-letter case drift (c:\\ws vs root C:/ws)', () 
   assert.equal(normalizeOutput('built c:/wsx/out.js', { root: 'C:/ws' }), 'built c:/wsx/out.js')
 })
 
+test('V7-L5: the drive-case fold is bidirectional — a lowercase root also folds UPPERCASE output', () => {
+  // The pre-fix variant list only ever emitted the LOWERCASED drive twin, so
+  // a root configured as c:/ws never matched output spelled C:\ws\src — the
+  // mirror image of the drift the uppercase-root test above pins. Dedupe
+  // broke in the false-inequality direction: same file, two addresses.
+  const out = normalizeOutput('failed at C:\\ws\\src\\a.ts and C:/ws/src/b.ts', { root: 'c:/ws' })
+  assert.equal(out, 'failed at $WORKSPACE/src/a.ts and $WORKSPACE/src/b.ts', 'either drive case in EITHER direction — one address')
+  // The two directions of the same configured root address identically.
+  const upperRoot = normalizeOutput('failed at c:\\ws\\src\\a.ts and c:/ws/src/b.ts', { root: 'C:/ws' })
+  assert.equal(sha256(out), sha256(upperRoot), 'c:/ws and C:/ws roots fold the same spellings to the same digest')
+  // Boundary anchor survives the new twins, both directions.
+  assert.equal(normalizeOutput('built C:/wsx/out.js', { root: 'c:/ws' }), 'built C:/wsx/out.js')
+})
+
 test('canonicalJson rejects values with no injective JSON rendering: bigint, symbol, function', () => {
   // Each of these used to fold onto some other value's rendering — 1n onto
   // the string "1", functions/symbols onto null — so distinct payloads

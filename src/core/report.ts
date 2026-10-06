@@ -27,6 +27,13 @@ import type { ClaimContract, ObligationResult } from './contract.ts'
 // τ: types only — core/coverage.ts is a leaf of the import graph (it depends
 // on nothing in core), so report can consume it without any cycle.
 import type { CoverageGateResult, CoverageSummary } from './coverage.ts'
+// Y-H-04 (report's consumption side): the grade gate consumes a certify
+// target handed in by the caller's ConfidenceInput; the engine/config
+// construction boundaries validate their own knobs, but this module's API
+// takes bare numbers, so it guards its own door the same way bayes.ts guards
+// its priors — one import, no cycle (bayes depends on evidence/ports/impact,
+// none of which import report).
+import { validateBayesKnobs } from './bayes.ts'
 
 /**
  * How the confidence number on a report was earned (β).
@@ -455,6 +462,35 @@ export interface EndorsementDoorInput {
  * endorser signs for), so an unlock is "every door closed except
  * below-target" — plus the engine's own extras. Every other open door is
  * missing or broken work, which endorsement never pays for (H3).
+ *
+ * V7-M5 (consumption contract, spelled for the engine): this module exports
+ * the door enumeration, the door-input shape and this function precisely so
+ * the engine can consume them as-is —
+ *
+ *     const doors = endorsementBlockers({
+ *       hasBaseline, discoveredCount, affectedCount,
+ *       regressions, newFailures, unverifiedCount, vanishedCount,
+ *       observedDecisive,
+ *       ...(confidence !== undefined ? { confidence } : {}),
+ *       requireFullCoverage,
+ *     })
+ *     const unlock = endorsed
+ *       && doors.every(d => d === 'below-target')
+ *       && <engine-only doors: unmet obligations, coverageBlocked,
+ *                       scriptDrifted, auditFailed>
+ *
+ * Every field is a primitive count the engine already states when it calls
+ * `assembleProof` (the same numbers `decideGrade` reads). TWO deliberate
+ * engine-side strictness notes, so the wiring does not silently lose them:
+ * (1) the engine's historic `unverified.length === 0` check is UNconditional
+ * — stricter than the `unfinished` door, which only opens under
+ * `requireFullCoverage` — and it subsumes `unobserved` (zero decisive
+ * observations with zero unverified affected checks is impossible), so the
+ * engine keeps it as its own door rather than passing `requireFullCoverage:
+ * false` here; (2) `graded.grade === 'stale'` (unlock only lifts residual
+ * risk, never a worse verdict) is likewise engine-side. A new door added to
+ * THIS enumeration is closed for both consumers by the `every` predicate;
+ * a new engine door is added next to it, visible in the same expression.
  */
 export function endorsementBlockers(input: EndorsementDoorInput): EndorsementDoor[] {
   const doors: EndorsementDoor[] = []
@@ -474,6 +510,16 @@ export function endorsementBlockers(input: EndorsementDoorInput): EndorsementDoo
 /** Statuses that actually answer the question — single source: `evidence.ts`. */
 
 function decideGrade(input: GradeInput): ProofGrade {
+  // Y-H-04 (V7-H2's report half): the certify target is a knob the caller
+  // wires through ConfidenceInput, and this gate is where it is CONSUMED —
+  // target 0 turns the `below-target` door into a tautology (every grade
+  // crosses it, `proven` for all inputs), target 1 into a permanent refusal,
+  // and NaN into "never below target". Neither endpoint is a policy choice
+  // (see validateBayesKnobs); refusing here means a direct assembleProof
+  // caller cannot smuggle one past an unvalidating engine the same way.
+  if (input.confidence !== undefined) {
+    validateBayesKnobs({ certifyTarget: input.confidence.target })
+  }
   // W6-F9: the doors are enumerated ONCE (endorsementBlockers) and consumed
   // here with the pinned per-regime priority; the engine's endorsement
   // unlock reads the same enumeration, so a new door can never again exist
