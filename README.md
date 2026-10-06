@@ -1,201 +1,524 @@
 # dsh-proof
 
-**Evidence-driven completion proof & regression attribution** — a DeepSeek Harness plugin.
+**Evidence-Driven Completion Proof & Regression Attribution** — an open standard, a Proof MCP Server, host adapters and a DeepSeek Harness plugin.
 
-> Turn "I'm done" from a self-report into a recomputable evidence chain.
-> Turn "I fixed it but broke something else" from a post-mortem into in-flight attribution.
+![protocol](https://img.shields.io/badge/protocol-APP%2F1.4-0969da)
+![version](https://img.shields.io/badge/version-0.27.0-0969da)
+![node](https://img.shields.io/badge/node-%5E22.19-1a7f37)
+![tests](https://img.shields.io/badge/tests-1099-1a7f37)
+![license](https://img.shields.io/badge/license-MIT-57606a)
+
+> Turn **"I'm done"** from a self-report into a recomputable evidence chain.
+> Turn **"I fixed it but broke something else"** from a post-mortem into in-flight attribution.
 
 ```
 $ proof_claim "fixed the login redirect bug and added a regression test"
 ✓ PROVEN — fixed the login redirect bug and added a regression test
 evidence root: 9f2c1ab47d0e
-PROVEN (p≈0.97) — "fixed the login redirect bug and added a regression test" is backed by evidence root 9f2c1ab47d0e: 3 check(s) passing, 0 regression(s), 1 pre-existing failure(s) left untouched.
+PROVEN (p≈0.97) — the claim is backed by evidence root 9f2c1ab47d0e:
+3 check(s) passing, 0 regression(s), 1 pre-existing failure(s) left untouched.
 ```
 
-**Install**
-
-```sh
-dsh plugin --profile web add dsh-proof        # from a registry
-dsh plugin --profile web add ./dsh-proof      # from a local checkout
-```
-
-📖 **[中文文档](./README.zh.md)** — full gap analysis, architecture and configuration reference.
-
-As of v0.15 the core is more than a plugin: it is an open standard, a standalone server, and host adapters — common infrastructure for any agent. The **Agent Proof Protocol (APP/1.4)** — see **[PROTOCOL.md](./PROTOCOL.md)** — pins the vocabulary, the content addressing, the signed chain and a portable bundle exchange format; the package ships a **Proof MCP Server** (any agent on any harness — Claude Desktop, Cursor, anything speaking MCP — can call `proof_verify` against a workspace that has never installed DSH) and, since v0.15, **host adapters** for Claude Code and OpenCode that enforce, at the tool-call seam, what no server can. Since v0.18 a **Proof Transparency Log** additionally makes the published checkpoint history publicly checkable — anyone can prove a delivery's checkpoint is in the log, and that the log never rewrote itself. Since v0.19 a **cross-agent responsibility DAG** makes delegation itself accountable: a delegated task carries a proof obligation, a parent's `proven` is preconditioned on its children's, and every DAG edge is an independently re-verifiable proof bundle. Since v0.20 the **training-data flywheel** gets its exhaust valve: the evidence log's machine-verified verdicts distill into an exportable, content-addressed, chain-anchored labeled dataset — deployment compounds into a proprietary data asset as a by-product of proving work honestly. Since v0.21 **verification has a unit cost**: every priced run leaves an economics ledger on the chain (compute spent, assertions verified, confidence purchased, information gained — each per dollar), and a `proven` grade can be priced into an insurance-style SLA whose exclusions are the system's honest limits written into the policy. Since v0.22 the whole codebase has been read line-by-line by a 27-agent adversarial audit (34 high findings, all closed): every product face that had quietly re-invented "self-report as truth" — delegation submissions, waivers, PTL publication, bundle verification — now demands a signature or a trust root it can check, learned priors no longer vouch for tampered script bodies, and the observation layer's tool-name and shell blind spots are guarded.
+📖 **[中文文档](./README.zh.md)** · 📜 **[Agent Proof Protocol](./PROTOCOL.md)** · 🔍 **[Audit findings ledger](./FINDINGS-LEDGER.md)**
 
 ---
 
 ## The gap
 
-The DSH ecosystem has 5000+ plugins across 14 categories. None of those categories is **verification**.
+Agent harnesses tell you what they *did*; they do not tell you whether it *works*. Self-reports are written by the party with the most to gain from being believed — so "I'm done" is a claim, not a fact.
 
-Three of the most common complaints from agent users share a single root cause — the agent's beliefs are not bound to the repository's facts:
+`dsh-proof` makes completion a **recomputable fact**:
 
-1. *"The agent said it was done, and the problem is still there."* A self-report cannot be falsified.
-2. *"I fixed one thing and broke three others."* Without a baseline you cannot tell pre-existing breakage from newly-caused breakage.
-3. *"I edited the file myself and the agent had no idea."* World-model drift; the model keeps reasoning on stale code.
-
-Existing plugins each cover part of it: `dsh-completion-guard` uses checklists the model ticks itself, `dsh-rollback` undoes changes after the fact, Aegis is a prompt-level methodology. **None of them produce machine-measured evidence at runtime.** That is what `dsh-proof` does.
-
----
-
-## Three pillars
-
-**1 · Baseline.** Before work starts, discover the workspace's *objective* checks (npm scripts, pytest/mypy/ruff, `go test`, `cargo test`, `make test`, …) and run them. Each outcome is recorded as content-addressed evidence: `evidenceId = sha256(canonical(record))`.
-
-**2 · Change-impact incremental verification.** Only re-run the checks this change set made stale, selected through a reverse-dependency closure (import graph) plus path coupling. Lockfiles, `tsconfig`, CI workflows and other global invalidators force a full run. Uncertainty *widens* the selection — over-running costs a minute, under-running hides a break.
-
-**3 · Claim → evidence.** `proof_claim` is the only compliant way to state completion. It re-runs the affected checks and returns `proven: true` only when nothing regressed and the claim is certified — posterior ≥ `certifyTarget` under the default bayesian scheduler, full coverage in `set` mode.
-
-### The headline distinction
-
-| baseline | current | verdict | whose fault |
-|---|---|---|---|
-| pass | pass | `still-passing` | — |
-| pass | fail | **`regression`** | **this session**, with suspect files |
-| fail | fail | `still-failing` | pre-existing — **not charged to you** |
-| fail | pass | `fixed` | this session fixed it |
-| absent | pass | `new-check` | first sight; counts as passing only if it actually ran |
-| absent | fail | `new-failure` | honestly unattributable |
-| present | not run | `not-run` | evidence stale |
-| either side skipped/timeout/aborted/error | — | `indeterminate` | **neither credit nor blame** — the honest middle |
-
-Working in an already-red repository is the normal condition. `dsh-proof` does not require you to fix history before you can prove you broke nothing. The verdict lattice is three-valued: credit (`still-passing`, `fixed`, a decisively-run `new-check`), blame (`regression`, `still-failing`, `new-failure`), and neither (`indeterminate`, `not-run`, a `new-check` that never ran) — unknown never borrows certainty from either side, and `summary` carries a separate `indeterminate` count.
-
-### Grades
-
-`proven` · `regressed` · `stale` · `unproven` · `no-baseline`
-
-Missing evidence is never papered over. Under the default `bayesian` scheduler (v0.9) the boundary is a confidence target: the claim is `proven` once its posterior crosses `certifyTarget` (narrative: `PROVEN (p≈0.97)`), `stale` below it — skipped checks carry their remaining uncertainty into the posterior instead of being hidden; with `scheduler: 'set'` a check that could not produce a decisive result makes the claim `stale`, not `proven`.
+- every objective check run is recorded as **evidence** — content-addressed, append-only, hash-chained;
+- the chain is sealed by **signed checkpoints** the agent itself can never produce, and mirrored to an **out-of-band anchor** it can never reach;
+- every mutation is **attributed** to the change that caused it, in-flight, not after the fact;
+- a verification **verdict** — `proven` / `regressed` / `stale` / `unproven` / `no-baseline` — is derived by re-running the evidence, never by asking the agent.
 
 ---
 
-## Nine model-facing tools
+## How it works — at a glance
 
-| tool | purpose |
-|---|---|
-| `proof_status` | baseline, discovered checks, latest evidence, evidence-log integrity |
-| `proof_baseline` | establish/refresh the baseline (runs every discovered check) |
-| `proof_verify` | incremental verification + grade + regression attribution |
-| `proof_claim` | state a claim **and** prove it; `blockers` is the to-do list; v0.10 adds contract params (`kind` + `budgetMs` / `review` / `entryPoints`) binding the claim to typed evidence obligations |
-| `proof_jury` | **Class B evidence, step 1**: request an LLM jury deliberation — returns the frozen deliberation prompt (rubric + claim + context, byte-deterministic) and records the request on-chain, verbatim prompt included |
-| `proof_jury_submit` | **Class B evidence, step 2**: record the verdict (`verdict` / `probability` / verbatim `reasoning`) as permanent evidence with the frozen prompt, declared model identity and independence tier; the claimId must match the pending request; gen auto-increments = appeal |
-| `proof_endorse` | **Class C evidence**: a named human endorses/rejects a claim — the call itself triggers the host approval prompt; endorse = risk acceptance (unlocks the grade gap, never inflates the number), reject = collapse |
-| `proof_conjure` | **Synthetic evidence, step 1**: request a conjured verification for an assertion no organic check covers — the plugin freezes the request (claim + paths) on-chain (`synthetic/requested`) and scaffolds a deterministic test template into `.proof-synthetic/` |
-| `proof_conjure_run` | **Synthetic evidence, step 2**: the plugin verifies the on-chain request, digests the sandbox script verbatim, screens its capabilities (refusal = `skipped`, never executed, nothing on chain) and runs it through the plugin's own port; the `scriptDigest`, sandbox tier, screening verdict and authorship ride the content-addressed evidence, closed by a `synthetic/run` marker |
+```mermaid
+flowchart LR
+    subgraph HOST["Host · DSH / Claude Code / OpenCode / any MCP client"]
+        AGENT["🧠 Agent"]
+        TOOLS["proof_* tools / hooks"]
+    end
 
-All nine follow DSH's hard contract: `execute` returns one canonical JSON value, prose lives in `output.render`, and UI cards come from **pure** `presentCall` / `presentResult` / `presentationMeta` projections so a session-log replay reproduces the identical card.
+    subgraph ENGINE["dsh-proof engine"]
+        POOL["check pool<br/>discover + synthetic"]
+        EV["Evidence Store<br/>evidence.jsonl"]
+        BP["baseline.json"]
+        GR["✔ Verdict + Grade"]
+    end
 
-## Runtime enforcement, not prompt hope
+    subgraph CHAIN["Tamper-evident trust chain"]
+        CH["hash chain<br/>+ signed checkpoints"]
+        AN["out-of-band anchor<br/>host-held key"]
+        PTL["Proof Transparency Log<br/>RFC 6962"]
+    end
 
-| extension point | mechanism |
-|---|---|
-| `tools/pre-execute` | with `requireBaseline: ask`, mutations require user approval until a baseline exists |
-| `tools/pre-execute` | with `evidenceStore: workspace`, mutation tools touching the evidence store are routed through user approval |
-| `tools/pre-execute` | `proof_endorse` always routes through `ask` — Class C evidence is a human's conscious decision, never the model's say-so |
-| `tools/result` | observes every tool result; maintains the dirty set and file fingerprints |
-| `agent/turn-stopping` | injects corrective context when a turn mutated the workspace without a proven claim, flags files changed outside the tool stream, and (with `requireBaseline: warn`) reminds the agent to establish a baseline first |
-| `ctx.systemPrompt.section()` | publishes the `proof:policy` section so the model knows the rules exist |
+    AGENT --> TOOLS -->|"proof_verify / proof_claim / proof_baseline"| ENGINE
+    POOL -->|"run checks (spawn)"| EV
+    BP --> GR
+    EV --> CH --> AN
+    CH --> PTL
+    EV --> GR
+    GR -->|"proven / unproven / regressed / stale"| TOOLS --> AGENT
 
-## Trust model (v0.2): the adversary is the auditee
-
-The agent under audit has file-write tools. It could rewrite `.proof/` wholesale and recompute every self-consistent address with the hashing functions this very package exports — self-addressing alone only catches naive tampering. v0.2 separates the prover from the verifier with four layers:
-
-1. **Hash chain** — every line carries `prev = sha256(previous line)`; editing or removing any line breaks the link into the next.
-2. **Signed checkpoints** — a checkpoint commits to `{count, head}` and is signed with a host-held Ed25519 key (`$DSH_HOME/proof/keys/`, never inside the workspace). The agent can forge a whole chain; it cannot forge a signature.
-3. **Out-of-band anchor** — the highest checkpoint ever written is mirrored next to the key, outside the workspace. Truncating or rewinding the log is detected as `rewind`.
-4. **Baseline digest in the chain** — `baseline.json` is plain JSON, so its sha256 is recorded as a chained marker at save time; later substitution trips `baselineTampered`.
-
-By default (`evidenceStore: host`) the log itself lives under `$DSH_HOME/proof/workspaces/<key>/`, outside the workspace — a *host property* the plugin guards rather than conjures: since v0.22, when the trust root is known, the shared adapter gates (Claude Code, OpenCode, and anything built on `src/adapters/shared`) deny absolute-path writes into the host-side store and shell commands that mention it (or the trust artifacts); a deployment that configures no trust root keeps the store outside the workspace but is honestly unguarded against absolute-path writes. `proof_status` surfaces the telemetry: `chainMode`, `checkpoints`, `chainIntact`, `rewindDetected`, `baselineTampered`, plus the v0.7 triage fields (`unverifiableCheckpoints`, `anchorForged`) and the checkpoint-window remainder (`tailRecords`).
-
-## Change-set provenance (v0.3): content-anchored, attribution-aware
-
-"What changed" and "who changed it" are now separate questions. The old change set was just `git status` — pre-baseline dirt, the user's IDE edits, and the agent's tool edits all charged to the session together. v0.3 rebuilds it:
-
-1. **Content-anchored baseline** — establishing a baseline digests every dirty file (`dirtyDigests`). Baseline checks ran against the working tree *as it was*, so those bytes, not a commit, are the diff anchor. Dirt unchanged since the baseline is excluded; a dirty file *reverted* to HEAD still counts as changed (`git diff HEAD` cannot see that); clean-at-baseline files resolve through `git diff <baselineHead>` plus untracked files.
-2. **Provenance** — the session-level tool-touch set classifies every changed file as `agent` / `external` / `explicit` / `unknown`.
-3. **Attribution split** — `attributedTo` only charges the session; external edits land in `externalSuspects`. A regression the *user* caused in their IDE is still reported honestly, but its rationale reads "changed outside the agent's tool stream — not charged to this session".
-
-The method is surfaced as `attributionMethod` (`baseline-content` / `git-head` / `dirty-fallback` / `explicit`) so degradation is visible, and `proof_verify` renders an "EXTERNAL edits" section with the files not charged to the agent.
-
-## LSP-fused impact (v0.4): dual-source confidence
-
-Impact analysis upgrades from regex approximation to a fusion of two edge sources. The trick: `goToDefinition` placed *on the module specifier of an import statement* resolves to the file that specifier binds to — which both verifies the regex graph's approximate edges and discovers **workspace-internal imports regex cannot see** (tsconfig `paths` aliases, package-internal paths): real missed-breakage blind spots in monorepos.
-
-Union semantics keep soundness absolute: verified and approximate edges are unioned; a missing language server, a failed query, or an exhausted budget simply leaves the edge approximate — *precision degrades, coverage never does*. Results are cached per (file, content version, position) with a hard per-build budget (`lspQueryBudget`, default 400), and the regime is surfaced as `impactPrecision`: `lsp-verified` / `approximate` / `forced`.
-
-## Smart excerpting (v0.5): spend the budget where the failure lives
-
-`headChars` used to be a dead knob — the value reached the engine but never the domain layer. v0.5 wires it into a real excerpt budget and upgrades how it is spent. Naive head truncation has a structural flaw: test output opens with a banner ("✓ 50 passing") while the assertion, the diff, and the stack trace live in the middle or at the end — truncation cut exactly what the model needs to fix the bug.
-
-The default `balanced` strategy allocates in three segments: the **first salient failure line** (AssertionError / expected-received / Traceback / stack frames / ✖ / not ok / timed out …) is always kept when it fits within half the budget; a **line-aligned tail window** keeps stack traces intact (never cut mid-word); and `[... N chars omitted ...]` markers account for every dropped character (`outputTruncated` / `outputOmittedChars` ride on the evidence record). The hard clamp trims tail, never the salient middle. Everything is a pure function of (text, config), so content addressing is unaffected. Regression narratives and `proof_verify` failure details now quote the first *informative* line, not the first line. `excerptStrategy: head` preserves the legacy behaviour.
-
-## Location-independent addressing (v0.6): one failure, one address, any machine
-
-Compiler errors and stack traces carry absolute paths, so digests used to vary per machine and per checkout directory — the same test outcome never addressed identically twice across machines, and usernames (`/home/alice/...`) leaked into records that may be exported for audit. v0.6 canonicalises captured output before hashing: **root → `$WORKSPACE` (specific first)**, **home → `$HOME` (general after)** — a workspace under the home directory still collapses to `$WORKSPACE/...` while sibling paths become `$HOME/...`; Windows paths match in either slash style. With `normalizeHome` (default on), the same failure produces the *identical* `outputDigest` and `evidenceId` on any machine, under any checkout, for any user — the dedupe/comparison primitive a proof transparency log rests on — and no username ever enters an evidence field. Without canonical roots, behaviour is byte-for-byte legacy.
-
-## Honesty hardening (v0.7): unknown never rounds up to "ok"
-
-A deep-read pass closed every path that could round uncertainty into good news. The **verdict lattice** is three-valued: non-decisive statuses (`skipped` / `timeout` / `aborted` / `error`) yield `indeterminate` — neither credit nor blame, counted separately — and blame requires a decisive baseline pass, credit a decisive baseline fail. Audit **trust triage** is three-state: a signature this host cannot check (no signer, foreign keyId) is `unverifiableCheckpoints` — a missing capability, not a forgery charge — while the anchor's own signature is now verified (`anchorForged`). Engine honesty edges: when git is unavailable (`gitAvailable?()` reports `false`) the change set is marked `degraded` and the engine **forces the full check set**, surfacing `VerifyOutcome.degraded`; an aborted baseline never lands on disk (evidence still enters the chain under a `baseline/aborted` marker); signer load failures degrade loudly via a `trust/signer-unavailable` chain marker; the evidence log writes through a **single-flight queue** so concurrent appends cannot fork the chain. Soundness closure: monorepo subpackage checks run in their own `cwd`, dynamic and multi-line imports produce impact edges, porcelain `-z` renames parse both paths, Windows drive-letter paths enter the path domain, and multi-byte output survives chunk boundaries.
-
-## Completeness closure (v0.8): books that balance, storage that endures
-
-The v0.7 pass closed paths where *unknown* rounded up to "ok"; v0.8 closes paths where the **facts themselves** were wrong — miscounted, mangled by crashes and restarts, or mistranslated by the adapter layer. **Excerpt truth-in-budgeting**: the budget now bounds the assembled `text` itself — the omission marker and joining newlines count against it — uniformly for both strategies, and a new `keptOriginalChars` field closes the books exactly (`omittedChars + keptOriginalChars === normalized.length`; reconcile against it, never against `text.length`, which the marker inflates). Picked salient failure lines are never cut in half; overrun sacrifices the earliest tail line, then the head window's tail, and only a pathological budget degrades to head semantics. **Storage endurance**: appends are idempotent *across processes* — the first log scan re-indexes every address already on disk, so replaying a check against a fresh store after a restart is a true no-op instead of a duplicate record. A crash mid-write leaves a torn final line that used to fail audit forever; it is now atomically rewritten away with the repair recorded on-chain as `log/recovered-partial-tail`, while corruption of a whole line mid-log is deliberately **not** repaired — that is the signature of tampering, and audit keeps reporting it. Explicit `checks` and auto-discovery dedupe by command (explicit wins; the same command runs once), `canonicalJson` rejects circular structures with a clear `TypeError`, and Windows drive-letter case drift (`c:\ws\...` vs `C:/ws/...`) folds into `$WORKSPACE` (backslash roots keep legacy digests). **Windows shim resolution**: `npm`/`pnpm`/`yarn` ship as `.cmd` shims that Node's spawn refuses to execute — pnpm simply could not be a check command on Windows. The shims are *parsed* (npm's generation template is stable) and reduced to a direct `spawn(node, [script])` — no shell, no injection surface; non-standard shims produce a clean error instead of mojibake. **Death-cause honesty**: `CommandResult.killedBySignal` carries the fact that an external signal killed the child (always absent on win32 — Windows does not propagate signals across processes), and a signal death is recorded as `error` with the signal named — no longer silently mis-filed as `timeout`. **Adapter races and honesty**: concurrent writes use unique temp names plus rename retries (Windows EPERM contention), startup probes the on-disk baseline so the first prompt never claims "no baseline" when one exists, turn-stopping observers flush before drift detection reads state, mutation classification has a single source of truth (unknown tools default to mutation — conservatively charged to the agent), and the `source` content key no longer leaks code-snippet text into the touched set where it misattributed edits. The scheduling core (runner) gained its first direct unit tests: concurrency clamping, budget skips, abort propagation, out-of-order completion, signal deaths, spawn errors, excerpt pass-through.
-
-## Bayesian verification scheduling (v0.9): certify at 0.97, don't run everything
-
-"Which checks to run" stops being set algebra and becomes an information-gain decision — predictive test selection (Google 2015–2021, Facebook 2019) applied to agent assertions for the first time. The evidence log is, among other things, a labelled historical dataset (checkId × status × duration); the new pure module `src/core/bayes.ts` learns each check's flakiness and cost from it and models every check as a noisy sensor for one binary proposition ("the workspace is healthy"): the prior π = clamp(1 − ρ·s, 0.05, 0.999) combines a Laplace-smoothed failure tendency ρ = (failures+1)/(runs+5) (a never-run check starts skeptical at ρ = 0.2, a 200-run all-green veteran decays to ≈ 0.005; flips pair decisive observations only) with a change-impact strength ladder (direct hit or LSP-confirmed edge 1.0, closure distance 1/(1+d), bare prefix 0.7, wildcard/no-evidence 0.5); α = P(false fail | healthy) is learned from flips and clamped to [0.01, 0.3]; β = P(false pass | broken) is fixed at 0.02 — unlearnable without breakage ground truth, an admitted guess. `rankByInformationGain` then prices every candidate run by expected reduction of the claim's binary entropy per millisecond (VOI ≥ 0 provably — the Bayesian update is a martingale), with deterministic greedy ordering and lexicographic tie-breaks. The engine dispatches **waves** of `concurrency` checks, folds each wave's real outcomes into the running posterior, and stops early on one of three conditions — the claim posterior crosses `certifyTarget` (default 0.97), a first decisive failure lands (the assertion is dead; attribution is already sufficient), or the budget drains — leaving the rest as auditable planned skips carrying their priors (`skippedByPlan` rides the `proof/verified` marker). Graded trust replaces the binary grade: `proven` now means "posterior ≥ target", displayed as `PROVEN (p≈0.97)` or `STALE (p≈0.61, target 0.97)`, with `confidenceBasis` naming how the number was earned (`full-coverage` — still below 1, the flake residual is honest; `certified-subset`; `degraded`), and `proof_verify` surfaces `confidence` / `confidenceBasis` / `certifiedSkips` / `stoppedEarly` / `waves`. Soundness is preserved: the candidate pool is still the impact closure (global invalidators and uncertain graphs still widen it to every check), `all: true` and degraded git facts still bypass the waves for a forced whole-batch run, and `scheduler: 'set'` is the kill-switch restoring v0.8 behaviour bit-for-bit. Honest limits: the claim posterior is a product of per-check factors — independence is the model's largest known distortion (checks sharing changed files fail correlated), so the number is a ranking signal, not a calibrated probability.
-
-## Typed assertion contracts (v0.10): the claim binds its own evidence obligations
-
-The claim text used to be free prose: the engine could prove "no affected check regressed", never what the sentence *ought* to prove. "I refactored X", "I added feature Y" and "nothing got slower" carry completely different proof obligations, and one generic no-regressions gate cannot tell them apart. v0.10 upgrades `proof_claim` with an optional **contract kind** that binds the assertion to a fixed set of decidable evidence obligations — stable obligation ids, and an unmet one says exactly what is missing and how to fix it:
-
-| kind | use for | obligations (fixed order) |
-|---|---|---|
-| `behavior-preserving` | refactors / optimisation | `zero-regressions` + `api-surface-unchanged` |
-| `behavior-adding` | new features / modules | `zero-regressions` + `new-paths-covered` |
-| `perf-budget` | performance claims | `zero-regressions` + `benchmark-evidence` + `within-budget` |
-| `docs-only` | documentation-only changes | `docs-only-changes` + `jury-review` |
-
-`api-surface-unchanged` diffs the public API surface in **both directions** (added and removed must both be empty): entry points come from `package.json` (`main`, `exports["."]`, `types`) or the `apiEntryPoints` config, are expanded through a bounded relative-import closure (depth ≤ 10, ≤ 500 files, truncation marked on-chain), and each file's exports are extracted per line in five forms — named declarations (including multi-declarator and destructuring lists), brace lists with aliases kept verbatim, `export default` → `#default`, `export *` → `#*` (plus the `ns` of `export * as ns`), and TS `export =` → `#=` — as sorted `file#symbol` strings riding the baseline as a non-addressing `apiSurface` attachment. Extraction deliberately **over-reports**: a missed export is a missed breaking change (a wrong pass), while a phantom export only makes an honest claim work harder (a wrong fail). `new-paths-covered` demands every changed source file be covered by a check that passed decisively this run — new behaviour must ride tested paths. A `perf-budget` claim force-runs **every** benchmark check (kind `benchmark`, from `bench` / `benchmark` / `perf:bench` scripts or explicit config) regardless of impact analysis, and its `durationMs` must stay within the claim's `budgetMs`. A `docs-only` claim runs **no checks at all** — `docs-only-changes` (docs extensions only; `requirements*.txt`-style traps guarded by the global-invalidator set) plus a `jury-review` self-attestation — and when everything holds the grade is `proven` with confidence structurally capped at `juryConfidenceCap` (default 0.8, basis `jury-only`, narrative `PROVEN (p≈0.80, jury evidence — self-attestation is capped)`): jury evidence never impersonates an experiment, and the verdict lands on the chain as a `claim/jury` marker. Contract runs go whole-batch — no bayesian planned skips, since an obligation must not rest on a check the plan skipped — and **a proven run carrying any unmet obligation is downgraded to `stale`** (confidence keeps what the run measured; the obligations say what is missing). Backwards compatibility: a claim without a `kind` behaves exactly as in v0.9, and a pre-v0.10 baseline without a surface fails `api-surface-unchanged` honestly, telling you to re-run `proof_baseline`.
-
-## Graded evidence classes (v0.11): testimony re-enters the proof system
-
-Machine measurement covers only half the world — the other half (readability improved, error messages friendlier, the migration guide accurate) had no exit but capped self-attestation. v0.11 brings **testimony** back as first-class evidence, giving each class the strongest honesty mechanism it can carry: **Class A** is machine measurement (recomputable — re-run the command, compare digests); **Class B** is an LLM jury (auditable — the *complete deliberation packet* lands on the tamper-evident chain: the verbatim prompt with the full `jury-rubric/v1` rubric, the declared model identity, the independence tier, and the entire verbatim output, so any third party can replay the frozen prompt against the same or a different model and compare; a verdict that will not replay is detectable); **Class C** is a named human endorsement (accountable — `proof_endorse` always routes through the host approval seam, and approver / approvedAt / scope ride the chain).
-
-The jury protocol is a request/submit pair: `proof_jury` deterministically assembles and freezes the deliberation prompt (header, versioned rubric, claim, context, output instruction — pure concatenation, byte-stable forever, request recorded on-chain with the verbatim prompt) and `proof_jury_submit` validates the verdict shape, binds it to the pending request's claimId, and appends the full packet at `gen + 1` — **appeals supersede rather than erase**: the chain is append-only, readers resolve to the highest generation per (claimId, kind), so the disputed record stays visible as the appeal's foil, and B/C channels resolve independently. Claims are identified by `claimIdOf` (first 16 hex of the claim's sha256) — rewording a claim is a new claim needing new testimony. The rubric orders one structured JSON ruling `{verdict: uphold|reject|abstain, probability, reasoning}`, demands judgement only from the given materials, and tells the juror its output becomes permanent, public, replayable Class B evidence.
-
-**Explicit trust weights, two maths each in its place.** `classBTrust` (0.7) and `classCTrust` (0.9) are declared policy constants, never learned — there is no labelled dataset of "this witness was right". For **pure-jury paths** (the new engine-level `llm-jury` contract kind: obligations `jury-delivered` + `jury-upholds` — an active on-chain B verdict upholding at probability ≥ 0.5 — zero commands run), confidence is Π `attestationFactor` with factor = p^w, a **log-odds discount**: w ∈ [0,1] and p ∈ [0,1] ⇒ p^w ∈ [p,1], so testimony can only *weaken* a claim, never amplify it — the right direction of skepticism for self-interested proof systems (abstain is exactly factor 1; NaN/out-of-range probabilities degrade to abstain so they can never poison the product). When a **machine certification already exists**, a witness speaking about the whole claim enters as the **reliability mixture** `fused = (1−w)·c + w·p`: pulled toward the asserted probability with strength exactly w, never overshooting it — a jury asserting 0.99 at w = 0.7 carries a 0.94 machine certification across the 0.97 target (the rescue), asserting 0.1 crashes it. **Class C endorsement is risk acceptance, not certainty transfer**: the approval seam is binary, human correctness is modelled as the constant `humanProbability` = 0.95, and 0.95^0.9 ≈ 0.955 can mathematically never cross a 0.97 target — so endorsement leaves the number untouched and unlocks the *grade* instead (stale-by-target-gap + zero regressions + every obligation met → `proven`; the human took the residual the machines could not cross). Endorsement cannot pay for missing work: unmet obligations or regressions do not unlock. The symmetric lock: an explicit reject — human or jury — collapses the number ((1−0.95)^0.9) and demotes a `proven` grade the number no longer supports. `ConfidenceBasis` grows `attested` (machine + B/C fusion, or pure C) and extends `jury-only` to pure-B paths (narrative: `PROVEN (p≈0.97, machine + B/C attested)`). Plain `verify()` never reads attestations at all — v0.9 pure-machine semantics stay byte-locked. Honest limits: v0.11's actual independence tier is the weakest (`same-session`), the model identity is the submitter's declaration (`session-model (unverified)`) verified only by replay audit, the jury's probability is a subjective judgement, and both 0.95 and the mixture are modelling choices, not derived posteriors.
-
-## PTC evidence synthesis (v0.12): conjured verification for the unchecked
-
-Some assertions land where no existing check looks — the change touched a path no discovered suite covers, and `new-paths-covered` used to be a dead end ("add a check whose paths cover them", which the agent cannot do: check discovery only reads build metadata and host config). v0.12 opens the third path: **the plugin itself constructs a verification for exactly that gap**. The agent's role changes from "the audited" to *a co-conspirator in constructing the evidence* — but the chain lets it influence only the test's truth value (how strict an assertion to write), never the execution result.
-
-The protocol is a two-tool pair. `proof_conjure(claim, paths)` freezes the request *before any script exists*: the claim and its paths land on-chain as a `synthetic/requested` marker (with a null `scriptDigest` — locking the request first is what makes a later script swap visible), and a deterministic scaffold is written into the sandbox (`syntheticDir`, default `.proof-synthetic/`). The scaffold's header warns in the file itself that this exact text becomes the `scriptDigest` of a piece of evidence — deleting an assertion mints a new address, and the old pass stops applying. The agent fills in a property test / minimal repro; `proof_conjure_run(claim, entry)` then checks the chain for the matching request, digests the script on disk verbatim, runs a deny-list capability screen (refusal returns the findings with status `skipped` — no execution, nothing lands on chain), and executes through **the plugin's own command port**. Three structural answers make the evidence unforgeable: the script source is sha256'd into `SyntheticEvidenceMeta` and participates in the `evidenceId` content address (two scripts, same output → two different pieces of evidence); execution never touches the agent's tool surface; and the request→run pair closes with markers, so a script swapped between the two calls runs under its own digest, visibly.
-
-**The math prices the interested party.** A synthetic check's false-pass β rises from 0.02 to `syntheticFalsePass` (default 0.15, 7.5×) — the cheapest false pass here is not a mechanical accident but an omission (write the empty assertion, skip the input that breaks the code), because the test's author is a party to the claim it tests. Same history, same pass: an organic check lifts the posterior to ≈ 0.9960, a conjured one to ≈ 0.9706 (pinned end-to-end). α and π still learn from history like any check — the discount prices *whose hand wrote the assertions*; a failing conjured check damns like any other. The default deliberately lives outside `BAYES_CONSTANTS` (the never-retuned laws): it is an overridable modelling guess. Executed conjured specs join `verify()` / `verifyContract` as ordinary specs, `behavior-adding` accepts them as coverage through a tier ladder (run-organic > run-synthetic > latest-organic > latest-synthetic — fresh beats stale, independent beats self-authored; detail: "covered by synthetic evidence (discounted)"), and when every decisive record this run was conjured, `confidenceBasis` becomes `synthetic` (priority: jury-only > attested > synthetic > certified-subset > full-coverage > degraded) with a narrative that says it out loud: `PROVEN (p≈0.97, synthetic evidence — conjured tests, discounted)`. The sandbox regime is honestly labelled `'screened-subprocess'` — static screening is **not** a sandbox (computed specifiers and `eval`/`createRequire` aliases are invisible to text); the real boundary is the sandbox cwd, the run timeout (`syntheticTimeoutMs`), the output cap, and a future host `ptc-runtime` tier whose probe point is already reserved.
-
-## Coverage-aware proof (v0.13): ran, green, and it actually executed the change
-
-`proven` used to mean "every affected check re-ran and none regressed" — with a blind spot no reader could see in the report: a check's `paths` matching the change says *selection* believed the check owned the file; it says nothing about whether the check's process ever *executed* the changed code. A suite can be green while no test imports the touched module; a typecheck was green before the edit. "All green" is a statement about the checks, not about the change. v0.13 upgrades `proven` to **ran + green + executed-the-change**, with the third dimension's evidence produced by the checked processes themselves — **zero instrumentation**: verification injects `NODE_V8_COVERAGE` into every check subprocess (a Node runtime flag delivered through the environment; npm/.cmd shims propagate it into nested node test processes), and each process writes its raw V8 coverage profile on exit. The new pure module `src/core/coverage.ts` parses those profiles — a file with any function range at `count > 0` was *executed*, present-but-all-zero is *loaded-not-executed* (bucketed, reserved), everything outside the workspace root and under any `node_modules` segment is dropped, and Windows drive-letter / percent-encoded `file://` forms are normalized. The defense against a forged profile is per-run isolation plus an mtime window (hardened in v0.22: each run stages into its own directory, and only profiles written inside the run's `[spawnedAt, collectedAt]` window are admitted — one profile outside drops the whole run's coverage) — a raised cost of forgery, not a cryptographic guarantee.
-
-Every decisively-passing evidence record attaches its own `coverage` split against the change set (`changedExecuted` / `changedUncovered`) — and like v0.12's `scriptDigest`, **the attachment participates in the `evidenceId` content address**: a record cannot claim to have exercised a change it never ran. Collection completes *before the first append*, so the chain never holds a plain record and its enriched twin; the staging tree (`${storeDir}/coverage/<nonce>` — the nonce is physical staging, never hash material) is removed after collection via a new optional `FsPort.removeDir`. The gate's demotion is deliberately a different word from `stale`: **`stale` is a process verdict** (verification did not finish; re-running rescues it) while the coverage **`unproven` is an evidence verdict** (the process finished, everything was green — and the green evidence never executed the change; re-running cannot help, what is missing is a check that actually reaches it). `regressed` and `stale` are never overwritten; the gate is pinned after the machine grade and before obligation/attestation fusion, so a claim coverage knocked to `unproven` cannot be endorsement-unlocked — missing work is not residual risk. Uncovered changes are named (first 3 files) with the remedy attached: `proof_conjure` can synthesize a test that executes them — v0.12's synthesis is the *prescription* for v0.13's blind spots, and fittingly the gate caught one of its own historical conjure fixtures being green while never touching the change on day one. Three modes (`coverage` config, default `observe`): `observe` gates only when data exists and shows `basis: 'none'` honestly when it does not (fake command ports and non-Node toolchains degrade visibly instead of failing a new way); `require` treats missing data itself as disqualifying (`no-coverage-data`) — strict deployments, not for non-node ecosystems; `off` injects nothing and gates nothing, byte-identical to v0.12. Narratives say it out loud — `PROVEN (p≈0.97, change-executed)` / `UNPROVEN (p≈0.97) — … — unexecuted change (src/feature.mjs) — proof_conjure can synthesize a test that executes them` — and baselines never inject: a baseline is a measurement, not a claim.
-
-## An open standard and an MCP server (v0.14): proof beyond this harness
-
-The verification core is now specified as the **Agent Proof Protocol (APP/1.0)** — an open standard ([PROTOCOL.md](./PROTOCOL.md), eight sections: Concepts, Vocabulary, Content addressing, Tamper evidence, Exchange format, Verification API, Security, Conformance) that any implementation can speak, not just this plugin. The dialect is fully named: the five wire vocabularies (8 verdicts, 5 grades, 6 check statuses, 3 chain modes, 5 claim kinds), the `sha256(canonicalJson(v))` addressing, the hash-chain / signed-checkpoint / out-of-band-anchor tamper evidence, and a **proof bundle** exchange format — a manifest (`protocol` / `appFingerprint` / `workspaceKey` / `createdAt` / `files[{path,sha256,bytes}]`) ahead of `evidence.jsonl` (plus `baseline.json` / `anchor.json` when they exist) — whose verifier owes the producer no trust: recompute every digest, walk the chain, re-check self-addressing, resolve anchor and baseline, and refuse anything that does not re-derive. `appFingerprint()` (`src/app/protocol.ts`) digests the vocabularies plus the three load-bearing rule strings, so any change to a value or a rule names a new dialect — a consumer refuses to interpret a bundle whose fingerprint it cannot reproduce against its own constants. Alongside the standard ships a **Proof MCP Server**: the `dsh-proof-mcp` bin (also `node --experimental-strip-types src/app/mcp-entry.ts` from a checkout) is a hand-written MCP JSON-RPC 2.0 server over stdio with **zero new npm dependencies** (the runtime still has exactly one) exposing exactly the five conformance tools — `proof_status` / `proof_baseline` / `proof_verify` / `proof_claim` / `proof_bundle` — configured entirely through environment variables; an invalid claim `kind` errors loudly instead of silently downgrading (a deliberate difference from the DSH tool face), and the jury/endorse/conjure families stay off the MCP surface because their host approval seam and session context are not an open server's to assume. The H1 trust hardening closes a real hole: a checkpoint's `count` must now be a safe integer equal to the records the walk actually counted (a new `malformedCheckpoints` audit channel), and the rewind/anchor comparison credits only checkpoints signed by the anchor's own key — a forged checkpoint (foreign keyId, inflated count) can no longer launder a chain rewrite (THE ADVERSARY II). Tests 388 → 424 (`test/21-protocol` pins the vocabulary, `test/22-bundle` attacks the exchange format, `test/23-mcp` drives the real server as a real subprocess, `09` gains five adversarial cases); `src/app/` adds five modules — protocol, bundle, mcp-server, mcp-entry, and an `index.ts` barrel for lib consumers.
-
-### Proof MCP Server quickstart
-
-Three steps — the server speaks plain MCP JSON-RPC 2.0 over stdio; no DSH installation required.
-
-**1 · Install**
-
-```sh
-npm i -g dsh-proof          # or use npx dsh-proof-mcp without installing
+    classDef ev fill:#1a7f37,stroke:#116329,color:#fff
+    classDef neut fill:#57606a,stroke:#3f444b,color:#fff
+    class ENGINE,POOL,BP,GR ev
+    class CH,AN,PTL ev
+    class AGENT,TOOLS,HOST neut
 ```
 
-**2 · Point a host at it.** Claude Desktop (`claude_desktop_config.json`):
+The host signals intent through `proof_*` tools; the engine runs objective checks, records what actually happened on a tamper-evident chain, and returns a grade a third party can re-derive from the bytes alone.
+
+---
+
+## One thesis, four shells
+
+```mermaid
+flowchart TB
+    THESIS["One thesis<br/>'I am done' stops being a self-report<br/>and becomes a recomputable evidence chain"]
+
+    THESIS --> PLUGIN
+    THESIS --> PROTOCOL
+    THESIS --> MCP
+    THESIS --> ADAPTERS
+
+    subgraph PLUGIN["① DSH plugin"]
+        P1["9 model-facing tools<br/>proof_status / verify / claim<br/>jury / endorse / conjure …"]
+        P2["runtime enforcement<br/>evidence-store guard · baseline gate<br/>drift detection · turn-stop"]
+    end
+
+    subgraph PROTOCOL["② Open standard"]
+        P3["Agent Proof Protocol · APP/1.4"]
+        P4["media types · grades · bundle format<br/>reference implementation = this repo"]
+    end
+
+    subgraph MCP["③ Proof MCP Server"]
+        M1["13 tools over stdio/JSON-RPC"]
+        M2["any harness, any language<br/>dsh-proof-mcp"]
+    end
+
+    subgraph ADAPTERS["④ Host adapters"]
+        A1["Claude Code · hooks<br/>PreToolUse / PostToolUse / Stop"]
+        A2["OpenCode · plugin"]
+    end
+
+    classDef core fill:#0969da,stroke:#0550ae,color:#fff
+    classDef green fill:#1a7f37,stroke:#116329,color:#fff
+    class THESIS core
+    class PLUGIN,PROTOCOL,MCP,ADAPTERS green
+```
+
+| Shell | What it is | Where |
+|---|---|---|
+| **DSH plugin** | nine model-facing tools + runtime enforcement | `src/index.ts`, `src/dsh/*` |
+| **Open standard** | Agent Proof Protocol **APP/1.4** — vocabulary, addressing, chain, bundle format | `PROTOCOL.md`, `src/app/protocol.ts` |
+| **Proof MCP Server** | thirteen tools over stdio; any harness, zero DSH install | `src/app/mcp-server.ts`, bin `dsh-proof-mcp` |
+| **Host adapters** | Claude Code hooks & OpenCode plugin — enforce at the tool-call seam | `src/adapters/*` |
+
+---
+
+## Architecture — pure core, thin shells
+
+```mermaid
+flowchart TB
+    subgraph H["Hosts"]
+        H1["DSH harness"]
+        H2["Claude Code"]
+        H3["OpenCode"]
+        H4["any MCP client"]
+    end
+
+    subgraph SHELL["Adapter shells — thin, host-shaped"]
+        S1["src/dsh · tools, hooks, prompt"]
+        S2["src/adapters · claude-code, opencode"]
+        S3["src/app · mcp-server, bundle, ptl"]
+    end
+
+    subgraph FACADE["Facade"]
+        ENG["ProofEngine<br/>src/engine.ts"]
+    end
+
+    subgraph CORE["Pure domain — src/core<br/>21 modules · zero @deepseek-ai/* · zero I/O"]
+        C1["evidence · trust · hash"]
+        C2["checks · impact · regression"]
+        C3["bayes · contract · attest"]
+        C4["report · economics · training"]
+    end
+
+    subgraph PORTS["Ports — the only way out"]
+        P1["CommandPort · FsPort · WorkspacePort"]
+        P2["SignerPort · JuryPort · Clock · Resolver"]
+    end
+
+    subgraph REAL["Node implementations"]
+        R1["NodeCommandPort · NodeFsPort · GitWorkspace"]
+    end
+
+    H --> SHELL
+    SHELL --> ENG
+    ENG --> CORE
+    CORE --> PORTS
+    PORTS --> REAL
+
+    classDef blue fill:#0969da,stroke:#0550ae,color:#fff
+    classDef green fill:#1a7f37,stroke:#116329,color:#fff
+    classDef grayp fill:#57606a,stroke:#3f444b,color:#fff
+    class CORE,ENG blue
+    class SHELL green
+    class PORTS grayp
+    class H,REAL grayp
+```
+
+The pure domain (`src/core`) never imports `@deepseek-ai/*`, never opens a socket, never reads `process`. Everything it needs arrives through ports — so the same core runs under DSH, under any MCP client, and in a plain test suite with in-memory fakes.
+
+---
+
+## Core concepts
+
+| Concept | Meaning | Code |
+|---|---|---|
+| **Claim** | a *typed* statement of completion, not free text — its kind binds it to evidence obligations | `src/core/contract.ts` |
+| **Evidence** | one observed run of one check: command, status, output digest, workspace snapshot | `src/core/evidence.ts` |
+| **Verdict** | the baseline→current differential for one check — credit, blame, or the honest middle | `verdictOf`, `src/core/evidence.ts` |
+| **Grade** | what a whole run concluded: `proven` / `regressed` / `stale` / `unproven` / `no-baseline` | `decideGrade`, `src/core/report.ts` |
+| **Baseline** | a named view over the log: latest record per check when work started, plus a Merkle root | `buildBaseline` |
+| **Checkpoint** | a signed statement committing to "chain head H, after N records" — unforgeable by the agent | `EvidenceStore.checkpoint()` |
+| **Anchor** | the highest checkpoint, mirrored outside the workspace next to the signing key — makes truncation detectable | `parseAnchor`, `src/core/trust.ts` |
+
+---
+
+## Evidence is self-addressing
+
+Every record is addressed by the SHA-256 of its **canonical** form — so the same outcome yields the same address on any machine, and any reader can re-hash a record and check that it addresses itself.
+
+```mermaid
+flowchart LR
+    subgraph RUN["One objective check run"]
+        SPEC["CheckSpec<br/>command · kind · timeout"]
+        OUT["RunOutcome<br/>exitCode · output · durationMs"]
+    end
+
+    subgraph ENCODE["Canonical encoding"]
+        NORM["normalizeOutput<br/>$WORKSPACE paths · &lt;duration&gt;"]
+        CANON["canonicalJson<br/>sorted keys · no undefined"]
+    end
+
+    EID["evidenceId<br/>sha256(canonical record)"]
+    ROOT["proofRoot<br/>merkleRoot(evidenceId …)"]
+    LOG["evidence.jsonl<br/>append-only · one line per record"]
+
+    SPEC --> OUT --> NORM --> CANON --> EID
+    EID --> ROOT
+    EID --> LOG
+
+    classDef green fill:#1a7f37,stroke:#116329,color:#fff
+    classDef blue fill:#0969da,stroke:#0550ae,color:#fff
+    class EID,ROOT blue
+    class NORM,CANON,LOG green
+```
+
+Keys are sorted, `undefined` is dropped, `-0` and `0` agree, non-finite numbers fold to `null`, and non-plain objects are **refused loudly** — an address that conflates two different values is strictly worse than a crash. Captured output is normalised before hashing (paths → `$WORKSPACE`, durations → `<duration>`, CRLF → LF), so the same failure on a different checkout is the *same evidence*.
+
+---
+
+## Trust model — the adversary is the auditee
+
+The agent can read *and write* every byte in the workspace, including the evidence log — and it knows the protocol's own hashing functions well enough to rewrite a self-consistent history. Three lines of defense close that hole.
+
+```mermaid
+flowchart TB
+    subgraph LEDGER["evidence.jsonl — every line is a hash-chained fact"]
+        direction TB
+        L1["evidence · check outcome"]
+        L2["marker · engine statement"]
+        L3["checkpoint · signed by host key"]
+        L4["evidence · check outcome"]
+        L5["checkpoint · signed by host key"]
+        L1 --> L2 --> L3 --> L4 --> L5
+    end
+
+    subgraph FLOOR["Vouched floor (v0.25)"]
+        BELOW["below the newest verified checkpoint<br/>— every trust decision may consume it"]
+        ABOVE["above the floor<br/>— counted, never trusted"]
+    end
+
+    subgraph ANCHOR["Out-of-band anchoring"]
+        KEY["Ed25519 host key<br/>$DSH_HOME/proof — outside the workspace"]
+        SNAP["highest checkpoint mirrored<br/>to a host-held anchor file"]
+    end
+
+    L3 --> BELOW
+    L5 --> ABOVE
+    KEY --> L3
+    KEY --> L5
+    L5 --> SNAP
+
+    classDef ev fill:#1a7f37,stroke:#116329,color:#fff
+    classDef cp fill:#0969da,stroke:#0550ae,color:#fff
+    classDef red fill:#cf222e,stroke:#a40e26,color:#fff
+    classDef green fill:#1a7f37,stroke:#116329,color:#fff
+    classDef blue fill:#0969da,stroke:#0550ae,color:#fff
+    class L1,L2,L4 ev
+    class L3,L5 cp
+    class BELOW green
+    class ABOVE red
+    class KEY,SNAP blue
+```
+
+1. **Hash chain** — every line links to the previous via `prev = sha256(prevLine)`: editing, inserting or deleting any interior line breaks the link into the next.
+2. **Signed checkpoints** — an Ed25519 signature over `{count, head, workspaceKey, at}` covers the chain head at a known record count. A forge can re-derive every digest but cannot forge the signature; the walker refuses checkpoints whose count or head disagrees with what it actually walked.
+3. **Out-of-band anchor** — a log ending below the anchor's high-water mark is a **rewind**; the anchor's own signature failure is a **forged anchor**.
+4. **Vouched floor (v0.25)** — every trust decision consumes only content *below* the newest checkpoint the host key actually verified; fresh appends above it are counted, never trusted.
+
+---
+
+## Three evidence classes
+
+Verification does not have to be all-machine. Testimony re-enters the proof system — *graded*, never equal.
+
+```mermaid
+flowchart LR
+    subgraph A["Class A · machine"]
+        A1["objective check runs<br/>recomputable from spec"]
+    end
+    subgraph B["Class B · LLM jury"]
+        B1["proof_jury + jury_submit<br/>JURY_RUBRIC · RUBRIC_V1"]
+    end
+    subgraph C["Class C · human"]
+        C1["proof_endorse<br/>human approval on chain"]
+    end
+
+    AF["full trust weight"]
+    BF["discounted by κ<br/>testimony weaker than a check"]
+    CF["human probability p<br/>strongest single factor"]
+
+    A1 --> AF
+    B1 --> BF
+    C1 --> CF
+
+    AF --> MIX["graded evidence\nmerkle'd into the chain"]
+    BF --> MIX
+    CF --> MIX
+
+    classDef green fill:#1a7f37,stroke:#116329,color:#fff
+    classDef purple fill:#8250df,stroke:#5e35b1,color:#fff
+    classDef blue fill:#0969da,stroke:#0550ae,color:#fff
+    class A,A1 green
+    class B,B1 purple
+    class C,C1 purple
+    class MIX blue
+```
+
+- **Class A (machine)** — objective check runs, recomputable from spec. Full weight, always.
+- **Class B (LLM jury)** — `proof_jury` deliberations per the `JURY_RUBRIC`; discounted by a trust exponent κ because testimony is weaker than an executed check — and a weak factor can only *weaken* a verdict, never strengthen it.
+- **Class C (human)** — `proof_endorse` puts a named human's approval on the chain; the strongest single factor, gated by a real host approval seam.
+
+---
+
+## Verification workflow — certify at 0.97, don't run everything
+
+```mermaid
+flowchart LR
+    DISC["discover checks<br/>+ synthetic pool"] --> BASE["load baseline"] --> AUD["chain audit gate<br/>audit.ok? else cap stale"]
+    AUD --> ATTR["attribute changeset<br/>which files moved?"]
+    ATTR --> AFF["affected checks<br/>impact closure + LSP"]
+    AFF --> RANK["rank by information gain / ms<br/>+ learn health priors"]
+    RANK --> WAVE["run next wave<br/>concurrently"]
+
+    WAVE --> POST["update posterior<br/>per check factor"]
+    POST --> GATE{"P(claim) ≥ 0.97?"}
+    GATE -->|"no · budget left"| WAVE
+    GATE -->|"yes"| GRADE["grade: proven"]
+    GATE -->|"budget exhausted"| GRADE2["grade: unproven / regressed"]
+
+    classDef blue fill:#0969da,stroke:#0550ae,color:#fff
+    classDef green fill:#1a7f37,stroke:#116329,color:#fff
+    classDef red fill:#cf222e,stroke:#a40e26,color:#fff
+    class AUD red
+    class GATE blue
+    class GRADE,GRADE2 green
+```
+
+`proof_verify` treats each check as a Bayesian factor: prior health from history, per-run costs, impact distance from the change set (graph closure + LSP-refined edges). Checks are ranked by **expected information gain per millisecond**, run in waves, and the posterior is updated from real outcomes — stopping the moment `P(claim) ≥ 0.97`. Missing evidence is never papered over: a chain that fails its own audit caps every grade at `stale`.
+
+---
+
+## Regression attribution — who broke what, in-flight
+
+```mermaid
+flowchart TB
+    subgraph WS["Workspace state"]
+        GIT["git dirty set + HEAD"]
+        IMPORTS["extracted imports<br/>regex + LSP-fused edges"]
+    end
+
+    GRAPH["dependency graph<br/>reverse edges · impact closure"]
+    AFF2["select affected checks<br/>path / glob / wildcard × status"]
+    ATTR2["attributeChecks<br/>per-factor posterior » attribution"]
+    NARR["regressionNarrative<br/>'you touched X → Y broke'"]
+
+    GIT --> GRAPH
+    IMPORTS --> GRAPH
+    GRAPH --> AFF2 --> ATTR2 --> NARR
+
+    classDef blue fill:#0969da,stroke:#0550ae,color:#fff
+    classDef green fill:#1a7f37,stroke:#116329,color:#fff
+    class GRAPH,AFF2 blue
+    class NARR green
+```
+
+Regressions are judged against the **baseline view** — the latest record per check when work started. A `pass → fail` move is a `regression` charged to this session; a `fail → fail` move is `still-failing`, *never* charged to the session; `error` / `timeout` / `aborted` are non-decisive — neither credit nor blame. The attribution narrative names exactly which files' changes selected which checks.
+
+---
+
+## Claims as typed contracts
+
+Free-text claims bind weaker than machines. `proof_claim` upgrades a claim into one of five **typed contracts**, each binding its own evidence obligations — `proven: true` only when every obligation holds, otherwise `blockers` is the to-do list.
+
+```mermaid
+flowchart LR
+    CLAIM["natural-language claim<br/>'adding X keeps Y working'"] --> KINDS
+
+    subgraph KINDS["five claim kinds — obligations auto-bound"]
+        K1["behavior-keep"]
+        K2["behavior-add"]
+        K3["performance-budget"]
+        K4["docs-only"]
+        K5["jury"]
+    end
+
+    KINDS --> OBL["obligation set<br/>which checks · which evidence · which jury rubric"]
+    OBL --> V["verify → contract verdict"]
+    V --> COST["cost via injected RateCard<br/>per-assertion, per-confidence"]
+
+    classDef blue fill:#0969da,stroke:#0550ae,color:#fff
+    classDef green fill:#1a7f37,stroke:#116329,color:#fff
+    class CLAIM,OBL blue
+    class V green
+```
+
+| Kind | Obligations (beyond the shared zero-regressions floor) |
+|---|---|
+| `behavior-preserving` | the public export face must not move in either direction |
+| `behavior-adding` | every changed source path is exercised by a passing check |
+| `perf-budget` | a decisive benchmark measurement inside the stated budget |
+| `docs-only` | change set really is documents; checks skipped, confidence capped |
+| `llm-jury` | an active jury deliberation upholds the exact claim text |
+
+---
+
+## Conjured verification — for the unchecked
+
+Not every claim has an objective test. `proof_conjure` lets the agent draft a synthetic test for the claim and execute it **on chain** — recorded, priced and discounted, never equal to an independent check.
+
+```mermaid
+flowchart LR
+    REQ["proof_conjure request<br/>claim + paths"] --> GEN["synthetic test drafted"]
+    GEN --> RUN2["executed on chain<br/>like any organic check"]
+    RUN2 --> DIS["discounted evidence<br/>synthetic false-pass rate ρ"]
+    DIS --> VERD["weaker than any<br/>independent check — by design"]
+
+    classDef blue fill:#0969da,stroke:#0550ae,color:#fff
+    classDef purple fill:#8250df,stroke:#5e35b1,color:#fff
+    class REQ,GEN blue
+    class DIS,VERD purple
+```
+
+---
+
+## Multi-agent accountability — the responsibility DAG
+
+Delegation is only as strong as the weakest proof in the tree. Since v0.19, a delegated task mints a **proof obligation** on the chain; a parent's `proven` is preconditioned on its children's; every DAG edge is an independently re-verifiable proof bundle.
+
+```mermaid
+flowchart TB
+    PRI["primary agent"] -->|"proof_delegate"| S1["sub-agent ① tasks"]
+    PRI -->|"proof_delegate"| S2["sub-agent ② tasks"]
+    PRI -->|"proof_delegate"| S3["sub-agent ③ tasks"]
+
+    S1 -->|"submitted proof"| M
+    S2 -->|"submitted proof"| M
+    S3 -->|"submitted proof"| M
+
+    M["responsibility lattice<br/>a delegation is only as strong<br/>as its weakest proof"]
+    M --> V2{"forgery?"}
+    V2 -->|"yes"| FAIL["fails the delegation — forgery dominates"]
+    V2 -->|"no"| OK["task verdict·own grade merge"]
+
+    classDef blue fill:#0969da,stroke:#0550ae,color:#fff
+    classDef red fill:#cf222e,stroke:#a40e26,color:#fff
+    classDef green fill:#1a7f37,stroke:#116329,color:#fff
+    class S1,S2,S3 blue
+    class FAIL red
+    class OK green
+```
+
+## Verification economics — the unit cost of trust
+
+Since v0.21 every priced run leaves an **economics ledger** on the chain: compute spent, assertions verified, confidence purchased, information gained — each per dollar. Prices are **injected by the deployer** (`RateCard`), never embedded; swap the card and the same evidence reprices.
+
+```mermaid
+flowchart LR
+    RUN3["verification run"] --> LED["run ledger on chain"]
+    LED --> CM["computeMs · Σ durations"]
+    LED --> COST["cost × injected RateCard<br/>never embedded prices"]
+    LED --> AS["assertions · decisive pass/fail"]
+    LED --> CPA["cost / assertion"]
+    LED --> CP["confidencePurchased<br/>posterior − prior"]
+    COST --> SLA["insurer-style SLA over 'proven'"]
+
+    classDef blue fill:#0969da,stroke:#0550ae,color:#fff
+    classDef green fill:#1a7f37,stroke:#116329,color:#fff
+    class RUN3,COST blue
+    class SLA green
+```
+
+`confidencePurchased = posterior − prior` — the marginal confidence a run actually bought, `null` when either side was never measured (never zero). `proof_sla_quote` prices a `proven` grade into an insurance-style offer; `regressed` is honestly denied, and the quote is content-addressed onto the chain so it can never be silently rewritten.
+
+---
+
+## Tool surface
+
+**MCP server — thirteen conformance tools** (APP/1.4), plus the DSH plugin's nine. All results are canonical JSON.
+
+| Tool | What it does |
+|---|---|
+| `proof_status` | baseline presence, discovered checks, chain mode & integrity |
+| `proof_baseline` | run everything, record evidence, save the baseline view |
+| `proof_verify` | graded verdict + per-check verdicts + regression attribution |
+| `proof_claim` | typed contract check: obligations all hold → `proven` |
+| `proof_bundle` | assemble manifest + log + anchor into a portable bundle |
+| `proof_publish` | append the latest signed checkpoint to the transparency log |
+| `proof_log_verify` | audit the transparency log from its own bytes |
+| `proof_delegate` | mint a child's proof obligation + worker instruction |
+| `proof_delegate_submit` | adjudicate a submitted bundle; anchor caps the grade |
+| `proof_task` | whole-graph overview or one task's composed verdict |
+| `proof_training_export` | distill the chain into a labeled, chain-anchored dataset |
+| `proof_economics` | replay the most recent run ledger on chain |
+| `proof_sla_quote` | price a `proven` grade into an insurance-style SLA |
+
+Jury, endorsement and conjure live on the **DSH plugin face only** — they depend on host-held seams (an approval prompt, a session) an open server cannot assume: `proof_jury`, `proof_jury_submit`, `proof_endorse`, `proof_conjure`, `proof_conjure_run`.
+
+---
+
+## Quickstart
+
+### 1 · Proof MCP Server — any harness, no DSH install
+
+```sh
+npm i -g dsh-proof        # or: npx dsh-proof-mcp
+DSH_PROOF_ROOT=/path/to/project dsh-proof-mcp
+# or straight from a checkout:
+node --experimental-strip-types src/app/mcp-entry.ts
+```
+
+Point any MCP client at it — Claude Desktop, Cursor, anything that speaks MCP:
 
 ```json
 {
@@ -212,33 +535,18 @@ npm i -g dsh-proof          # or use npx dsh-proof-mcp without installing
 }
 ```
 
-Generic command line (any MCP client that spawns a command):
+First run: `proof_baseline` (every discovered check runs once; the signed chain + anchor are established) → `proof_verify` (graded verdict) → `proof_claim` (prove a claim) → `proof_bundle` (pack for hand-off).
+
+### 2 · DSH plugin
 
 ```sh
-DSH_PROOF_ROOT=/path/to/project dsh-proof-mcp
-# or straight from a checkout:
-node --experimental-strip-types src/app/mcp-entry.ts
+dsh plugin --profile web add dsh-proof        # from a registry
+dsh plugin --profile web add ./dsh-proof      # from a local checkout
 ```
 
-The server reads **no `cordis.yml`** — every knob is an environment variable: `DSH_PROOF_ROOT` (the workspace root it verifies, default cwd), `DSH_PROOF_TRUST_DIR` (keys and anchors, default `$DSH_HOME/proof`), `DSH_PROOF_EVIDENCE_STORE` (`host` | `workspace`, default `host`), `DSH_PROOF_PTL_DIR` (transparency log for `proof_publish` / `proof_log_verify`, v0.18, default `<trustRoot>/ptl`). Protocol version negotiation accepts `2025-06-18` / `2025-03-26` / `2024-11-05`.
+### 3 · Claude Code — hooks enforce what no server can
 
-**3 · First run.** Open any project directory and have the agent call `proof_baseline` — every discovered check runs once and the signed chain + anchor are established — then `proof_verify` for the graded verdict with regression attribution. `proof_claim` states a completion claim and proves it; `proof_bundle` packs the manifest + log for hand-off to another machine or a third party.
-
-Note: the testimony and synthesis tools are deliberately **not** on the MCP face — `proof_jury`, `proof_endorse` and `proof_conjure` need a host-held human approval seam and session context an open server cannot assume; those live in the DSH plugin, where the approval prompt belongs to the host.
-
-## Host adapters (v0.15): common infrastructure for every agent
-
-v0.14 made the verification core *speakable* by any harness; v0.15 completes the repositioning from "a plugin for DSH" to **common infrastructure for every agent**. Any host now integrates on three faces, each doing only what it can: the **tools face** is `dsh-proof-mcp` — the MCP server above, its conformance tool list frozen by the protocol version (thirteen tools as of APP/1.4), nothing else required; the **enforcement face** is a host adapter — the pre-tool gate (the evidence-store guard as a hard `deny`, the baseline gate as `ask`/`warn`), post-tool observation (which files tool calls actually moved, fingerprinted at observation time — provenance), and turn/drift detection at the turn boundary (files changed outside the tool stream are intercepted and named, plus one-shot baseline/verify reminders); the **context face** is injection (SessionStart / `chat.params`) of the `proof:policy` section and the tool guidance, so the model knows the rules before its first mistake. A tool server can run checks; it cannot hold a tool call, watch one land, or stop a turn — that gap is exactly what the adapter layer fills.
-
-`src/adapters/shared/` is the host-agnostic core, three modules. **`paths.ts`** derives every artifact location (log, baseline, anchor, session dir) by mirroring the engine's private derivations verbatim — adapter hooks and the MCP server never share an address space (every hook invocation is its own process), so byte-parity of the derivation rules is the only way both sides agree on where the evidence lives — and it closes the H10 hole the DSH adapter never did: the evidence-store guard here compares paths case-insensitively (on Windows `.PROOF/evidence.jsonl` names the same file as `.proof/evidence.jsonl`; an over-deny costs one blocked call, an under-deny costs the chain). **`session.ts`** re-expresses the DSH watcher as a serialisable snapshot — touched/read/fingerprints as load-apply-save values with atomic persistence, because "one long-lived object per plugin" is a home DSH gives you and a per-hook process model is not; the drift rules mirror `observe.ts` case for case. **`gates.ts`** holds the three decisions every host needs as pure functions (pre-tool, baseline probe, turn-end evaluation), mirroring the DSH adapter's semantics where they transfer and deviating deliberately where a real host seam is stronger — a genuine `deny`, not just an `ask`.
-
-Two adapters ship. The **Claude Code adapter** is the `dsh-proof-cc` bin (`dsh-proof-cc <pre-tool-use|post-tool-use|stop|session-start>`), wired through `.claude/settings.json` hooks ([examples/claude-code.settings.json](./examples/claude-code.settings.json) is paste-ready): PreToolUse answers as a `permissionDecision` of `ask`/`deny`, Stop answers `{decision:'block'}` with the reason fed back to the model (drift re-arms every stop; the baseline/verify reminders are one-shot per session), SessionStart injects `additionalContext`; the tool face rides `claude mcp add proof -- dsh-proof-mcp`. The **OpenCode adapter** is a plugin (`lib/adapters/opencode/plugin.js`, named in `opencode.json`'s `plugin` array) that duck-types its surfaces at runtime — `tool.execute.before/after` plus `chat.params` — and degrades gracefully while that API keeps evolving: a surface that does not probe into a known shape stays idle with one stderr line, and the MCP tools keep working regardless. OpenCode has no Stop hook, so drift is anchored at the **next tool call** (the first call after external changes is held with the drift narrative; each distinct drift set surfaces at most once per plugin lifetime), and a held call takes the `{error:{message}}` shape. Known blind spots, stated honestly: paths inside a shell command string cannot be extracted on *any* host (DSH included) — shell-made changes fall back to drift detection — and OpenCode has no turn-end seam at all. Tests 424 → 493 (`test/24-adapters-shared` 27 — derivation parity against a real engine, the case-variant hole, session-as-value, atomic persistence; `test/25-cc` 23 — handlers over real directories plus the real protocol over **real subprocesses**; `test/26-opencode` 19 — the duck-typing matrix, the next-call drift anchor, hostile contexts that must never throw into the host); `src/adapters/` adds three directories — `shared/`, `claude-code/`, `opencode/`.
-
-### Adapters: Claude Code & OpenCode
-
-The MCP quickstart above gives any host the tools. What MCP cannot give is enforcement — holding a tool call, observing what it moved, stopping a turn — so v0.15 ships two host adapters.
-
-**Claude Code** — register the tool face once per project, then paste the hooks object into `.claude/settings.json` (project) or `~/.claude/settings.json` (user); the full file with matchers, every documented knob and a comment block lives at [examples/claude-code.settings.json](./examples/claude-code.settings.json):
+Register the tool face, then paste the hooks into `.claude/settings.json`:
 
 ```sh
 claude mcp add proof -- dsh-proof-mcp
@@ -257,7 +565,9 @@ claude mcp add proof -- dsh-proof-mcp
 }
 ```
 
-**OpenCode** — merge into your project's `opencode.json` (full file at [examples/opencode.json](./examples/opencode.json)); from a checkout, run `npm run build` first and point `plugin` at the compiled file inside it:
+### 4 · OpenCode
+
+Merge into your `opencode.json` (build first from a checkout: `npm run build`):
 
 ```json
 {
@@ -272,273 +582,78 @@ claude mcp add proof -- dsh-proof-mcp
 }
 ```
 
-Both adapters (and the MCP server) are configured through the same environment variables, so gates and tools always guard the same store:
+Full commented examples: [claude-code.settings.json](./examples/claude-code.settings.json), [opencode.json](./examples/opencode.json).
 
-| variable | meaning | default |
-|---|---|---|
-| `DSH_PROOF_ROOT` | workspace root to verify | the hook's cwd (the project dir) |
-| `DSH_PROOF_TRUST_DIR` | trust root — keys, anchors, adapter sessions | `$DSH_HOME/proof` |
-| `DSH_PROOF_EVIDENCE_STORE` | `host` (store outside the workspace) \| `workspace` (`.proof`, guarded) | `host` |
-| `DSH_PROOF_EVIDENCE_DIR` | workspace-relative evidence dir (workspace mode only) | `.proof` |
-| `DSH_PROOF_PTL_DIR` | transparency-log dir for the two v0.18 tools (MCP server + `dsh-proof-ptl` CLI; not an adapter knob) | `<trustRoot>/ptl` |
-| `DSH_PROOF_REQUIRE_BASELINE` | baseline gate: `off` \| `warn` \| `ask` | `warn` |
-| `DSH_PROOF_DRIFT` | `0` disables drift detection | on |
-| `DSH_PROOF_ENFORCE_TURN_END` | `0` disables the turn-end reminder | on |
-
-**Writing another adapter** — `src/adapters/shared/` *is* the adapter cookbook: `paths.ts` (where everything lives, engine-parity guaranteed), `session.ts` (observation as a value, one snapshot per session id) and `gates.ts` (the three decisions as pure functions). Host-specific code stays thin by design — translate your host's hook payload, call the shared functions, render your host's answer shape — and the two shipped adapters are the reference implementations: copy the one whose host looks like yours.
-
-## Honesty closes its own loopholes (v0.16): what did the run actually observe?
-
-v0.16 is a close-out release: one deep audit of every judgment the core emits, every high-priority finding fixed in a single pass. The shared shape of those findings: the confidence vocabulary existed (grades, bases, priors — v0.9 through v0.13), but its two consumer lines — the grade and the basis — never cross-checked *what was actually observed*. A prior is not an observation (H2): a bayesian verify whose wave produced zero decisive observations no longer grades `proven` — it degrades to `stale`; certified-subset early stops now demand decisive records from *this wave*; non-decisive records stay in `pending` instead of being swept out of it; and the dormant `runCheckIds` field is live again, so confidence names the checks that actually ran. An endorsement is not a substitute for work (H3): `proof_endorse` can no longer unlock a claim whose checks never ran or whose coverage gate blocked — risk acceptance now presupposes the work (`unverified = 0`, gate not blocking), and the test narrative inverted to match.
-
-The check definitions themselves became evidence (H5): the baseline anchors a `scriptDigest` of every npm script body it discovered, and verify compares — a drifted check is force-re-run, priced at the synthetic tier (falsePass 0.15) and named in a summary warning line, closing the "agent quietly edits the test script" attack; a check anchored in the baseline but *vanished* from discovery is reported honestly and blocks `proven`, closing the "delete the failing check's definition" attack. Failures fail closed (H6): a failed git query used to answer "no changes" silently — it now degrades the run and forces full verification, and a git failure during baseline snapshot rides along as a `snapshotDegraded` attachment. Timeouts became an observed state, not an inference (H7): the command port reports a `timedOut` flag and a genuinely timed-out check books as `'timeout'` on both platforms — before, the production port could not report that cause of death and real timeouts landed as plain `error`; the suite's first real-timeout test pins it.
-
-The rest of the sweep holds the same discipline: API-face extraction no longer misses `export const x: number = 1` and no longer conjures phantom names from destructuring annotations (H4 — behavior-preserving claims work on idiomatic TS again); the observer's `pathsIn` array branch no longer bypasses the key whitelist, and after a shell has run in-session, changes outside the touched set are attributed `unknown` rather than `external` — better unattributable than misattributed (H9); `.PROOF`-style case variants and backslash configs no longer slip the workspace evidence guard (H10); a signing key that fails to read rotates only on ENOENT, so an antivirus transient lock no longer triggers silent rotation (H11); a baseline whose run exhausted its budget or timed out refuses to anchor, flagged `aborted` (H12); the `proof_endorse` approval prompt shows the approver name the agent self-reported, so impersonation is at least visible (M5); verify and baseline force re-discovery, so a script added mid-flight cannot silently escape (M7); and the config→engine passthrough closed its last gaps — `lspQueryBudget`, `logger`, `verbose` (M14). Tests 493 → 543 (+50), no new config keys: everything above is observed state, not knobs.
-
-## Every remaining seam, closed (v0.17): what the maths actually said, and what the tests never covered
-
-v0.17 finishes what v0.16 started: the same deep read of every judgment the core emits, this time clearing the whole medium-priority batch and the test-infrastructure gaps the audit exposed alongside it. The largest fix was in the scheduler itself (M3): the bayesian update restarted each factor from its raw prior instead of its current value, so the folded factor domain drifted (E[p₁] ≠ p₀, off by 13.5pp) and the rerun value of a check that had already failed was understated by 61% — the very check you most want re-run ranked least worth it; the ranking maths is now exact over the full factor domain. The confidence vocabulary stopped lying in the small (M4/M10/M13): the tool layer no longer drops the `synthetic`/`attested`/`jury-only` bases, so a canonical value cannot carry a probability with no basis attached (ClaimValue carries basis and regime); an llm-jury claim is no longer penalized for accepting a human endorsement — endorse is risk acceptance, not evidence, so it can leave the product unchanged but never worsen it, while reject's veto stands; and an out-of-range jury probability now disqualifies the whole testimony on both adjudication layers.
-
-Silence turned conservative or visible across the tool face (M5/M6/M8/M9/M15/M18/M19): `proof_claim` without a claim or with an illegal kind fails cleanly instead of silently downgrading to the no-contract path; `FsPort.walk` returns `{files, truncated}` and a >2000-file workspace flags `graph.truncated`, forcing selection to treat the uncertain as run-all — before, silently missed importers manufactured false `proven`; unsupported glob shapes like `src/**/*.ts` over-include instead of never matching (a dead check is a lie wearing green); an anchor that exists but will not parse surfaces as `anchorUnreadable`; a signer transient failure is retried at both the engine and storage layers with only successes cached, so a recovered key re-signs instead of poisoning the chain unsigned forever; explicit `changed` paths are normalized so backslash and `./` prefixes are no longer misjudged uncovered; and the dead parameters `proof_verify.claim` / `proof_baseline.reason` are wired into their markers, with the τ-gate degradation narrative naming its cause and `anchorMismatch` reaching structured output and the banner (M19). `canonicalJson` is injective by construction (M17): bigint, symbol, function, `Date`, `Map` and other exotic values throw a `TypeError` instead of folding to bytes another value already owns — two different payloads can no longer mint the same evidenceId — while non-finite numbers keep the legacy fold as an explicit, pinned decision (see Honest limits). The synthetic screen closed three bypass classes (M11 — backtick-templated, Unicode-escaped and `node:`-prefixed spellings of `process`) and the `SYNTHETIC: PASS` last-line protocol is enforced (M12): an empty script that exits 0 no longer books as a pass.
-
-The audit also caught the tests pretending: the audit's five channels (`badCheckpoints`, `headMismatches`, `unsignedCheckpoints`, `anchorMismatch`, `corruptLines`) are now triggered for real — `08`'s `fakeAudit` was a formatter test in disguise — `fuseConfidence` gained its first direct unit tests, and `MemoryFs` counts `mtimeMs` so LSP cache invalidation is testable at all. Tests 543 → 584 (+41), config stays at 32 keys: nothing above added a knob.
-
-## A transparency log for proof checkpoints (v0.18): the delivery history becomes publicly checkable
-
-Everything before v0.18 proved things *inside one workspace* — the chain, the checkpoints, the anchor. v0.18 turns outward to the enterprise audit question: "the agent handed me a green bundle; who proves the history behind it was never quietly rewritten *after* I looked?" The answer applies the certificate-transparency / sigstore playbook to agent delivery evidence: a **Proof Transparency Log (PTL)** — an append-only, hash-committed, publicly verifiable log of the signed checkpoints themselves. Publishing is *mirroring*, not re-derivation: a workspace's latest signed checkpoint `{count, head, at, sig, keyId}` lands as one Merkle leaf (RFC 6962 tree; leaf hash `SHA-256(0x00 || canonicalJson(entry))` — canonical bytes so any implementation, in any language, recomputes the same tree), and the log operator signs a **tree head (STH)** over the whole log after every append, with an operator key that is deliberately separate from the workspace chain key (`logId` names the operator's keyId). From then on anyone holding only public data can check the three things an auditor actually needs: **completeness** — an RFC 6962 inclusion proof that *this* delivery's checkpoint really is in the log; **ordering** — sequence numbers only grow and STH timestamps never rewind (a head that shrinks the tree, re-roots the same size, or backdates its timestamp is refused outright); and **immutability** — an RFC 6962 consistency proof that every older signed head is still derivable from every newer one, so a truncated or edited history cannot reproduce a root the operator already signed.
-
-The log is a **dumb notary**, stated as a principle: it hosts each workspace signature verbatim and never verifies it — adjudicating that signature against the workspace public key remains the auditor's job, an independent question from whether publication was sound. One core, three faces. The **engine** grows `publishCheckpoint()` (`ptlDir`; idempotent by leaf hash — a replayed checkpoint is the same event, not a new one, so re-publishing can never pad the tree; serialized behind a single-flight queue so concurrent publishes cannot double-append). The **MCP server** adds `proof_publish` / `proof_log_verify` — which is the entirety of the **APP/1.0 → APP/1.1** version bump, and an honest one: the protocol tool face grew 5 → 7, `PROTOCOL_VERSION` is fingerprint material, so a 1.0 consumer refuses a 1.1 manifest instead of guessing at tools it never agreed to; nothing else moved — addressing, chain and bundle formats are byte-identical and old bundles verify exactly as before. And a **standalone CLI** (`dsh-proof-ptl append | head | verify`; from a checkout, `node --experimental-strip-types src/app/ptl-entry.ts`) gives non-MCP auditors the same powers: `verify --bundle` runs the four-check chain `leafMatch → inclusion` (against the bundle-pinned published head, not today's) `→ consistency` (published head → current head) `→ headSignature`, naming the broken check on any failure. Bundles grew an optional `transparency` manifest record (`{logId, sequence, leafHash, publishedHead, inclusionProof}`): `verifyBundle` checks its structure; the log-level proofs belong to the log — the three-step audit walkthrough is [examples/ptl-workflow.md](./examples/ptl-workflow.md). Config stays at 32 keys: a transparency log is a deployment, not a knob — addressed by `DSH_PROOF_PTL_DIR` (default `<trustRoot>/ptl`, beside the keys, outside every workspace it publishes for).
-
-The domain layer is `src/core/transparency.ts` — a direct recursive translation of RFC 6962 §2 / §2.1.1 / §2.1.2 with the verifiers written as the exact mirror of the generators, pinned against the RFC's own §2.1.3 worked example and differentially tested against an independent naive implementation over every tree shape n = 0..33 and 178 consistency pairs. The honest boundary, said out loud: v1 is a **single-operator, file-backed log** — the cryptography guarantees the log's own history cannot be rewritten undetectably (root mismatch, failed consistency, or the rewind guard catches edits and truncation even by the operator), while a **split-view** operator serving different trees to different parties is *not* catchable by any single log; multi-witness / gossip — the full CT answer — is explicit future work, not a property of this version. For procurement teams mapping this onto audit frameworks the claim is deliberately modest: a PTL supplies exactly the three evidence primitives such frameworks ask for — completeness, ordering, immutability — which is the *entry ticket* for evidence/auditability conversations (NIST's emerging agent-security standardization included); this project claims capability alignment, never compliance or certification. Tests 584 → 632 (+48: `test/27-transparency` 25, `test/28-ptl-cli` 12, five engine publish cases in `05`, two MCP-tool cases in `23`, three bundle-record cases in `22`, and the 1.1 fingerprint pin in `21`); `src/` adds `core/transparency.ts` and `app/ptl-entry.ts`.
-
-## The responsibility DAG (v0.19): accountable trust topology for multi-agent systems
-
-Everything before v0.19 proved one agent in one workspace. The moment an orchestrator *delegates*, proof used to degenerate into bookkeeping: a parent task sends work down, a child agent reports "done", and the parent's verdict silently inherits a self-report from the party with the most to gain from its being believed — a muddled ledger of who owes whom what proof. v0.19 replaces the ledger with a **responsibility DAG**: a delegated task carries a **proof obligation**, a parent task's `proven` is *preconditioned on all its children being proven*, and every edge of the graph is a proof bundle any party can re-verify from bytes — a trust topology multi-agent systems can actually be audited against.
-
-The domain layer is `src/core/obligations.ts` (pure, deterministic, no I/O). A `TaskObligation` is minted at delegation — the claim the child must make true, optional acceptance criteria, the issuing workspace, the parent task — and its identity is content-addressed the way claims are (`obligationIdOf`: first 16 hex of the sha256 of the canonical record), so rewording a claim mints a new obligation, never a silent edit of an old one. What composes the DAG is a strict-priority **synthesis lattice**: ① **forgery or regression outranks everything** — a child that *claimed* `proven` whose bundle does not verify is forgery, booked `regressed` at its parent, and **no waiver can buy it out** (a waiver excuses missing work, never broken or forged work — the exact symmetry of v0.11's rule that an endorsement cannot buy broken work); ② any unwaived child that is *missing work* (unsubmitted, `stale`, `unproven`, `no-baseline`) holds the parent `stale`; ③ with every child proven or waived, the parent's grade is its **own** evidence, and a pure delegator is `proven` — nothing of its own to fail. Composition is recursive over the subtree with memoisation (a grandchild shared by two parents composes once and answers both identically), and an obligation is discharged by a submitted bundle or a waiver — never by a green subtree alone: a task that was issued an obligation but turned in nothing stays *unsubmitted* even over green grandchildren.
-
-**Every DAG edge is a v0.14 bundle.** The worker proves the obligation in *its own* workspace — `proof_baseline` → the work → `proof_verify`/`proof_claim` → `proof_bundle` — and submits the export back; the orchestrator adjudicates it with zero-trust `verifyBundle` (digests recomputed, chain walked, nothing the submitter asserts is trusted), and `bundleFingerprint` — the order-independent hash over the manifest's file-digest column — anchors exactly which bytes the submission stands behind. The engine grows four verbs: `delegateTask` (mints `task-<n>`, refuses parents that do not exist, runs `detectCycles` as defense in depth, lands the `delegation/created` marker on-chain), `submitDelegation` (the `verifyBundle` adjudication becomes `artifactVerified`; `claimedGrade` defaults deliberately two-valued — verified bundle carrying a baseline → `proven`, anything else → `no-baseline` — because finer grades are workspace-local judgments the submitter must *declare*, and a declared grade the artifact cannot back is priced as forgery), `taskVerdict` (rebuilds the whole graph from markers and composes recursively; the parent's own evidence enters as `ownGrade`), and `waiveDelegation` (a named human's risk acceptance — `by` and `reason` mandatory — booked on-chain; whether it lifts anything is the lattice's judgment, and over forgery or regression it is refused by semantics).
-
-The protocol bumps **APP/1.1 → APP/1.2** — a tool-surface expansion, 7 → 10: `proof_delegate`, `proof_delegate_submit`, `proof_task` join the MCP conformance face; addressing, chain and bundle formats are untouched, and the fingerprint moves by construction (`test/21` pinned three generations — 1.0, 1.1, 1.2 mutually unintelligible; v0.20 pins a fourth). `proof_delegate` returns an `instruction` — ready-to-paste handoff text for the worker's initial prompt, stating the claim, the acceptance criteria, the five-step worker protocol, and the sentence that makes the topology real: *your "proven" is the precondition of the parent task's "proven"*. Roles in one line: the orchestrator speaks `proof_delegate` / `proof_task`; the worker speaks `proof_verify` / `proof_bundle` / `proof_delegate_submit`; a third-party auditor speaks `proof_log_verify` and the bundle's own bytes. For the dsh side there is an experimental **agent-team bridge** (`src/dsh/agent-team.ts`, opt-in via `agentTeamBridge`, default false): dsh's published plugin types expose no team interface yet, so the bridge duck-types four candidate event seams at runtime (`agent/team:delegated`, `agent/delegation`, `team/task-created`, `agent/subtask` — each subscription in its own try/catch), narrows every event from `unknown` (a shape that cannot prove itself is skipped, never guessed at), mirrors a detected delegation onto the chain as a signed obligation and writes the worker handoff `instruction` back where the host can ship it to the child. Nothing in it ever throws into the host — a bridge failure degrades to a stderr line, and the explicit tools remain the first-class path; an experimental seam must not surprise deployments that never asked for it.
-
-Tests 632 → 668 (+36: `test/29-obligations` 20 — the full composition matrix, recursion, the diamond, cycle detection; six engine cases in `05` — honest/forged/waived/parameter-defense/three-deep-propagation/marker-facts; five MCP cases in `23` — handoff instruction, pre-submission overview, honest-bundle `proven`, forged-bundle attribution, malformed usage; five plugin-wiring cases in `08` — the agent-team bridge: defensive event narrowing, delegation mirroring with instruction injection, seam probing with graceful degradation, opt-in default, the handoff instruction); `src/` adds `core/obligations.ts` and `dsh/agent-team.ts`. Config grows by exactly one key — `agentTeamBridge` (default false): the DAG itself is protocol, not a knob; the only new knob is the experimental bridge's opt-in.
-
-## The training-data flywheel (v0.20): deployment compounds into a data asset
-
-Everything through v0.19 paid out at use time: verified completions, attributed regressions, auditable delegation. v0.20 picks up the second asset the same log has been quietly accumulating: **a labeled agent-behaviour dataset minted as a by-product of honest work**. Every log entry pairs (check, change set, evidence, verdict), and the verdict is a machine-verified baseline differential under hash-chain protection — an objective label, not the model's self-report of how it did. A deployment that proves its work is, whether it intended to or not, accumulating exactly the ground-truth-labelled trajectory data that agent-behaviour datasets normally spend a human label budget to approximate.
-
-The online half of this flywheel has been running since v0.9: the bayesian scheduler already learns each check's flakiness and cost from the log — the more a deployment verifies, the sharper its scheduling priors. v0.20 installs the **exhaust valve**: the accumulated data can now leave the machine as an exportable, verifiable dataset (new pure module `src/core/training.ts`, schema `dsh-training/1`) — the honest version of a data network effect: the asset is a by-product of use, it compounds with use, and it is the deployer's.
-
-**Two sample kinds ride in one schema.** A **verification** sample is one decisive observation — check, change set, verdict, and the scalar `reward` that verdict earns under a written convention (`VERDICT_REWARD`, deliberately not a knob, snapshotted into every manifest): credit `still-passing`/`fixed` 1.0, neutral `new-check`/`still-failing` 0.5 (a pre-existing failure is not the agent's fault — charging it 0 would be as dishonest as crediting it 1), blame `regression`/`new-failure` 0.0 — and `indeterminate` never enters the dataset at all: unknown is not zero, and a real pass punished like a regression is worse data than no data. A **flip-pair** is one adjacent fail↔pass disagreement in a check's decisive subsequence, in DPO's fixed direction (`rejected` always the fail side, `chosen` always the pass side; time direction preserved in the `recordedAt` stamps) — a preference pair the log mints for free.
-
-**Privacy and causal purity are defaults, not homework.** `private` fidelity (the default) exports zero output characters — structure, labels and digests only — so a dataset can leave the machine before anyone has read every line of it (`full` adds the normalized excerpt, truncated to 200 characters; degradation runs toward silence, never leakage). `agent-only` provenance (the default) voids the *whole session's* verification labels the moment one changed path is externally attributed — a reward of 1.0 asserts "the agent's edit kept the suite green", and that sentence is false when a human was also editing the workspace — while flip-pairs survive (pass-then-fail within one chain is a temporal fact about the check, whatever hand moved the files). The manifest records the filter honestly even — especially — when it emptied the dataset.
-
-**The dataset is content-addressed and chain-anchored.** Each sample's `sampleHash` is the first 16 hex of its canonical digest; the manifest's `root` is the Merkle root over them — edit one character of one sample and the root moves, so a dataset cannot be quietly re-labeled after the fact, and two exports compare without trusting either exporter. The reward table rides the manifest as a snapshot (a number without its minting law is unlabeled data), and every export is pinned by an **anchor** — `{count, head, keyId}` of the last signed checkpoint at export time (the last well-formed checkpoint of an unsigned chain, honestly keyless) — so a consumer holding the log re-derives the root or knows it holds a different chain. The engine verb is `exportTrainingData` (its `path` option writes the JSONL samples plus the manifest document to disk atomically); the MCP face is `proof_training_export` — which is the entirety of the **APP/1.2 → APP/1.3** bump (10 → 11, a tool-surface expansion on the same honest terms: nothing else moved, the fingerprint moved by construction, `test/21` now pins four generations literally). Samples never ride an MCP response — manifest, anchor and `sampleCount` only; pass `path` and `writtenTo` names where the JSONL landed.
-
-Honest limits, stated here and kept in the list below: the reward table is a **convention, not ground truth** — the verdicts underneath are machine-verified differentials, the 1.0/0.5/0.0 pricing is declared policy; flip pairing is an **adjacency heuristic** (adjacent in the log's decisive subsequence, not a claim that nothing intervened in the world); and **merging datasets across deployments is an unsolved trust question** — whose data is this, and was it poisoned? Anchoring dataset provenance in the transparency log (anti data-laundering) is the future direction, not this version.
-
-Tests 668 → 685 (+17: `test/30-training` 8 — the ground-truth exhaust over every verdict class and both flip directions, the reward-table pin, private/full fidelity, the external-void, determinism, sample addressing, the empty log; six engine cases in `05` — end-to-end export with flip pair/counts/root/anchor, default private, default agent-only with honest no-provenance degradation, `path` writes the two files, injected-clock determinism, the empty chain; four MCP cases in `23` — private default with samples never on the wire, full+`path` writes the JSONL, loud enum refusal, and the parameter-face pins). `src/` adds `core/training.ts`; config stays at 33 keys — the flywheel is protocol, not a knob.
-
-## Verification economics (v0.21): the unit cost of trust
-
-Everything through v0.20 made trust *recomputable*; v0.21 gives it a **unit cost** — what one verification cost, what the money bought, and what a `proven` grade is worth insuring. The seed was already in v0.9: the bayesian scheduler ranks checks by expected information gain **per millisecond** — certainty per unit cost as a scheduling decision. v0.21 makes that implicit meter explicit, as a ledger and a price. The new pure module `src/core/economics.ts` turns the two things money can honestly be charged against — measured wall-clock (`durationMs` on every record) and consumed human review (B/C attestations, counted upstream) — into statements, and turns a `proven` grade into an insurance-style offer.
-
-**The run ledger.** A verification that runs with a rate card (`economics: {computePerMs, humanReviewPerItem?}` on `proof_verify` — the MCP face takes it directly; or `VerifyOptions.economics` on the engine) returns — and records on the chain — one run restated as a statement of cost and purchase: `computeMs` (Σ measured durations over **all** records — a timed-out check burned the milliseconds all the same), `cost` (the rate card injected, never hardcoded — swap the card, the same evidence reprices), `assertions` (the decisive count: each decisive check answer is one verified assertion) and `costPerAssertion`, `confidencePurchased` (posterior − prior — the marginal confidence the run actually bought), `confidencePerDollar`, `infoNats` (Σ signed entropy drop per factor, in nats — **paying to learn bad news is still information**, so a factor folding toward failure contributes its negative sign honestly) and `natsPerDollar`. The ledger's honesty rules are the point: `skippedCount` keeps the sunk cost visible instead of hiding spend that bought no assertion; an unmeasured prior purchases `null`, never zero (do not pretend a purchase nobody priced); zero cost buys `null` per dollar, never `Infinity`; and every amount is rounded to six decimals so floating-point dust never reaches a statement.
-
-**The SLA pricer — three doors, no fourth.** `proof_sla_quote` (engine verb `slaQuote`) turns a graded proof into an insurance-style offer over `dsh-proof/SLA-1`: a **`proven`** grade with a measured confidence in [0,1] earns an **offer** — `premium = coverageAmount × (1 − confidence)`, the expected loss the residual risk (`pUndetected = 1 − confidence`) leaves open, with `minPremium` as the floor and the `deductible` passed through verbatim, never folded into the premium. **No second β**: the confidence already absorbed every false-pass discount on its way in (organic 0.02, synthetic 0.15), so `1 − confidence` *is* the comprehensive undetected-defect probability — multiplying another β in would discount the discount and under-price the book. A **`regressed`** grade is honestly **denied** — "the delivery failed verification": insuring a known loss is not underwriting. `stale` / `unproven` / `no-baseline` (and a `proven` with no measured confidence) route to **manual underwriting** — a human takes over rather than a number being invented. Every quote is content-addressed over its own pricing content (`quoteId`: same inputs mint the same bytes, one cent of coverage is a different quote, rewording a denial re-prices nothing) and lands on the chain as an `economics/quote` marker — a quoted premium cannot be silently rewritten after the fact.
-
-**Exclusions — the honest limits, written into the policy.** Every quote carries five exclusion clauses verbatim, and they are the project's own documented blind spots restated as coverage terms: the shell-attribution blind spot (a defect hidden behind a rewritten command line), the single-operator transparency log (a divergent fork view held by another operator), the post-checkpoint tail window (chain cover only), human endorsement as accepted risk (never verified fact), and non-decisive outcomes (they verified nothing — the surface they never answered is not covered). An exclusion nobody can quote is a promise nobody made; the tests pin all five verbatim.
-
-**The seam closes at the MCP face.** `proof_verify` accepts `economics: {computePerMs, humanReviewPerItem?}` directly (validated loudly at the boundary — the card is host input, and a negative or NaN price is refused, never computed with), the ledger rides the `proof/verified` marker (pricing is a **chain fact**), and the new pure-query tool `proof_economics` replays the most recent rate-carrying marker **verbatim from the chain's own bytes** — never recomputing a price, never trusting a caller's summary, and answering "no economics yet" with the exact remedy. The protocol bumps **APP/1.3 → APP/1.4** — the fourth tool-surface expansion (11 → 13: `proof_economics`, `proof_sla_quote`), on the same honest terms as the previous three: nothing else moved, the fingerprint moved by construction, and `test/21` now pins **five generations** of fingerprints literally. The rate card is a **query parameter, not a configuration key** — config stays at 33 keys; the same chain reprices under different cards without redeploying anything. Contract paths carry their own honest calibers: `docs-only` prices an honest zero (no compute, no paid review), `llm-jury` counts the testimony it consumed (`humanReviewItems` = the B/C witnesses the verdict rested on), and the machine path reports the final (post-fusion) confidence as its posterior.
-
-Honest limits, stated here and kept in the list below: the rate card is the **deployer's injected cost basis, not a real bill**; `pUndetected` is a **model probability, not actuarial claims history**; and the premium is an **illustrative, model-based quote, not a financial product** — `dsh-proof/SLA-1` is a written convention for pricing residual risk, in the same spirit and with the same limits as the training reward table.
-
-Tests 685 → 720 (+35: `test/31-economics` 24 — the unit-cost ledger (compute/assertions/confidence/nats, each per dollar), the null-discipline (zero cost never divides, unmeasured prior never pretends), signed infoNats, degenerate entropy endpoints, sunk-cost visibility, six-decimal money spec, the offer math exactly, degenerate-but-legal confidence endpoints, minPremium floor, deductible passthrough, the one-sentence denial, all four manual-underwriting routes, the five exclusions pinned verbatim, quoteId addressing (one cent of coverage is a different quote; the rate card is not part of the address), and the input defenses; six engine cases in `05` — a bayesian verify priced end-to-end, a budget-starved run showing every skip and pricing no purchase, `slaQuote` on-chain determinism, `slaQuote` boundary refusal writing nothing, the machine contract path carrying economics with the final confidence as posterior, an llm-jury verdict pricing the testimony it consumed; five MCP cases in `23` — a priced offer (coverage 10000 at confidence 0.97 costs exactly 300), the honest denial, malformed usage refused loudly, the absent-ledger remedy, and the closed seam: a priced `proof_verify` mints a ledger `proof_economics` replays verbatim off the chain). `src/` adds `core/economics.ts`; config stays at 33 keys — pricing rides the tool call, not a knob.
-
-## The full-depth audit, paid in full (v0.22.0): self-report is uprooted wherever it regrew
-
-v0.16 and v0.17 were deep-read passes over the core's judgment surfaces; v0.22 is the same discipline taken to the whole codebase at once. A 27-agent adversarial audit read every line — all 21,563 lines of `src/` and all 17,683 lines of `test/` — and filed 34 high-priority, 85 medium-priority and 68 low-priority findings. The meta-finding was structural, and it named three patterns that kept recurring: fixes that closed only *the door they named* (H3's unlock forgot `vanished`, H12's guard forgot `'error'`); trust decisions that were *reborn in every new product face* (PTL publication, bundle verification, delegation, the MCP surface each re-invented "self-report as truth"); and defences quietly *eroded by their neighbours* (a β discount compounded away by learned history, a screen bypassed by the global `fetch` it never listed). v0.22 closes all 34 highs, most of the mediums, and pins every closure with tests — 720 → 857 (+137), a large share of them adversarial: the audit's own proof-of-concept attacks (the drifted-body prior laundering, the whole-cloth delegation bundle, the `reject@0.99` confidence lift) are now executable test cases that must stay red-side.
-
-**Thread one: every new face stops believing self-reports.** Delegation submissions now demand a *trust root*: `submitDelegation` additionally requires the bundle's evidence chain to carry a signed checkpoint — naming the obligation minter's anchor key when this chain has one (or at least some well-formed signed checkpoint when the minter never anchored), because a signature is the one thing an empty-log forger cannot self-supply; unanchored evidence caps the derived grade at `unproven` no matter how self-consistent the bytes are, with the pinned problem `bundle evidence not anchored`. A `claimedGrade` that exceeds what the artifact's evidence derives is capped with the discrepancy recorded on the submission, and `ownGrade` is demoted to what it always was — a declaration: `taskVerdict` derives the workspace's own grade from the chain's `proof/verified` markers, and a self-report above the derived grade is refused with the reason on the record. `waiveDelegation` grew authorization: the waiver's `by` must resolve to the host that holds the obligation minter's anchor key — anyone else's waiver is refused loudly *and recorded*, so an unauthorized waiver is at least a visible event. The PTL stack closed the same hole on its two faces: the CLI's `append` now selects checkpoints exactly the way the engine does, and whenever the local key matches the selected checkpoint's keyId the checkpoint signature itself is verified *before* the entry enters the tree — a foreign `keyId` can no longer ride the operator's hand into the Merkle log; `verify --bundle` grew from four checks to six, adjudicating the pinned `publishedHead`'s signature and logId rather than deconstructing-and-dropping them, and a missing STH is no longer a pass. And `verifyBundle` — the DAG's zero-trust authority — now mirrors `malformedCheckpoints` into its problems and actually adjudicates checkpoint signatures when the verifier holds the named key; a chain whose checkpoints merely *carry* `sig` fields nobody checked reports a new fourth chain mode, `signed-unverified`, because "signatures exist" and "signatures were verified" are different claims and the mode must not make the second for free.
-
-**Thread two: the learning priors stop testifying for a tampered body.** The v0.16 script-drift defense priced a drifted check's false pass at β = 0.15 — once — while the learned prior (≈ 0.836 after five green runs on the *old* body) kept compounding forever, so a `"test"` script rewritten to `node -e ""` borrowed the old body's green history and a single forged pass crossed the default 0.97 target. Two moves close it. The drifted id's history is now **time-sliced**: only records stamped after the chain first recorded that id's drift are summarised — at first detection no such records exist, so the id prices at the cold prior (ρ = 0.2, π ≤ 0.9, and any factor ≤ 0.9 caps the claim product below the 0.97 target), and later the *new* body re-earns its prior honestly, pass by pass, from its own records alone. And the unreviewed body gets its own β (`driftedFalsePass`, default 0.5 — above the synthetic tier, because these bytes replaced a body the baseline vouched for, chosen by the hand that owns the claim, screened by no one), so a single new-body pass lands at ≈ 0.94, visibly short of 0.97: re-certification takes multiple honest observations or a fresh baseline, and "rewrite the test to a no-op" is no longer a proof. The same completeness discipline reached the endorsement unlock (its enumeration had missed `vanished`, `scriptDrifted` and baseline integrity — a deleted check definition, an un-re-anchored body and a tampered baseline are missing work, not residual risk, and none of them unlocks anymore) and the baseline file itself: `loadBaseline` now re-derives `baselineId`, so stripping a field (`scriptDigests`, `apiSurface`) — which used to be indistinguishable from an old-version baseline and silently disabled the corresponding defense — trips `baselineTampered` and caps the grade at `stale`.
-
-**Thread three: the observation layer stops being blind to names and shells.** The tool-name classifier was a word-regex that required mutation words to be delimiter-bounded — `MultiEdit` and `NotebookEdit` (real, documented Claude Code mutators) matched nothing, and because the gate is allowlist-semantics the miss meant *pass-through*: in workspace mode the agent could write `.proof/evidence.jsonl` through either tool with zero interception. Classification is now an anchored, case-insensitive whole-name list with an unknown-name default of MUTATION (`MultiEdit`/`NotebookEdit` land in `deny` like every other mutator, `notebook_path` extracts like every path key), and the reverse bug died with it — `Read`/`Grep` are no longer misfiled as mutations, so a read file is not "touched" and drift detection works again. Shell command strings — the v0.13 H9③ hole, open since the beginning — are now swept at the gate: a shell-class tool's command string is matched textually against every spelling of the evidence store and the trust artifacts (anchors, keys, host-mode store dirs, both workspace identity spellings), conservatively. And host mode — the *default* deployment — finally has a structured guard at the adapter layer: when the trust root is known, an absolute-path write into `<trustRoot>/workspaces/<key>` is denied with the reason said out loud. The honest edge stays honest: host mode *without* a known trustRoot remains unguarded — "the store is outside the sandbox" is a host property the shared gates can enforce but not conjure. Supporting the same layer: `workspaceKey` is now normalized (four spellings of one directory no longer fork into four identities with four anchors), with a migration probe that detects a legacy-keyed store and tells the operator what to do; adapter session storage carries a content digest (a tampered session file is refused, not silently loaded); the `DSH_PROOF_*` environment contract is parsed in exactly one place (`resolveAdapterEnv`, shared by the CC hooks, the OpenCode plugin and the MCP entry — v0.21's "set the variable and the guard watches a phantom store" split is dead); and the OpenCode before-hook now fails *closed* — a throwing gate call holds the tool call instead of waving it through.
-
-The rest of the sweep, each named where it lives: **V8 coverage** collection stages per-run (a clock nonce plus a monotonic run sequence — concurrent and sequential runs never share a directory) and admits only profiles whose mtime falls inside the run's `[spawnedAt, collectedAt]` window; one profile outside the window drops the *whole* run's coverage to `basis: 'none'` with a `coverage/untrusted` marker, so a pre-forged profile planted in a stale directory no longer executes the change by fiat. **Training export** front-loads the integrity audit (a chain that fails its own `audit()` is refused — loudly, writing nothing — before a single sample is distilled), slices the log to the current baseline's anchor (the anchoring batch used to self-compare against the baseline it built, minting reward-1.0 positives out of thin air), and deduplicates same-content samples (re-verifying a green workspace N times no longer mints N identical "still-passing" positives); the MCP `path` parameter is confined workspace-relative at *both* the face and the engine. **Economics** gained an input-domain master gate: every amount sits under a 1e15 money ceiling (an input whose rounding would overflow is refused at the gate, never computed with — the quoteId collision PoC is dead), the grade vocabulary is enforced (a foreign grade routes to manual underwriting, never the proven branch), and a non-finite or negative `durationMs` books as unknown, never as a number on a statement. **Contradictory testimony** is refused at parse: a jury record whose verdict and probability disagree on direction (`reject` at probability 0.99) no longer enters the arithmetic — before, the maths read only the probability and a sworn rejection *raised* certification past the target. The **synthetic screen** caught up with Node ≥ 18: the zero-import outbound globals `fetch`/`WebSocket` (and the `cluster`/`worker_threads`/`dns`/`tls` family) join the deny-list, so the easiest exfiltration channel no longer sails past a screen that only knew `require` spellings. **Python impact** finally resolves the three forms the absolute-form-only fix never covered (`from .mod import x`, `from . import x` with its `__init__.py` candidates, bare `import pkg.mod`). **Process trees** are reaped whole on POSIX (the child becomes its own process-group leader so a timeout kill takes down grandchildren too — a grandchild holding the stdout pipe used to hang the whole verify forever), and **LSP queries** are raced against a wall-clock deadline (a hung language server degrades the graph to approximate; it no longer hangs the run). And the protocol grew a **fingerprint ancestor table**: a verifier recognises every dialect this genealogy ever spoke (APP/1.0–1.3, recomputed from the live constants with only the version swapped, never a stale literal), so the five version bumps no longer orphan every previously-minted bundle — an old bundle verifies clean on today's implementation, flagged `legacyProtocol`, while an incoherent version/fingerprint pair is still refused with both digests named.
-
-Honest boundaries, as ever in the list below — the three the audit left open on purpose: shell-command matching is a **conservative substring sweep** (a rewritten command that avoids every guarded spelling can still slip past; the guard errs toward over-blocking, and drift detection remains the backstop); the V8 coverage defense is **isolation plus an mtime window, not a cryptographic guarantee** (a process able to write into the run's own staging directory with an in-window mtime defeats it — v0.22 raised the cost of forgery from "inherit the env variable" to "win a race with the engine's own clock", it did not make forgery impossible); and in a deployment with **no trustRoot configured**, the PTL operator key may still resolve beside the log directory it notarises (`<ptlDir>/ptl-operator-key`) — pass `--operator-key` (or set `DSH_PROOF_OPERATOR_KEY_DIR` / a trust root) explicitly to separate the key from the tree it signs.
-
-Tests 720 → 857 (+137, a large share adversarial: the audit's PoCs — drifted-prior laundering, whole-cloth bundles, `reject@0.99`, shell writes into the store, `MultiEdit` passthrough, coverage-profile planting, quoteId collisions — are all now pinned as executable attacks that must fail). Config stays at 33 keys — the unreviewed-body β rides `EngineOptions.driftedFalsePass` (default 0.5), an overridable modelling guess in the same tier as `syntheticFalsePass`, not a new knob; everything else above is a closed door, not a setting.
-
-## The verified read (v0.23.0): one door for every trust decision
-
-v0.22 paid the audit in full — and then a second 23-agent survey read the *result* line by line and filed 19 more highs, of which **42% had been introduced by the fixes themselves**. That number was the design instruction. The recurring disease was never missing defenses; it was defenses that existed and were *never consulted* — the signature verifier nobody passed a key to, the audit verdict nobody read, the suspect filter that missed exactly one call-site. So v0.23 is not another layer of walls. It is three structural moves that make the wall-building mistake difficult to repeat.
-
-**Move one: THE verified read.** Every trust consumer now reads the chain through one exported view (`createVerifiedView` in `core/evidence.ts`): a single-pass reader that walks the log once, applies the suspect position test, verifies checkpoint signatures when a key is available, and — the piece v0.22 lacked — carries a *generational fallback*: a label whose every marker is suspect (a pre-headRef log after upgrade) still returns its last record marked `degraded`, instead of silently forgetting an entire deployment's history. The raw line-parsing paths are `@internal` now; a future consumer cannot accidentally wire itself to the unverified read, because the verified one is the only door left open on the corridor. Through that door went the four worst dead channels of v0.22: `submitDelegation` now hands `verifyBundle` an actual `anchorSigner` (the three-state signature adjudication finally has a caller in production), the engine's drift-boundary scan filters suspects like every other reader, the MCP face's marker reads go through the same view, and `audit().ok` — which v0.22's verdicts never once consulted — now rides the same four consumers as `baselineTampered`: a chain that fails its own audit cannot mint a `proven`, no matter which single channel is clean.
-
-**Move two: epoch awareness.** The drift time-slice of v0.22 asked "when did the chain first record drift for this id?" — a question whose answer spans baseline generations, so a drift → re-anchor → drift cycle let each new body inherit the previous body's re-earned history. The boundary is now *generational*: only markers after the current baseline's anchor count, and the delegation task sequence derives from the verified marker count with `max + 1`, so an upgrade (or a suspect purge) can no longer roll `task-1` back onto an existing obligation. The same epoch discipline closed the tail-absorption laundering: `preSignAudit` now refuses to notarise `baseline/saved`/`baseline/established` lines this process never wrote (authorship plus position, both checkable), and `savePtlHead` refuses to extend a stored head it cannot verify — *uncertain = fail* at last, on the CLI face, the engine face and the bundle face alike, because the publish predicate everywhere is now "the selected checkpoint verifies, or the publish refuses".
-
-**Move three: value scanning, not enumeration.** The roster disease died by starvation. The command sweep no longer enumerates key names (`command`/`cmd`/`script` — three names v0.22 checked and three it didn't): a mutation-class call has *every string value* it carries swept against the guarded spellings — `{commandLine: …}`, `{code: …}`, an argv vector, a key nobody has named yet; all the same sweep. The path layer got the same treatment: one `foldHostPath` (device-namespace prefixes stripped, drive-relative `C:x` projections, case, separators, trailing-dot deformation — every fold that used to live in four disagreeing implementations) is now *the* fold, consumed by the gates, the DSH face and the engine's export confinement alike; `\\?\`-prefixed and drive-relative writes no longer fall through the gap between four half-folds. And a relative `DSH_PROOF_TRUST_DIR`/`DSH_HOME` is now a loud startup failure, not a silent move of the keys into the workspace.
-
-The rest of the ledger, named where it lives: **bundle verification** mirrors the core's head-liar check (a *replayed* signature over a false head is now `invalid`, not `verified`), treats records riding behind the last checkpoint as a problem rather than a footnote, and refuses a structurally-intact but record-empty log; **delegation composition** no longer defaults an unsubmitted leaf to `proven` (a leaf nobody proved is `unproven`), and an own-`regressed` child can no longer be laundered into a waivable `stale` by a missing sibling — a waiver excuses missing work, never broken work; the **require-mode coverage gate** keys its synthetic exclusion on pool membership rather than a record field (a self-deleting script now records `error`, not a pass); the **Bayes knob domain** is validated at every boundary (`driftedFalsePass` of 0 no longer turns the drift defense into a one-shot certify, `certifyTarget` of 0 no longer collapses the target); `proof_*` tool calls are exempt from the OpenCode baseline ask (the ask could deadlock the very tool that resolves it); the synthetic screen catches the computed-member and alias forms (`globalThis['fetch']`, `(0, fetch)`, `const f = fetch`) and denies `node:vm`/`node:module`; Python impact resolves dotted specifiers both ways (`./x.component` is a filename; `from . import x` reaches the sibling, not the grandparent) plus semicolon statements and parenthesised import lists; and the drift re-earning ladder is documented per impact tier — a wildcard check's new body re-crosses 0.97 after ≈4 honest passes where a direct hit needs ≈13, which is the honest number, not the flattering one.
-
-The gate for all of it: the third survey's own proof-of-concept attacks were re-run against this code — eight of nine now fail at the exact seam they used to walk through (the absorbed tail is refused a signature, the forged STH is refused an extension, the unsubmitted leaf composes `unproven`, the replayed checkpoint reports `invalid`), and the ninth is covered by the epoch tests its target's rewrite shipped with. Tests 857 → 951 (+94, the large majority adversarial or KAT). The honest boundary moved but did not vanish, and the list below says where: shape forensics still cannot stop a *properly-shaped* append on a writable log — only signature adjudication can, and v0.23's bet is that one verified door, always consulted, beats any number of walls that might not be.
-
-## Claims as contracts (v0.24.0): the promises now fail loudly when they stop being true
-
-The fourth survey read the v0.23 result line by line and found 17 highs — half of them *introduced by the fixes*, and the worst of them not bugs at all but **unfulfilled claims**: the verified view had zero production callers while three documents swore it was the one door; the Bayes knob validator was dead code while README, config comments and a test all said "validated at every boundary". The pattern had a name — document, code and test swearing the same untruth together — and no amount of wall-building touches it, because every wall shipped with its own certificate of existence.
-
-v0.24 closes all 17 and then does the structural thing: **`test/32-claims.test.ts` turns each architectural claim into a contract that fails the suite the moment it stops being true.** Ten claims, each citing the sentence it enforces: the verified view *has* production consumers (and the bare raw-read export is gone from `src/` imports — renamed into an internal escape hatch); the Bayes knobs throw at the *construction* boundary (`new ProofEngine({certifyTarget: 0})` is an error, not a silently-certifying engine); `foldHostPath` is the *one* fold — engine and DSH face carry no hand-rolled twins; the value sweep has exactly one implementation, imported; `MCP_DEFAULT_VERSION` and the PROTOCOL reference line must equal `package.json` (the version constant had been left at 0.22.0 *and pinned by a test*); the protected-marker roster covers every label a trust decision reads; the publish predicate never selects a head-liared checkpoint; a refused-to-sign generation is *forgiven* by the documented re-anchor (audit.ok returns to true); a self-deleted synthetic script records `error`, never a pass; and the store face and the MCP face agree on blank-line semantics — one log, one judgement. The fix agents worked *against* this file: four claims started red and turned green as the wiring landed, which is the file working exactly as designed.
-
-The wiring itself, briefly: the engine now reads every marker and checkpoint through `this.verified` (the view is consulted, not just exported), the drift epoch takes the *last* sighting in-generation (a replaced body no longer inherits its predecessor's re-earned history), `priorsFor` and the training slice stop at the last vouched checkpoint (forged evidence lines above the anchor no longer price anything), delegation that cannot be adjudicated is capped loudly instead of degrading to keyId-presence, the refusal ledger is billed per generation (an honest crash no longer bricks the workspace forever — and the recovery flow that used to mint a *second* refusal no longer does), unparseable STH bytes are a refusal rather than a cold start, an un-anchored signing key cannot be copied out through the adapter face (the target set is one shared constructor both faces import), `hasBaselineOnDisk` actually receives the chain digest its signature has been asking for at all seven call sites, the DSH face derives its workspace key through the same normalised derivation as everyone else, and oversize command strings keep *both* end windows in the sweep (a needle that opens the string is as live as one that closes it).
-
-Tests 951 → 1036 (+85, including the ten claims). The fourth survey's own PoCs were re-run against this code after a rebuild: the planted-head notarisation, the head-liar publication, the unsubmitted-leaf `proven` and the sweep ladders all die at their seams. The curve this version is built to break: fixes introducing 42% → 50% of the next survey's highs — not because walls got weaker, but because *nobody was checking whether the walls existed*. Now the suite checks. That is the whole trick, and it is the cheapest one in this README.
-
-## The vouched floor (v0.25.0): pattern five, closed at the root
-
-Five audit rounds kept finding the same deepest weakness, always in a new costume: on a writable log, a *properly-shaped* append — correct hash chain, correct headRef, honest-looking bytes — passes every structural test, because shape is all structure can see. v0.24 answered with authorship sets and position tests; the fourth survey's PoC simply computed the position correctly. The shape-forensics arms race has no end, so v0.25 stops running it: **every trust decision now consumes only what lies below the vouched floor — the line index of the latest checkpoint whose signature this host's key has actually verified** — and a fresh append above the floor is structurally inert no matter how well-shaped it is. It cannot enter κ fusion, cannot plant a delegation obligation, cannot re-cut a drift boundary, cannot anchor a quote, cannot compose a verdict. It is *counted* (the boundary markers say how many markers "ride above the last verified checkpoint and price nothing"), never *believed*. Deployment facts stay honest: a chain with no signatures has no floor and reads whole — that is what it means to run unsigned, and the audit mode still says so.
-
-The floor itself had to be DoS-proof: v0.24's derivation picked the newest checkpoint and one garbage-signed twin at the tail could evict it, un-flooding the whole honest prefix. The floor is now a reverse scan — the newest checkpoint of this host's key that *actually verified*, well-formed and not position-lying — and publication inherited the same discipline: the engine's publish path no longer lets one bad candidate veto the tree, it walks candidates newest-first and publishes the first one the operator's key can actually vouch for (the CLI's rule, at last shared). And the last cycle-lag closed: sworn testimony is checkpointed the moment it is sworn, so a witness is priceable immediately, not one boundary later.
-
-The rest of the ledger: `synthetic/run` joined the protected-marker roster (an injected twin can no longer promote an unexecuted offer into the verification pool); LSP queries are budgeted by wall-clock, not query count (a slow server can no longer burn an unbounded evening one fast-failing call at a time); the engine refuses to bootstrap a fresh operator key onto a log whose checkpoints name a different workspace (identity mismatch, said out loud); the remaining round-four mediums fell — abort double-counting, silent non-boolean `all`, claim truncation without a marker, rehydration oldest-wins, contract's budget twin, per-check timeout floors, and a `FakeSigner` that finally keeps a secret. Two new claims joined `test/32`: the floor's consumers (fusion, DAG, drift) must route through the floor-bounded reader, and testimony writes must sit next to their checkpoint — the day someone adds a trust reader that forgets the floor, the suite goes red before the next audit does. Tests 1036 → 1054.
-
-## The roster and the door (v0.26.0): the last fresh-append channels, closed
-
-The seventh survey's sharpest finding was aimed at the guard itself: the claims file that v0.24 built was the round's biggest vulnerability surface — its claim 1b ("the bare raw-read door is gone") was **already bypassed in the shipping tree**, four production readers quietly importing the renamed `_readMarkers` escape hatch, one of them the very jury-prompt read the floor was built to protect. The lesson writes itself: a contract is only as honest as its regex is ungameable, and a rename is not a refactor.
-
-v0.26 closes the finding and the lesson together. The four raw readers migrated to the real doors (the engine's floor-bounded read for the jury prompt — now a public `engine.vouchedMarkers` — and a thin, *documented* `readChainMarkers` for the two adapter processes that hold no engine); the bare escape hatch lost its export entirely; and the claims file grew teeth: every static assertion now matches against **comment-stripped source** (a `// vouchedMarkersWith` in a comment no longer satisfies a contract), the "no twin implementations" checks catch renamed siblings (`foldHost2`, `sweepInputs`), the call-form assertions require real invocations rather than dead imports, and the two most gameable claims gained behavioural halves — the testimony claim now drives a real jury flow and asserts the sworn bytes landed *below a signed checkpoint*.
-
-The trust layer closed its own two fresh-append channels: the pre-sign authorship roster now covers **every protected marker** (a session-gap `attest/jury` or `delegation/created` with a perfectly-computed headRef is refused a notarisation instead of being absorbed and vouched by the host's next checkpoint — the missing step that let forgery ride the floor), and the generational-fallback bound excludes transplanted and position-lying checkpoints (a signed checkpoint moved to the tail no longer raises the degraded pool's ceiling). Plus the medium-grade closures: contract's `latest` lookups now stop at the floor (a self-addressing fake pass line at the tail can no longer satisfy `new-paths-covered` without running anything), the absorption check uses the vouched floor instead of the positional newest (an out-of-key garbage twin no longer frames an honest chain), publication checks the workspace identity on its main path, missing synthetic scripts are refused instead of silently skipping re-screening, the MCP face surfaces drift/vanished warnings it used to swallow, and a failed post-testimony checkpoint is a warning, never a lost verdict. Tests 1054 → 1066; claims 12/12 with negative self-checks (twenty-one bypass shapes, twenty caught statically, the twenty-first by behaviour).
-
-## The ledger of record (v0.27.0): the audit trail becomes a self-verifying asset
-
-Seven rounds produced a hundred high-severity findings, five structural innovations, and a paper trail spread across four survey reports. This version ends the paper era: **every finding ever filed now lives in `FINDINGS-LEDGER.md` with a four-state verdict — CLOSED (with the test that pins it), CLOSED-WITH-NOTES (with the boundary it keeps), RESIDUAL-DOCUMENTED (with the boundary, the backstop that catches it if breached, and the README section that says so), or SUPERSEDED (with the bigger door that ate it)** — and the ledger is itself under contract: `test/33-ledger.test.ts` verifies that every CLOSED row's test reference exists and really contains the pin, that every residual is registered in `residuals.json` with a non-empty boundary and backstop, that the README's honest-limits section covers every residual by name, and that the closure count never quietly shrinks below what the fix commits claimed. The completion status of every finding is no longer a claim in a commit message — it is an assertion the suite runs on every build.
-
-The tally the ledger swears to: **100 high-severity verdicts — 70 closed, 24 closed with stated boundaries, 2 superseded by larger closures, 4 residual** (the τ coverage window's interior, the same-host session forgery, the knowledge-based delegation waiver at the library boundary, and the PTL operator key beside a rootless log) — plus 26 mid/low findings grouped in families, and **30 registered residuals in `residuals.json`, every one with its boundary and its backstop on record**. The honest-limits sections of both READMEs grew the fourteen boundary entries the contract demanded; the docs and the ledger can no longer drift apart, because a test would fail.
-
-That is the ultimate move this genealogy had left: not another wall, but the **inversion of the audit itself** — the trail of everything found, fixed, bounded or accepted, turned into an artifact that verifies its own honesty. A future contributor who closes a residual updates one row and its backstop; one who introduces a seam the next survey finds adds a row with a PoC; the suite holds the book. Tests 1066 → 1073.
-
-## Architecture
-
-## Architecture
-
-## Architecture
-
-## Architecture
-
-## Architecture
-
-```
-src/core/*      pure domain — zero @deepseek-ai/* imports, all I/O through ports
-                (21 modules; v0.21 adds economics.ts — the run ledger & SLA pricer)
-src/engine.ts   ProofEngine — the imperative façade hosts call
-src/dsh/*       thin Cordis adapter — tools, hooks, prompt section
-src/app/*       APP/1.4 open-standard layer — protocol constants, bundle, MCP server, PTL CLI
-src/adapters/*  host adapters — shared host-agnostic core + Claude Code + OpenCode
-src/vendor/     contract snapshot pinned to dsh v0.2.1-alpha.1
-```
-
-The domain core is framework-free on purpose: it is fully unit-testable offline, and it survives DSH's preview-phase breaking changes. At runtime `@deepseek-ai/dsh-tools` and `@deepseek-ai/cordis` resolve from the user's dsh installation as peer dependencies.
-
-## Verifying it
-
-```sh
-npm install
-npm run typecheck     # tsc --noEmit
-npm test              # 1073 tests, node:test
-npm run build
-npm run bundle:check  # packaging contract self-check
-```
-
-The suite includes a **real-shell integration test** (`test/07-integration.test.ts`): it builds a throwaway project, actually runs `npm run --silent test`, breaks something, and asserts the pipeline reports `regressed` with the offending file attributed. Since v0.14 it also includes a **real-subprocess MCP integration test** (`test/23-mcp.test.ts`): it spawns the server over stdio, handshakes, and drives the whole baseline → verify → status → bundle chain with real npm runs — nothing stubbed. Since v0.15 the adapter layer has the same discipline (`test/24-26`): `24-adapters-shared` checks the adapter path derivations against where a **real engine** actually writes, `25-cc` drives the real Claude Code hook protocol over real subprocesses (one process per event, sharing only the session file), and `26-opencode` pins the duck-typed plugin surface including hostile contexts that must never throw into the host.
+---
 
 ## Configuration
 
-Every tunable is a `cordis.yml` field — no hardcoded knobs. See [README.zh.md § 八](./README.zh.md#八配置) for the full catalogue and the `checks` schema.
+Everything tunable is a configuration field — nothing is hardcoded. The MCP server, both adapters and `dsh-proof-ptl` are configured by environment variables:
 
-```yaml
-- insert:
-    - id: dsh-proof
-      name: dsh-proof
-      config:
-        requireBaseline: warn      # off | warn | ask
-        scheduler: bayesian        # bayesian = VOI-ranked waves + graded trust (default) | set = legacy whole-batch
-        certifyTarget: 0.97        # claim posterior that certifies `proven` without running everything
-        apiEntryPoints: []         # API-surface entry points; [] = derive from package.json main/exports/types
-        juryConfidenceCap: 0.8     # confidence ceiling for docs-only jury self-attestation
-        classBTrust: 0.7           # Class B (LLM jury) trust weight: log-odds exponent / mixture strength
-        classCTrust: 0.9           # Class C (human) trust weight: endorse discounts gently, reject collapses
-        syntheticDir: .proof-synthetic # sandbox where conjured-test scaffolds and scripts live (pinned out of discovery)
-        syntheticFalsePass: 0.15    # β priced into agent-authored (synthetic) checks; organic default is 0.02
-        syntheticTimeoutMs: 60000   # cooperative timeout for one conjured-test execution
-        coverage: observe           # coverage-aware proof gating: observe = gate only when V8 data exists (default) | require = no data is disqualifying | off = no injection, no gating
-        agentTeamBridge: false      # v0.19 experimental dsh agent-team bridge: duck-typed event seams, opt-in — leave off unless your dsh build emits team events
-        impactGraph: true
-        driftDetection: true
-        enforceOnTurnEnd: true
+| Env var | Meaning | Default |
+|---|---|---|
+| `DSH_PROOF_ROOT` | workspace root to verify | process cwd |
+| `DSH_PROOF_TRUST_DIR` | trust root — keys, anchor, adapter sessions | `$DSH_HOME/proof` |
+| `DSH_PROOF_EVIDENCE_STORE` | `host` (outside workspace) \| `workspace` (`.proof`, guarded) | `host` |
+| `DSH_PROOF_EVIDENCE_DIR` | workspace-relative evidence dir (workspace mode only) | `.proof` |
+| `DSH_PROOF_PTL_DIR` | transparency log dir | `<trustRoot>/ptl` |
+| `DSH_PROOF_REQUIRE_BASELINE` | baseline gate: `off` \| `warn` \| `ask` | `warn` |
+| `DSH_PROOF_DRIFT` | `0` disables drift detection | on |
+| `DSH_PROOF_ENFORCE_TURN_END` | `0` disables turn-end reminders | on |
+
+Plugin-level knobs (`cordis.patch.yml`, see [examples/cordis.yml](./examples/cordis.yml)): `checkpointEvery`, `autoDiscover`, `checks[]`, `checkTimeoutMs`, `verifyBudgetMs`, `concurrency`, `impactGraph`, `lspImpact`, `certifyTarget`, `requireBaseline`, `driftDetection` and more.
+
+---
+
+## Development & verification
+
+```sh
+npm test                 # 33 files · 1099 tests, Node's own runner with type stripping
+npm run typecheck
+npm run build
 ```
+
+- **Pure-core testability** — `test/helpers.ts` provides in-memory fakes for every port, so the whole engine runs without a harness, git, or a shell.
+- **Adversarial suites** — `test/09-trust` attacks the chain; `test/22-bundle` attacks the exchange format; `test/23-mcp` drives the real server as a real subprocess; `test/25-cc` tests the real Claude Code protocol on a real child process.
+- **Claims as contracts** — `test/32-claims.test.ts` pins architectural claims to production call surfaces: a promise that rots to "built but unconsumed" turns the suite red.
+- **Seven audit rounds** — 27-agent adversarial audits closed 34 high-severity findings across v0.13–v0.26; the full ledger lives in [FINDINGS-LEDGER.md](./FINDINGS-LEDGER.md) and is itself pinned by `test/33-ledger.test.ts`.
+
+---
 
 ## Honest limits
 
-- Check discovery is heuristic. For monorepos or custom build systems, declare `checks` explicitly with `paths` so incremental verification stays precise.
-- The dependency graph is approximate and errs toward over-inclusion. Dynamic `import()` calls, multi-line ESM imports and Python dotted imports produce edges since v0.7; reflection and string-built paths still cannot be resolved.
-- The claim posterior (v0.9) is a product of per-check health factors: independence is the model's largest known distortion — checks sharing changed files fail correlated — so `confidence` is a ranking signal, not a calibrated probability. β (false-pass) is fixed at 0.02, an admitted guess; the checks a certified-subset run skips stay on the books as planned skips carrying their priors, and priors are only as good as the evidence log.
-- The API surface (v0.10) is a line-regex extraction that deliberately over-reports: runtime-computed exports (dynamically built export names, string-assembled re-exports) are invisible to it, and a missed export would be a missed breaking change — so when in doubt it reports, and a phantom export only makes an honest claim work harder. Set `apiEntryPoints` when `package.json` does not point at the real entries.
-- The docs-only jury (v0.10) is self-attestation, not experiment: `review` is the author's own note, confidence is capped at `juryConfidenceCap` (default 0.80) with basis `jury-only` — the number is a ceiling, never a measurement.
-- `perf-budget`'s `durationMs` (v0.10) is a wall-clock measurement subject to machine noise (load, frequency scaling, contention) and not comparable across machines; leave headroom in `budgetMs` and expect boundary jitter.
-- Class B testimony's independence is at its weakest tier in v0.11: the tooling records `same-session` (deliberated inside the authoring agent's own context — the most contamination-prone tier, named honestly on the chain), and the model identity is the submitter's declaration (`session-model (unverified)`) — the plugin cannot verify who answered; what catches impersonation is third-party replay of the frozen prompt, not the declaration. The trust weights are declared constants, not learned.
-- The jury's `probability` (v0.11) is a subjective probability, not a measurement: the rubric demands "the number your own reasoning actually supports", but an LLM's self-reported figure carries no calibration guarantee — read p = 0.99 vs 0.9 as wording strength. All the testimony arithmetic consumes this subjective number; it does not make it objective.
-- `humanProbability` = 0.95 (v0.11) is a modelling choice: the Class C approval seam is binary and elicits no number, so human correctness enters as a constant — deliberately below 1, because a human who could never be wrong would make every endorsed claim unfalsifiable.
-- The reliability mixture (v0.11) is a scoring-rule choice, not a derived posterior: `fused = (1−w)·c + w·p` models "the witness is reliable with probability w, else noise" because a witness speaking about the whole claim is not one more independent factor in the product; which maths applies (p^w discount vs mixture vs risk-acceptance unlock) is decided by whether the machines already spoke, never by which number looks better.
-- Static screening is not a sandbox (v0.12): the conjured-script screen is a text-level deny-list — computed specifiers (`import(buildName())`), alias channels (`createRequire` / `eval` / `new Function`) and case-mangled specifiers are invisible to it, because text cannot see runtime values. What actually bounds a runaway script is the sandbox cwd restriction, the run timeout (`syntheticTimeoutMs`), the output cap and a future host `ptc-runtime` tier; the screen only makes the *easy* exfiltration attempts fail loudly, before execution. The regime label says `'screened-subprocess'`, honestly.
-- The synthetic β = 0.15 (v0.12) is an admitted guess that is unlearnable by construction: a false-pass rate needs breakage ground truth to learn, and a self-serving test (empty assertion, skipped breaking input) produces no breakage signal to learn from — it is forever green in the log. Like the organic 0.02 it is a priced stance, not a measurement; it deliberately lives in the overridable `syntheticFalsePass` rather than the never-retuned `BAYES_CONSTANTS`.
-- Synthetic coverage is always weaker than its organic peer (v0.12): the same pass lifts the posterior less (end-to-end: synthetic ≈ 0.9706 < organic ≈ 0.9960), the obligation tier ladder yields to organic at every tier, and an all-synthetic run renames the basis. Read conjured coverage as "the claim's author ran and passed their own check", never as independent confirmation — the β, the ladder and the basis all encode that one sentence.
-- Execution coverage is file-granular (v0.13): "executed" means the file has at least one function range at `count > 0` — it does not distinguish the changed lines from the untouched function next door, so a test touching only unchanged code in the same file counts the same as one executing the change. Line/symbol-level verdicts (baseline content blobs or LSP symbol maps) are an evolution, not this version; read `change-executed` as "this file ran", never "this line ran".
-- Non-node ecosystems have no coverage data (v0.13): `NODE_V8_COVERAGE` is a Node runtime flag — pytest, `go test`, `cargo test` inherit the variable but write no V8 profile, so the dimension reads `basis: 'none'` for them. `observe` never gates such workspaces; `require` makes every claim `unproven`. That is a deployment decision, not a defect: pure-node toolchains can run `require`, mixed or non-node stacks should stay on `observe` (or `off`).
-- The loaded-not-executed bucket is parsed but unused (v0.13): V8 reports carry a third fact — files imported yet never run — which v1 buckets and reserves but does not consume for stronger verdicts (sharper suspect ranking, a more precise `new-paths-covered`). Recorded here as an honest edge of what the gate currently says.
-- The MCP face is the thirteen conformance tools (v0.14's five plus the transparency pair of v0.18, the delegation trio of v0.19, the training export of v0.20 and the economics pair of v0.21): `proof_status`, `proof_baseline`, `proof_verify`, `proof_claim`, `proof_bundle`, `proof_publish`, `proof_log_verify`, `proof_delegate`, `proof_delegate_submit`, `proof_task`, `proof_training_export`, `proof_economics`, `proof_sla_quote`. `proof_jury`, `proof_jury_submit`, `proof_endorse`, `proof_conjure` and `proof_conjure_run` are deliberately not exposed over MCP — they lean on host-held seams (a human approval prompt, session context, an isolated deliberation model) an open server cannot assume. A client wanting testimony or synthesis runs the plugin inside DSH, where the approval seam lives.
-- Bundle verification is not a substitute for local audit (v0.14): a verifying party re-derives everything from the bundle's own bytes — file digests, chain linkage, per-record self-addressing, the baseline digest — but checkpoint signatures can be adjudicated only when the verifier holds (or is handed) the named key, and anchor monotonicity only when the anchor file is available. A missing adjudication capability is recorded as such, never rounded up to a forgery charge; an anchor-less bundle keeps its chain and addressing guarantees but loses rewind cover.
-- Checkpoint counts are normative as of v0.14 (H1): a checkpoint whose `count` is not a safe integer equal to the walked record count lands in `malformedCheckpoints` no matter who signed it, and the anchor comparison credits only checkpoints signed by the anchor's own key — a forged checkpoint (foreign keyId, inflated count) can no longer launder a truncation. The flip side is symmetric: an honest-but-buggy producer with a miscounted checkpoint is rejected the same way, and there is no override.
-- Shell command strings are a provenance blind spot on every host (v0.15; the *guard* half closed in v0.22): a `Bash`/shell tool names no structured path, so a command like `sed -i … src/a.ts` extracts nothing for *attribution* — DSH, Claude Code and OpenCode share this hole by design (mining a command line for path-shaped words would fingerprint noise). A shell-written file gets no fingerprint and no touch attribution; the safety net is drift detection, which still catches a shell changing a previously observed file (the bytes no longer match the recorded fingerprint). Only the attribution of *brand-new* shell-made files escapes — prefer Write/Edit for changes you want charged and attributed. What v0.22 added is the guard half: a shell command that *names the evidence store or its trust artifacts* (any spelling, both workspace identities) is denied before execution — see the next entry for what that match can and cannot see.
-- OpenCode has no turn-end seam (v0.15): with no Stop hook and an unstable event bus, drift and the one-time baseline/verify notices anchor on the next tool call instead — the first call after external changes is held with the drift narrative, and each distinct drift set surfaces at most once per plugin lifetime (an ignored message must not hold every future call). The `ask` decision cannot round-trip a user approval on this host either: `ask` and `deny` both hold the call, the reason saying what to do instead.
-- Timeouts are an observed state now, not an inference (v0.16): the command port reports a `timedOut` flag and the runner books a genuinely timed-out check as `'timeout'` on both platforms — before v0.16 the production port could not report that cause of death and real timeouts landed as plain `error`. The boundary stays where it was: signal deaths remain `error`-with-signal on platforms that can report them (see the v0.8 entry), and a Windows kill that arrives as a plain exit code still reads `error` — the plugin reports what the port observed, never more.
-- After a shell ran in-session, `external` degrades to `unknown` (v0.16): absence from the touched set used to be read as affirmative evidence of an outside edit — but once the session has used a shell (whose paths no host can extract, see v0.15), that absence may just be the agent's own shell work unattributed. Attribution now says `unknown` instead of a confident-but-possibly-wrong `external`, and the drift narrative and external-suspect charging both read the demotion; `external` survives only when nothing in the session could have produced the change.
-- The MCP `serverInfo.version` is the package version (v0.16): `initialize` answers with `MCP_DEFAULT_VERSION`, kept in step with `package.json` by release discipline and pinned by the `test/23-mcp` handshake assertion — it is the *implementation* version, not a protocol capability statement; protocol compatibility is negotiated separately (`2025-06-18` et al.).
-- The synthetic deny-list grew to include the process family (v0.17): `process` / `node:process` joins the forbidden list, and the spellings the text layer can see — backtick templates, `\u`/`\x` escapes, `node:` prefixes — are unescaped and normalized before matching, so an `import { env } from 'node:process'` can no longer bypass the env-read check. The additions are non-breaking for honest scripts by construction: the scaffold protocol reaches process state through the global (`process.exitCode`, no import), so a legitimate conjured test loses nothing. What the list still cannot see is what it never could — runtime-computed specifiers and alias channels (see the v0.12 entry): text is not a sandbox, and the list is a locked contract with the engine, so additions are a breaking change to what hosts must enforce, not a casual edit.
-- `canonicalJson` is injective for ordinary JSON, and deliberately not for non-finite numbers (v0.17): bigint, symbol, function and non-plain objects (`Date`, `Map`, class instances…) throw a `TypeError` instead of silently folding to bytes another value already owns — two different payloads can no longer mint the same evidenceId. `NaN`/`±Infinity` keep the legacy fold to `'null'`, now an explicit pinned decision rather than an accident: the adjudication read paths feed `JSON.parse`-derived numbers, where a forged `"count": 1e999` parses to `Infinity` — throwing there would crash the audit mid-walk instead of adjudicating the checkpoint malformed, and the fold already yields the correct verdict (signature verification fails, and the walk's own safe-integer gate flags the lie). Flipping it to a throw is blocked on those call sites pre-gating it first.
-- The transparency log is single-operator (v0.18): v1 specifies one operator, one file-backed log. What the cryptography guarantees is that the log's own history cannot be rewritten undetectably — an interior edit moves the root, a truncation shrinks the tree, both fail the signed head or the consistency proof, and the rewind guard refuses a head that shrinks, re-roots, or backdates. What it does not catch is a **split-view** operator serving different trees to different verifiers: detecting that needs multiple witnesses or gossip between auditors (the full certificate-transparency answer), which is explicit future work — the docs do not claim it.
-- The transparency log does not verify workspace signatures (v0.18): the log is a dumb notary by design — it hosts each checkpoint's `{count, head, at, sig, keyId}` verbatim and never adjudicates `sig`. Adjudicating the workspace signature against the workspace public key remains the auditor's independent job; a published entry proves ordered, unrewritten *publication*, never that the published bytes were honest.
-- The engine cannot re-run the child's checks (v0.19): they ran in another workspace, against another baseline. `artifactVerified` is bundle verification — structure, digests, chain — not re-execution; the `claimedGrade` default is deliberately two-valued (verified bundle with a baseline → `proven`, anything else → `no-baseline`), and every finer grade (`unproven`, `stale`, `regressed`) rests on the submitter's explicit declaration. The pricing of a lie is the forgery rule: a declared grade the artifact cannot back — an inflated `proven` above all — books as `regressed`, waiver-immune; declaration buys nothing the bytes do not support.
-- The dsh agent-team seam is not stable (v0.19): dsh's published plugin types expose no team interface, so the experimental bridge (`agentTeamBridge`, default false, opt-in) duck-types four candidate event seams at runtime and degrades gracefully — every event narrowed from `unknown`, every subscription in its own try/catch, nothing thrown into the host. On a dsh build that emits none of the probed events the bridge simply stays idle (one stderr line at most); the delegation tools driven explicitly over MCP or the engine remain the first-class path, whatever the bridge does.
-- The training reward table is a convention, not ground truth (v0.20): the verdicts underneath the labels are machine-verified baseline differentials, but the 1.0/0.5/0.0 pricing (`VERDICT_REWARD`) is declared policy, snapshotted into every manifest — a consumer who disagrees with `still-failing = 0.5` must re-price, and the snapshot tells them exactly what they are re-pricing. Flip pairing is likewise an adjacency heuristic: "adjacent" means adjacent in the exported log's decisive subsequence, not a claim that nothing intervened in the world between the two observations.
-- The `private` tier removes output text, not context (v0.20): a private export carries zero output characters but still carries workspace paths and output digests — a path can itself be sensitive, and a digest can confirm a guess. Dataset consumers owe the data care even at private fidelity.
-- Cross-deployment dataset aggregation is an unsolved trust question (v0.20): merging datasets from multiple exporters raises "whose data is this, and was it poisoned?" — questions this version does not answer. Anchoring dataset provenance in the transparency log (anti data-laundering) is the future direction, not a property of v0.20.
-- The economics rate card is an injected cost basis, not a real bill (v0.21): `computePerMs` and `humanReviewPerItem` are the deployer's declared prices for compute and review, and the ledger is only as honest as the card — nothing in the package knows what your verification compute actually cost.
-- `pUndetected` is a model probability, not actuarial claims history (v0.21): it descends from the v0.9 claim posterior, with all of that model's admitted distortions (independence above all — see the v0.9 entry); no loss data feeds it, and it carries no claims-history calibration.
-- The SLA premium is an illustrative, model-based quote, not a financial product (v0.21): `dsh-proof/SLA-1` has no regulator, no reserve and no claims process behind it — it is a written convention for pricing residual risk, in the same spirit and with the same limits as the training reward table (v0.20).
-- Shell-command guarding is a conservative substring match, not a parser (v0.22): the guard folds case and separators on both sides and refuses any command whose text mentions the evidence store or the trust artifacts — which means a *rewritten* command that avoids every guarded spelling (an env-var indirection, a differently-cased UNC root the fold happens to miss, a script file that does the writing) can still slip past it. The choice is deliberate: a parser would miss more than it caught, so the guard over-blocks and names the reason; drift detection remains the backstop for everything that slips attribution.
-- The V8 coverage defense is isolation plus an mtime window, not cryptography (v0.22): each run stages into its own directory and admits only profiles whose mtime falls inside the run's own `[spawnedAt, collectedAt]` window, and one untrusted profile drops the whole run's coverage to `basis: 'none'`. What that buys is a raised cost of forgery — the checked process must now win a race with the engine's clock inside the engine's own staging directory instead of merely inheriting the env var — not an impossibility: a process able to write into the current run's directory with an in-window mtime still defeats it.
-- The PTL operator key separates from the log only when a trust root is known (v0.22): with `DSH_PROOF_TRUST_DIR` set, the key lives at `<trustRoot>/ptl-operator-key`, outside the log directory it notarises; with none set it may resolve to `<ptlDir>/ptl-operator-key` — beside the very tree it signs, the self-reference the audit flagged. Pass `--operator-key` (or `DSH_PROOF_OPERATOR_KEY_DIR`) explicitly to separate them; pre-0.22 logs whose key sits at `<logDir>/operator-key` keep verifying by passing that path explicitly.
-- Checkpoint cadence leaves a window (v0.2): records after the last signed checkpoint are chain-covered but not checkpoint-covered. The window is bounded by `checkpointEvery`, closed at every baseline/verify/claim boundary, and *visible* — `proof_status` reports `tailRecords`, the count of records since the last checkpoint. The anchor protects against the audited agent, not against a fully compromised host.
-- On machines without the signing key, signed checkpoints cannot be adjudicated locally: the audit reports them as `unverifiableCheckpoints` (a missing capability, not a forgery charge — the audit does not fail on it; anchor count/head comparison still bounds rewind).
-- `proven` permits pre-existing red checks — they are reported prominently but not charged to the session. Deliberate, not a hole.
-- It orchestrates and attributes your existing objective checks. v0.12's evidence synthesis does not change that boundary: the agent drafts the assertions, and the plugin only scaffolds, screens, executes — and prices the result below every independent check.
-- DSH is a developer preview and its plugin contract changes. This plugin pins a minimal contract snapshot and declares peers rather than bundling, but upstream shifts still need re-alignment.
-- The vouched floor is a signed-deployment discipline (v0.25): every trust decision consumes only what lies below the last checkpoint this host's key actually verified, and fresh appends above the floor are counted, never believed. An unsigned chain has no floor and reads whole — that is what running unsigned means, the audit says so, and every unsigned line is exactly as trustworthy as the filesystem it sits on.
-- The adapter session ledger is a behavioural cache, not a trust anchor (v0.26): its digest binds content, not authorship — any process on the host can recompute it over a forged ledger, so a same-user forgery loads quietly. The signed evidence log is the record trust consumes; a damaged session file is announced and reset, never silently adopted beyond what the chain vouches for.
-- A delegation waiver authenticates knowledge, not identity, at the library boundary (v0.26): the issuing workspace's key is a public chain string, so a direct engine caller who knows it can accept the risk; the MCP face does not expose waive at all, the anchor-key path requires the private key, and every waiver (or refused attempt) is a visible chain fact.
-- A directly constructed `ProofEngine` without a `workspaceKey` shares the literal identity `'default'` (v0.26): the workspace-identity refusals — publication laundering, foreign-checkpoint bootstrap warnings — compare identities that every wired face derives from the root. Library embedders must pass their own, or the identity defenses compare `'default'` against `'default'`.
-- The verified view's `maxLine`/`sinceLine` windows slice the currently adjudicated pool, not the pool as it physically stood at line N (v0.25): the "as of" semantics hold for position, not for historical adjudication state. The parameters have no production consumer and exist for forensic tooling only.
-- Synthetic run markers from before headRef adoption drop silently on mixed-generation chains (v0.25): when any witnessed `synthetic/run` exists, the pre-adoption half leaves the ran-set (the honest direction — refusing to trust what carries no witness), and the recovery is re-running the conjure. The first mixed generation itself goes unmarked.
-- The anchor's rewind answer can be silenced by a transplanted checkpoint copy (v0.25): a line carrying the anchor's own `(count, head)` answers the comparison while the walk's head-mismatch audit stays red and pre-sign refuses — detection and refusal compensate; the silence itself is not separately flagged. Symmetrically, refused-signature candidates deliberately stay listed in the publish pool (first-verifiable-wins), so a consumer must adjudicate before trusting `candidates[0]`; and the engine publish selection keeps a dead parameter beside the shared candidate core it re-derives.
-- Floor-withheld testimony is visible on the chain, not always in the tool reply (v0.26): `aboveFloorAttestations` rides the claim/jury marker, while a tool reply may instruct a re-submit that self-heals — the re-sworn checkpoint lands below the floor. The same visibility seam runs the other way: the MCP face forwards drift and vanished warnings (v0.25.1) but no test pins the forwarding yet, and a failed follow-up checkpoint after sworn testimony degrades to a warning in the returned note whose failure path has no test pin either.
-- The LSP cumulative budget is wall-clock, not injectable (v0.25): tests that pin budget exhaustion burn real time, and an exhausted budget still pays one stat per import site before refusing. The degradation is honest — a null answer never narrows selection — but the seam is not.
-- The test doubles are approximations (v0.26): `MemoryFs` keeps mtimes under `removeDir` and hides registered-but-empty subdirectories from `readDir` (a parent holding only empty directories answers `undefined`); `FakeCommands` rules scan the whole table latest-first, so an argv that merely carries `'node'` can collide with a later rule. Tests avoid stale-state dependence by construction rather than detecting it; `FakeSigner` keeps a real secret since v0.25, but port-level fidelity is never total.
-- String caps differ across faces (v0.26): the DSH face caps tool arguments at 4096 characters while the MCP face forwards the claim whole (warning past 200) — the two faces hash different canonical ids for a claim longer than the cap. Say it in 200; the chain record truncates there anyway.
-- The vouched floor's own residual debt is deliberate and visible (v0.26): the floor is recomputed per trust verb — an attacker appending garbage checkpoints makes every verb pay failing verifies (honest counting, priced CPU); publish refusal markers can over-describe skipped candidates never adjudicated; the foreign-checkpoint bootstrap warning is issued regardless of the verbose flag (over-warning, never under). None is a trust inversion; all is priced visibility.
-- Hook wiring is host-configured (v0.23): the shipped example matcher enumerates the host's mutating tool names — a tool outside the list never triggers the PreToolUse gate at all, while the plugin's own classification is total for any name it sees. The experimental agent-team bridge's mapping recovery likewise reads the suspect-filtered store rather than the vouched floor — the seam is default-off and opt-in.
-- The claims contract mixes behavioural and static teeth (v0.26): the behavioural halves (a real jury flow, sworn bytes below a signed checkpoint) carry the load; the static negatives can still be satisfied by unconventional formatting, the engine publish leaf identity is pinned weaker than the CLI face twin, two differential tests compare clean against attacked without absolute anchors on the clean side, the refusal-amnesty loop runs one round (a latched amnesty would still pass), and the protected roster assertion is a snapshot list rather than the prefix family itself.
+Stated in the open, never hidden — [the full list](./README.zh.md#诚实边界):
+
+- **Static check discovery is not a sandbox.** Checks are the project's own build metadata; the plugin orchestrates and attributes, it does not sandbox.
+- **Tail records are chain-covered but not checkpoint-covered.** The window above the last checkpoint is bounded by the cadence and closed at every baseline/verify/claim boundary.
+- **The V8 coverage defense is isolation + an mtime window, not cryptography.** A same-process forge inside the window raises cost, not impossibility — and it is documented as such.
+- **The anchor can be unreadable.** On another machine or after key rotation, anchor checks are *skipped*, not failed — rewind cover is lost, chain and signature cover are not.
+- **The adapter session ledger is a behavioural cache, not a trust anchor.** Genuine trust lives in the signed evidence log; a corrupted session file is reset loudly, never silently adopted.
+- **An unsigned chain has no floor.** Every line's trust equals the trustworthiness of the filesystem that holds it — the audit says so honestly.
+
+---
+
+## Version history
+
+| Version | Landing |
+|---|---|
+| v0.15 | open standard (APP/1.0) + Proof MCP Server + Claude Code / OpenCode adapters |
+| v0.16 | honesty closure: what did the run actually observe? |
+| v0.17 | the maths corrected, the untested seams closed |
+| v0.18 | Proof Transparency Log (RFC 6962) — delivery history publicly checkable |
+| v0.19 | cross-agent responsibility DAG |
+| v0.20 | training-data flywheel — deployment compounds into a data asset |
+| v0.21 | verification economics — unit cost of trust, SLA pricing |
+| v0.22 | 27-agent adversarial audit, 34 high findings, all closed |
+| v0.23 | the verified read — one door for every trust decision |
+| v0.24 | claims as contracts — promises fail loudly when they stop being true |
+| v0.25 | the vouched floor — the last trust seam, closed at the root |
+| v0.26 | the roster and the door — last fresh-append channels closed |
+| v0.27 | the ledger of record — the audit trail becomes a self-verifying asset |
+
+Protocol history lives in [PROTOCOL.md §6](./PROTOCOL.md). The full per-version changelog is in the [中文文档](./README.zh.md).
+
+---
 
 ## License
 
