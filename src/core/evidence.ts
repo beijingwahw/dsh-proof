@@ -546,8 +546,11 @@ export function isProtectedMarkerLabel(label: unknown): boolean {
  * anchor, with its own tamper/degradation metadata). An out-of-band append
  * under either label re-defines the baseline the next session verifies
  * against, which is why the pre-sign audit refuses to lend the host key over
- * foreign ones (see `preSignAudit`). Informational `baseline/*` labels beyond
- * these two (none today) would need the same treatment before being added.
+ * foreign ones (see `preSignAudit`; v0.25's U1-H1 widened that refusal roster
+ * to the full `isProtectedMarkerLabel` list — this predicate now scopes only
+ * the Y-H-02 re-anchor recovery witness and the read-time baseline
+ * authorship demand). Informational `baseline/*` labels beyond these two
+ * (none today) would need the same treatment before being added.
  */
 export function isBaselineMarkerLabel(label: unknown): boolean {
   return label === 'baseline/saved' || label === 'baseline/established'
@@ -577,10 +580,16 @@ export interface MarkerRecord {
  * @internal The single-pass parsing core BOTH trust-decision surfaces derive
  * from (v0.24, Y-H-03): `EvidenceStore.markersWith`/`audit` and
  * `createVerifiedView().markers` call this same function, so suspect
- * adjudication cannot fork between the store face and the view face. The
- * clean name is deliberately absent from the export surface — the
- * underscore prefix marks the one escape hatch (engine's raw position pass);
- * trust decisions must go through the store or the view, never around them.
+ * adjudication cannot fork between the store face and the view face.
+ * v0.25.1 (U4-H1): the export is GONE. The underscore prefix used to mark
+ * "the one accepted escape hatch", and four production consumers (index.ts,
+ * the DSH attest tools, both adapter faces) walked through it — each
+ * hand-assembling view semantics from raw lines while the claims contract
+ * stayed green on a regex that deliberately ignored the underscore. The
+ * module-private core now has exactly two sanctioned exits: the store/view
+ * reads (engine-holding processes) and {@link readChainMarkers} (the
+ * engine-less adapter faces). Trust decisions go through the store or the
+ * view, never around them.
  *
  * V1-M8 (v0.24): the line-array contract is the node-ports `readLines`
  * convention — blank lines removed. Blank lines are normalised away here
@@ -595,7 +604,7 @@ export interface MarkerRecord {
  * suspect lines (the shape κ fusion and baseline-digest reads want: the
  * honest writer's line survives, the attacker's appended twin does not).
  */
-export function _readMarkers(lines: readonly string[], options: { readonly label?: string; readonly excludeSuspect?: boolean } = {}): MarkerRecord[] {
+function _readMarkers(lines: readonly string[], options: { readonly label?: string; readonly excludeSuspect?: boolean } = {}): MarkerRecord[] {
   const normalized = lines.filter(line => line.trim().length > 0)
   const out: MarkerRecord[] = []
   normalized.forEach((line, index) => {
@@ -609,6 +618,36 @@ export function _readMarkers(lines: readonly string[], options: { readonly label
     out.push({ index, label: payload.label, payload: payload as Record<string, unknown>, suspect })
   })
   return out
+}
+
+/**
+ * The one PUBLIC read that carries the H-32 position verdict over a caller's
+ * own line snapshot (v0.25.1, U4-H1) — the formal replacement for the retired
+ * `_readMarkers` export, not an escape hatch: importing it is a declared,
+ * contract-pinned decision, not an accident of naming.
+ *
+ * WHO MAY USE IT: processes that hold NO engine and NO store. The adapter
+ * faces (claude-code hooks, opencode plugin) re-derive `lastBaselineDigest`'s
+ * trusted-first selection over their own `readFile` snapshot because their
+ * runtime contract carries no fs port and no store wiring — for them this is
+ * the only door. Every engine-holding consumer must instead read through
+ * `EvidenceStore.markersWith` or `createVerifiedView().markers`: the same
+ * single-pass core, plus the generational fallback and the epoch bound this
+ * thin read deliberately does NOT re-implement (a hand-rolled fallback beside
+ * the view's is exactly how two faces come to disagree about what exists).
+ * test/32 claim 1b pins the importer set to the two adapter files.
+ *
+ * Pure over the given lines; blank lines are normalised away (V1-M8), so a
+ * raw `split('\n')` and a `readLines` snapshot derive the same indexes and
+ * the same verdicts. `options.label` filters to one label; suspect records
+ * stay in the result (flagged) so a caller can apply its own trusted-first
+ * degradation, `options.excludeSuspect: true` drops them instead.
+ */
+export function readChainMarkers(
+  lines: readonly string[],
+  options: { readonly label?: string; readonly excludeSuspect?: boolean } = {},
+): MarkerRecord[] {
+  return _readMarkers(lines, options)
 }
 
 /**
@@ -658,14 +697,22 @@ export class EvidenceStore {
    */
   private signerResolveError: string | undefined
   /**
-   * X-H-08 (v0.23): digests of every `baseline/saved` / `baseline/established`
-   * marker line THIS process wrote (via `mark`/`saveBaseline`). Content
-   * addressing makes the set replay-proof: an attacker re-appending one of
-   * these lines verbatim keeps its digest but breaks the chain (its `prev`
-   * still points at its original predecessor); altering anything to re-chain
-   * it changes the digest out of the set. See `preSignAudit`.
+   * X-H-08 (v0.23), widened v0.25 (U1-H1): digests of every PROTECTED-marker
+   * line THIS process wrote (via `mark`/`saveBaseline` — every protected label
+   * flows through `markInternal`, so the set is closed over this process's own
+   * writes by construction). v0.23 collected only the baseline family; the
+   * laundering the pre-sign audit exists to stop was therefore open under
+   * every OTHER protected label: a between-sessions append of a headRef-
+   * correct `attest/*` / `delegation/*` / `proof/verified` / `claim/jury` /
+   * `economics/quote` / `synthetic/*` line was absorbed by `ensureTail` and
+   * then notarised by the host's own next checkpoint — the floor launders the
+   * tail at the moment it is minted. Content addressing makes the set
+   * replay-proof: an attacker re-appending one of these lines verbatim keeps
+   * its digest but breaks the chain (its `prev` still points at its original
+   * predecessor); altering anything to re-chain it changes the digest out of
+   * the set. See `preSignAudit`.
    */
-  private readonly selfBaselineMarkers = new Set<string>()
+  private readonly selfProtectedMarkers = new Set<string>()
   /**
    * Single-flight tail for every log-mutating operation. Two concurrent
    * `append`/`mark`/`checkpoint` calls both read the same `this.tail`, both
@@ -879,10 +926,12 @@ export class EvidenceStore {
       payload: { label, ...callerData, ...(isProtectedMarkerLabel(label) ? { headRef: this.tail } : {}) },
     }
     await this.writeEnvelope(envelope)
-    // X-H-08: remember the digest of every baseline-family marker line THIS
+    // X-H-08/U1-H1: remember the digest of every protected-marker line THIS
     // process wrote — the author set the pre-sign audit's unvouched-marker
-    // rule (see `preSignAudit`) checks foreign lines against.
-    if (isBaselineMarkerLabel(label)) this.selfBaselineMarkers.add(this.tail)
+    // rule (see `preSignAudit`) checks foreign lines against. Every protected
+    // label's write flows through here, so the in-process honest path can
+    // never refuse on its own markers.
+    if (isProtectedMarkerLabel(label)) this.selfProtectedMarkers.add(this.tail)
     this.recordsSoFar += 1
     this.sinceCheckpoint += 1
     await this.maybeCheckpoint()
@@ -988,10 +1037,11 @@ export class EvidenceStore {
    * foreign one is NOT a reason to refuse — those have their own channels,
    * and refusing on them would make recovery from an honest blip impossible.
    *
-   * X-H-08 (v0.23) adds the one *authorship* signal: a `baseline/saved` or
-   * `baseline/established` marker line sitting on the checkpoint-uncovered
-   * tail that THIS process never wrote (see `selfBaselineMarkers`). See the
-   * rule's full comment inline below.
+   * X-H-08 (v0.23) adds the one *authorship* signal: a PROTECTED-marker line
+   * sitting on the checkpoint-uncovered tail that THIS process never wrote
+   * (see `selfProtectedMarkers`; v0.25 widened the roster from the baseline
+   * family to every label trust decisions read). See the rule's full comment
+   * inline below.
    */
   private async preSignAudit(signer: SignerPort): Promise<string | undefined> {
     const lines = await this.logLines()
@@ -1024,24 +1074,29 @@ export class EvidenceStore {
       if (honest) vouchedIndex = cp.index
       else { problems.push(`refuted-signature@${cp.index}`); break }
     }
-    // X-H-08 (v0.23): cross-session tail absorption. Between sessions (no
-    // store process alive — CLI invocations, MCP server restarts) an append
-    // of well-formed, correctly-chained, headRef-correct lines is invisible
-    // to every shape check above: nothing breaks, nothing lies structurally,
-    // and the next process's ensureTail absorbs the bytes as honest history.
-    // The one append whose laundering matters most is a foreign
-    // `baseline/saved`/`baseline/established` marker: it re-defines the
-    // baseline the next session verifies against, and the host key signing
-    // the next checkpoint would notarise it and lift the anchor over it.
+    // X-H-08 (v0.23), widened v0.25 (U1-H1): cross-session tail absorption.
+    // Between sessions (no store process alive — CLI invocations, MCP server
+    // restarts) an append of well-formed, correctly-chained, headRef-correct
+    // lines is invisible to every shape check above: nothing breaks, nothing
+    // lies structurally, and the next process's ensureTail absorbs the bytes
+    // as honest history. v0.23 refused to notarise exactly one append — a
+    // foreign `baseline/saved`/`baseline/established` marker — leaving the
+    // identical laundering open under every OTHER protected label: a forged
+    // `attest/jury {verdict:'uphold', probability:0.999}`, a planted
+    // `delegation/created`, a never-executed `synthetic/run` (all with the
+    // headRef anyone who reads the log can compute) rode into the vouched
+    // prefix under the host's own next checkpoint, because the floor launders
+    // whatever sits BELOW it the moment it is minted. The roster is now the
+    // full `isProtectedMarkerLabel` list — the labels trust decisions read.
     //
-    // The rule: per baseline-family label, the NEWEST marker line physically
-    // after the last host-verified checkpoint (the signed tail — the only
-    // prefix the key already vouches for) must be one THIS process wrote
-    // (see `selfBaselineMarkers`). Newest-per-label, because marker reads
-    // are last-wins: an older foreign line sitting beneath a newer
-    // self-written one is a dead letter — it no longer answers anything —
-    // while a foreign line that IS the newest of its label is a live claim
-    // nobody authored, and the store refuses to lend it the key.
+    // The rule: per protected label, the NEWEST marker line physically after
+    // the last host-verified checkpoint (the signed tail — the only prefix
+    // the key already vouches for) must be one THIS process wrote (see
+    // `selfProtectedMarkers`). Newest-per-label, because marker reads are
+    // last-wins: an older foreign line sitting beneath a newer self-written
+    // one is a dead letter — it no longer answers anything — while a foreign
+    // line that IS the newest of its label is a live claim nobody authored,
+    // and the store refuses to lend it the key.
     //
     // Boundary notes, deliberately conservative and testable:
     // - Both attack windows are covered by position alone: appended while a
@@ -1053,19 +1108,22 @@ export class EvidenceStore {
     //   untestable against an in-memory clock; authorship-plus-position
     //   catches strictly more of the marker channel, so mtime is not
     //   consulted.
-    // - Honest restarts do not refuse: `saveBaseline` writes its marker and
-    //   checkpoints in the same breath, so a previous session's baseline
-    //   markers always sit at-or-below a verified checkpoint, and THIS
-    //   process's own newest markers are in the author set by construction.
-    // - The narrow honest casualty — a session dying between
-    //   `mark('baseline/…')` and its checkpoint, or one whose checkpoint
-    //   landed only as a sigError line (which vouches nothing) — leaves a
+    // - Honest restarts do not refuse: every boundary verb checkpoints over
+    //   its own protected markers before the next read runs, so a previous
+    //   session's markers always sit at-or-below a verified checkpoint, and
+    //   THIS process's own newest markers are in the author set by
+    //   construction (every write goes through `markInternal`).
+    // - The narrow honest casualty — a session dying between a protected
+    //   `mark(...)` and the checkpoint that was to cover it (conjure's two
+    //   halves, an un-checkpointed quote), or one whose checkpoint landed
+    //   only as a sigError line (which vouches nothing) — leaves a
     //   foreign-newest marker behind; the next session refuses ONCE and the
-    //   documented recovery is the re-anchor flow: `saveBaseline` (or the
-    //   engine's establish) writes a newer SELF-authored marker, superseding
-    //   the orphan, and signing resumes. (A deployment that adds a signer to
-    //   a previously unsigned workspace takes exactly one such refusal, on
-    //   the first boundary, before re-anchoring — by design.)
+    //   documented recovery is superseding: write a newer SELF-authored
+    //   marker of the same label (re-run the conjured check, quote again,
+    //   `saveBaseline`/establish for the baseline family), and signing
+    //   resumes. (A deployment that adds a signer to a previously unsigned
+    //   workspace takes exactly one such refusal, on the first boundary,
+    //   before re-anchoring — by design.)
     // - There is no automatic pardon beyond superseding, on purpose: any
     //   pardon the store itself grants for an un-authored newest claim is a
     //   pardon an attacker can forge the shape of. The refusal line stays on
@@ -1077,11 +1135,11 @@ export class EvidenceStore {
       const envelope = parseEnvelope(line)
       if (envelope?.kind !== 'marker') return
       const markerPayload = envelope.payload as { label?: unknown }
-      if (typeof markerPayload?.label !== 'string' || !isBaselineMarkerLabel(markerPayload.label)) return
-      lastOfLabel.set(markerPayload.label, { index, self: this.selfBaselineMarkers.has(lineDigest(line)) })
+      if (typeof markerPayload?.label !== 'string' || !isProtectedMarkerLabel(markerPayload.label)) return
+      lastOfLabel.set(markerPayload.label, { index, self: this.selfProtectedMarkers.has(lineDigest(line)) })
     })
     const unvouched = [...lastOfLabel.values()].filter(last => !last.self).map(last => last.index).sort((a, b) => a - b)
-    if (unvouched.length > 0) problems.push(`unvouched-baseline-marker@${unvouched.join(',')}`)
+    if (unvouched.length > 0) problems.push(`unvouched-protected-marker@${unvouched.join(',')}`)
     // The anchor is the out-of-band high-water mark this checkpoint is about
     // to move. A disarmed anchor file (H-09) must not be quietly overwritten
     // by a fresh one — the tampering stays visible until a human looks. And
@@ -1266,12 +1324,14 @@ export class EvidenceStore {
     const firstVerifiedOwn = verifiedOwn.size > 0 ? Math.min(...verifiedOwn) : Number.POSITIVE_INFINITY
     // Y-H-02 (v0.24): the re-anchor witness for the refusal slicing below —
     // line indexes of baseline-family marker rows THIS process wrote (the
-    // digest set `markInternal` collects). Computed lazily: only a log that
-    // actually refused needs it.
+    // digest set `markInternal` collects, U1-H1-widened; the label filter
+    // keeps the witness baseline-specific — the documented recovery for the
+    // baseline family). Computed lazily: only a log that actually refused
+    // needs it.
     const selfBaselineMarkerLines = new Set<number>()
     if (refusedPendingProbe(walk)) {
       lines.forEach((line, index) => {
-        if (!this.selfBaselineMarkers.has(lineDigest(line))) return
+        if (!this.selfProtectedMarkers.has(lineDigest(line))) return
         const envelope = parseEnvelope(line)
         const payload = envelope?.payload as { label?: unknown } | undefined
         if (envelope?.kind === 'marker' && isBaselineMarkerLabel(payload?.label)) selfBaselineMarkerLines.add(index)
@@ -1477,7 +1537,7 @@ export class EvidenceStore {
       const allSignedForeign = signer !== undefined && signedCps.length > 0
         && signedCps.every(cp => cp.keyId !== signer.keyId)
       const authorised = signer !== undefined && !allSignedForeign
-        ? baselineMarkerAuthorised(answering, lines, this.selfBaselineMarkers, lastVerifiedOwn)
+        ? baselineMarkerAuthorised(answering, lines, this.selfProtectedMarkers, lastVerifiedOwn)
         : true
       if (!authorised) {
         baselineTampered = true
@@ -1794,7 +1854,7 @@ export class EvidenceStore {
         const allSignedForeign = signedCps.length > 0 && signedCps.every(cp => cp.keyId !== signer.keyId)
         if (!allSignedForeign) {
           const lastVerifiedOwn = await this.lastVerifiedOwnIndex(lines, signer)
-          if (!baselineMarkerAuthorised(answering, lines, this.selfBaselineMarkers, lastVerifiedOwn)) return undefined
+          if (!baselineMarkerAuthorised(answering, lines, this.selfProtectedMarkers, lastVerifiedOwn)) return undefined
         }
       }
       const saved = baselineDigestOf(answering)
@@ -1946,6 +2006,12 @@ export interface VerifiedViewOptions {
  *   `selectPublishable` first-verifiable-wins semantics, living in the
  *   evidence layer). `bestCheckpoint` is exactly `candidates[0]` adjudicated
  *   — the two faces cannot disagree about which checkpoint is newest.
+ *   API-contract warning (F6, v0.25): `candidates[0]` is the NEWEST
+ *   structurally-publishable checkpoint, NOT a verdict — the pool checks
+ *   structure only (well-formed count, non-liar position, sig + keyId
+ *   present), never that the signature verifies. A consumer that publishes
+ *   `candidates[0]` without adjudicating it publishes a possibly-refutable
+ *   line; every in-repo consumer verifies before use.
  * - `audit` — passthrough, so verdict paths stop cherry-picking single
  *   channels (X-H-09's `audit.ok` consumption lands on this surface).
  *
@@ -2069,12 +2135,30 @@ export function createVerifiedView(store: EvidenceStore, options: VerifiedViewOp
  * actually verified over the given snapshot, or `undefined` when the walk has
  * no checkpoint that can serve as a bound (no checkpoints at all, or none
  * this key can adjudicate).
+ *
+ * U2-H1 (v0.25): the loop now skips malformed-count and head-liar
+ * checkpoints, aligning it with the two derivations that already did —
+ * `checkpointPool`/`selectBestCheckpoint` (the selection faces) and the
+ * engine's `vouchedFloor` (the key/liar/malformed scan-back). The bound
+ * guards the invariant "a suspect line ABOVE the epoch bound is fresh, not
+ * legacy — it
+ * does not enter the degraded pool": a TRANSPLANTED honest checkpoint (an
+ * original signed line re-appended at the tail, `prev` re-chained) still
+ * verifies under the key — the signature covers {count, head, workspaceKey,
+ * at}, not the envelope's position — but the walk flags it `headLiared`
+ * (and its count falls behind → malformed). v0.24's bound counted it anyway,
+ * so the transplant raised the bound above a fresh headRef-less twin and the
+ * twin entered the degraded pool as physically-last. A line whose position
+ * or count the walk refutes cannot vouch for the content below it, whatever
+ * its signature says.
  */
 async function verifiedEpochBound(lines: readonly string[], signer: SignerPort): Promise<number | undefined> {
   const walk = walkChain(lines)
   if (walk.checkpoints.length === 0) return undefined
+  const malformed = new Set(walk.malformedCheckpoints)
   let bound: number | undefined
   for (const cp of walk.checkpoints) {
+    if (malformed.has(cp.index) || cp.headLiared) continue
     if (cp.sig === null || cp.keyId !== signer.keyId) continue
     let honest: boolean
     try {

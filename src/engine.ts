@@ -1094,6 +1094,26 @@ export class ProofEngine {
       humanProbability: DEFAULT_TRUST_WEIGHTS.humanProbability,
     }
     const workspaceKey = options.workspaceKey ?? 'default'
+    // U1-L6 (v0.25): every identity defense this engine carries — the W9-M5
+    // publish identity cross-check, the V2-L8 foreign-chain bootstrap
+    // warning, and the vouched floor's workspace filter — compares against
+    // this key, and the literal 'default' is shared by every construction
+    // that stays silent, so those defenses compare 'default' === 'default'
+    // and never fire. Wired faces (adapters/shared/paths.ts) derive a
+    // path-based key; a DIRECT library construction that wires signer/
+    // trustDir/ptlDir without naming its workspace gets one stderr line at
+    // construction, pointing at the explicit key. Read-only and byte-free:
+    // no chain bytes change, deriving a key here would.
+    if (options.workspaceKey === undefined
+      && (options.signer !== undefined || options.trustDir !== undefined || options.ptlDir !== undefined)) {
+      try {
+        process.stderr.write(
+          '[dsh-proof] WARNING: ProofEngine constructed without workspaceKey — identity-dependent defenses '
+          + "(publish cross-check, vouched floor, bootstrap warning) fall back to the shared identity 'default'. "
+          + 'Pass EngineOptions.workspaceKey explicitly for this workspace.\n',
+        )
+      } catch { /* stderr unwritable — the wired faces derive their own key */ }
+    }
     // v0.18: transparency-log wiring. `ptlDir` is normalised once (trailing
     // slashes folded — every composition below is `${ptlDir}/...`). The
     // operator-signer default lives OUTSIDE the published log dir (H-07's
@@ -1405,10 +1425,20 @@ export class ProofEngine {
       const newest = Math.max(saved.last?.index ?? -1, established.last?.index ?? -1)
       if (newest < 0) return false
       if (this.signerProvider !== undefined) {
-        const best = await this.verified.bestCheckpoint()
-        const vouched = best.signature === 'verified' && best.checkpoint !== undefined
-          ? best.checkpoint.index
-          : -1
+        // U1-M3 (v0.25): the boundary is the vouched floor — the scan-back
+        // over every checkpoint of this host's key whose signature actually
+        // verifies (well-formed, non-liar) — not the positional-last
+        // `bestCheckpoint()`. ONE appended twin (a well-formed checkpoint
+        // line under a foreign keyId, or under this key with a garbage
+        // signature) used to flip the positional selection to
+        // `unverifiable`/`refuted`, collapse this boundary to -1, and fire
+        // the absorption flag on an honest chain — a false accusation (the
+        // baseline markers were NOT on an unvouched tail) capping every
+        // verdict at `stale` until hand-cleaning, exactly the twin-veto
+        // shape v0.25's `vouchedFloor` closed everywhere else. The floor's
+        // three filters drop only lines that cannot vouch; `undefined` (no
+        // verified checkpoint at all) is -1's meaning.
+        const vouched = (await this.vouchedFloor()) ?? -1
         return newest > vouched
       }
       // Signer-less deployment: the last checkpoint LINE is the only
@@ -1500,6 +1530,24 @@ export class ProofEngine {
     const checkpoint = best.signature === 'verified' && best.headLiared !== true && best.checkpoint !== undefined
       ? best.checkpoint
       : await this.selectPublishableCheckpoint(best)
+    // U1-M2 (v0.25): the W9-M5 workspace-identity check now covers BOTH
+    // branches — it used to live only in the fallback, on the theory that
+    // "the primary selection's identity agreement is the store's own
+    // construction"; it never was (`bestCheckpointCore` compares no
+    // workspace keys). A chain copied from workspace A into workspace B
+    // under a reused operator key had A's positional-last checkpoint
+    // verified and published with `entry.workspaceKey = B` while the
+    // checkpoint's signed bytes said A — no warning, no refusal. One
+    // predicate after selection: the checkpoint is signed for the workspace
+    // this engine derives, or it is a foreign chain being laundered under
+    // this one's identity. (A checkpoint that predates the field signs
+    // `null` — nothing to cross-check, exactly the CLI face's rule.)
+    if (checkpoint.payload.workspaceKey !== null && checkpoint.payload.workspaceKey !== this.workspaceKey) {
+      const reason = `the selected checkpoint is signed for workspace ${JSON.stringify(checkpoint.payload.workspaceKey)}`
+        + ` but this workspace derives ${JSON.stringify(this.workspaceKey)} — a chain copied into a foreign workspace is not this workspace's evidence`
+      this.refusePublishUnadjudicated(reason, checkpoint.keyId)
+      throw new Error(`refusing to publish: ${reason} — the transparency log would be notarising an unverified checkpoint`)
+    }
     // Precondition before any mutation: a publish that cannot end in a signed
     // tree head must not leave a headless entry on the public log.
     const operator = await this.resolvePtlSigner()
@@ -1653,6 +1701,22 @@ export class ProofEngine {
         this.refusePublishUnadjudicated(reason, anchor.keyId)
         throw new Error(`refusing to publish: ${reason} — the transparency log would be notarising an unverified checkpoint`)
       }
+      // U1-L7 (v0.25): the X-H-11 no-key-material refusal, mirrored from the
+      // ptl CLI face, BEFORE the scan. When the anchor names a key this host
+      // holds no material for, the scan's verifier predicate is false on
+      // `verifier.keyId === cp.keyId` for every candidate — nothing was ever
+      // verified, yet the scan's refusal text charged the candidates with
+      // "failed signature verification". Fail-closed, wrong diagnosis on the
+      // record: the honest charge is that no key material exists to verify
+      // with, and the remedy names where to bring it.
+      if (signer === undefined || signer.keyId !== anchor.keyId) {
+        const reason = `the anchor names key ${JSON.stringify(anchor.keyId)} but this host holds no key material that can verify it`
+          + ' — a checkpoint whose signature cannot be verified is not publishable, whatever keyId it claims'
+          + ' (X-H-11: keyId matching without verification is the forgery shape). Provide the anchor/engine key material —'
+          + ' wire EngineOptions.signer/trustDir on the host that anchors this workspace'
+        this.refusePublishUnadjudicated(reason, anchor.keyId)
+        throw new Error(`refusing to publish: ${reason} — the transparency log would be notarising an unverified checkpoint`)
+      }
     } else if (signer !== undefined) {
       candidates = honest.filter(cp => cp.keyId === signer?.keyId)
       if (candidates.length === 0) {
@@ -1685,30 +1749,46 @@ export class ProofEngine {
       this.refusePublishUnadjudicated(reason, verifier?.keyId)
       throw new Error(`refusing to publish: ${reason} — the transparency log would be notarising an unverified checkpoint`)
     }
-    // W9-M5 mirror (fallback branch only — the primary selection's identity
-    // agreement is the store's own construction): the chosen checkpoint is
-    // signed for the workspace this engine derives, or it is a chain copied
-    // into a foreign workspace being laundered under this one's identity.
-    if (chosen.payload.workspaceKey !== null && chosen.payload.workspaceKey !== this.workspaceKey) {
-      const reason = `the selected checkpoint is signed for workspace ${JSON.stringify(chosen.payload.workspaceKey)}`
-        + ` but this workspace derives ${JSON.stringify(this.workspaceKey)} — a chain copied into a foreign workspace is not this workspace's evidence`
-      this.refusePublishUnadjudicated(reason, chosen.keyId as string)
-      throw new Error(`refusing to publish: ${reason} — the transparency log would be notarising an unverified checkpoint`)
-    }
+    // W9-M5 mirror (v0.24, fallback branch): the workspace-identity refusal
+    // was born here — U1-M2 (v0.25) hoisted the identical predicate to
+    // `publishCheckpointInternal`, right after selection, so it covers the
+    // primary branch too; see that call site. No local copy remains: two
+    // copies of one trust rule is how the primary branch shipped without
+    // one in the first place.
     // W2-M3: every checkpoint NEWER than the one published was skipped by
     // this scan (rejected, liar-excluded or malformed-excluded). Each is an
     // unadjudicated line on a chain whose publish just succeeded — the fact
     // lands on the record, fired not awaited, exactly like a refusal.
+    // U1-L8 (v0.25): the skipped partition is labelled, not lumped — a line
+    // excluded from the pool never "failed adjudication", and saying so on
+    // the record misdiagnosed honest own-key checkpoints above an older
+    // anchor-key choice. Four buckets over the lines above the chosen one:
+    // head-liars, malformed counts, pool-excluded (never candidates — no
+    // signature, or the wrong key for the pool's rule), and the scanned
+    // rejected (verification actually ran and failed).
+    const liared = walk.checkpoints.filter(cp => cp.headLiared && cp.index > chosen.index)
+    const malformedSkipped = walk.checkpoints.filter(cp => malformed.has(cp.index) && cp.index > chosen.index)
+    const rejectedSkipped = rejected.filter(cp => cp.index > chosen.index)
+    const rejectedIndexes = new Set(rejectedSkipped.map(cp => cp.index))
+    const poolExcluded = walk.checkpoints
+      .filter(cp => cp.index > chosen.index && !malformed.has(cp.index) && !cp.headLiared && !rejectedIndexes.has(cp.index))
     const skipped = signed.filter(cp => cp.index > chosen.index)
-    if (skipped.length > 0) {
+    if (skipped.length > 0 || liared.length > 0 || malformedSkipped.length > 0 || poolExcluded.length > 0) {
+      const skippedDetail = [
+        `rejected-by-verification@${rejectedSkipped.map(cp => cp.index).join(',') || 'none'}`,
+        `head-liar@${liared.map(cp => cp.index).join(',') || 'none'}`,
+        `malformed-count@${malformedSkipped.map(cp => cp.index).join(',') || 'none'}`,
+        `pool-excluded@${poolExcluded.map(cp => cp.index).join(',') || 'none'}`,
+      ].join(' | ')
       if (this.verbose && this.logger !== undefined) {
         this.logger(`[dsh-proof] publish skipped ${skipped.length} newer checkpoint line(s) (${skipped.map(cp => cp.index).join(', ')}) — published the newest that verified (line ${chosen.index})`)
       }
       void this.store.mark('ptl/publish-unadjudicated', {
         keyId: null,
-        reason: `${skipped.length} newer checkpoint line(s) failed adjudication and were skipped; published the newest that verified (line ${chosen.index}, keyId ${chosen.keyId})`
+        reason: `${skipped.length} newer checkpoint line(s) were skipped; published the newest that verified (line ${chosen.index}, keyId ${chosen.keyId})`
           .slice(0, 200),
         skipped: skipped.map(cp => cp.index),
+        skippedDetail: skippedDetail.slice(0, 300),
         published: chosen.index,
       })
         .catch(() => { /* the log itself is unwritable; nothing more to record */ })
@@ -2732,7 +2812,16 @@ export class ProofEngine {
     // latest evidence per check — the synthetic fallback for new-paths-
     // covered rests on it, because a conjured test's own execution record
     // (proof_conjure_run) lives on the chain, not necessarily in this run's
-    // batch.
+    // batch. U2-H2 (v0.25): the fallback map is now vouched-floor-bounded —
+    // `store.latest()` is a raw last-wins read over the whole log, so an
+    // out-of-band self-addressing `pass` row appended after the last
+    // checkpoint (chain green, no break, tailRecords never failing `ok`)
+    // used to win the fallback and lift new-paths-covered to met without a
+    // single execution — Y-H-05 bounded `priorsFor` against exactly this
+    // row-shape in v0.24 but left the verdict side open. Rows above the
+    // floor no longer answer the fallback; this run's own records still do
+    // (they are `collected.records`, judged first), and unsigned deployments
+    // keep the whole-log read (no notarisation layer exists to demand).
     const apiSurfaceAfter = await this.computeApiSurface()
     const apiSurfaceBefore = (baseline as EngineBaseline | undefined)?.apiSurface
     const verdict = evaluateContract(
@@ -2741,7 +2830,7 @@ export class ProofEngine {
         changed,
         specs: pool,
         records: collected.records,
-        latestByCheckId: await this.store.latest(),
+        latestByCheckId: await this.vouchedLatestByCheckId(),
         baseline,
         apiSurfaceBefore: apiSurfaceBefore === undefined ? undefined : [...apiSurfaceBefore],
         apiSurfaceAfter: apiSurfaceAfter === undefined ? undefined : [...apiSurfaceAfter],
@@ -3284,8 +3373,21 @@ export class ProofEngine {
   private async syntheticSpecs(): Promise<CheckSpec[]> {
     const requested = await this.markersWith('synthetic/requested')
     if (requested.length === 0) return []
+    // U1-M4 (v0.25): the ran-set read is a TRUST decision (which offers have
+    // executed) and now rides the floor — `vouchedMarkersWith`, like every
+    // other trust-consumed label. The unbounded `markersWith` read stays for
+    // allocation only (conjureRequest's seq count, conjureRun's request
+    // lookup): an appended marker's number is burned whether or not anyone
+    // vouches for it. An out-of-band `synthetic/run` pair (pattern 5 —
+    // headRef-correct, correctly chained) used to mint a spec targeting
+    // arbitrary claims into every verify's pool; on a chain that CAN vouch,
+    // a run marker nobody's signature covers now prices nothing. Honest
+    // chains are unaffected in effect: the first post-conjure verify covers
+    // the run marker with its own checkpoint, and unsigned deployments have
+    // no floor to demand.
+    const ranView = await this.vouchedMarkersWith('synthetic/run')
     const ran = new Set(
-      (await this.markersWith('synthetic/run')).map(m => `${String(m.payload.claimId)}\0${String(m.payload.entry)}`),
+      ranView.records.map(m => `${String(m.payload.claimId)}\0${String(m.payload.entry)}`),
     )
     const out: CheckSpec[] = []
     for (const record of requested) {
@@ -3299,8 +3401,33 @@ export class ProofEngine {
       // never runs" is a promise about every execution, not the first one.
       // The refusal is a chain fact, loudly: the spec simply does not join
       // the pool, and the marker says why.
+      //
+      // U1-M4 (v0.25): on a chain that CAN vouch, a MISSING script file is
+      // refused the same way, not silently waved through. The old
+      // `if (source !== undefined)` guard skipped re-screening when the file
+      // could not be read — so a vouched run naming an entry that no longer
+      // exists minted a spec whose execution could only fail, dragging the
+      // affected claims' verdicts red: a body-less marker composing
+      // FAILURES. Unsigned deployments keep the X-H-05 re-dispatch contract
+      // exactly as documented (README "a self-deleting script now records
+      // error, not a pass"): the spec joins, the runner records the miss,
+      // and `reattachSyntheticMeta` rewrites it to the vanished-body error —
+      // there, no notarisation layer exists to distinguish a vanished honest
+      // body from an invented one, and a log-only writer can append fail
+      // evidence rows directly anyway (the floor is the defense that makes
+      // the refusal meaningful; refusing without it would only break the
+      // documented recovery).
       const source = await this.fs.readFile(`${this.syntheticRoot()}/${request.entry}`)
-      if (source !== undefined) {
+      if (source === undefined) {
+        if (ranView.floor !== undefined) {
+          await this.store.mark('synthetic/refused', {
+            claimId: request.claimId,
+            entry: request.entry,
+            findings: [`script file missing at ${this.options.syntheticDir}/${request.entry} — a vouched run whose body cannot be read is not a check`],
+          })
+          continue
+        }
+      } else {
         const screening = screenScript(source)
         if (!screening.ok) {
           await this.store.mark('synthetic/refused', {
@@ -4852,13 +4979,17 @@ export class ProofEngine {
    * every forged marker above the real boundary. The floor is now the newest
    * checkpoint of this host's key whose signature verifies under that key —
    * the same derivation the evidence layer's own epoch bound uses for the
-   * generational fallback (`verifiedEpochBound`), with one deliberate
-   * widening on this face: head-liared and malformed-count checkpoints are
-   * not boundary candidates here, because a line whose position or count
-   * the walk refutes cannot vouch for the content below it even when its
-   * signature is genuine. On an honest chain the two derivations agree
-   * byte-for-byte (the last checkpoint is the verified one); they differ
-   * only under attack, where v0.25 keeps the floor v0.24 dropped.
+   * generational fallback (`verifiedEpochBound`), with deliberate widenings
+   * on this face: head-liared and malformed-count checkpoints are not
+   * boundary candidates here, because a line whose position or count the
+   * walk refutes cannot vouch for the content below it even when its
+   * signature is genuine (U2-H1 aligned the epoch bound to the same rule);
+   * and since v0.25's repair round (U1-L5) neither is a checkpoint signed
+   * for a FOREIGN workspace, however genuine its signature under this key —
+   * the W9-M5 laundering judgement, applied to the floor itself. On an
+   * honest chain the two derivations agree byte-for-byte (the last
+   * checkpoint is the verified one); they differ only under attack, where
+   * v0.25 keeps the floor v0.24 dropped.
    *
    * `undefined` when the chain offers no verified checkpoint: an unsigned
    * deployment has no notarisation layer to demand, a keyless host cannot
@@ -4884,10 +5015,16 @@ export class ProofEngine {
     let floor: number | undefined
     for (const cp of walk.checkpoints) {
       // Only this host's own key, only well-formed non-liar positions, only
-      // signatures that actually verify: each of the three filters drops a
-      // line that cannot vouch, never a line an honest writer produced.
+      // signatures that actually verify, only THIS workspace's identity
+      // (U1-L5, v0.25): each of the four filters drops a line that cannot
+      // vouch, never a line an honest writer produced. The identity filter
+      // is the publish fallback's W9-M5 judgement applied to the floor
+      // itself — a foreign-workspace checkpoint under this host's key (a
+      // chain copied between workspaces sharing one key) sets no floor
+      // here, exactly as it publishes no leaf there.
       if (cp.sig === null || cp.keyId !== signer.keyId) continue
       if (malformed.has(cp.index) || cp.headLiared) continue
+      if (cp.payload.workspaceKey !== null && cp.payload.workspaceKey !== this.workspaceKey) continue
       let honest: boolean
       try {
         honest = await signer.verify(checkpointSignedData(cp.payload), cp.sig)
@@ -4922,6 +5059,23 @@ export class ProofEngine {
    * anyone vouches for it, and re-minting a live number is the aliasing
    * evil V3-M3/X-H-06 closed; allocation is not a trust decision.
    */
+  /**
+   * v0.26: the floor-bounded read, public for the TOOL face. `proof_jury`
+   * binds the deliberation prompt verbatim from the pending request marker —
+   * a trust consumption (an out-of-band forged request above the vouched
+   * floor must not choose the prompt), so the tools face reads through the
+   * same floor the engine's own consumers read through. Allocation reads
+   * (gen numbering, seq counters) stay on the unbounded `markersWith`.
+   */
+  vouchedMarkers(label: string): Promise<{
+    readonly records: readonly VerifiedMarkerView[]
+    readonly withheld: readonly VerifiedMarkerView[]
+    readonly degraded: boolean
+    readonly floor: number | undefined
+  }> {
+    return this.vouchedMarkersWith(label)
+  }
+
   private async vouchedMarkersWith(label: string): Promise<{
     readonly records: readonly VerifiedMarkerView[]
     readonly withheld: readonly VerifiedMarkerView[]
@@ -4986,6 +5140,28 @@ export class ProofEngine {
       }
     })
     return { records, positionById }
+  }
+
+  /**
+   * U2-H2 (v0.25): the vouched-floor-bounded form of `store.latest()` —
+   * latest-per-check computed over the vouched prefix only. The raw read is
+   * a whole-log last-wins map with no position concept, so an out-of-band
+   * self-addressing, correctly-chained `pass` row appended above the last
+   * checkpoint won it (audit green the whole time — tail rows are not
+   * charges) and fed `evaluateContract`'s new-paths-covered fallback; this
+   * is Y-H-05's `priorsFor` shape applied to the verdict side. First
+   * position per id (the `indexedEvidenceRecords` twin rule: an appended
+   * twin never moves a boundary), unsigned deployments read the whole log.
+   */
+  private async vouchedLatestByCheckId(): Promise<Map<string, Evidence>> {
+    const { records: all, positionById } = await this.indexedEvidenceRecords()
+    const floor = await this.vouchedFloor()
+    const covered = floor === undefined
+      ? all
+      : all.filter(record => (positionById.get(record.evidenceId) ?? -1) < floor)
+    const map = new Map<string, Evidence>()
+    for (const ev of covered) map.set(ev.checkId, ev) // later entries win
+    return map
   }
 
   /**

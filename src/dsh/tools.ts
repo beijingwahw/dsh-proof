@@ -26,7 +26,12 @@ import {
   type HumanAttestation, type JuryAttestation,
 } from '../core/attest.ts'
 import { SYNTHETIC_DIR_DEFAULT } from '../core/synthetic.ts'
-import { _readMarkers } from '../core/evidence.ts'
+// v0.25.1 (U4-H1): the raw `_readMarkers` primitive is retired from the
+// import surface — the attest read-backs below go through `createVerifiedView`
+// over the engine's own store, the same single door the engine's trust
+// decisions and the MCP face read through (test/32 claim 1b pins the raw
+// door gone from src/).
+import { createVerifiedView } from '../core/evidence.ts'
 import { sha256 } from '../core/hash.ts'
 
 // ---------------------------------------------------------------------------
@@ -942,6 +947,39 @@ function createClaimTool(engine: ProofEngine, touched?: () => readonly string[],
 const JURY_INSTRUCTION = 'deliberate strictly per the rubric, then call proof_jury_submit with your JSON verdict; '
   + 'your output becomes permanent Class B evidence, replayable by any third party with this exact prompt'
 
+/**
+ * U3-L6 (v0.25.1): the K1 follow-up checkpoint over a just-sworn testimony
+ * is BEST-EFFORT. The marker is already on the chain when it runs, so a
+ * checkpoint that throws (fs/anchor error) must not turn the tool call into
+ * an error for a decision that is recorded — a human who just approved an
+ * endorsement would read a failure, re-approve, and land gen+1 over their
+ * own superseded verdict. Degrade loudly instead, the `markBestEffort`
+ * discipline the agent-team bridge already applies to its marker writes:
+ * one stderr line (the record a headless run keeps), one `ops/` marker
+ * (informational, unprotected, never trust-consumed — the failure note is
+ * operations, not testimony), and the caller appends the warning to the
+ * canonical note so the model knows its witness prices nothing until a
+ * later boundary covers it. Returns the failure message for that note.
+ */
+async function testifyCheckpointFailure(
+  engine: ProofEngine,
+  what: string,
+  detail: Record<string, unknown>,
+  error: unknown,
+): Promise<string> {
+  const message = error instanceof Error ? error.message : String(error)
+  console.error(
+    `dsh-proof: ${what} was recorded on the chain, but the follow-up checkpoint failed (${message}) — `
+    + 'the testimony sits above the vouched floor and prices nothing until a later boundary checkpoints over it',
+  )
+  try {
+    await engine.storeView.mark('ops/checkpoint-failed', { what, ...detail, error: message })
+  } catch {
+    // The chain itself is unwritable — the stderr line above is the record.
+  }
+  return message
+}
+
 function createJuryTool(engine: ProofEngine): ToolDefinition {
   return {
     name: 'proof_jury',
@@ -1007,6 +1045,14 @@ function createJuryTool(engine: ProofEngine): ToolDefinition {
         rubricVersion: RUBRIC_V1,
         prompt,
       })
+      // v0.26 (U3-F1): checkpoint right after the request is written — the
+      // pending prompt becomes priceable immediately, and anything reading
+      // above the floor afterwards is out-of-band by construction.
+      try {
+        await engine.storeView.checkpoint()
+      } catch (error) {
+        console.error(`[dsh-proof] jury request checkpoint failed (${error}) — the request rides above the vouched floor until the next checkpoint`)
+      }
       return {
         claimId,
         rubricVersion: RUBRIC_V1,
@@ -1145,7 +1191,21 @@ function createJurySubmitTool(engine: ProofEngine, evidenceLogPath?: string): To
       // K1 residual: testimony must land BELOW a checkpoint or the vouched
       // floor withholds it from fusion for a full cycle — checkpoint right
       // after recording so a witness is priceable the moment it is sworn.
-      await engine.storeView.checkpoint()
+      // U3-L6 (v0.25.1): the checkpoint is best-effort — the verdict is
+      // already ON the chain, so a failing checkpoint (fs/anchor error) must
+      // not report the whole swear as failed. It degrades loudly instead:
+      // stderr + an ops marker, and the note tells the model its witness
+      // prices nothing until a later boundary covers it.
+      let checkpointFailure: string | undefined
+      try {
+        await engine.storeView.checkpoint()
+      } catch (error) {
+        checkpointFailure = await testifyCheckpointFailure(
+          engine, 'the attest/jury verdict',
+          { claimId: attestation.claimId, gen, verdict: attestation.verdict },
+          error,
+        )
+      }
       return {
         recorded: true as const,
         claimId: attestation.claimId,
@@ -1156,7 +1216,11 @@ function createJurySubmitTool(engine: ProofEngine, evidenceLogPath?: string): To
         // precision so a third party recomputing p^classB gets these bytes.
         factor: attestationFactor(attestation, DEFAULT_TRUST_WEIGHTS),
         note: 'Class B evidence recorded. Re-deliberation supersedes: call proof_jury again to appeal — '
-          + 'the appeal lands at gen + 1 and readers resolve to the highest gen.',
+          + 'the appeal lands at gen + 1 and readers resolve to the highest gen.'
+          + (checkpointFailure !== undefined
+            ? ` WARNING: recording succeeded but the follow-up checkpoint failed (${checkpointFailure}) — `
+              + 'the verdict sits above the vouched floor and prices nothing until a later boundary checkpoints over it.'
+            : ''),
       } as unknown as JsonValue
     },
   }
@@ -1256,7 +1320,19 @@ function createEndorseTool(engine: ProofEngine, evidenceLogPath?: string): ToolD
         decision: parsed.decision,
       }
       await engine.storeView.mark('attest/human', { ...attestation })
-      await engine.storeView.checkpoint()
+      // K1 residual (as above) + U3-L6 (v0.25.1): the endorsement is already
+      // recorded; a failing checkpoint degrades loudly (stderr + ops marker +
+      // the note below) instead of failing the human's approved decision.
+      let checkpointFailure: string | undefined
+      try {
+        await engine.storeView.checkpoint()
+      } catch (error) {
+        checkpointFailure = await testifyCheckpointFailure(
+          engine, 'the attest/human endorsement',
+          { claimId, gen, decision: attestation.decision, approver },
+          error,
+        )
+      }
       return {
         recorded: true as const,
         claimId,
@@ -1264,7 +1340,11 @@ function createEndorseTool(engine: ProofEngine, evidenceLogPath?: string): ToolD
         approver,
         scope: attestation.scope,
         note: 'Class C evidence recorded. Endorsement is risk acceptance: it unlocks the grade gap, '
-          + 'it never inflates the number; rejection collapses it.',
+          + 'it never inflates the number; rejection collapses it.'
+          + (checkpointFailure !== undefined
+            ? ` WARNING: recording succeeded but the follow-up checkpoint failed (${checkpointFailure}) — `
+              + 'the endorsement sits above the vouched floor and prices nothing until a later boundary checkpoints over it.'
+            : ''),
       } as unknown as JsonValue
     },
   }
@@ -1489,25 +1569,35 @@ function escapeRegExp(value: string): string {
 
 // ---------------------------------------------------------------------------
 // λ: chain read-back. The store appends markers but never reads them back, so
-// the attestation tools parse the raw log lines through the engine's own fs
-// port — the same route the engine's fusion pass takes. Parsing is defensive
-// because the input is chain data: anything unreadable degrades to absence,
-// never to a throw, and (per the guards above) absence means refusal.
+// the attestation tools read them through the VERIFIED VIEW over the engine's
+// own store — the same surface the engine's trust decisions and the MCP face
+// read through, so no face can disagree about which markers exist. Parsing is
+// defensive because the input is chain data: anything unreadable degrades to
+// absence, never to a throw, and (per the guards above) absence means refusal.
 // ---------------------------------------------------------------------------
 
 /**
  * Marker payloads under the given labels, in log order (newest last).
  *
- * W13/X-H-05 (v0.23): the read is now VERIFIED — the marker pass
- * (core/evidence.ts's `_readMarkers`, the one chain-side rule) flags every
- * protected marker whose
- * `headRef` contradicts its physical position, and this read excludes them.
- * The old raw `JSON.parse` loop read last-wins over ALL lines, so a marker
- * appended out of band (the audited agent's shell echo-ing a forged
- * `attest/jury-requested` line with a prompt of its own choosing) became
- * "the pending request" and bound the next verdict to the FORGED prompt —
- * jury prompt injection through the chain itself. A suspect line here is
- * absence: the submit refuses, and the log's integrity is audit()'s charge.
+ * W13/X-H-05 (v0.23): the read is VERIFIED — the marker pass flags every
+ * protected marker whose `headRef` contradicts its physical position, and the
+ * view excludes them. The old raw `JSON.parse` loop read last-wins over ALL
+ * lines, so a marker appended out of band (the audited agent's shell echo-ing
+ * a forged `attest/jury-requested` line with a prompt of its own choosing)
+ * became "the pending request" and bound the next verdict to the FORGED
+ * prompt — jury prompt injection through the chain itself. A suspect line
+ * here is absence: the submit refuses, and the log's integrity is audit()'s
+ * charge.
+ *
+ * v0.25.1 (U4-H1): the read now goes through `createVerifiedView` over
+ * `engine.storeView` instead of the retired `_readMarkers` raw door — the
+ * suspect rule is the same single-pass core, PLUS the X-H-06 generational
+ * fallback the view owns (an all-legacy pre-witness label degrades and keeps
+ * reading instead of evaporating — engine parity, the exact rule the MCP
+ * face's `markerPayloads` already applies). `logPath` remains the wiring
+ * guard it always was: a direct construction that passed no log location
+ * still degrades every read-backed guard to refusal rather than trusting an
+ * unverifiable submitter.
  */
 async function markerPayloads(
   engine: ProofEngine,
@@ -1516,10 +1606,17 @@ async function markerPayloads(
 ): Promise<Record<string, unknown>[]> {
   if (logPath === undefined) return []
   try {
-    const lines = await engine.fsView.readLines(logPath)
-    return _readMarkers(lines, { excludeSuspect: true })
-      .filter(marker => labels.has(marker.label))
-      .map(marker => marker.payload)
+    const view = createVerifiedView(engine.storeView)
+    const found: { readonly index: number; readonly payload: Record<string, unknown> }[] = []
+    for (const label of labels) {
+      for (const marker of (await view.markers(label)).records) {
+        found.push({ index: marker.index, payload: marker.payload })
+      }
+    }
+    // Log order, whatever order the labels were collected in: `index` is the
+    // position in the blank-filtered domain the store's own read produces.
+    found.sort((a, b) => a.index - b.index)
+    return found.map(marker => marker.payload)
   } catch {
     // An unreadable log cannot invent testimony; every caller degrades to
     // absence (the log's own integrity is audit()'s charge, not this read's).
@@ -1532,7 +1629,12 @@ async function latestJuryRequest(
   engine: ProofEngine,
   logPath: string | undefined,
 ): Promise<{ claimId: unknown; prompt: string | undefined; rubricVersion: string | undefined } | undefined> {
-  const payloads = await markerPayloads(engine, logPath, new Set(['attest/jury-requested']))
+  // v0.26 (U3-F1): the pending request is a TRUST read (its prompt is bound
+  // verbatim into the verdict) — read through the engine's vouched floor so a
+  // forged out-of-band request above the last verified checkpoint cannot
+  // choose the deliberation prompt. Absent floor = unsigned chain = whole log.
+  const vouched = await engine.vouchedMarkers('attest/jury-requested')
+  const payloads = vouched.records.map(record => record.payload as Record<string, unknown>)
   const last = payloads[payloads.length - 1]
   if (last === undefined) return undefined
   return {

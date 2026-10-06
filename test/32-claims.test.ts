@@ -1,7 +1,7 @@
 /**
- * CLAIM-CONTRACT TESTS (v0.24) — 让架构主张的落空在 951 绿下当场变红。
+ * CLAIM-CONTRACT TESTS (v0.24, hardened v0.25.1) — 让架构主张的落空在 951 绿下当场变红。
  *
- * MISSION. This file pins the v0.23/v0.24 ARCHITECTURAL CLAIMS to their
+ * MISSION. This file pins the v0.23/v0.24/v0.25 ARCHITECTURAL CLAIMS to their
  * production call surfaces. The v0.23 survey's meta-finding was the
  * "documentation-code-test triple lie": the same unfulfilled promise was
  * written in README, in code comments and in green tests at once, so a claim
@@ -13,22 +13,19 @@
  * "built but unconsumed", the suite goes red HERE, in the file whose only
  * job is to notice.
  *
- * OWNERSHIP: this file only. No src/ file is modified by this batch.
+ * OWNERSHIP: the v0.24 batch owned this file only. The v0.25.1 batch (U4)
+ * both migrates the four remaining raw-door consumers in src/ (index.ts,
+ * dsh/tools.ts, both adapter faces — the migration claim 1b used to wait on)
+ * and hardens the assertions here: every static check now runs over
+ * comment-STRIPPED source (U4-H2: a commented-out call used to satisfy any
+ * existence claim), existence claims match CALL-FORM syntax inside the
+ * consuming function's own span, and absence claims match renamed-twin
+ * FAMILIES instead of exact spellings (U4-H4).
  *
- * PARALLEL-FIX DEPENDENCIES (assertions that are red until the matching
- * v0.24 fix lands, recorded here so a red run is legible):
- *   - #2 (Bayes knobs at the construction boundary) — waits on the
- *     validateBayesKnobs wiring in the engine constructor + the config
- *     schema's syntheticFalsePass open interval.
- *   - #3 (one fold) — waits on the engine's export-confinement fold and
- *     index.ts's trustRoot hand-fold retiring into paths.ts foldHostPath.
- *   - #1b (the raw readMarkers import gone from src/) — waits on the last
- *     raw-door consumers (engine's raw position pass, index.ts, dsh/tools.ts,
- *     the two adapter faces) finishing their migration.
- *   - #5b (PROTOCOL.md reference row) — waits on the doc face catching up
- *     to the package version.
- * The claims as asserted are the TRUE end-state semantics; none was relaxed
- * to fit the pre-fix tree.
+ * PARALLEL-FIX DEPENDENCIES: none outstanding — the raw-door migration
+ * (#1b's dependency) landed in this batch; #2's validateBayesKnobs wiring
+ * and #3's foldHostPath consolidation landed in v0.24; #5b's doc face is
+ * green. The claims as asserted are the TRUE end-state semantics.
  */
 
 import { test } from 'node:test'
@@ -46,6 +43,8 @@ import { sha256 } from '../src/core/hash.ts'
 import { loadPtl } from '../src/core/transparency.ts'
 import { MCP_DEFAULT_VERSION, markerPayloads } from '../src/app/mcp-server.ts'
 import type { McpEngineDeps } from '../src/app/mcp-server.ts'
+import { createProofTools } from '../src/dsh/tools.ts'
+import type { ToolRunContext } from '../src/vendor/dsh-tools.ts'
 import { ProofEngine } from '../src/engine.ts'
 import type { SignerPort } from '../src/core/ports.ts'
 import { FakeClock, FakeCommands, FakeWorkspace, MemoryFs } from './helpers.ts'
@@ -67,6 +66,59 @@ function listSrcFiles(): string[] {
   return readdirSync(SRC_ROOT, { recursive: true })
     .map(entry => join(SRC_ROOT, String(entry)))
     .filter(p => p.endsWith('.ts'))
+}
+
+/**
+ * U4-H2 (v0.25.1): strip `//` line comments and `/* ... *\/` block comments
+ * before ANY static assertion runs. A comment could otherwise satisfy every
+ * existence claim below ("// vouchedMarkersWith" is not a call; a doc
+ * mention of foldHostPath is not a consumption) and mask every absence
+ * claim (a commented-out twin reads as present code to a naive regex).
+ * Deliberately naive about string literals — the `[^:]` guard keeps `https://`
+ * intact and no assertion below keys on text containing comment syntax; the
+ * alternative (a real lexer) is not this file's job. Every strip is followed
+ * by call-form or span-bounded matching, never bare substring presence.
+ */
+function stripComments(src: string): string {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+}
+
+/**
+ * U4-H2/H3 (v0.25.1): the span of a class method, from its declaration to
+ * the closing brace at member indent (`\n  }`). Existence claims are judged
+ * INSIDE this span so "the call lives in this function's own body" is what
+ * is asserted — not "the token appears within N characters of the name"
+ * (the fixed-window shape the v0.24 claims used: a long signature or a
+ * helper extraction moved the real call out of the window, and a comment or
+ * an unrelated call moved in). The `}` must end its line, so a multi-line
+ * return-type literal's `}>` does not terminate the span prematurely.
+ */
+function methodSpan(src: string, declMatch: RegExpExecArray): string {
+  const rel = src.slice(declMatch.index).search(/\n  \},?\n/)
+  return src.slice(declMatch.index, declMatch.index + (rel === -1 ? src.length - declMatch.index : rel))
+}
+
+/** The declaration of a class method by name, tolerant of modifier/async spelling. */
+function methodDecl(src: string, name: string): RegExpExecArray {
+  const match = new RegExp(`(^|\\n)\\s*(?:(?:private|protected|public)\\s+)?(?:async\\s+)?${name}\\s*\\(`).exec(src)
+  assert.ok(match !== null, `${name} must exist as a method declaration`)
+  return match
+}
+
+/** Minimal tool-execution context: the attest tools only read `signal`. */
+function toolExecution(name: string): ToolRunContext {
+  return {
+    callId: 'call-1',
+    rootCallId: 'call-1',
+    name,
+    arguments: {},
+    token: Symbol('token'),
+    signal: new AbortController().signal,
+    deferContext: () => undefined,
+    concludeTurn: () => undefined,
+  }
 }
 
 const LOG = '/ws/.proof/evidence.jsonl'
@@ -136,7 +188,7 @@ function transplantLastCheckpoint(fs: MemoryFs, logPath: string): void {
 // Claim 1 — "one door for every trust decision" (README.md:374, :378)
 // ---------------------------------------------------------------------------
 
-test('claim 1: the verified view has production consumers, and the bare raw-read door is gone from src/ imports', () => {
+test('claim 1: the verified view has production consumers, and both raw-read doors are gone from src/ imports', () => {
   // CLAIM (README.md:378, "The verified read (v0.23.0): one door for every
   // trust decision"): "Every trust consumer now reads the chain through one
   // exported view (`createVerifiedView` in `core/evidence.ts`) ... The raw
@@ -147,43 +199,67 @@ test('claim 1: the verified view has production consumers, and the bare raw-read
   // it — engine hand-rolled its own parse+excludeSuspect+fallback twin, the
   // MCP/DSH faces called the raw `readMarkers` export, and the README's
   // "MCP face goes through the same view" was falsifiable line by line while
-  // 951 tests stayed green (survey Y-H-03). The contract is not "the view
-  // exists" (a unit test already says that) but "the view is CONSUMED by
-  // production code, and the raw door is not".
+  // 951 tests stayed green (survey Y-H-03). And v0.24's contract had a hole
+  // the tree was ALREADY falling through (U4-H1): the v0.24 regex
+  // deliberately ignored the underscore rename, so four production
+  // consumers walked through `_readMarkers` while this file stayed green —
+  // the "accepted escape hatch" WAS the bypass. The contract is therefore
+  // not "the view exists" but "the view is CONSUMED, and no raw door —
+  // clean-named, underscored, or re-branded — is".
   //
   // SIGNATURES: (1a) engine.ts must IMPORT createVerifiedView from
-  // core/evidence.ts AND invoke it (a call site `createVerifiedView(`), or —
-  // the accepted alternative fix shape — evidence.ts's own store surface
-  // delegates to the view internally (`createVerifiedView(this`, a store
-  // method handing itself to the one read layer). A doc-comment mention
-  // alone fails the invocation half on purpose. (1b) no src/ file outside
-  // core/evidence.ts may IMPORT the bare name `readMarkers` — the regex uses
-  // a negative lookbehind for `[_\w]` so the renamed `_readMarkers` escape
-  // hatch does not trip it: the claim is the NAME is gone from the import
-  // surface ("the clean name is deliberately absent"), not that an
-  // underscore-marked internal cannot exist.
+  // core/evidence.ts AND invoke it — a call site `createVerifiedView(`,
+  // judged on comment-stripped source so a doc mention alone cannot satisfy
+  // the invocation half. The v0.24 "OR the store delegates internally"
+  // alternative is GONE (U4-M6): a comment in evidence.ts used to satisfy
+  // the OR while the engine branch was deleted — engine consumption is the
+  // claim, so engine consumption is the assertion. (1b) no src/ file
+  // outside core/evidence.ts may IMPORT `readMarkers` in ANY spelling the
+  // underscore family produces (`_*readMarkers`: readMarkers, _readMarkers,
+  // __readMarkers...) — the name is gone from the import surface, not
+  // merely the clean spelling. (1c) the one sanctioned engine-less read,
+  // `readChainMarkers`, may be imported by exactly the two adapter faces
+  // (claude-code hooks, opencode plugin) — processes with no engine and no
+  // store. Any engine-holding file importing it is re-opening a raw door
+  // with a clean name; the importer set is pinned so widening it is a
+  // deliberate, claim-visible decision.
 
-  const engine = srcText('engine.ts')
-  const evidence = srcText('core/evidence.ts')
+  const engine = stripComments(srcText('engine.ts'))
   const engineImportsView = /import\s*\{[^}]*\bcreateVerifiedView\b[^}]*\}\s*from\s*['"][^'"]*evidence\.ts['"]/.test(engine)
   const engineCallsView = /\bcreateVerifiedView\s*\(/.test(engine)
-  const storeDelegatesInternally = /createVerifiedView\(\s*this\b/.test(evidence)
   assert.ok(
-    (engineImportsView && engineCallsView) || storeDelegatesInternally,
+    engineImportsView && engineCallsView,
     'claim 1a (README.md:378 "one door"): engine.ts must consume createVerifiedView '
-    + '(import + call site), or evidence.ts\'s store surface must delegate to the view internally '
-    + `(import=${engineImportsView} call=${engineCallsView} storeDelegation=${storeDelegatesInternally})`,
+    + '(import + call site, comment-stripped — the OR alternative that a store-side comment '
+    + `used to satisfy is retired; import=${engineImportsView} call=${engineCallsView})`,
   )
 
-  const importers = listSrcFiles()
+  const rawDoorImport = /import\s*\{[^}]*?(?<![_\w])_*readMarkers\b[^}]*\}\s*from\s*['"][^'"]*evidence\.ts['"]/
+  const rawImporters = listSrcFiles()
     .map(p => p.replace(/\\/g, '/'))
     .filter(p => !p.endsWith('/core/evidence.ts'))
-    .filter(p => /import\s*\{[^}]*?(?<![_\w])readMarkers\b[^}]*\}\s*from\s*['"][^'"]*evidence\.ts['"]/.test(readFileSync(p, 'utf8')))
+    .filter(p => rawDoorImport.test(stripComments(readFileSync(p, 'utf8'))))
   assert.deepEqual(
-    importers.map(p => p.slice(p.lastIndexOf('src/'))),
+    rawImporters.map(p => p.slice(p.lastIndexOf('src/'))),
     [],
-    'claim 1b (README.md:378 "raw line-parsing paths are @internal"): the bare '
-    + `readMarkers import must be gone from src/ — still importing: ${importers.join(', ')}`,
+    'claim 1b (README.md:378 "raw line-parsing paths are @internal"): no src/ file may '
+    + 'import the raw marker read — not the clean name, not the underscore family '
+    + `(the v0.24 escape hatch the tree was actively using; still importing: ${rawImporters.join(', ')})`,
+  )
+
+  const enginelessFaces = ['src/adapters/claude-code/hooks.ts', 'src/adapters/opencode/plugin.ts']
+  const chainImporters = listSrcFiles()
+    .map(p => p.replace(/\\/g, '/'))
+    .filter(p => !p.endsWith('/core/evidence.ts'))
+    .filter(p => /import\s*\{[^}]*\breadChainMarkers\b[^}]*\}\s*from\s*['"][^'"]*evidence\.ts['"]/.test(stripComments(readFileSync(p, 'utf8'))))
+    .map(p => p.slice(p.lastIndexOf('src/')))
+  assert.deepEqual(
+    [...chainImporters].sort(),
+    [...enginelessFaces].slice().sort(),
+    'claim 1c (the one public raw read carries the position verdict): readChainMarkers is '
+    + 'the declared door for ENGINE-LESS processes only — the two adapter faces. An '
+    + 'engine-holding file importing it re-opens a raw door with a clean name '
+    + `(importers: ${chainImporters.join(', ')})`,
   )
 })
 
@@ -191,7 +267,7 @@ test('claim 1: the verified view has production consumers, and the bare raw-read
 // Claim 2 — "the Bayes knob domain is validated at every boundary" (README.md:384)
 // ---------------------------------------------------------------------------
 
-test('claim 2: Bayes knobs are rejected at the construction boundary — engine certifyTarget:0 and config syntheticFalsePass:0 both throw', () => {
+test('claim 2: Bayes knobs are rejected at the construction boundary — certifyTarget/driftedFalsePass 0 and config syntheticFalsePass edges all throw', () => {
   // CLAIM (README.md:384): "the **Bayes knob domain** is validated at every
   // boundary (`driftedFalsePass` of 0 no longer turns the drift defense into
   // a one-shot certify, `certifyTarget` of 0 no longer collapses the target)".
@@ -205,11 +281,15 @@ test('claim 2: Bayes knobs are rejected at the construction boundary — engine 
   // pure core's RangeError fired mid-verify on first use instead of at
   // configuration time (survey Y-H-04: "validated at every boundary" was
   // written in config comments, tests and README simultaneously — the triple
-  // lie). The contract is behavioral: BOTH construction boundaries must
+  // lie). The contract is behavioral: EVERY construction boundary must
   // refuse the degenerate knob LOUDLY, naming it.
   //
-  // NOTE: config's certifyTarget already refuses 0 (schema min 0.01) — that
-  // half is pinned as a green control proving the config face CAN refuse.
+  // U4-M4 (v0.25.1): the v0.24 contract pinned only 2 of the 3 named knob
+  // refusals — `driftedFalsePass: 0` (the README's FIRST example) had no
+  // engine pin, so deleting that one line from validateBayesKnobs' call
+  // left this suite green. Now pinned. The config face's closed-interval
+  // UPPER edge (1) joins the lower edge (0): percent() is [0,1], the
+  // domain is (0,1), and both ends had to be refused at configuration time.
 
   assert.throws(
     () => new ProofEngine({
@@ -225,10 +305,31 @@ test('claim 2: Bayes knobs are rejected at the construction boundary — engine 
   )
 
   assert.throws(
+    () => new ProofEngine({
+      root: '/ws',
+      fs: MemoryFs.of(PROJECT),
+      commands: new FakeCommands(),
+      workspace: new FakeWorkspace('/ws'),
+      driftedFalsePass: 0,
+    }),
+    /driftedFalsePass/,
+    'claim 2c (README.md:384, first example in the sentence): ProofEngine construction '
+    + 'must reject driftedFalsePass 0 — the knob whose 0 turns the drift defense into a '
+    + 'one-shot certify; the v0.24 contract forgot to pin it',
+  )
+
+  assert.throws(
     () => Config({ syntheticFalsePass: 0 } as never),
     /syntheticFalsePass/,
     'claim 2b (README.md:384): the plugin config face must reject syntheticFalsePass 0 '
     + '(percent() is a CLOSED [0,1]; β=0 makes one forged pass certify)',
+  )
+
+  assert.throws(
+    () => Config({ syntheticFalsePass: 1 } as never),
+    /syntheticFalsePass/,
+    'claim 2b upper edge (U4-M4): the config face must also refuse the closed interval\'s '
+    + 'other end — β=1 makes a fail prove health; only the open interval (0,1) is a domain',
   )
 
   assert.throws(
@@ -242,7 +343,7 @@ test('claim 2: Bayes knobs are rejected at the construction boundary — engine 
 // Claim 3 — "one foldHostPath ... is now *the* fold" (README.md:382)
 // ---------------------------------------------------------------------------
 
-test('claim 3: foldHostPath is the one fold — engine and index.ts carry no hand-rolled fold twins', () => {
+test('claim 3: foldHostPath is the one fold — engine and index.ts carry no hand-rolled fold twins, renamed or not', () => {
   // CLAIM (README.md:382, "Move three: value scanning, not enumeration"):
   // "one `foldHostPath` (device-namespace prefixes stripped, drive-relative
   // `C:x` projections, case, separators, trailing-dot deformation — every
@@ -252,41 +353,51 @@ test('claim 3: foldHostPath is the one fold — engine and index.ts carry no han
   //
   // WHY A CONTRACT: "alike" is the claim. The gates face consumed the one
   // fold while the engine's export confinement kept a local weak-subset
-  // lambda (`const foldHost =` — separator+case only, no `\\?\` strip, no
-  // drive-relative projection) and index.ts hand-folded the trust root for
-  // its host-store spellings (`const trustFolded = trustRoot.replace(...)`)
-  // — exactly the four-half-folds drift the claim says died (survey L-level
-  // "engine 弱子集 foldHost lambda", Y-H-12's index.ts straggler).
+  // lambda and index.ts hand-folded the trust root — exactly the
+  // four-half-folds drift the claim says died (survey L-level "engine 弱子集
+  // foldHost lambda", Y-H-12's index.ts straggler).
   //
-  // SIGNATURES: engine's twin is pinned by its exact local-binding shape
-  // `const foldHost =` (an import of the shared foldHostPath never binds a
-  // `const` with that name, so no false positive); the positive half
-  // requires engine.ts to reference `foldHostPath` at all. index.ts must
-  // import the guard helpers (touchesEvidencePath / foldHostPath) from
-  // adapters/shared/paths.ts, and must not hand-fold trustRoot itself (the
-  // `const trustFolded = trustRoot.replace` prefix is the exact hand-fold
-  // line the audit named; a delegation to the shared fold would not match).
+  // SIGNATURES (U4-H4, v0.25.1 — renamed twins die too): the v0.24 negative
+  // `!/const\s+foldHost\s*=/` pinned one spelling, so `foldHost2`/`hostFold`
+  // walked through while the positive half was satisfied by a DEAD IMPORT or
+  // a comment mention. The negative is now a FAMILY: no local fold-flavoured
+  // arrow (`const <…fold…> = (value|toolInput|input) => …`), no fold-flavoured
+  // function declaration, and (index.ts) no fold-named binding over a bare
+  // `.replace(` hand-fold — each judged on comment-stripped source, each
+  // exempting exactly the shared export names (foldHostPath in paths.ts —
+  // a scanned file defining it is re-shipping the fold, which the family
+  // match still catches by name collision with the import). The positive
+  // half demands a CALL (`foldHostPath(`), not a mention: import lines and
+  // comments do not consume anything.
 
-  const engine = srcText('engine.ts')
-  assert.ok(!/const\s+foldHost\s*=/.test(engine),
-    'claim 3a (README.md:382 "one fold ... alike"): engine.ts must not define a local foldHost lambda — the export confinement folds through paths.ts foldHostPath')
-  assert.ok(/\bfoldHostPath\b/.test(engine),
-    'claim 3b (README.md:382): engine.ts\'s export confinement must consume the shared foldHostPath')
+  const engine = stripComments(srcText('engine.ts'))
+  const foldTwinArrow = /const\s+(\w*(?:[fF]old|[sS]weep)\w*)\s*=\s*\(?\s*(?:value|toolInput|input)\b[^)]*\)?\s*=>/.exec(engine)
+  const foldTwinFn = /function\s+(\w*(?:[fF]old|[sS]weep)\w*)\s*\(/.exec(engine)
+  assert.ok(foldTwinArrow === null && foldTwinFn === null,
+    'claim 3a (README.md:382 "one fold ... alike"): engine.ts must not define a local '
+    + 'fold implementation under ANY name — the export confinement folds through paths.ts '
+    + `foldHostPath (twin arrow: ${foldTwinArrow?.[1] ?? 'none'}, twin fn: ${foldTwinFn?.[1] ?? 'none'})`)
+  assert.ok(/[^/\w]foldHostPath\s*\(/.test(engine),
+    'claim 3b (README.md:382): engine.ts\'s export confinement must CALL the shared '
+    + 'foldHostPath — an import line or a comment mention consumes nothing')
 
-  const index = srcText('index.ts')
+  const index = stripComments(srcText('index.ts'))
   assert.ok(
     /import\s*\{[^}]*(?:touchesEvidencePath|foldHostPath)[^}]*\}\s*from\s*['"][^'']*shared\/paths\.ts['"]/.test(index),
     'claim 3c (README.md:382 "the DSH face"): index.ts must import the paths.ts guard (touchesEvidencePath/foldHostPath) instead of hand-folding',
   )
-  assert.ok(!/const\s+trustFolded\s*=\s*trustRoot\.replace/.test(index),
-    'claim 3d (README.md:382): index.ts must not hand-fold the trust root — trustRoot spellings fold through the one foldHostPath')
+  const handFold = /const\s+(\w*[fF]old\w*)\s*=\s*\w+\.replace\s*\(/.exec(index)
+  assert.ok(handFold === null,
+    'claim 3d (README.md:382): index.ts must not hand-fold — a fold-named binding over a '
+    + `bare .replace( is the hand-fold shape under any name (found: ${handFold?.[1] ?? 'none'}); `
+    + 'trustRoot spellings fold through the one foldHostPath')
 })
 
 // ---------------------------------------------------------------------------
 // Claim 4 — "all the same sweep" (README.md:382)
 // ---------------------------------------------------------------------------
 
-test('claim 4: sweepToolInputStrings has exactly one implementation — gates.ts imports the observe.ts sweep', () => {
+test('claim 4: sweepToolInputStrings has exactly one implementation — gates.ts imports AND calls the observe.ts sweep', () => {
   // CLAIM (README.md:382): "a mutation-class call has *every string value* it
   // carries swept against the guarded spellings ... all the same sweep."
   // src/dsh/observe.ts exports `sweepToolInputStrings` as the sweep;
@@ -298,20 +409,32 @@ test('claim 4: sweepToolInputStrings has exactly one implementation — gates.ts
   // sweep while claiming lockstep — and the copies forked within one
   // release (>8192-char strings: gates dropped them whole, observe kept the
   // head; survey Y-H-10). Two implementations under one promise is the
-  // minimal shape of the drift the claim forbids. The contract is greppable:
-  // gates.ts must IMPORT the sweep from observe.ts and must not define one.
+  // minimal shape of the drift the claim forbids.
   //
-  // SIGNATURES: the local-copy shape is a function definition
-  // (`function sweepToolInputStrings`); the import shape is an import
-  // statement binding the same name from a path ending in observe.ts.
+  // SIGNATURES (U4-H4, v0.25.1): the v0.24 negative pinned the exact
+  // spelling `function sweepToolInputStrings`, so a renamed local copy
+  // (`const sweepInputs = (input) => …`) plus the — possibly dead — import
+  // passed both halves: v0.23's Y-H-10 fork, reconstructed. The negative is
+  // now the family (no sweep-flavoured arrow over value/toolInput/input, no
+  // sweep-flavoured function declaration, comment-stripped, exempting the
+  // shared export name); the positive now demands a CALL SITE in addition
+  // to the import — an import that is never called is the dead half of the
+  // double-green.
 
-  const gates = srcText('adapters/shared/gates.ts')
-  assert.ok(!/function\s+sweepToolInputStrings/.test(gates),
-    'claim 4a (README.md:382 "all the same sweep"): gates.ts must not define its own sweepToolInputStrings — the local copy is how the two faces forked (Y-H-10)')
+  const gates = stripComments(srcText('adapters/shared/gates.ts'))
+  const sweepTwinArrow = /const\s+(\w*(?:[sS]weep|[fF]old)\w*)\s*=\s*\(?\s*(?:value|toolInput|input)\b[^)]*\)?\s*=>/.exec(gates)
+  const sweepTwinFn = /function\s+(\w*(?:[sS]weep|[fF]old)\w*)\s*\(/.exec(gates)
+  assert.ok(sweepTwinArrow === null && sweepTwinFn === null,
+    'claim 4a (README.md:382 "all the same sweep"): gates.ts must not define its own '
+    + 'sweep under ANY name — the renamed local copy is how the two faces forked (Y-H-10) '
+    + `(twin arrow: ${sweepTwinArrow?.[1] ?? 'none'}, twin fn: ${sweepTwinFn?.[1] ?? 'none'})`)
   assert.ok(
     /import\s*\{[^}]*\bsweepToolInputStrings\b[^}]*\}\s*from\s*['"][^'']*observe\.ts['"]/.test(gates),
     'claim 4b (README.md:382): gates.ts must import sweepToolInputStrings from dsh/observe.ts — one sweep, one implementation',
   )
+  assert.ok(/[^/\w]sweepToolInputStrings\s*\(/.test(gates),
+    'claim 4c (README.md:382): gates.ts must CALL the shared sweep — the import alone '
+    + '(possibly dead) plus no local twin was the v0.23 double-green the family match now closes')
 })
 
 // ---------------------------------------------------------------------------
@@ -371,7 +494,7 @@ test('claim 6: the protected-marker list covers every label trust decisions cons
   // grow.
 
   const required: readonly string[] = [
-    'attest/jury', 'baseline/saved', 'delegation/created', 'proof/verified',
+    'attest/jury', 'attest/jury-requested', 'baseline/saved', 'delegation/created', 'delegation/verdict', 'delegation/waive', 'proof/verified',
     'claim/jury', 'economics/quote', 'agent-team/delegated', 'synthetic/requested',
   ]
   for (const label of required) {
@@ -384,7 +507,7 @@ test('claim 6: the protected-marker list covers every label trust decisions cons
 // Claim 7 — "the publish predicate everywhere" (README.md:380; evidence.ts view doc)
 // ---------------------------------------------------------------------------
 
-test('claim 7: the publish predicate is complete — a head-liared checkpoint is never selected, never notarised', async () => {
+test('claim 7: the publish predicate is complete — a head-liared checkpoint is never selected, never notarised, and an honest selection is never refused', async () => {
   // CLAIM (README.md:380, "Move two: epoch awareness"): "the publish
   // predicate everywhere is now 'the selected checkpoint verifies, or the
   // publish refuses'"; the view's doc (src/core/evidence.ts, BestCheckpoint)
@@ -405,11 +528,13 @@ test('claim 7: the publish predicate is complete — a head-liared checkpoint is
   // check: whatever the engine publish notarises must be the corroborated
   // selection, never the transplant.
   //
-  // FIXTURE NOTE: the transplant is a byte-copy of the store's own signed
-  // checkpoint appended at the tail with `prev` re-chained — signature
-  // verifies, count stays consistent (no records were added), and ONLY the
-  // position witness (headLiared on the walk) can object. That isolates the
-  // head-liar rule from the malformed-count rule.
+  // U4-M1 (v0.25.1): the v0.24 consumer half swallowed ANY publish throw
+  // (`catch { }`), so a regression to a v0.24-style always-refuse DoS — or
+  // any silent failure — skipped the leaf assertions while the comment
+  // claimed "a refusal is also compliant". On this MIXED fixture the honest
+  // checkpoint is selected and verified, so success is the only compliant
+  // outcome: the publish must produce a leaf, and a throw is admissible
+  // ONLY as a loud refusal that names its reason.
 
   const engine = new ProofEngine({
     root: '/ws',
@@ -447,14 +572,23 @@ test('claim 7: the publish predicate is complete — a head-liared checkpoint is
     'the view selects the corroborated original, not the tail transplant')
 
   // Consumer half: the engine publish notarises exactly the corroborated
-  // selection. (A refusal is also compliant with the claim; a successful
-  // publish of the TRANSPLANT is the one forbidden outcome.)
+  // selection — and on this fixture it MUST publish at all.
   let published: Awaited<ReturnType<typeof engine.publishCheckpoint>> | undefined
   try {
     published = await engine.publishCheckpoint()
-  } catch {
-    published = undefined // refusing is the other compliant answer
+  } catch (error) {
+    // U4-M1: a throw is still a documented outcome — but only as a LOUD
+    // refusal that names its reason. Anything else is a bug wearing the
+    // refusal's coat, and the published-undefined assertion below turns it
+    // red anyway.
+    const message = error instanceof Error ? error.message : String(error)
+    assert.match(message, /refusing to publish: .+|no signed checkpoint on the evidence chain/,
+      'claim 7 (U4-M1): a throwing publish must be a loud refusal that names its reason — '
+      + 'a generic or silent failure is the DoS the bare catch used to hide')
   }
+  assert.ok(published !== undefined,
+    'claim 7 (U4-M1): with an honest, verified selection on the chain the publish must '
+    + 'SUCCEED — an always-refuse regression used to hide behind the bare catch')
   if (published !== undefined) {
     const { log: ptl } = await loadPtl(realFs, '/ws/ptl')
     const entry = ptl.entries[ptl.entries.length - 1]
@@ -468,7 +602,8 @@ test('claim 7: the publish predicate is complete — a head-liared checkpoint is
   }
 
   // Pure attack: a rewrite leaves ONLY the transplanted liar on the chain.
-  // Nothing is publishable — the transplant does not stand in.
+  // Nothing is publishable — the transplant does not stand in — and the
+  // refusal is loud, naming the liars (not a silent undefined-return).
   const firstLine = lines[0] as string
   const honestCp = lines[selected.index] as string
   const sole = JSON.stringify({ ...JSON.parse(honestCp), prev: lineDigest(firstLine) })
@@ -478,7 +613,8 @@ test('claim 7: the publish predicate is complete — a head-liared checkpoint is
   assert.equal((await createVerifiedView(engine.storeView).bestCheckpoint()).signature, 'none',
     'the view agrees: none — never the transplant')
   await assert.rejects(() => engine.publishCheckpoint(),
-    'the engine publish refuses on a chain with nothing publishable — notarising the transplant is the Y-H-01 attack')
+    /refusing to publish: .+|no signed checkpoint on the evidence chain/,
+    'the engine publish refuses LOUDLY on a chain with nothing publishable — notarising the transplant is the Y-H-01 attack, and a silent empty-return is its quiet cousin')
 })
 
 // ---------------------------------------------------------------------------
@@ -486,7 +622,7 @@ test('claim 7: the publish predicate is complete — a head-liared checkpoint is
 // preSignAudit doc; README.md:378 audit.ok consumption)
 // ---------------------------------------------------------------------------
 
-test('claim 8: a refused-to-sign generation is forgiven after the documented re-anchor — audit.ok returns to true', async () => {
+test('claim 8: refused-to-sign generations are forgiven after the documented re-anchor — every round, with the refusals staying on record', async () => {
   // CLAIM (src/core/evidence.ts, preSignAudit): "the next session refuses
   // ONCE and the documented recovery is the re-anchor flow: `saveBaseline`
   // (or the engine's establish) writes a newer SELF-authored marker,
@@ -504,6 +640,12 @@ test('claim 8: a refused-to-sign generation is forgiven after the documented re-
   // superseding the orphan + a fresh signed checkpoint over the tail), the
   // audit must clear. The refusal stays ON RECORD (channels stay visible) —
   // what must not persist is the verdict cap.
+  //
+  // U4-M5 (v0.25.1): the v0.24 contract ran ONE refuse→re-anchor round, so a
+  // one-shot absolution latch passed it and re-bricked the deployment on
+  // the second honest blip. The fixture now runs TWO rounds — refuse,
+  // re-anchor, refuse again, re-anchor again — and demands the audit clear
+  // BOTH times while refusedToSign accumulates visibly on the record.
 
   const fs = MemoryFs.of({})
   const { store } = trustedStore(fs)
@@ -512,15 +654,19 @@ test('claim 8: a refused-to-sign generation is forgiven after the documented re-
 
   // The refusal trigger: an authorless baseline/established marker lands on
   // the checkpoint-uncovered tail (X-H-08's shape).
-  const lines = (await fs.readLines(LOG)).slice()
-  const prev = lineDigest(lines[lines.length - 1] as string)
-  const twin = JSON.stringify({
-    v: 2, kind: 'marker', at: '2026-10-05T00:00:00.000Z', prev,
-    payload: { label: 'baseline/established', reason: 'never happened', headRef: prev },
-  })
-  fs.mutate(LOG, `${[...lines, twin].join('\n')}\n`)
+  const orphanOnTail = async (reason: string): Promise<void> => {
+    const lines = (await fs.readLines(LOG)).slice()
+    const prev = lineDigest(lines[lines.length - 1] as string)
+    const twin = JSON.stringify({
+      v: 2, kind: 'marker', at: '2026-10-05T00:00:00.000Z', prev,
+      payload: { label: 'baseline/established', reason, headRef: prev },
+    })
+    fs.mutate(LOG, `${[...lines, twin].join('\n')}\n`)
+  }
 
+  // -- Round 1 -------------------------------------------------------------
   const session2 = trustedStore(fs).store
+  orphanOnTail('never happened')
   await session2.checkpoint()
   const refused = await session2.audit()
   assert.equal((refused.chain.refusedToSign ?? []).length, 1, 'the store refuses ONCE to lend the key over the orphan')
@@ -536,6 +682,30 @@ test('claim 8: a refused-to-sign generation is forgiven after the documented re-
     + `a forever-capped ok turns the promise into a permanent stale (refusedToSign=${JSON.stringify(recovered.chain.refusedToSign)})`)
   assert.ok(recovered.chain.checkpoints > refused.chain.checkpoints,
     'recovery means signed checkpoints resumed, not merely that the accusation aged out of view')
+  assert.ok((recovered.chain.refusedToSign ?? []).length >= 1,
+    'claim 8 (U4-M5, "refusal stays ON RECORD"): the pardoned refusal must stay visible in '
+    + 'the refusedToSign channel after recovery — the scar is evidence, only the verdict cap is lifted')
+
+  // -- Round 2 (U4-M5) -------------------------------------------------------
+  // A SECOND orphan generation: a one-shot absolution latch (the exact
+  // regression this round exists to forbid) re-bricks the deployment here.
+  orphanOnTail('never happened either')
+  const session3 = trustedStore(fs).store
+  await session3.checkpoint()
+  const refused2 = await session3.audit()
+  assert.equal((refused2.chain.refusedToSign ?? []).length, 2,
+    'the second orphan generation refuses too — refusals accumulate on the record')
+  assert.equal(refused2.ok, false, 'the second refusal is a live accusation until re-anchored')
+
+  await session3.mark('baseline/established', { reason: 'operator re-anchor after the second refusal' })
+  await session3.checkpoint()
+  const recovered2 = await session3.audit()
+  assert.equal(recovered2.ok, true,
+    'claim 8 (U4-M5): the SECOND documented re-anchor must clear the audit too — a one-shot '
+    + 'absolution latch turns the second honest blip into the permanent stale the claim retired')
+  assert.equal((recovered2.chain.refusedToSign ?? []).length, 2,
+    'claim 8: both refusals stay on the record after both recoveries — "the refusal stays '
+    + 'ON RECORD" is an assertion, not a failure message')
 })
 
 // ---------------------------------------------------------------------------
@@ -651,7 +821,7 @@ test('claim 10: blank-line semantics agree across the store face and the MCP fac
 // v0.25 claims: the floor and the witness
 // ---------------------------------------------------------------------------
 
-test('claim 11: trust reads stop at the vouched floor — every fusion, DAG and drift consumer routes through the floor, fresh appends above it price nothing', async () => {
+test('claim 11: trust reads stop at the vouched floor — every fusion, DAG and drift consumer CALLS the floor-bounded reader in its own body', async () => {
   // Claim origin: the v0.25 "vouched floor everywhere" completion of the
   // v0.24 section's closing bet — README (v0.25): "any trust decision
   // consumes only what lies below the last verified checkpoint; a fresh,
@@ -659,35 +829,121 @@ test('claim 11: trust reads stop at the vouched floor — every fusion, DAG and 
   // behavioural pins live in test/05 (K1a/K1b/K1c); THIS contract guards the
   // wiring itself: the day someone adds a new trust reader that forgets the
   // floor, the static signature below changes and this claim goes red.
-  const engine = srcText('engine.ts')
-  assert.ok(/vouchedMarkersWith/.test(engine),
-    'claim 11a: engine.ts must have the floor-bounded reader (vouchedMarkersWith)')
+  //
+  // U4-H2 (v0.25.1) — the v0.24 shape pinned nothing of the sort: a
+  // 3000-character window after `private async <consumer>` containing the
+  // SUBSTRING `vouchedMarkersWith` was satisfied by a comment (the
+  // logAboveFloor docstring nearly spells it), by an import line, or by a
+  // real call from a DIFFERENT method inside the window; and the real call
+  // could silently become the floor-less twin `this.markersWith(` — one
+  // word apart — with the window none the wiser. Now: comment-stripped
+  // source, the consumer's own method SPAN (declaration to closing brace —
+  // a helper extraction or a longer signature cannot move the goalposts),
+  // a CALL-FORM match (`this.vouchedMarkersWith(`), and the twin's
+  // call-form banned from the same span.
+  //
+  // HONEST COMPLETENESS NOTE: this pins the three NAMED consumers, not the
+  // set of all future trust readers — a new reader is this contract's blind
+  // spot by construction, and closing that is the K1 behaviour pins' job in
+  // test/05 (a new above-floor label must price zero on all three faces).
+
+  const engine = stripComments(srcText('engine.ts'))
+  assert.ok(/private\s+async\s+vouchedMarkersWith\s*\(/.test(engine),
+    'claim 11a: engine.ts must define the floor-bounded reader (vouchedMarkersWith)')
   for (const consumer of ['activeAttestationsAll', 'delegationObligations', 'scriptDriftFirstSeen']) {
-    // The function-body window (not a name-proximity regex): the reader the
-    // claim guards lives inside the consumer's own body, so the assertion
-    // extracts each private method's span and demands the floor call inside it.
-    const defAt = engine.indexOf(`private async ${consumer}`)
-    assert.ok(defAt !== -1, `claim 11b: ${consumer} must exist`)
-    const body = engine.slice(defAt, defAt + 3_000)
-    assert.ok(body.includes('vouchedMarkersWith'),
-      `claim 11b: ${consumer} must read through the vouched floor — a reader that forgot the floor reopens pattern five`)
+    const body = methodSpan(engine, methodDecl(engine, consumer))
+    assert.ok(/this\s*\.\s*vouchedMarkersWith\s*\(/.test(body),
+      `claim 11b: ${consumer} must CALL this.vouchedMarkersWith( inside its own method body — `
+      + 'a comment, an import line, or a call from another method is not this consumer '
+      + 'reading through the floor (U4-H2: the substring window was)')
+    assert.ok(!/this\s*\.\s*markersWith\s*\(/.test(body),
+      `claim 11c: ${consumer} must not call the floor-less twin this.markersWith( in the `
+      + 'same body — the one-word rename is exactly how a floor-less read re-enters while '
+      + 'the contract stays green (U4-H2)')
   }
 })
 
-test('claim 12: sworn testimony is checkpointed the moment it is recorded — a witness is priceable the moment it is sworn, not a cycle later', async () => {
+test('claim 12: sworn testimony is checkpointed the moment it is recorded — mark and checkpoint share the tool body that swears the witness', async () => {
   // Claim origin: the K1 residual closed in v0.25 — testimony written by the
   // DSH tools after the last boundary checkpoint used to sit ABOVE the floor
   // for a full cycle, invisible to fusion. The fix checkpoints right after
   // each attest write; this contract keeps the two writes together.
-  const tools = srcText('dsh/tools.ts')
+  //
+  // U4-H3 (v0.25.1) — the v0.24 shape asserted a 700-character window after
+  // `mark('<label>'` containing the SUBSTRING `storeView.checkpoint()`:
+  // a comment or a conditionally-dead `if (x) storeView.checkpoint()`
+  // satisfied it, and the honest parameterised refactor (folding the two
+  // copy-paste twins into a loop over labels) broke it. Two halves now:
+  // (static) comment-stripped source, the ENCLOSING execute body as the
+  // span, and a call-form match — the `await engine.storeView.checkpoint()`
+  // must stand in the same function that wrote the marker (a best-effort
+  // try/catch around it — U3-L6, landed in this batch — still matches: the
+  // call is real and in the same span); (behavioural, the half a regex
+  // cannot lie about) a full jury round through the real tool face on a
+  // signed chain, asserting the sworn verdict lands BELOW a checkpoint —
+  // the exact property a conditionally-dead or removed follow-up checkpoint
+  // would violate, because the baseline's checkpoint is the only one left
+  // and the marker sits above it.
+  const tools = stripComments(srcText('dsh/tools.ts'))
   for (const label of ['attest/jury', 'attest/human']) {
-    // Body window, same style as claim 11: the mark call and its checkpoint
-    // must sit in the same small span — testimony never waits a cycle.
-    const markAt = tools.indexOf(`mark('${label}'`)
+    const markNeedle = `storeView.mark('${label}'`
+    const markAt = tools.indexOf(markNeedle)
     assert.ok(markAt !== -1, `claim 12: the ${label} marker write must exist`)
-    const window = tools.slice(markAt, markAt + 700)
-    assert.ok(window.includes('storeView.checkpoint()'),
-      `claim 12: the ${label} write must be followed by a checkpoint — testimony above the vouched floor prices nothing`,
-    )
+    // The enclosing tool body: execute methods sit at 4-space member indent
+    // in the tool factories' returned object literals.
+    const execDecl = /\n    async execute\(/g
+    let span: string | undefined
+    for (let m = execDecl.exec(tools); m !== null; m = execDecl.exec(tools)) {
+      const rel = tools.slice(m.index).search(/\n    \},?\n/)
+      const end = m.index + (rel === -1 ? tools.length : rel)
+      if (markAt > m.index && markAt < end) span = tools.slice(m.index, end)
+    }
+    assert.ok(span !== undefined, `claim 12: the ${label} marker write must sit inside a tool's execute body`)
+    assert.ok(/await\s+engine\.storeView\.checkpoint\(\)/.test(span ?? ''),
+      `claim 12: the ${label} write and 'await engine.storeView.checkpoint()' must share the `
+      + 'same execute body — testimony above the vouched floor prices nothing, and a comment '
+      + 'or a conditionally-dead call in a nearby window proved nothing (U4-H3)')
   }
+
+  // Behavioural half: the sworn verdict is priceable the moment it is sworn.
+  const engine = new ProofEngine({
+    root: '/ws',
+    fs: MemoryFs.of(PROJECT),
+    commands: new FakeCommands().on(argv => argv.includes('node'), { exitCode: 0, output: 'pass\n' }),
+    workspace: new FakeWorkspace('/ws'),
+    clock: new FakeClock(),
+    workspaceKey: 'ws',
+    signer: () => Promise.resolve(new FakeSigner('ws-key')),
+    autoDiscover: false,
+    checks: [{ command: ['node', '-e', 'process.exit(0)'], kind: 'test' }],
+  })
+  await engine.establishBaseline()
+  const tools9 = createProofTools(engine, undefined, LOG)
+  const jury = tools9.find(t => t.name === 'proof_jury')!
+  const submit = tools9.find(t => t.name === 'proof_jury_submit')!
+  const claim = 'claim 12 behavioural: the verdict lands below a checkpoint the moment it is sworn'
+  const request = await jury.execute({ claim }, toolExecution('proof_jury')) as { claimId: string }
+  const verdict = await submit.execute(
+    { claimId: request.claimId, verdict: 'uphold', probability: 0.9, reasoning: 'the follow-up checkpoint covered the testimony immediately.' },
+    toolExecution('proof_jury_submit'),
+  ) as { recorded: boolean; gen: number }
+  assert.equal(verdict.recorded, true, 'fixture sanity: the jury round recorded through the real tool face')
+
+  const fs = engine.fsView as MemoryFs
+  const lines = (fs.files.get(LOG) ?? '').split('\n').filter(l => l.trim().length > 0)
+  let verdictAt = -1
+  let lastCheckpointAt = -1
+  lines.forEach((line, index) => {
+    try {
+      const env = JSON.parse(line) as { kind?: unknown; sig?: unknown; payload?: { label?: unknown; gen?: unknown } }
+      if (env.kind === 'marker' && env.payload?.label === 'attest/jury' && env.payload?.gen === verdict.gen) verdictAt = index
+      if (env.kind === 'checkpoint' && typeof env.sig === 'string' && env.sig.length > 0) lastCheckpointAt = index
+    } catch { /* not an envelope */ }
+  })
+  assert.ok(verdictAt !== -1, 'fixture sanity: the sworn verdict marker is on the chain')
+  assert.ok(lastCheckpointAt > verdictAt,
+    'claim 12 behavioural (U4-H3): a checkpoint SIGNED AFTER the verdict must cover it — '
+    + 'testimony that rides above the last verified checkpoint prices nothing for a full '
+    + 'cycle, and only a follow-up checkpoint that actually runs (not one a comment or a '
+    + 'conditional names) puts the witness below the vouched floor')
 })

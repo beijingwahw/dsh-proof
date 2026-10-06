@@ -32,9 +32,9 @@ import {
 import { buildPolicySection } from './dsh/prompt.ts'
 import { createLspResolver } from './dsh/lsp-impact.ts'
 import { attachTeamBridge, createTeamBridge } from './dsh/agent-team.ts'
-// v0.24 (Y-H-03): the bare `readMarkers` export is gone — the underscore
-// primitive is the one escape hatch; trust reads belong on the store/view.
-import { _readMarkers } from './core/evidence.ts'
+// v0.25.1 (U4-H1): the raw `_readMarkers` primitive is no longer imported
+// anywhere outside core/evidence.ts — the underscore escape hatch is retired
+// and every trust read here goes through the engine's own store face.
 import { NodeFsPort } from './node-ports.ts'
 import type { FsPort } from './core/ports.ts'
 import type {
@@ -505,12 +505,14 @@ export function apply(ctx: Context, config: Config): void {
       // read the λ tools use (suspect lines excluded), so a restarted bridge
       // re-adopts its predecessor's hostId→engineId edges instead of
       // forgetting them and re-minting the children as roots.
+      // v0.25.1 (U4-H1): the read goes through the store's own public
+      // `markersWith` — ONE physical read owned by the store that wrote the
+      // markers, not a hand-wired fsView.readLines + raw parse pass
+      // re-deriving view semantics beside the door (the retired `_readMarkers`
+      // escape hatch; test/32 claim 1b now pins it gone from src/).
       mappings: async () => {
         try {
-          return _readMarkers(await engine.fsView.readLines(evidenceLogPath), {
-            label: 'agent-team/delegated',
-            excludeSuspect: true,
-          })
+          return (await engine.storeView.markersWith('agent-team/delegated', { excludeSuspect: true }))
             .map(marker => marker.payload as { hostTaskId?: unknown; engineTaskId?: unknown })
             .filter((payload): payload is { hostTaskId: string; engineTaskId: string } =>
               typeof payload.hostTaskId === 'string' && payload.hostTaskId.length > 0

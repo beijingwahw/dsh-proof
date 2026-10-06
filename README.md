@@ -403,6 +403,16 @@ The floor itself had to be DoS-proof: v0.24's derivation picked the newest check
 
 The rest of the ledger: `synthetic/run` joined the protected-marker roster (an injected twin can no longer promote an unexecuted offer into the verification pool); LSP queries are budgeted by wall-clock, not query count (a slow server can no longer burn an unbounded evening one fast-failing call at a time); the engine refuses to bootstrap a fresh operator key onto a log whose checkpoints name a different workspace (identity mismatch, said out loud); the remaining round-four mediums fell — abort double-counting, silent non-boolean `all`, claim truncation without a marker, rehydration oldest-wins, contract's budget twin, per-check timeout floors, and a `FakeSigner` that finally keeps a secret. Two new claims joined `test/32`: the floor's consumers (fusion, DAG, drift) must route through the floor-bounded reader, and testimony writes must sit next to their checkpoint — the day someone adds a trust reader that forgets the floor, the suite goes red before the next audit does. Tests 1036 → 1054.
 
+## The roster and the door (v0.26.0): the last fresh-append channels, closed
+
+The seventh survey's sharpest finding was aimed at the guard itself: the claims file that v0.24 built was the round's biggest vulnerability surface — its claim 1b ("the bare raw-read door is gone") was **already bypassed in the shipping tree**, four production readers quietly importing the renamed `_readMarkers` escape hatch, one of them the very jury-prompt read the floor was built to protect. The lesson writes itself: a contract is only as honest as its regex is ungameable, and a rename is not a refactor.
+
+v0.26 closes the finding and the lesson together. The four raw readers migrated to the real doors (the engine's floor-bounded read for the jury prompt — now a public `engine.vouchedMarkers` — and a thin, *documented* `readChainMarkers` for the two adapter processes that hold no engine); the bare escape hatch lost its export entirely; and the claims file grew teeth: every static assertion now matches against **comment-stripped source** (a `// vouchedMarkersWith` in a comment no longer satisfies a contract), the "no twin implementations" checks catch renamed siblings (`foldHost2`, `sweepInputs`), the call-form assertions require real invocations rather than dead imports, and the two most gameable claims gained behavioural halves — the testimony claim now drives a real jury flow and asserts the sworn bytes landed *below a signed checkpoint*.
+
+The trust layer closed its own two fresh-append channels: the pre-sign authorship roster now covers **every protected marker** (a session-gap `attest/jury` or `delegation/created` with a perfectly-computed headRef is refused a notarisation instead of being absorbed and vouched by the host's next checkpoint — the missing step that let forgery ride the floor), and the generational-fallback bound excludes transplanted and position-lying checkpoints (a signed checkpoint moved to the tail no longer raises the degraded pool's ceiling). Plus the medium-grade closures: contract's `latest` lookups now stop at the floor (a self-addressing fake pass line at the tail can no longer satisfy `new-paths-covered` without running anything), the absorption check uses the vouched floor instead of the positional newest (an out-of-key garbage twin no longer frames an honest chain), publication checks the workspace identity on its main path, missing synthetic scripts are refused instead of silently skipping re-screening, the MCP face surfaces drift/vanished warnings it used to swallow, and a failed post-testimony checkpoint is a warning, never a lost verdict. Tests 1054 → 1066; claims 12/12 with negative self-checks (twenty-one bypass shapes, twenty caught statically, the twenty-first by behaviour).
+
+## Architecture
+
 ## Architecture
 
 ## Architecture
@@ -426,7 +436,7 @@ The domain core is framework-free on purpose: it is fully unit-testable offline,
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit
-npm test              # 1054 tests, node:test
+npm test              # 1066 tests, node:test
 npm run build
 npm run bundle:check  # packaging contract self-check
 ```

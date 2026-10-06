@@ -21,7 +21,7 @@ import { SYNTHETIC_TEMPLATE } from '../src/core/synthetic.ts'
 import { bundleFingerprint } from '../src/core/obligations.ts'
 import { buildBundle } from '../src/app/bundle.ts'
 import type { ProofBundle } from '../src/app/bundle.ts'
-import { SIG_REFUSED_PREFIX, lineDigest } from '../src/core/trust.ts'
+import { GENESIS_PREV, SIG_REFUSED_PREFIX, checkpointSignedData, lineDigest } from '../src/core/trust.ts'
 import { createProofTools, toVerifyValue } from '../src/dsh/tools.ts'
 import { deriveProofPaths, touchesEvidencePath } from '../src/adapters/shared/paths.ts'
 import { NodeCommandPort, NodeFsPort, SystemClock } from '../src/node-ports.ts'
@@ -4199,8 +4199,373 @@ test('v0.25 (V4-M6): a forged tail twin no longer vetoes the publish — the new
     'the published leaf carries the honest checkpoint the scan backed up to')
   // W2-M3: a genuinely forged signature lands a chain fact even when an
   // honest predecessor outvotes it — the skip is on the record.
-  assert.ok(fs.log.some(l => l.includes('ptl/publish-unadjudicated') && l.includes('failed adjudication and were skipped')),
+  // U1-L8 (v0.25): the record now PARTITIONS why each skipped line was
+  // skipped — this twin was scanned and its verification failed, so it must
+  // be named under rejected-by-verification, never under the pool-excluded
+  // bucket (a line never tried is not a line that failed).
+  assert.ok(fs.log.some(l => l.includes('ptl/publish-unadjudicated') && l.includes('were skipped')),
     'the skipped twin is recorded as unadjudicated')
+  assert.ok(fs.log.some(l => l.includes('"skippedDetail"') && l.includes('rejected-by-verification@')
+    && !l.includes('rejected-by-verification@none')),
+    'the partition names the twin as rejected by verification')
+})
+
+// -- v0.25 repair round (U1/U2): floor-bounded verdicts, identity, diagnosis ------
+
+/**
+ * The signed-engine shape this block runs on: a host key that vouches (so a
+ * floor exists) over FakeCommands, with explicit checks for determinism.
+ */
+function signedEngine(
+  fs: MemoryFs,
+  commands: FakeCommands,
+  overrides: Partial<ConstructorParameters<typeof ProofEngine>[0]> = {},
+) {
+  return new ProofEngine({
+    root: ROOT,
+    fs,
+    commands,
+    workspace: new FakeWorkspace(ROOT),
+    clock: new FakeClock(),
+    workspaceKey: 'ws',
+    signer: () => Promise.resolve(new FakeKey('ws-key')),
+    impactGraphLimit: 1_000,
+    ...overrides,
+  })
+}
+
+test('v0.25 (U2-H2): a forged tail pass row cannot open the new-paths-covered fallback — latest-by-check is floor-bounded', async () => {
+  // Y-H-05 (v0.24) bounded `priorsFor` against exactly this row-shape; the
+  // verdict side still read the raw whole-log `store.latest()`. One
+  // self-addressing, correctly-chained `pass` row appended after the last
+  // checkpoint keeps the audit green (tail rows are not charges) and used to
+  // win the last-wins map — so a behavior-adding claim over a path whose
+  // check FAILED this run met new-paths-covered on an execution that never
+  // happened. The engine now hands `evaluateContract` the vouched-prefix
+  // latest only (Y-H-05's shape, verdict side).
+  const build = async (): Promise<{ fs: MemoryFs; engine: ProofEngine; logPath: string; checkId: string }> => {
+    const fs = MemoryFs.of(project())
+    const commands = new FakeCommands()
+    commands.on(argv => argv.includes('test'), { exitCode: 1, output: 'honestly failing this run\n' })
+    const engine = signedEngine(fs, commands, {
+      autoDiscover: false,
+      checks: [{ label: 'b tests', command: ['node', 'test'], kind: 'test', paths: ['src/b.ts'] }],
+    })
+    await engine.establishBaseline() // the check fails honestly; the baseline records the fail under a signed checkpoint
+    const checkId = (await engine.loadChecks())[0]!.id
+    return { fs, engine, logPath: `${ROOT}/.proof/evidence.jsonl`, checkId }
+  }
+  const { fs, engine, logPath, checkId } = await build()
+
+  // The attack: a forged passing record for the covering check, appended
+  // above the last checkpoint with a correct prev — this package's own
+  // makeEvidence makes it self-addressing by construction.
+  const forged = makeEvidence(
+    spec({ id: checkId, paths: ['src/b.ts'] }),
+    { status: 'pass', exitCode: 0, durationMs: 3, output: 'forged green\n' },
+    snapshotWorkspace('head2', ['src/b.ts']),
+    new FakeClock(),
+  )
+  const lines = ((await fs.readFile(logPath)) ?? '').split('\n').filter(l => l.trim().length > 0)
+  const prev = lineDigest(lines[lines.length - 1] as string)
+  await fs.appendLine(logPath, JSON.stringify({ v: 2, kind: 'evidence', at: '2026-10-07T00:00:00.000Z', prev, payload: forged }))
+  assert.equal((await engine.audit()).ok, true, 'fixture: the forged row breaks no audit axis — the floor is the only defense')
+
+  const outcome = await engine.verifyContract({
+    changed: ['src/b.ts'],
+    contract: { kind: 'behavior-adding', claim: 'the b path is covered' },
+  })
+  const covered = outcome.contract.obligations.find(o => o.id === 'new-paths-covered')
+  assert.ok(covered !== undefined)
+  assert.equal(covered.met, false, `the fallback must not open on an un-vouched tail row: ${covered.detail}`)
+  assert.match(covered.detail, /not covered by any passing check/,
+    'the latest the fallback saw is the honest below-floor fail, not the forged pass')
+  assert.notEqual(outcome.report.grade, 'proven', 'no behavior-adding certification over an execution that never happened')
+})
+
+test('v0.25 (U1-M3): a foreign-key garbage-sig checkpoint twin no longer triggers a false baseline-absorption accusation', async () => {
+  // The V4-M6 twin-veto family, absorption branch: ONE appended well-formed
+  // checkpoint line under a foreign keyId (honest count and head, garbage
+  // signature — unverifiable, deliberately not an audit charge) used to flip
+  // the positional-last `bestCheckpoint()` to `unverifiable`, collapse the
+  // absorption boundary to -1, and stamp `baselineAbsorptionSuspect` on an
+  // HONEST chain — every verdict capped at stale with a misleading
+  // diagnosis. The boundary is the floor's scan-back now: the twin's key
+  // never vouched here, so the floor never moved.
+  const fs = MemoryFs.of(project())
+  const engine = signedEngine(fs, new FakeCommands())
+  await engine.establishBaseline()
+  const first = await engine.verify({ changed: ['src/a.ts'] })
+  assert.equal(first.report.grade, 'proven', 'fixture: the honest chain certifies before the twin lands')
+  assert.equal(first.baselineAbsorptionSuspect, undefined)
+
+  const logPath = `${ROOT}/.proof/evidence.jsonl`
+  const lines = ((await fs.readFile(logPath)) ?? '').split('\n').filter(l => l.trim().length > 0)
+  const records = lines.filter(l => {
+    try {
+      const kind = (JSON.parse(l) as { kind?: unknown }).kind
+      return kind === 'evidence' || kind === 'marker'
+    } catch { return false }
+  }).length
+  const prev = lineDigest(lines[lines.length - 1] as string)
+  await fs.appendLine(logPath, JSON.stringify({
+    v: 2,
+    kind: 'checkpoint',
+    at: '2026-10-07T00:00:00.000Z',
+    prev,
+    // count/head honest for the position: well-formed and NOT a head liar —
+    // the only thing wrong with the line is the foreign keyId.
+    payload: { count: records, head: prev, workspaceKey: 'ws', at: '2026-10-07T00:00:00.000Z' },
+    sig: 'sig:foreign-key:garbage',
+    keyId: 'foreign-key',
+  }))
+  assert.equal((await engine.audit()).ok, true, 'fixture: an unverifiable foreign checkpoint is a visible channel, not a charge')
+
+  const after = await engine.verify({ changed: ['src/a.ts'] })
+  assert.equal(after.baselineAbsorptionSuspect, undefined,
+    'the twin does not move the boundary — the floor scan-back ignores keys that never vouched here')
+  assert.equal(after.auditFailed, undefined)
+  assert.equal(after.report.grade, 'proven', 'no false stale cap from a positional selection the old derivation trusted')
+})
+
+test('v0.25 (U1-M4): an appended synthetic pair above the floor mints no spec — and a vouched run whose body vanished is refused, not executed', async () => {
+  const fs = MemoryFs.of(project())
+  const commands = new FakeCommands()
+  commands.on(argv => argv.includes('node'), { exitCode: 0, output: 'SYNTHETIC: PASS' })
+  const engine = signedEngine(fs, commands, {
+    autoDiscover: false,
+    checks: [{ label: 'a tests', command: ['node', '-e', 'ok'], kind: 'test', paths: ['src/a.ts'] }],
+  })
+  await engine.establishBaseline()
+  const claim = 'the honest conjured loop'
+  const { request } = await engine.conjureRequest({ claim, paths: ['src/a.ts'] })
+  fs.mutate(`${ROOT}/.proof-synthetic/${request.entry}`, "console.log('SYNTHETIC: PASS')\n")
+  const run = await engine.conjureRun({ claim, entry: request.entry })
+  assert.equal(run.status, 'pass', 'fixture: the honest loop executed')
+
+  // Honest-flow pin (documented in syntheticSpecs): the fresh run marker
+  // rides ABOVE the floor until a checkpoint covers it — the first
+  // post-conjure verify does not re-execute the conjured check, its own
+  // checkpoint covers the protocol markers, and the second verify does.
+  const first = await engine.verify({ changed: ['src/a.ts'] })
+  assert.ok(!first.checks.some(c => c.checkId === run.checkId),
+    'the fresh (uncovered) run marker prices nothing yet — the spec joins only below a checkpoint')
+  const second = await engine.verify({ changed: ['src/a.ts'] })
+  assert.ok(second.checks.some(c => c.checkId === run.checkId),
+    'once the run marker is vouched, the conjured check re-joins the pool')
+
+  // The attack (pattern 5): a synthetic/requested + synthetic/run pair for a
+  // claim nobody conjured, both headRef-correct and correctly chained —
+  // minting a spec that targets arbitrary claims into every verify's pool.
+  const evilClaim = 'the forged offer'
+  const evilEntry = `synthetic-${claimIdOf(evilClaim)}-0.mjs`
+  const lines = ((await fs.readFile(`${ROOT}/.proof/evidence.jsonl`)) ?? '').split('\n').filter(l => l.trim().length > 0)
+  let prev = lineDigest(lines[lines.length - 1] as string)
+  const appended: string[] = []
+  const chainLine = (payload: Record<string, unknown>): string => {
+    const line = JSON.stringify({ v: 2, kind: 'marker', at: '2026-10-07T00:00:00.000Z', prev, payload: { ...payload, headRef: prev } })
+    prev = lineDigest(line)
+    return line
+  }
+  appended.push(chainLine({
+    label: 'synthetic/requested', claimId: claimIdOf(evilClaim), claim: evilClaim,
+    paths: ['src/b.ts'], entry: evilEntry, scriptDigest: null, requestedAt: 1_767_225_600_000,
+  }))
+  appended.push(chainLine({
+    label: 'synthetic/run', claimId: claimIdOf(evilClaim), entry: evilEntry,
+    checkId: 'node never-ran', scriptDigest: sha256('no body'), status: 'pass', exitCode: 0,
+  }))
+  await fs.appendLine(`${ROOT}/.proof/evidence.jsonl`, `${appended.join('\n')}\n`)
+
+  const third = await engine.verify({ changed: ['src/a.ts'] })
+  assert.ok(!third.checks.some(c => c.label.includes(claimIdOf(evilClaim))),
+    'the appended pair sits above the vouched floor — its ran marker prices nothing, no spec is minted')
+  assert.ok(!fs.log.some(l => l.includes('synthetic/refused') && l.includes(evilEntry)),
+    'the pair never even reached the script read — it is excluded at the ran-set, not refused at screening')
+
+  // The missing-script half: a VOUCHED run (below the floor) whose body can
+  // no longer be read is refused loudly, not silently admitted to a pool
+  // whose execution could only fail and drag verdicts red.
+  fs.files.delete(`${ROOT}/.proof-synthetic/${request.entry}`)
+  const fourth = await engine.verify({ changed: ['src/a.ts'] })
+  assert.ok(!fourth.checks.some(c => c.checkId === run.checkId),
+    'the vanished body mints no spec — no fail record composes itself from a missing file')
+  assert.ok(fs.log.some(l => l.includes('"synthetic/refused"') && l.includes('script file missing') && l.includes(request.entry)),
+    'the refusal is a chain fact naming the missing body')
+})
+
+test('v0.25 (U1-M2): the W9-M5 workspace check covers the PRIMARY publish path — a copied chain under a reused key refuses', async () => {
+  // The laundering shape: workspace A's chain (signed for 'ws') reused in
+  // workspace B that shares the same host key (operator key reuse). The
+  // positional-last A-checkpoint verifies under the key, so the publish used
+  // to take the PRIMARY branch — which carried no identity check at all (the
+  // mirror lived only in the fallback) — and minted a leaf keyed 'other-ws'
+  // over A's signed bytes. One predicate after selection now covers both
+  // branches.
+  const fs = MemoryFs.of(project())
+  const engineA = publishingEngine(fs)
+  await engineA.establishBaseline()
+  await engineA.verify({ changed: ['src/a.ts'] })
+
+  const engineB = publishingEngine(fs, { workspaceKey: 'other-ws' })
+  await assert.rejects(
+    () => engineB.publishCheckpoint(),
+    /refusing to publish: the selected checkpoint is signed for workspace "ws" but this workspace derives "other-ws"/,
+    'the primary (signature-verified) selection is identity-checked too, not just the fallback',
+  )
+  assert.equal((await loadPtl(fs, PTL_DIR)).log.size, 0, 'no leaf was minted under the foreign identity')
+  assert.ok(fs.log.some(l => l.includes('ptl/publish-unadjudicated') && l.includes('signed for workspace')),
+    'the refusal is a chain fact before it is a throw')
+})
+
+test('v0.25 (U1-L5): a foreign-workspace checkpoint under this host\'s key raises no vouched floor — the witness above the honest floor stays withheld', async () => {
+  // The floor used to skip the identity dimension entirely: a checkpoint
+  // under THIS host's key but signed for a DIFFERENT workspace (a chain
+  // copied between workspaces sharing one key — its signature is genuine,
+  // its count and head honest for the position) set the floor, and every
+  // marker below it entered fusion. The publish fallback calls this exact
+  // shape laundering; the floor now refuses to derive from it.
+  const build = async (): Promise<{ fs: MemoryFs; engine: ProofEngine; logPath: string }> => {
+    const fs = MemoryFs.of(surfaceProject())
+    const engine = signedEngine(fs, new FakeCommands())
+    await engine.establishBaseline()
+    return { fs, engine, logPath: `${ROOT}/.proof/evidence.jsonl` }
+  }
+  const claim = 'the retry loop honours cancellation'
+  const clean = await build()
+  const attacked = await build()
+  // Both chains swear an honest jury verdict that rides ABOVE the last
+  // verified checkpoint (no boundary has covered it yet).
+  for (const { engine } of [clean, attacked]) {
+    await seedJuryAttestation(engine, claim, { gen: 0, verdict: 'uphold', probability: 0.99 })
+  }
+
+  // The laundering attempt: a genuinely-signed, position-honest checkpoint
+  // for workspace 'other-ws' appended above the jury marker. Without the
+  // identity filter it raises the floor over the marker and the witness
+  // enters fusion — certifying the claim.
+  const key = new FakeKey('ws-key')
+  const lines = ((await attacked.fs.readFile(attacked.logPath)) ?? '').split('\n').filter(l => l.trim().length > 0)
+  const prev = lineDigest(lines[lines.length - 1] as string)
+  const records = lines.filter(l => {
+    try {
+      const kind = (JSON.parse(l) as { kind?: unknown }).kind
+      return kind === 'evidence' || kind === 'marker'
+    } catch { return false }
+  }).length
+  const at = '2026-10-07T00:00:00.000Z'
+  const payload = { count: records, head: prev, workspaceKey: 'other-ws', at }
+  await attacked.fs.appendLine(attacked.logPath, JSON.stringify({
+    v: 2, kind: 'checkpoint', at, prev, payload,
+    sig: await key.sign(checkpointSignedData(payload)), keyId: 'ws-key',
+  }))
+  assert.equal((await attacked.engine.audit()).ok, true,
+    'fixture: the foreign-workspace checkpoint breaks no audit axis — the floor filter is the only defense')
+
+  const cleanRun = await clean.engine.verifyContract({ contract: { kind: 'llm-jury', claim } })
+  const attackedRun = await attacked.engine.verifyContract({ contract: { kind: 'llm-jury', claim } })
+  assert.equal(attackedRun.report.grade, cleanRun.report.grade,
+    'the foreign checkpoint changed nothing for the witness above the honest floor')
+  assert.notEqual(attackedRun.report.grade, 'proven',
+    'a foreign-workspace line under this key vouches for nothing here — the jury marker stays withheld and the claim does not certify')
+  const upheld = attackedRun.contract.obligations.find(o => o.id === 'jury-upholds')
+  assert.ok(upheld !== undefined && upheld.met === false, 'the withheld witness upholds nothing')
+})
+
+test('v0.25 (U1-L7): an anchor naming a key this host does not hold refuses with the no-key-material diagnosis, not a false forgery charge', async () => {
+  // The fallback used to accuse anchor-key candidates of "failing signature
+  // verification" when the real fact was that this host holds no material
+  // for the anchored key at all — the scan's verifier predicate is false on
+  // keyId alone, nothing was ever verified. Fail-closed, wrong diagnosis on
+  // the record. The refusal now mirrors the ptl CLI's X-H-11 wording.
+  const fs = MemoryFs.of(project())
+  const trustDir = `${ROOT}/.trust`
+  const engineA = publishingEngine(fs, { trustDir })
+  await engineA.establishBaseline() // anchor on record under ws-key
+  const engineB = publishingEngine(fs, { trustDir, signer: () => Promise.resolve(new FakeKey('other-key')) })
+  await assert.rejects(
+    () => engineB.publishCheckpoint(),
+    /the anchor names key "ws-key" but this host holds no key material that can verify it/,
+    'X-H-11 wording, aligned with the CLI face',
+  )
+  assert.ok(!fs.log.some(l => l.includes('ptl/publish-unadjudicated') && l.includes('failed signature verification')),
+    'no candidate was ever verified — the false forgery charge is gone from the record')
+  assert.ok(fs.log.some(l => l.includes('ptl/publish-unadjudicated') && l.includes('holds no key material')),
+    'the accurate diagnosis is the chain fact')
+})
+
+test('v0.25 (U1-L8): the skipped-checkpoint record partitions WHY each line was skipped — pool-excluded is not verification-failed', async () => {
+  const fs = MemoryFs.of(project())
+  const engine = publishingEngine(fs)
+  await engine.establishBaseline()
+  await engine.verify({ changed: ['src/a.ts'] })
+  const logPath = `${ROOT}/.proof/evidence.jsonl`
+  const appendCp = async (shape: { sig?: string; keyId?: string; headOverride?: string }): Promise<void> => {
+    const lines = ((await fs.readFile(logPath)) ?? '').split('\n').filter(l => l.trim().length > 0)
+    const prev = lineDigest(lines[lines.length - 1] as string)
+    const records = lines.filter(l => {
+      try {
+        const kind = (JSON.parse(l) as { kind?: unknown }).kind
+        return kind === 'evidence' || kind === 'marker'
+      } catch { return false }
+    }).length
+    const at = '2026-10-07T00:00:00.000Z'
+    await fs.appendLine(logPath, JSON.stringify({
+      v: 2,
+      kind: 'checkpoint',
+      at,
+      prev,
+      payload: { count: records, head: shape.headOverride ?? prev, workspaceKey: 'ws', at },
+      ...(shape.sig !== undefined ? { sig: shape.sig, keyId: shape.keyId } : {}),
+    }))
+  }
+  // Three skipped shapes above the honest checkpoints: a garbage-signature
+  // own-key twin (scanned, verification failed), a naked line (never in the
+  // signed pool), and a head-liar (excluded positionally).
+  await appendCp({ sig: 'sig:ws-key:garbage', keyId: 'ws-key' })
+  await appendCp({})
+  await appendCp({ sig: 'sig:ws-key:garbage', keyId: 'ws-key', headOverride: lineDigest('a head it never saw') })
+
+  const published = await engine.publishCheckpoint()
+  assert.equal(published.duplicate, false, 'the honest checkpoint publishes through the scan-back')
+  const record = fs.log.find(l => l.includes('"skippedDetail"'))
+  assert.ok(record !== undefined, 'the skip landed on the record with its partition')
+  const detail = ((JSON.parse(record!) as { payload: { skippedDetail?: string } }).payload).skippedDetail ?? ''
+  assert.match(detail, /rejected-by-verification@\d+/, 'the garbage-sig twin is named as verification-failed')
+  assert.match(detail, /head-liar@\d+/, 'the lying position is named as a head-liar')
+  assert.match(detail, /pool-excluded@\d+/, 'the naked line is named as pool-excluded — it was never tried')
+  assert.match(detail, /malformed-count@none/, 'no malformed line exists to name')
+  assert.match(record!, /were skipped/, 'the headline stays: the fact is on the record')
+})
+
+test('v0.25 (U1-L6): constructing a signer-wired engine without workspaceKey warns on stderr — the shared default identity is not silent', async () => {
+  const writes: string[] = []
+  const original = process.stderr.write.bind(process.stderr)
+  process.stderr.write = ((chunk: Uint8Array | string): boolean => {
+    writes.push(String(chunk))
+    return true
+  }) as typeof process.stderr.write
+  try {
+    // The exact shape the warning exists for: identity-consuming wiring
+    // (a signer) over the silent 'default' key.
+    void new ProofEngine({
+      root: ROOT, fs: MemoryFs.of({}), commands: new FakeCommands(),
+      workspace: new FakeWorkspace(ROOT), clock: new FakeClock(),
+      signer: () => Promise.resolve(new FakeKey('ws-key')),
+    })
+    // The named construction stays silent, and so does a plain unsigned one.
+    void signedEngine(MemoryFs.of({}), new FakeCommands())
+    void new ProofEngine({
+      root: ROOT, fs: MemoryFs.of({}), commands: new FakeCommands(),
+      workspace: new FakeWorkspace(ROOT), clock: new FakeClock(),
+    })
+  } finally {
+    process.stderr.write = original
+  }
+  const warnings = writes.filter(w => w.includes('workspaceKey'))
+  assert.equal(warnings.length, 1,
+    'exactly one construction warned: the signer-wired default identity, never the named or unsigned constructions')
+  assert.match(warnings[0] ?? '', /shared identity 'default'/)
 })
 
 test('v0.25 (V4-M6): when NO candidate verifies, the publish refuses loudly and lists the rejected', async () => {

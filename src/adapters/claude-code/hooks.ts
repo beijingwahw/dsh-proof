@@ -68,7 +68,10 @@ import type { AdapterSession } from '../shared/session.ts'
 import { applyObservation, computeDrift, emptySession, loadSession, saveSession, windowStart } from '../shared/session.ts'
 import type { DriftResult, GateOptions, StopFacts } from '../shared/gates.ts'
 import { decidePreToolUse, evaluateStop, hasBaselineOnDisk } from '../shared/gates.ts'
-import { _readMarkers } from '../../core/evidence.ts'
+// v0.25.1 (U4-H1): `readChainMarkers` is the one public read carrying the
+// H-32 position verdict, reserved for engine-less faces (this process holds
+// no store); the `_readMarkers` escape hatch is retired (test/32 claim 1b).
+import { readChainMarkers } from '../../core/evidence.ts'
 import { buildPolicySection } from '../../dsh/prompt.ts'
 import { MCP_TOOLS } from '../../app/mcp-server.ts'
 
@@ -244,7 +247,12 @@ async function savedBaselineDigest(
   const raw = await readFile(logPath)
   if (raw === undefined) return undefined
   const lines = raw.split('\n').filter(line => line.trim().length > 0)
-  const markers = _readMarkers(lines, { label: 'baseline/saved' })
+  // v0.25.1 (U4-H1): the read goes through `readChainMarkers` — the one
+  // PUBLIC read that carries the H-32 position verdict, imported by exactly
+  // the two engine-less adapter faces (test/32 claim 1b pins the importer
+  // set). Same single-pass core the store's `markersWith` and the verified
+  // view derive from; the underscore `_readMarkers` escape hatch is retired.
+  const markers = readChainMarkers(lines, { label: 'baseline/saved' })
     .filter(marker => typeof marker.payload.digest === 'string')
   const trusted = markers.filter(marker => !marker.suspect)
   const pool = trusted.length > 0 ? trusted : markers

@@ -155,7 +155,7 @@ export const MCP_SERVER_NAME = 'agent-proof-protocol'
  * reason. Bump it with package.json (an operator who needs to pin the string
  * still can, via DSH_PROOF_SERVER_VERSION).
  */
-export const MCP_DEFAULT_VERSION = '0.25.0'
+export const MCP_DEFAULT_VERSION = '0.26.0'
 
 /**
  * Protocol versions this server speaks, newest first. A client asking for a
@@ -846,6 +846,11 @@ async function callVerifyTool(deps: McpEngineDeps, args: Record<string, unknown>
   const verified = toVerifyValue(
     outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
     outcome.schedule, outcome.coverage,
+    // U3-M2 (v0.25.1): H5/H5② ride this face too — a drifted or vanished
+    // baseline definition must not read as a clean proven here while the
+    // DSH face appends the warning tail (the number is already discounted
+    // by the engine; this is the anti-deception visibility half).
+    outcome.scriptDrift, outcome.vanished,
   )
   const warnings: string[] = []
   if (changed.droppedNonString > 0) warnings.push(droppedWarning('proof_verify', 'changed', changed.droppedNonString))
@@ -954,6 +959,8 @@ async function callClaimTool(deps: McpEngineDeps, args: Record<string, unknown>)
     const verified = toVerifyValue(
       outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
       outcome.schedule, outcome.coverage,
+      // U3-M2 (v0.25.1): H5/H5② warning tails ride the typed-claim path too.
+      outcome.scriptDrift, outcome.vanished,
     )
     const claimed = toClaimValue(claim, outcome.report, verified, outcome.contract)
     if (warnings.length > 0) return toolResult({ ...claimed, warnings })
@@ -966,6 +973,8 @@ async function callClaimTool(deps: McpEngineDeps, args: Record<string, unknown>)
   const verified = toVerifyValue(
     outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
     outcome.schedule, outcome.coverage,
+    // U3-M2 (v0.25.1): H5/H5② warning tails ride the untyped-claim path too.
+    outcome.scriptDrift, outcome.vanished,
   )
   const claimed = toClaimValue(claim, outcome.report, verified)
   if (warnings.length > 0) return toolResult({ ...claimed, warnings })

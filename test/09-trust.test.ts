@@ -1144,7 +1144,7 @@ test('X-H-08: a between-sessions baseline/saved absorption is refused, not notar
   assert.equal(audit.ok, false, 'v0.22 kept this audit GREEN while the anchor was lifted onto the attack')
   assert.equal(await fs.readFile(ANCHOR), anchorBefore, 'the out-of-band high-water mark is not moved over the absorption')
   const refusal = (await fs.readLines(LOG)).find(l => l.includes('trust/checkpoint-refused'))
-  assert.match(String(refusal), /unvouched-baseline-marker/, 'the refusal names the authorless baseline claim')
+  assert.match(String(refusal), /unvouched-protected-marker/, 'the refusal names the authorless claim (U1-H1: the roster is the full protected list; baseline/saved among them)')
 
   // Recovery is the documented re-anchor flow: THIS process saves a baseline,
   // its marker supersedes the orphan as the newest of the label, and signing
@@ -1206,6 +1206,178 @@ test('X-H-08: a foreign baseline/established tail marker is refused too (and sup
   assert.equal(recovered.chain.refusedToSign!.length, 1, 'no second refusal: the newest claim of the label is self-authored')
   assert.equal(recovered.chain.checkpoints, 3)
   assert.equal(recovered.ok, true, 'Y-H-02: the re-anchor recovered the refusal\'s generation — visible scar, green audit')
+})
+
+// -- U1-H1 (v0.25): the authorship roster is the FULL protected list ----------------
+//
+// THE ADVERSARY (audit v0.25 F1, the heaviest finding): the floor launders
+// the tail at the moment it is minted. A between-sessions append of a
+// headRef-CORRECT attest/jury (or delegation/created, proof/verified,
+// economics/quote, synthetic/run) passes every shape check — nothing breaks,
+// nothing lies structurally — and v0.23's authorship refusal covered only the
+// baseline family, so the host's own next checkpoint notarised the forged
+// line into the vouched prefix, below every floor, where κ fusion, the
+// delegation DAG and SLA quotes all trusted it. The roster is now
+// `isProtectedMarkerLabel`: the newest marker of ANY protected label on the
+// checkpoint-uncovered tail must be one this process wrote.
+
+test('U1-H1: a between-sessions attest/jury injection (headRef-correct) is refused, not notarised', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1'))
+  await store.checkpoint() // the vouching boundary session 1 leaves behind
+  const anchorBefore = await fs.readFile(ANCHOR)
+
+  // The attack: a perfectly shaped jury verdict — correct prev, correct
+  // headRef (computable by anyone who reads the log) — claiming an uphold at
+  // 0.999 no deliberation ever rendered.
+  const lines = await fs.readLines(LOG)
+  const prev = lineDigest(lines[lines.length - 1] as string)
+  const injected = JSON.stringify({
+    v: 2, kind: 'marker', at: '2026-10-06T00:00:00.000Z', prev,
+    payload: {
+      label: 'attest/jury', kind: 'attest/jury', claimId: 'claim-1', gen: 0,
+      verdict: 'uphold', probability: 0.999, headRef: prev,
+    },
+  })
+  fs.mutate(LOG, `${[...lines, injected].join('\n')}\n`)
+
+  // Session 2 absorbs the bytes as history — and refuses to lend them the key.
+  const session2 = trustedStore(fs).store
+  await session2.checkpoint()
+  const audit = await session2.audit()
+  assert.equal(audit.chain.refusedToSign!.length, 1,
+    'the boundary refuses: the authorless jury claim is never notarised below the floor')
+  assert.equal(audit.ok, false)
+  assert.equal(await fs.readFile(ANCHOR), anchorBefore, 'the anchor is not lifted over the injection')
+  const refusal = (await fs.readLines(LOG)).find(l => l.includes('trust/checkpoint-refused'))
+  assert.match(String(refusal), /unvouched-protected-marker/,
+    'the refusal names the protected-label authorship break (attest/jury is on the roster)')
+
+  // Recovery by superseding, the documented shape: THIS process swears its
+  // own verdict for the same label — the newest claim of the label is
+  // self-authored again, and signing resumes. The refusal stays on the
+  // record as history (no pardon beyond superseding, on purpose).
+  await session2.mark('attest/jury', { kind: 'attest/jury', claimId: 'claim-1', gen: 0, verdict: 'abstain', probability: 0.5 })
+  await session2.checkpoint()
+  const recovered = await session2.audit()
+  assert.equal(recovered.chain.refusedToSign!.length, 1, 'exactly one refusal — superseding recovers, it does not loop')
+  assert.equal(recovered.chain.checkpoints, 3, 'signing resumed over the superseded tail')
+})
+
+test('U1-H1: the roster covers the delegation and synthetic labels too — newest-per-label, older lines are dead letters', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1'))
+  await store.checkpoint()
+
+  // Two foreign appends: a delegation obligation nobody created, and an
+  // execution that never happened. Plus one OLDER foreign attest line
+  // sitting beneath a self-written one — the dead-letter shape the rule
+  // deliberately ignores (last-wins never consults it).
+  const lines = await fs.readLines(LOG)
+  let prev = lineDigest(lines[lines.length - 1] as string)
+  const appended: string[] = []
+  const chain = (payload: Record<string, unknown>): string => {
+    const line = JSON.stringify({ v: 2, kind: 'marker', at: '2026-10-06T00:00:00.000Z', prev, payload: { ...payload, headRef: prev } })
+    prev = lineDigest(line)
+    return line
+  }
+  appended.push(chain({ label: 'attest/human', claimId: 'claim-1', decision: 'endorse', approver: 'ghost' }))
+  appended.push(chain({ label: 'delegation/created', taskId: 'task-9', obligation: 'planted' }))
+  appended.push(chain({ label: 'synthetic/run', claimId: 'claim-9', entry: 'synthetic-never-ran.mjs' }))
+  fs.mutate(LOG, `${[...lines, ...appended].join('\n')}\n`)
+
+  // The same process supersedes ONLY the attest line: the two other foreign
+  // newest-of-label claims still block the key.
+  const session2 = trustedStore(fs).store
+  await session2.mark('attest/human', { claimId: 'claim-1', decision: 'reject', approver: 'operator' })
+  await session2.checkpoint()
+  const audit = await session2.audit()
+  assert.equal(audit.chain.refusedToSign!.length, 1, 'still refused: delegation/created and synthetic/run are authorless newest claims')
+  const refusal = (await fs.readLines(LOG)).find(l => l.includes('trust/checkpoint-refused'))
+  assert.match(String(refusal), /unvouched-protected-marker@\d+,\d+/,
+    'the refusal names BOTH authorless newest lines (the superseded attest line is a dead letter, not named)')
+})
+
+test('U1-H1 control: same-process protected markers never refuse — every markInternal write is in the author set', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1'))
+  // The in-process honest flow across every label family: this process wrote
+  // each line, so the pre-sign authorship demand answers self on all of them.
+  await store.mark('attest/human', { claimId: 'claim-1', decision: 'endorse', approver: 'lead' })
+  await store.mark('delegation/created', { taskId: 'task-1', obligation: 'honest' })
+  await store.mark('proof/verified', { grade: 'proven', claim: 'c' })
+  await store.mark('economics/quote', { premium: 1 })
+  await store.mark('synthetic/run', { claimId: 'claim-2', entry: 'synthetic-x-0.mjs' })
+  await store.mark('claim/jury', { claimId: 'claim-3', verdict: 'uphold' })
+  await store.checkpoint()
+  const audit = await store.audit()
+  assert.deepEqual(audit.chain.refusedToSign, [], 'this process wrote every protected marker — no refusal')
+  assert.equal(audit.ok, true)
+  assert.equal(audit.chain.suspectMarkers!.length, 0, 'and each carried its headRef witness honestly')
+})
+
+test('U2-H1: a transplanted checkpoint cannot raise the generational epoch bound — fresh twins stay out of the degraded pool', async () => {
+  // Audit v0.25 F1's PoC shape. The bound guards "a suspect line ABOVE the
+  // epoch bound is fresh, not legacy — it does not enter the degraded pool":
+  // a TRANSPLANTED honest checkpoint (its original signed line re-appended
+  // at the tail, prev re-chained) still verifies under the key — the
+  // signature covers {count, head, workspaceKey, at}, not position — but the
+  // walk flags it headLiared (and its count falls behind → malformed).
+  // v0.24's bound counted it anyway, raising the bound above a fresh
+  // headRef-less twin, and the twin joined the degraded pool as its
+  // physically-last member — a never-executed offer promoted into the
+  // ran-set. The bound now applies the same liar/malformed exclusion
+  // checkpointPool and the engine's vouchedFloor already had.
+  const fs = MemoryFs.of({})
+  const signer = new FakeSigner()
+  const store = new EvidenceStore(fs, LOG, BASE, new FakeClock(), {
+    signer: async () => signer,
+    anchorPath: ANCHOR,
+    workspaceKey: 'ws',
+    checkpointEvery: 1000,
+  })
+  const view = createVerifiedView(store)
+  // The honest prefix is hand-built, the shape a real pre-adoption chain
+  // has: a v0.24-era run marker (no headRef — the witness did not exist
+  // yet), an evidence row, and a signed checkpoint over both. (Writing it
+  // through today's store would either add the headRef witness — changing
+  // the legacy premise — or, for the marker, be refused by the U1-H1
+  // authorship rule; a raw historical prefix is the honest fixture.)
+  const lines: string[] = []
+  let prev = GENESIS_PREV
+  const push = (envelope: Record<string, unknown>): void => {
+    const line = JSON.stringify({ ...envelope, prev })
+    lines.push(line)
+    prev = lineDigest(line)
+  }
+  push({ v: 2, kind: 'marker', at: '2024-01-01T00:00:00Z', payload: { label: 'synthetic/run', claimId: 'c1', entry: 'old.js' } })
+  push({ v: 2, kind: 'evidence', at: '2024-01-01T00:01:00Z', payload: evidence('check-a') })
+  const cpPayload = { count: 2, head: prev, workspaceKey: 'ws', at: '2024-01-01T00:02:00Z' }
+  push({ v: 2, kind: 'checkpoint', at: cpPayload.at, payload: cpPayload, sig: await signer.sign(checkpointSignedData(cpPayload)), keyId: signer.keyId })
+  fs.mutate(LOG, `${lines.join('\n')}\n`)
+
+  const before = await view.markers('synthetic/run')
+  assert.equal(before.records.length, 1)
+  assert.equal(before.degraded, true, 'the all-legacy label reads degraded — the honest generational fallback')
+
+  // The attack: a fresh headRef-less twin, then the transplant of the honest
+  // checkpoint line (re-chained at the tail).
+  push({ v: 2, kind: 'marker', at: '2026-01-01T00:00:00Z', payload: { label: 'synthetic/run', claimId: 'c9', entry: 'evil.js' } })
+  const transplant = lines[2] as string
+  push(JSON.parse(transplant) as Record<string, unknown>)
+  fs.mutate(LOG, `${lines.join('\n')}\n`)
+
+  const after = await view.markers('synthetic/run')
+  assert.equal(after.records.length, 1, 'the fresh twin never enters the degraded pool — the transplant raised no bound')
+  assert.equal(String(after.last?.payload.entry), 'old.js', 'last-wins still answers with the legacy honest row, not c9/evil.js')
+  // The transplant is named for what it is on the walk's own channel.
+  const walk = walkChain(await fs.readLines(LOG))
+  const liars = walk.checkpoints.filter(cp => cp.headLiared)
+  assert.equal(liars.length, 1, 'the transplanted line is a head-liar')
+  assert.equal(liars[0]?.payload.count !== liars[0]?.expectedCount, true, 'and its count falls behind — malformed by the walk')
 })
 
 // -- X-H-03: headLiared on the walk (v0.23) ---------------------------------------
