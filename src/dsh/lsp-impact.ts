@@ -8,17 +8,30 @@
  * aliases and package-internal imports that regex extraction cannot see.
  *
  * Cost control: every result is cached per (file, content version, position),
- * and a hard query budget degrades the remainder to the approximate graph.
+ * a hard query budget degrades the remainder to the approximate graph, and —
+ * H-34 — every round-trip is raced against a wall-clock deadline: a language
+ * server that never answers degrades its position to a null answer (uncached,
+ * retried later), never hangs the whole verify.
  *
  * @module dsh-proof/dsh/lsp-impact
  */
 
 import type { DefinitionResolverPort, FsPort } from '../core/ports.ts'
-import type { LspLike, LspLocation } from '../vendor/dsh-tools.ts'
+import type { LspLike, LspLocation, LspQueryResult } from '../vendor/dsh-tools.ts'
 
 export interface LspResolverOptions {
   /** Maximum language-server round-trips (per resolver instance). */
   readonly budget?: number
+  /**
+   * H-34: wall-clock ceiling for ONE language-server round-trip, in ms. A
+   * server that never answers (init deadlock, a zombie language-server
+   * process) must degrade that position to a null answer — costing one
+   * query's worth of latency — instead of hanging the whole verify: no
+   * engine budget covers this await (graph building sits outside the check
+   * dispatch loop). Default 5s; injectable so tests can pin the behaviour in
+   * real time.
+   */
+  readonly queryTimeoutMs?: number
 }
 
 /** Build a caching, budgeted resolver over the host's LSP seam, if present. */
@@ -29,7 +42,9 @@ export function createLspResolver(
   options: LspResolverOptions = {},
 ): DefinitionResolverPort | undefined {
   if (lsp === undefined) return undefined
-  return new CachingLspResolver(lsp, root, fs, options.budget ?? 400)
+  return new CachingLspResolver(
+    lsp, root, fs, options.budget ?? 400, Math.max(1, options.queryTimeoutMs ?? 5_000),
+  )
 }
 
 class CachingLspResolver implements DefinitionResolverPort {
@@ -39,16 +54,17 @@ class CachingLspResolver implements DefinitionResolverPort {
   private readonly root: string
   private readonly fs: FsPort
   private readonly budget: number
+  private readonly queryTimeoutMs: number
 
-  constructor(lsp: LspLike, root: string, fs: FsPort, budget: number) {
+  constructor(lsp: LspLike, root: string, fs: FsPort, budget: number, queryTimeoutMs: number) {
     this.lsp = lsp
     this.root = root
     this.fs = fs
     this.budget = budget
+    this.queryTimeoutMs = queryTimeoutMs
   }
 
   async resolveDefinition(file: string, line: number, character: number): Promise<string | null> {
-    if (this.queries >= this.budget) return null
     const stat = await this.fs.stat(`${this.root}/${file}`).catch(() => undefined)
     const version = stat === undefined ? 'none' : `${stat.mtimeMs}:${stat.size}`
     let entry = this.entries.get(file)
@@ -57,18 +73,72 @@ class CachingLspResolver implements DefinitionResolverPort {
       this.entries.set(file, entry)
     }
     const positionKey = `${line}:${character}`
+    // M-30: a cache hit answers for free. The budget gates NEW round-trips
+    // only — this resolver is a plugin-lifetime singleton and the budget a
+    // whole-session allowance, so checking the budget first used to blind
+    // the graph to answers already paid for the moment the counter flipped.
     const cached = entry.results.get(positionKey)
     if (cached !== undefined) return cached
+    if (this.queries >= this.budget) return null
 
     this.queries += 1
-    const result = await this.lsp
-      .query('goToDefinition', { file: `${this.root}/${file}`.replace(/\\/g, '/'), line, character })
-      .catch(() => null)
-    const target = result !== null && result.kind === 'locations'
-      ? firstWorkspaceRelative(result.locations, this.root)
+    const outcome = await this.timedQuery(file, line, character)
+    if (outcome.transient) {
+      // H-34/M-30: a timeout or a rejection is a fact about the SERVER
+      // (cold start, hiccup, hang), not about the code — it must not be
+      // cached: the old `.catch(() => null)` + set() froze "no definition"
+      // at this position until the file changed on disk, silently pinning
+      // the graph to approximate precision for the rest of the session.
+      // Return null now (soundness never narrows) and let the next query retry.
+      return null
+    }
+    const target = outcome.value !== null && outcome.value.kind === 'locations'
+      ? firstWorkspaceRelative(outcome.value.locations, this.root)
       : null
     entry.results.set(positionKey, target)
     return target
+  }
+
+  /**
+   * One round-trip, raced against the deadline, with the vendor seam's abort
+   * signal passed through (it is free to ignore it). Resolves to
+   * `{ transient: true }` on timeout or rejection — indistinguishable-from-
+   * failure inputs deliberately collapse here so neither can be cached.
+   */
+  private async timedQuery(
+    file: string, line: number, character: number,
+  ): Promise<{ transient: true } | { transient: false; value: LspQueryResult | null }> {
+    const controller = new AbortController()
+    let timeoutHit = false
+    let deadlineDone: () => void = () => { /* replaced by the promise executor */ }
+    const deadline = new Promise<void>((resolve) => { deadlineDone = resolve })
+    const timer = setTimeout(() => {
+      timeoutHit = true
+      controller.abort()
+      deadlineDone()
+    }, this.queryTimeoutMs)
+    try {
+      const winner = await Promise.race([
+        this.lsp
+          .query(
+            'goToDefinition',
+            { file: `${this.root}/${file}`.replace(/\\/g, '/'), line, character },
+            controller.signal,
+          )
+          .then(
+            (value) => ({ timedOut: false as const, value }),
+            () => ({ timedOut: true as const, value: null as LspQueryResult | null }),
+          ),
+        deadline.then(() => ({ timedOut: true as const, value: null as LspQueryResult | null })),
+      ])
+      if (winner.timedOut || timeoutHit) return { transient: true }
+      return { transient: false, value: winner.value }
+    } finally {
+      // The timer keeps the event loop alive until cleared; a won race must
+      // not leak it. A lost (still-pending) server promise already has its
+      // rejection handled by the .then mapping above.
+      clearTimeout(timer)
+    }
   }
 }
 

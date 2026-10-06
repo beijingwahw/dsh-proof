@@ -154,3 +154,68 @@ test('snapshotWorkspace resolves through a WorkspacePort', async () => {
   assert.equal(snapshot.head, 'abc123')
   assert.deepEqual(snapshot.dirty, ['x.ts'])
 })
+
+test('M-34: a failed git query is a degraded snapshot, never a clean tree', async () => {
+  const broken = new FakeWorkspace('/ws')
+  broken.gitHead = async () => { throw new Error('index.lock: another git process') }
+  const snapshot = await snapshotWorkspace(broken)
+  assert.equal(snapshot.gitDegraded, true, 'head:null + dirty:[] now say WHY: the queries failed, the tree was not observed clean')
+  assert.equal(snapshot.head, null)
+  assert.deepEqual(snapshot.dirty, [])
+  // The honest port attaches nothing — every existing address is untouched.
+  const clean = await snapshotWorkspace(new FakeWorkspace('/ws'))
+  assert.equal('gitDegraded' in clean, false)
+})
+
+test('H-23: loadBaseline refuses a baseline that cannot re-derive its own identity', async () => {
+  const fs = MemoryFs.of({})
+  const clock = new FakeClock()
+  const store = new EvidenceStore(fs, '/ws/.proof/evidence.jsonl', '/ws/.proof/baseline.json', clock)
+  const records = [makeEvidence(spec({ id: 'c1' }), { status: 'pass', exitCode: 0, durationMs: 1, output: 'ok' }, WS, clock)]
+  const baseline = buildBaseline(records, WS, clock)
+  await store.saveBaseline(baseline)
+  assert.notEqual(await store.loadBaseline(), undefined, 'sanity: the honest round trip still loads')
+
+  // The lazy edit: flip a payload field under a kept evidenceId. The file
+  // parses and shape-checks; only recomputing the identity catches it.
+  const doctored = JSON.parse(JSON.stringify(baseline)) as typeof baseline
+  ;(doctored.checks[0] as { status: string }).status = 'fail'
+  fs.mutate('/ws/.proof/baseline.json', JSON.stringify(doctored, null, 2))
+  assert.equal(await store.loadBaseline(), undefined, 'a doctored payload under a kept id is not a baseline')
+  const audit = await store.audit()
+  assert.equal(audit.chain.baselineTampered, true)
+  assert.equal(audit.ok, false)
+})
+
+test('H-23: stripping a non-addressing attachment (scriptDigests) is caught by the chain digest', async () => {
+  const fs = MemoryFs.of({})
+  const clock = new FakeClock()
+  const store = new EvidenceStore(fs, '/ws/.proof/evidence.jsonl', '/ws/.proof/baseline.json', clock)
+  const records = [makeEvidence(spec({ id: 'c1' }), { status: 'pass', exitCode: 0, durationMs: 1, output: 'ok' }, WS, clock)]
+  const baseline = buildBaseline(records, WS, clock)
+  // The engine's shape: scriptDigests rides as a non-addressing attachment —
+  // canonical ids alone can never see it, the recorded file digest can.
+  const anchored = { ...baseline, scriptDigests: { 'config:c1': 'deadbeef' } }
+  await store.saveBaseline(anchored)
+  assert.notEqual(await store.loadBaseline(), undefined, 'the attachment loads while intact')
+
+  fs.mutate('/ws/.proof/baseline.json', JSON.stringify(baseline, null, 2))
+  assert.equal(await store.loadBaseline(), undefined, 'stripping the field changed the bytes the chain remembers — not the baseline the chain saved')
+  const audit = await store.audit()
+  assert.equal(audit.chain.baselineTampered, true)
+  assert.equal(audit.ok, false)
+})
+
+test('a baseline with no chain witness loads on canonical merit alone (legacy tolerance)', async () => {
+  const fs = MemoryFs.of({})
+  const clock = new FakeClock()
+  const store = new EvidenceStore(fs, '/ws/.proof/evidence.jsonl', '/ws/.proof/baseline.json', clock)
+  const records = [makeEvidence(spec({ id: 'c1' }), { status: 'pass', exitCode: 0, durationMs: 1, output: 'ok' }, WS, clock)]
+  // Hand-placed, never marked: no baseline/saved witness exists. Integrity
+  // still holds canonically, and the loader degrades to the canonical check
+  // rather than manufacturing an accusation it cannot support.
+  fs.mutate('/ws/.proof/baseline.json', JSON.stringify(buildBaseline(records, WS, clock), null, 2))
+  const loaded = await store.loadBaseline()
+  assert.notEqual(loaded, undefined)
+  assert.equal(loaded?.checks.length, 1)
+})

@@ -516,13 +516,16 @@ test('a missing or malformed sth.json loads as undefined, never throws', async (
 test('savePtlHead round-trips and advances; the identical head re-saves idempotently', async () => {
   const fs = MemoryFs.of({})
   const shared = variedLeaves(5) // one history: 3-leaf prefix, then 5-leaf extension
+  // v0.22: the entries live on disk — an advancing head must prove its
+  // prefix consistency against them, so the log has to be real.
+  for (const e of shared) await appendPtlEntry(fs, DIR, e)
   const sthA = await mintSth(new TransparencyLog(shared.slice(0, 3)), '2026-10-06T01:00:00.000Z')
   await savePtlHead(fs, DIR, sthA)
   assert.deepEqual((await loadPtl(fs, DIR)).sth, sthA)
   // Same head again: allowed (idempotent re-assertion).
   await savePtlHead(fs, DIR, sthA)
   assert.deepEqual((await loadPtl(fs, DIR)).sth, sthA)
-  // Advance: bigger tree, later timestamp.
+  // Advance: bigger tree, later timestamp, consistent prefix.
   const sthB = await mintSth(new TransparencyLog(shared), '2026-10-06T02:00:00.000Z')
   await savePtlHead(fs, DIR, sthB)
   assert.deepEqual((await loadPtl(fs, DIR)).sth, sthB)
@@ -532,6 +535,61 @@ test('savePtlHead round-trips and advances; the identical head re-saves idempote
     true,
     'the stored heads are mutually consistent',
   )
+})
+
+test('savePtlHead (v0.22): a LONGER head over a rewritten history is refused — longer is not enough, the prefix must prove', async () => {
+  const fs = MemoryFs.of({})
+  const honest = variedLeaves(3)
+  for (const e of honest) await appendPtlEntry(fs, DIR, e)
+  const sthA = await mintSth(new TransparencyLog(honest), '2026-10-06T01:00:00.000Z')
+  await savePtlHead(fs, DIR, sthA)
+
+  // The attacker rewrites the whole file into a longer, self-consistent,
+  // ENTIRELY DIFFERENT history and asks the operator to sign its head.
+  const rewritten = variedLeaves(6) // fresh content, same length arithmetic
+  fs.mutate(ENTRIES_PATH, `${rewritten.map(e => canonicalJson(e)).join('\n')}\n`)
+  const sthAttack = await mintSth(new TransparencyLog(rewritten), '2026-10-06T02:00:00.000Z')
+  await assert.rejects(
+    () => savePtlHead(fs, DIR, sthAttack),
+    /refusing to sign a head that does not extend the published history/,
+    'M-60: size growth without a consistency proof from the OLD head is a rewrite, not an append',
+  )
+  assert.equal((await loadPtl(fs, DIR)).sth!.root, sthA.root, 'the published head is untouched')
+
+  // Back on the honest history, its genuine extension still signs fine.
+  fs.mutate(ENTRIES_PATH, `${honest.map(e => canonicalJson(e)).join('\n')}\n`)
+  await appendPtlEntry(fs, DIR, entry(50))
+  const grown = (await loadPtl(fs, DIR)).log
+  const sthHonest = await mintSth(grown, '2026-10-06T03:00:00.000Z')
+  await savePtlHead(fs, DIR, sthHonest)
+  assert.equal((await loadPtl(fs, DIR)).sth!.treeSize, 4)
+})
+
+test('savePtlHead (v0.22): operator identity flips, unparseable timestamps, and heads beyond the log are refused loudly', async () => {
+  const fs = MemoryFs.of({})
+  const leaves = variedLeaves(2)
+  for (const e of leaves) await appendPtlEntry(fs, DIR, e)
+  const opA = await mintSth(new TransparencyLog(leaves), '2026-10-06T01:00:00.000Z')
+  await savePtlHead(fs, DIR, opA)
+
+  // A head signed by a DIFFERENT operator over a grown tree: the identity
+  // that auditors pin must not flip mid-log (M-60/A2-M3).
+  const opB = new FakeOperator('OTHER-OPERATOR')
+  const unsigned = { logId: opB.keyId, treeSize: 2, root: new TransparencyLog(leaves).merkleRoot(), at: '2026-10-06T02:00:00.000Z' }
+  const flipped: SignedTreeHead = { ...unsigned, sig: await opB.sign(sthSignedData(unsigned)) }
+  await assert.rejects(() => savePtlHead(fs, DIR, flipped), /refusing to change the transparency log operator/)
+
+  // An `at` that is not a parseable instant is refused outright (A2-L1): a
+  // garbage stamp could wedge every later honest comparison.
+  const wedged = { ...opA, at: 'zzzz' } as SignedTreeHead
+  await assert.rejects(() => savePtlHead(fs, DIR, wedged), /timestamp cannot be parsed/)
+
+  // A head promising more entries than the file holds is disconnected, and
+  // the disconnect is adjudicated instead of surfacing as a RangeError later.
+  const beyond = await mintSth(new TransparencyLog(variedLeaves(9)), '2026-10-06T02:00:00.000Z')
+  await assert.rejects(() => savePtlHead(fs, DIR, beyond), /refusing to sign a head over 9 entries while the log holds 2/)
+
+  assert.equal((await loadPtl(fs, DIR)).sth!.logId, opA.logId, 'nothing was clobbered')
 })
 
 test('savePtlHead refuses every rewind: smaller tree, same tree different root, earlier timestamp', async () => {
@@ -648,4 +706,64 @@ test('reordering two entries moves the root: the RFC tree is an ORDERED tree, no
   // Same multiset, different sequence: set-hash semantics would NOT have
   // caught this — the ordered RFC tree is what makes the log a ledger.
   assert.deepEqual([...reordered.entries].slice(0, 2), [...honest.entries].slice(0, 2))
+})
+
+// ---------------------------------------------------------------------------
+// v0.22 storage disciplines — torn tails, honest corruption reports,
+// in-process append serialisation
+// ---------------------------------------------------------------------------
+
+test('appendPtlEntry refuses to append behind a TORN tail, naming the repair (M-61)', async () => {
+  const fs = MemoryFs.of({})
+  await appendPtlEntry(fs, DIR, entry(0))
+  // Crash mid-write: a valid prefix with no closing brace, no newline.
+  fs.mutate(ENTRIES_PATH, `${canonicalJson(entry(1)).slice(0, 25)}`)
+  await assert.rejects(
+    () => appendPtlEntry(fs, DIR, entry(2)),
+    /torn \(unterminated\) line.*Repair the tail/s,
+    'the silent-publication-loss shape must refuse, not splice',
+  )
+  // The file is untouched by the refusal.
+  assert.equal(fs.files.get(ENTRIES_PATH), canonicalJson(entry(1)).slice(0, 25))
+  // After repairing the tail (here: dropping the partial line), appending works.
+  fs.mutate(ENTRIES_PATH, `${canonicalJson(entry(0))}\n`)
+  const appended = await appendPtlEntry(fs, DIR, entry(2))
+  assert.deepEqual(appended, { sequence: 1, duplicate: false })
+  const { log } = await loadPtl(fs, DIR)
+  assert.deepEqual(log.entries, [entry(0), entry(2)], 'the new line landed as its own line, provable by inclusion')
+})
+
+test('loadPtl counts whitespace-only lines as bad, and flags a head that overcommits the file (M-63/L3)', async () => {
+  const e0 = entry(0)
+  const raw = `${canonicalJson(e0)}\n   \n\t\n${canonicalJson(entry(1))}\n`
+  const fs = MemoryFs.of({ [ENTRIES_PATH]: raw })
+  const { log, badLines, headOvercommits } = await loadPtl(fs, DIR)
+  assert.equal(badLines, 2, 'a line reduced to whitespace is damaged, not absent')
+  assert.equal(log.size, 2)
+  assert.equal(headOvercommits, undefined, 'no head on record: nothing to overcommit')
+
+  const sth = await mintSth(log, '2026-10-06T01:00:00.000Z')
+  const fs2 = MemoryFs.of({
+    [ENTRIES_PATH]: raw,
+    [HEAD_PATH]: canonicalJson({ ...sth, treeSize: sth.treeSize + 8 }),
+  })
+  const loaded2 = await loadPtl(fs2, DIR)
+  assert.equal(loaded2.headOvercommits, true, 'a head promising more entries than the file holds is stated, not saved for a later RangeError')
+  assert.equal(loaded2.log.size, 2)
+})
+
+test('concurrent appendPtlEntry calls serialise: every entry lands, exactly once, in submit order (M-62)', async () => {
+  const fs = MemoryFs.of({})
+  const outcomes = await Promise.all(
+    [entry(0), entry(1), entry(2), entry(3), entry(4)].map(e => appendPtlEntry(fs, DIR, e)),
+  )
+  assert.deepEqual(outcomes.map(o => o.sequence), [0, 1, 2, 3, 4], 'no interleaving lost or duplicated a sequence number')
+  assert.deepEqual(outcomes.map(o => o.duplicate), [false, false, false, false, false])
+  const { log, badLines } = await loadPtl(fs, DIR)
+  assert.equal(log.size, 5)
+  assert.equal(badLines, 0)
+  assert.equal(log.merkleRoot(), naiveRoot([entry(0), entry(1), entry(2), entry(3), entry(4)].map(naiveLeafHash)))
+  // And the whole file is newline-terminated — no torn line can survive the
+  // atomic whole-file commit even under racing writers.
+  assert.ok(fs.files.get(ENTRIES_PATH)!.endsWith('\n'))
 })

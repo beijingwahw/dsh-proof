@@ -56,11 +56,13 @@ const DEFAULT_SCRIPT_KINDS: Record<string, CheckKind> = {
   'lint:ci': 'lint',
   stylelint: 'lint',
   eslint: 'lint',
-  // ε: perf scripts map to the benchmark kind so perf-budget claims have
-  // durationMs-carrying evidence to bind to.
-  bench: 'benchmark',
-  benchmark: 'benchmark',
-  'perf:bench': 'benchmark',
+  // ε/B6-L4: perf keys are deliberately NOT in the default name map. A script
+  // merely NAMED `bench`/`benchmark`/`perf:bench` is usually a long-running
+  // local helper, and name-key discovery promoted it to a must-pass
+  // `benchmark` check under the default 120s timeout — a red check the
+  // project never opted into. Perf-budget claims get their benchmark evidence
+  // through an explicit `checks` entry with `kind: 'benchmark'` (or a
+  // `scriptKinds` override), which is opt-in by construction.
 }
 
 const DEFAULT_IGNORE_DIRS = [
@@ -234,6 +236,16 @@ export function checkId(source: CheckSource, command: readonly string[], cwd?: s
   // field existed (every root-dir check) stay byte-identical and the baselines
   // addressing them keep verifying. Monorepo siblings share argv but not cwd,
   // which is exactly what separates their identities.
+  //
+  // B6-L1 (collision note): the id truncates sha256 to 12 hex chars = 48
+  // bits. Two *different* (source, command, cwd) triples colliding is the
+  // birthday bound ~n²/2⁴⁹ (n=10⁴ checks in one workspace ⇒ ~3·10⁻⁷) and an
+  // adversary needs ~2⁴⁸ chosen invocations; behavioural dedupe (below) keys
+  // on (command, cwd), so a same-id/different-command collision would surface
+  // as two specs sharing one id — a wrong-fail, not a silent merge. Widening
+  // to 16 hex would change every existing id and orphan every baseline: it is
+  // a versioned protocol change, not a casual fix — this comment is the
+  // standing decision record.
   const material = cwd === undefined ? command.join('\u0000') : `${command.join('\u0000')}\u0000${cwd}`
   return `${source}:${sha256(material).slice(0, 12)}`
 }
@@ -242,8 +254,41 @@ export function checkId(source: CheckSource, command: readonly string[], cwd?: s
 // helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * B6-L3: minimal shell-words split for config `command` strings — quotes
+ * group, whitespace separates. The old `split(/\s+/)` shredded
+ * `pytest -k "foo bar"` into `["pytest","-k","\"foo","bar\""]`, and the quote
+ * fragments rode into argv, the label and the checkId material. Single and
+ * double quotes both group (no escape processing beyond `\'` inside single
+ * and `\"` inside double, matching the common shell reading); an unterminated
+ * quote keeps the rest of the string as one token rather than inventing a
+ * split the author never wrote. Behaviour for quote-free strings is
+ * byte-identical to the old splitter, so every existing id stays put.
+ */
 function toArray(command: string | readonly string[]): string[] {
-  return typeof command === 'string' ? command.split(/\s+/).filter(Boolean) : [...command]
+  if (typeof command !== 'string') return [...command]
+  const out: string[] = []
+  let current = ''
+  let quote: '"' | "'" | undefined
+  let started = false
+  const push = () => {
+    if (started) { out.push(current); current = ''; started = false }
+  }
+  for (let i = 0; i < command.length; i += 1) {
+    const ch = command[i] as string
+    if (quote !== undefined) {
+      if (ch === quote) { quote = undefined; continue }
+      if (ch === '\\' && i + 1 < command.length && command[i + 1] === quote) { current += quote; i += 1; continue }
+      current += ch
+      continue
+    }
+    if (ch === '"' || ch === "'") { quote = ch; started = true; continue }
+    if (/\s/.test(ch)) { push(); continue }
+    current += ch
+    started = true
+  }
+  push()
+  return out
 }
 
 function join(root: string, ...parts: string[]): string {

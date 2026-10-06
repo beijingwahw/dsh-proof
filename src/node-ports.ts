@@ -175,8 +175,24 @@ function findCmdShim(command: string, env: NodeJS.ProcessEnv, cwd: string): stri
   return undefined
 }
 
+/**
+ * H-18: how long the port keeps waiting for `close` (exit + stdio EOF) after
+ * it already knows the child is gone — the window in which a grandchild still
+ * holding an inherited pipe must either let go or be declared "the pipes are
+ * stuck". Also the grace added to the kill deadline for the absolute
+ * settle-or-error backstop. Injectable so the deadline behaviour is testable
+ * in real time instead of sleeping five seconds per case.
+ */
+export const PROCESS_TREE_GRACE_MS = 5_000
+
 /** Spawns argv vectors without a shell — no quoting games, no injection surface. */
 export class NodeCommandPort implements CommandPort {
+  private readonly settleGraceMs: number
+
+  constructor(settleGraceMs: number = PROCESS_TREE_GRACE_MS) {
+    this.settleGraceMs = settleGraceMs
+  }
+
   async run(argv: readonly string[], options: CommandRunOptions): Promise<CommandResult> {
     // An already-aborted signal never fires its 'abort' listener, so checking
     // after spawn would let the child run until the timeout killed it.
@@ -187,9 +203,29 @@ export class NodeCommandPort implements CommandPort {
     // same PATH the child will: inherited environment first, deterministic
     // color/CI defaults on top of it, caller overlay last — hosts stay free
     // to override when they must, everything else gets deterministic output.
+    // B8-L2: an inherited NODE_V8_COVERAGE (the host process itself being
+    // instrumented) is stripped — without this every check child and every
+    // git child would keep writing V8 profiles into the HOST's coverage tree,
+    // polluting the host report and perturbing the audited code. The runner's
+    // deliberate per-run injection arrives via `options.env`, and the
+    // overlay-last order keeps it authoritative.
+    const inherited: NodeJS.ProcessEnv = { ...process.env }
+    delete inherited.NODE_V8_COVERAGE
     const env: NodeJS.ProcessEnv = {
-      ...process.env, CI: '1', FORCE_COLOR: '0', NO_COLOR: '1', ...(options.env ?? {}),
+      ...inherited, CI: '1', FORCE_COLOR: '0', NO_COLOR: '1', ...(options.env ?? {}),
     }
+    // B8-L2 platform fact, verified on node 24/win32: Node core propagates
+    // NODE_V8_COVERAGE into spawned node children EVEN WHEN the passed env
+    // block omits it (NODE_OPTIONS-family behaviour; control variables do
+    // not leak — the env block is honoured). When the host instrumented
+    // itself but this run injects no coverage of its own, the host's flag is
+    // unset for the duration of the synchronous spawn — the only window Node
+    // reads it in — so the child cannot inherit it through that channel
+    // either. An explicit overlay (the runner's per-run staging directory)
+    // wins over the propagation, so the deliberate injection is unaffected.
+    const hostCoverageLeak = options.env?.NODE_V8_COVERAGE === undefined
+      ? process.env.NODE_V8_COVERAGE
+      : undefined
     const [command, ...args] = process.platform === 'win32'
       ? resolveWindowsArgv(argv, env, options.cwd)
       : [...argv]
@@ -204,6 +240,9 @@ export class NodeCommandPort implements CommandPort {
       let aborted = false
       let timedOut = false
       let settled = false
+      // H-18(b): the child's own death facts, captured at 'exit' so a forced
+      // settle (pipes stuck open) can still report them honestly.
+      let exitSeen: { code: number | null; signal: string | null } | undefined
       // One decoder per stream: a multi-byte UTF-8 character straddling a
       // chunk boundary must survive the join instead of becoming U+FFFD —
       // captured evidence has to be byte-faithful for digests to be stable.
@@ -212,11 +251,24 @@ export class NodeCommandPort implements CommandPort {
 
       let child: ReturnType<typeof spawn>
       try {
+        if (hostCoverageLeak !== undefined) delete process.env.NODE_V8_COVERAGE
         child = spawn(command, args, {
           cwd: options.cwd,
           env,
           stdio: ['ignore', 'pipe', 'pipe'],
           shell: false,
+          // H-18: on POSIX the child becomes its own process-group leader so
+          // a timeout/abort kill can take down the WHOLE tree — a grandchild
+          // holding an inherited stdio pipe is exactly why `close` (exit +
+          // stdio EOF) would otherwise never fire after the direct child
+          // dies, leaving this CommandResult forever pending and the whole
+          // verification batch hung. Windows is deliberately untouched:
+          // libuv spawns children into a job object there, and controlled
+          // experiments (D1 cross-validation + this suite's tree-kill test)
+          // show BOTH a kill of the direct child and its voluntary exit take
+          // the entire tree with them — `detached` would only detach the
+          // child from that guarantee without adding anything.
+          ...(process.platform !== 'win32' ? { detached: true } : {}),
         })
       } catch (error) {
         // Some argv heads (an explicit `.cmd`/`.bat` path, a null byte)
@@ -231,7 +283,19 @@ export class NodeCommandPort implements CommandPort {
           spawnError: `spawn failed: ${error instanceof Error ? error.message : String(error)}`,
         })
         return
+      } finally {
+        // B8-L2: restore the host's own instrumentation flag the instant the
+        // synchronous spawn (or its synchronous failure) is past — the host
+        // process keeps its own coverage configuration untouched.
+        if (hostCoverageLeak !== undefined) process.env.NODE_V8_COVERAGE = hostCoverageLeak
       }
+
+      // H-18(b): settle safety nets. `close` = exit + stdio EOF; a descendant
+      // holding an inherited pipe can keep EOF away long after (on POSIX,
+      // forever). These timers force the promise to settle with the facts the
+      // port already holds instead of hanging the caller's batch. Both are
+      // cleared by `finish` on the normal path.
+      const settleTimers: NodeJS.Timeout[] = []
 
       const finish = (
         exitCode: number | null,
@@ -242,13 +306,22 @@ export class NodeCommandPort implements CommandPort {
         if (settled) return
         settled = true
         clearTimeout(timer)
+        for (const t of settleTimers) clearTimeout(t)
         options.signal.removeEventListener('abort', onAbort)
         // Flush decoders: a tail partial sequence (killed process) surfaces
         // as replacement characters instead of silently vanishing bytes.
         output += stdoutDecoder.end() + stderrDecoder.end()
+        // B7-L1: truncation is stated IN the captured output, not merely
+        // implied by the cap — a reader holding a clean-looking head must be
+        // able to tell there was more (the failure line was typically at the
+        // tail we dropped). The marker rides the tail and is digested like
+        // any other content.
+        const captured = output.length > maxChars
+          ? `${output.slice(0, maxChars)}\n[dsh-proof] output truncated: kept ${maxChars} of ${output.length} chars`
+          : output
         resolve({
           exitCode,
-          output: output.slice(0, maxChars),
+          output: captured,
           durationMs: Date.now() - started,
           aborted,
           ...(spawnError !== undefined ? { spawnError } : {}),
@@ -265,6 +338,30 @@ export class NodeCommandPort implements CommandPort {
         })
       }
 
+      // H-18(b): the exit facts survive a missing `close`. When the deadline
+      // fires the child is already gone on POSIX-shaped platforms — only the
+      // pipes were stuck — so its own exit code/signal are the honest answer,
+      // annotated with why the port settled without `close`.
+      const forceSettle = (reason: string): void => {
+        if (exitSeen !== undefined) {
+          if (timedOut && exitSeen.code === null) {
+            finish(null, `timed out after ${options.timeoutMs}ms (${reason})`, undefined, true)
+            return
+          }
+          finish(
+            exitSeen.code,
+            `${reason}; descendants may still hold the pipes`,
+            exitSeen.signal ?? undefined,
+            timedOut || undefined,
+          )
+          return
+        }
+        // Not even `exit` arrived: the kill window (timeout + escalation)
+        // elapsed without the child dying. Best-effort error shape carrying
+        // whatever first-class facts the port holds.
+        finish(null, `${reason}: no exit within the deadline`, undefined, timedOut || undefined)
+      }
+
       const onAbort = () => { aborted = true; killChild(child) }
       options.signal.addEventListener('abort', onAbort, { once: true })
 
@@ -272,6 +369,15 @@ export class NodeCommandPort implements CommandPort {
         timedOut = true
         killChild(child)
       }, Math.max(1, options.timeoutMs))
+
+      // H-18(b) absolute backstop: even `exit` refusing to arrive (kill
+      // escalation failing, platform weirdness) must not hang the batch
+      // forever. Fires after the full kill window (budget + grace + the
+      // SIGTERM→SIGKILL escalation) and settles with the no-exit shape above.
+      settleTimers.push(setTimeout(
+        () => forceSettle('kill deadline exceeded'),
+        Math.max(1, options.timeoutMs) + this.settleGraceMs + 2_500,
+      ))
 
       // Always feed the decoders (their buffered partial bytes must not
       // desync), only stop appending once the capture cap is far exceeded.
@@ -286,6 +392,16 @@ export class NodeCommandPort implements CommandPort {
       child.on('error', (error: NodeJS.ErrnoException) => {
         finish(null, `spawn failed: ${error.code ?? error.message}`)
       })
+      child.on('exit', (code: number | null, signal: string | null) => {
+        if (exitSeen !== undefined) return
+        exitSeen = { code, signal }
+        // Grace window for `close` to follow `exit` (it is milliseconds in
+        // the normal case): beyond it, somebody still holds the pipes.
+        settleTimers.push(setTimeout(
+          () => forceSettle('stdio still open after child exit'),
+          this.settleGraceMs,
+        ))
+      })
       child.on('close', (code: number | null, signal: string | null) => {
         if (timedOut && code === null) {
           // The spawnError text stays (consumers match on it), but the
@@ -293,18 +409,37 @@ export class NodeCommandPort implements CommandPort {
           finish(null, `timed out after ${options.timeoutMs}ms`, undefined, true)
           return
         }
-        // `signal` is the child's own signalCode at exit time, surfaced
-        // verbatim: how the process died is a fact the port must carry.
-        finish(code, undefined, signal ?? undefined)
+        // H-18(d)/B7-M1: a child that trapped our SIGTERM and exited BY CODE
+        // (graceful services, jest worker pools — common on POSIX) must not
+        // launder the timeout into a decisive exit-code result: "we killed it
+        // for exceeding the budget" is true whatever shape the corpse took,
+        // so `timedOut` rides along and the runner reads it before the code.
+        finish(code, undefined, signal ?? undefined, timedOut || undefined)
       })
     })
   }
 }
 
 function killChild(child: ReturnType<typeof spawn>): void {
+  // H-18: take the whole process tree down, not just the direct child.
+  // POSIX: the child was spawned detached (group leader), so a negative pid
+  // signals the entire group — grandchildren included — which is what
+  // releases the stdio pipes `close` is waiting on. Windows: libuv's job
+  // object already kills the tree together with the child (verified by
+  // controlled experiment — kill AND voluntary exit both take grandchildren
+  // down on win32), so the plain child kill is the whole answer there.
+  const groupKill = (signal: NodeJS.Signals): void => {
+    if (process.platform !== 'win32' && child.pid !== undefined) {
+      try {
+        process.kill(-child.pid, signal)
+        return
+      } catch { /* group already gone — fall through to the direct kill */ }
+    }
+    try { child.kill(signal) } catch { /* already gone */ }
+  }
   try {
-    child.kill('SIGTERM')
-    setTimeout(() => { try { child.kill('SIGKILL') } catch { /* already gone */ } }, 2_000).unref()
+    groupKill('SIGTERM')
+    setTimeout(() => { groupKill('SIGKILL') }, 2_000).unref()
   } catch { /* already gone */ }
 }
 
@@ -413,6 +548,25 @@ export class NodeFsPort implements FsPort {
 
   async appendLine(filePath: string, line: string): Promise<void> {
     await fsp.mkdir(path.dirname(filePath), { recursive: true })
+    // M-31: the log path must be a regular file before the host appends to
+    // it. In workspace evidence mode the log lives in an agent-writable
+    // directory; a symlink planted there used to redirect every host-side
+    // append (agent-influenced JSON payloads) through to ANY file the host
+    // can write. `writeFile` already refuses transitively (temp+rename
+    // replaces the link itself); this makes appendLine symmetric with it.
+    // An absent path is fine (first line); anything that exists and is not a
+    // regular file — symlink, junction, directory — is refused loudly.
+    let existing: import('node:fs').Stats | undefined
+    try {
+      existing = await fsp.lstat(filePath)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    if (existing !== undefined && !existing.isFile()) {
+      throw new Error(
+        `appendLine refuses '${filePath}': not a regular file (${existing.isSymbolicLink() ? 'symlink' : existing.isDirectory() ? 'directory' : 'special file'}) — the evidence log must not be a redirect`,
+      )
+    }
     await fsp.appendFile(filePath, `${line}\n`, 'utf8')
   }
 
@@ -497,10 +651,16 @@ export class NodeEd25519Signer implements SignerPort {
       const publicPem = publicKey.export({ type: 'spki', format: 'pem' }) as string
       // Write the private half first (atomic temp+rename, owner-only) so a
       // crash never leaves a public half without its private counterpart.
+      // M-83: the public half is now atomic too — a torn first write used to
+      // leave a half PEM whose sha256 drifted the keyId and made verify()
+      // throw (read as `false`) for every historical checkpoint until an
+      // operator deleted the file by hand.
       const privateTmp = nextTempName(privateKeyPath)
       await fsp.writeFile(privateTmp, privatePem, { mode: 0o600 })
       await renameReplacing(privateTmp, privateKeyPath)
-      await fsp.writeFile(publicKeyPath, publicPem, { mode: 0o644 })
+      const publicTmp = nextTempName(publicKeyPath)
+      await fsp.writeFile(publicTmp, publicPem, { mode: 0o644 })
+      await renameReplacing(publicTmp, publicKeyPath)
     }
     let publicPem: string
     try {
@@ -508,7 +668,35 @@ export class NodeEd25519Signer implements SignerPort {
     } catch {
       // Key exists but the public half is missing: derive it from the private key.
       publicPem = createPublicKey(createPrivateKey(privatePem)).export({ type: 'spki', format: 'pem' }) as string
-      await fsp.writeFile(publicKeyPath, publicPem, { mode: 0o644 })
+      const publicTmp = nextTempName(publicKeyPath)
+      await fsp.writeFile(publicTmp, publicPem, { mode: 0o644 })
+      await renameReplacing(publicTmp, publicKeyPath)
+    }
+    // M-83: the private half is the authority — verify the public file
+    // actually matches it. A torn write or an on-disk swap used to be
+    // adopted silently, drifting keyId (a torn half) or pinning verification
+    // to a stranger's key (a swap). Mismatch repairs the public half
+    // atomically from the private key (keyId stays stable, every historical
+    // checkpoint keeps verifying) and says so loudly: the trust directory is
+    // host-side operational surface, stderr is the always-available channel.
+    const derivedPublicPem = createPublicKey(createPrivateKey(privatePem))
+      .export({ type: 'spki', format: 'pem' }) as string
+    if (publicPem !== derivedPublicPem) {
+      process.stderr.write(
+        `dsh-proof: signer public key at ${publicKeyPath} does not match the private key — repaired from the private half (torn write or tamper?)\n`,
+      )
+      const repairTmp = nextTempName(publicKeyPath)
+      await fsp.writeFile(repairTmp, derivedPublicPem, { mode: 0o644 })
+      await renameReplacing(repairTmp, publicKeyPath)
+      publicPem = derivedPublicPem
+    }
+    // Belt and braces: one sign+verify round-trip through the loaded pair
+    // before the signer is handed out, so a key that cannot even self-verify
+    // fails HERE, loudly, instead of poisoning every later checkpoint.
+    const selfTest = Buffer.from('dsh-proof signer self-test', 'utf8')
+    const selfSignature = edSign(null, selfTest, createPrivateKey(privatePem))
+    if (!edVerify(null, selfTest, createPublicKey(publicPem), selfSignature)) {
+      throw new Error(`ed25519 key pair in ${dir} failed its sign+verify self-test`)
     }
     return new NodeEd25519Signer(privatePem, publicPem)
   }
@@ -568,8 +756,17 @@ export function parsePorcelainZ(output: string): string[] {
 export class GitWorkspace implements WorkspacePort {
   readonly root: string
   private readonly commands: CommandPort
-  /** Cached availability probe: git usability does not flip mid-process. */
+  /**
+   * Cached availability probe — with a B8-L4 twist: only a DEFINITIVE answer
+   * (git ran and said "true", or ran and exited non-zero) is remembered for
+   * the process lifetime. A probe that produced no answer at all (timeout
+   * while an AV scanner warms up git.exe, a spawn failure) may have been
+   * transient, so exactly one in-session re-probe is allowed before the
+   * failure is believed — "the probe could not run" is not "there is no git".
+   */
   private gitAvailablePromise: Promise<boolean> | undefined
+  private gitAvailableDefinitive = false
+  private gitProbeAttempts = 0
 
   constructor(root: string, commands: CommandPort = new NodeCommandPort(), clock: Clock = new SystemClock()) {
     this.root = root
@@ -579,23 +776,33 @@ export class GitWorkspace implements WorkspacePort {
 
   /**
    * Whether git can answer questions about this workspace at all — the binary
-   * is present AND the root sits inside a work tree (E3). Probed once and
-   * remembered: availability cannot flip while the process lives, and every
-   * re-probe on a git-less host would burn the 5s timeout again.
+   * is present AND the root sits inside a work tree (E3). Probed and
+   * remembered as described on the fields above: definitive answers never
+   * re-probe; answer-less probes get one retry.
    *
    * `--is-inside-work-tree` exits non-zero outside any repository, but exits
    * ZERO with "false" inside a bare one — so the output is checked too, not
    * just the exit code, or a bare repo would pass as verifiable.
    */
   gitAvailable(): Promise<boolean> {
-    this.gitAvailablePromise ??= this.commands
+    if (this.gitAvailablePromise !== undefined
+      && (this.gitAvailableDefinitive || this.gitProbeAttempts >= 2)) {
+      return this.gitAvailablePromise
+    }
+    this.gitProbeAttempts += 1
+    this.gitAvailablePromise = this.commands
       .run(['git', 'rev-parse', '--is-inside-work-tree'], {
         cwd: this.root, timeoutMs: 5_000, signal: AbortSignal.timeout(5_000),
       })
-      .then(
-        result => result.exitCode === 0 && result.output.trim() === 'true',
-        () => false, // a probe that cannot even run is not an availability proof
-      )
+      .then((result) => {
+        if (result.exitCode !== null && result.spawnError === undefined) {
+          this.gitAvailableDefinitive = true
+          return result.exitCode === 0 && result.output.trim() === 'true'
+        }
+        // A probe that cannot even run is not an availability proof — and not
+        // proof of absence either: answer false now, retry once later.
+        return false
+      }, () => false)
     return this.gitAvailablePromise
   }
 
@@ -603,6 +810,20 @@ export class GitWorkspace implements WorkspacePort {
     const result = await this.commands.run(['git', 'rev-parse', 'HEAD'], {
       cwd: this.root, timeoutMs: 5_000, signal: AbortSignal.timeout(5_000),
     })
+    // B8-L1/M-82: "no answer" (timeout kill, caller abort, spawn failure) is
+    // a query FAILURE, not "no commit" — folding it into null let a transient
+    // HEAD failure silently narrow every later change set (changedSince is
+    // skipped on a null head, and nothing said the head was merely unknown).
+    // Throwing lands in the engine's existing git-blind degradation
+    // (gitHeadMissing -> forced full run). Only an ANSWERED non-zero exit —
+    // an unborn branch, a non-repo — is the legitimate null: "no commit" is
+    // a fact, not a failure.
+    if (result.exitCode === null || result.spawnError !== undefined) {
+      const detail = result.spawnError !== undefined
+        ? result.spawnError
+        : `killed or timed out${result.aborted ? ' (aborted by the caller)' : ''}`
+      throw new Error(`git rev-parse HEAD produced no answer (${detail})`)
+    }
     return result.exitCode === 0 ? result.output.trim() || null : null
   }
 
@@ -652,10 +873,13 @@ export class GitWorkspace implements WorkspacePort {
    * A failed query rejects (see `requireGitOk`): never a silent empty set.
    */
   async changedSince(ref: string): Promise<string[]> {
-    const result = await this.commands.run(['git', 'diff', '--name-only', '-z', ref], {
+    // B8-L5: the trailing `--` ends the revision list — a ref that begins
+    // with '-' (it comes from baseline material) must never be parsed as a
+    // git OPTION (`--output=<file>` writes files).
+    const result = await this.commands.run(['git', 'diff', '--name-only', '-z', ref, '--'], {
       cwd: this.root, timeoutMs: 15_000, signal: AbortSignal.timeout(15_000),
     })
-    this.requireGitOk(result, `diff --name-only -z ${ref}`)
+    this.requireGitOk(result, `diff --name-only -z ${ref} --`)
     return result.output.split('\0').filter(Boolean).sort()
   }
 

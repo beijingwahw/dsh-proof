@@ -244,9 +244,12 @@ export const DEFAULT_TRUST_WEIGHTS: TrustWeights = { classB: 0.7, classC: 0.9, h
  * believe, which is the correct direction of skepticism for self-interested
  * proof systems.
  *
- * Direction needs no special case: a 'reject' verdict arrives with a low
- * probability-that-the-claim-is-true, and p^w is low exactly then. The
- * probability carries the direction; the weight carries only the belief.
+ * Direction needs no special case IN THE FACTOR: a 'reject' verdict arrives
+ * with a low probability-that-the-claim-is-true, and p^w is low exactly then.
+ * The probability carries the direction; the weight carries only the belief.
+ * (The *fusion* layer does consume the verdict — see `fuseConfidence` —
+ * because there a rejection raising the machine's confidence must be
+ * structurally impossible, number field notwithstanding.)
  */
 export function attestationFactor(att: Attestation, weights: TrustWeights): number {
   if (att.kind === 'attest/jury') {
@@ -292,6 +295,19 @@ export function attestationFactor(att: Attestation, weights: TrustWeights): numb
  * value can never overshoot the witness's own assertion (both mixture
  * endpoints are p and current).
  *
+ * H-30 — a REJECTING verdict never mixtures. The mixture's premise is that
+ * the witness asserts a probability for the WHOLE claim; a juror whose
+ * verdict is 'reject' testifies *against* it, and testimony against enters
+ * as the discount (`attestationFactor`, multiplicatively — the same seam a
+ * Class C rejection takes), never as an asserted high confidence. Before
+ * this, `fuseConfidence(0.94, reject@0.99)` returned 0.975 — a sworn
+ * rejection CARRYING the number across a 0.97 certify target — because the
+ * algebra read only the probability field and treated the verdict as display
+ * text. (`parseJury` now refuses such self-contradictory records at the
+ * chain-read boundary; this branch is the second lock, for
+ * directly-constructed records, so the guarantee does not depend on which
+ * door the record came through.)
+ *
  * Class C is binary (the approval seam carries no number), so it does not
  * mixture: an endorsement is *risk acceptance*, not certainty transfer — it
  * leaves the confidence untouched (the human accepted the residual; the
@@ -309,6 +325,9 @@ export function fuseConfidence(current: number, att: Attestation, weights: Trust
   }
   if (att.verdict === 'abstain') return current
   if (!isUsableProbability(att.probability)) return current
+  // H-30: the verdict is consumed — a rejection books the discount, whatever
+  // its number field says; only an uphold mixture-pulls toward the number.
+  if (att.verdict === 'reject') return current * attestationFactor(att, weights)
   const w = weights.classB
   return (1 - w) * current + w * att.probability
 }
@@ -415,12 +434,33 @@ function isJuryProbability(v: unknown): v is number {
   return isFiniteNumber(v) && v >= 0 && v <= 1
 }
 
+/**
+ * H-30: the verdict and the probability must agree on direction — `reject`
+ * is "the materials contradict the claim", `uphold` is "the materials
+ * support it", and `probability` is (per the rubric the juror was shown) the
+ * probability the claim is TRUE. `reject @ 0.99` and `uphold @ 0.01` are a
+ * witness contradicting its own delivery in one payload: the obligation
+ * layer reads the verdict ('not upheld'), the fusion layer used to read the
+ * number ('pull to 0.99'), and the record could carry a certification it
+ * swore against. Same handling as an out-of-domain probability — the record
+ * is skipped through the identical malformed-payload channel; there is no
+ * verdict on record, and no layer can cherry-pick the half that suits it.
+ * `abstain` carries no direction and is coherent at any probability (the
+ * number is recorded, read as display context, and priced as abstain).
+ */
+function isCoherentJury(verdict: string, probability: number): boolean {
+  if (verdict === 'uphold') return probability >= 0.5
+  if (verdict === 'reject') return probability <= 0.5
+  return true
+}
+
 function parseJury(p: Record<string, unknown>): JuryAttestation | undefined {
   if (
     !isString(p.claimId) || !isGen(p.gen) || !isString(p.prompt) || !isString(p.rubricVersion)
     || !isString(p.model) || typeof p.independence !== 'string' || !INDEPENDENCE.has(p.independence)
     || typeof p.verdict !== 'string' || !VERDICTS.has(p.verdict)
-    || !isJuryProbability(p.probability) || !isString(p.output) || !isFiniteNumber(p.at)
+    || !isJuryProbability(p.probability) || !isCoherentJury(p.verdict, p.probability)
+    || !isString(p.output) || !isFiniteNumber(p.at)
   ) return undefined
   return {
     kind: 'attest/jury',

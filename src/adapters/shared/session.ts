@@ -10,13 +10,24 @@
  * mirror observe.ts:184-214 case for case; where this file diverges it says so
  * and why in a comment.
  *
+ * H-19 (v0.23): the snapshot file is self-checking. It carries a canonical
+ * digest as its tail field, recomputed on every load; a file whose body does
+ * not address itself is treated as damaged — reset to empty and announced on
+ * stderr — instead of being trusted. This is a CONTENT check, not an
+ * authenticated one: a same-user process can recompute the digest too. What
+ * it buys honestly: the cheap forgery (hand-edit `firedNotices`, swap in a
+ * pre-burned ledger, splice observations) stops being SILENT — the reset is
+ * loud, and one-time notices that were "already fired" fire again. The
+ * boundary of this defence is documented in the adapters: chain integrity
+ * lives in the signed evidence log, not here.
+ *
  * @module dsh-proof/adapters/shared/session
  */
 
 import * as fsp from 'node:fs/promises'
 
-import { sha256 } from '../../core/hash.ts'
-import { SHELL_TOOL_RE, WorkspaceWatch, isMutationToolName, toWorkspaceRelative } from '../../dsh/observe.ts'
+import { canonicalJson, sha256 } from '../../core/hash.ts'
+import { isShellToolName, WorkspaceWatch, isMutationToolName, toWorkspaceRelative } from '../../dsh/observe.ts'
 
 /**
  * Everything the watcher knows about one session, in JSON.
@@ -26,19 +37,25 @@ import { SHELL_TOOL_RE, WorkspaceWatch, isMutationToolName, toWorkspaceRelative 
  * - `fingerprints` records the LAST bytes a tool call observed per path —
  *   the anchor drift detection compares the disk against. It survives
  *   `windowStart` (bytes do not become un-seen because a turn ended).
+ * - `shellUsed` (M-29): a shell-class tool ran at least once this session.
+ *   Like observe.ts's session-level fact it is never cleared — once a shell
+ *   ran, "not in the touched set" no longer proves "changed outside the
+ *   agent's tools", and the drift narrative must say so instead of accusing.
+ *   Optional: pre-v0.23 snapshots predate it.
  */
 export interface AdapterSession {
   readonly touched: string[]
   readonly read: string[]
   readonly fingerprints: Record<string, string>
   readonly windowStartedAt: string
-  /** One-time notice ids already fired ('baseline' | 'verify'); reset never happens implicitly. */
+  /** One-time notice ids already fired ('baseline'); 'verify' re-arms per turn since v0.23. */
   readonly firedNotices: string[]
+  readonly shellUsed?: boolean
 }
 
 /** A fresh session: nothing observed, window starting now. */
 export function emptySession(nowIso: string): AdapterSession {
-  return { touched: [], read: [], fingerprints: {}, windowStartedAt: nowIso, firedNotices: [] }
+  return { touched: [], read: [], fingerprints: {}, windowStartedAt: nowIso, firedNotices: [], shellUsed: false }
 }
 
 /** Append without duplicates, preserving first-seen order (Set semantics as a value). */
@@ -52,17 +69,19 @@ function withPath(paths: readonly string[], rel: string): string[] {
  *
  * Classification is the two-way split the adapter contract fixes:
  * mutation-name → touched, everything else with paths → read. observe.ts's
- * third bucket (unknown-but-not-whitelisted → mutation, DSH tool names) is a
- * host-tool-name heuristic that does not transfer; the two-way split is the
- * part both adapters can name identically.
+ * unknown-name default IS mutation now (H-01's anchored list), so the split
+ * here inherits the conservative charge — an unrecognised write tool can
+ * only over-record a touch, never escape attribution.
  *
- * Shell tools are a documented blind spot and deliberately record NOTHING:
- * a command line carries no structured paths, and mining one for
- * path-shaped words would fingerprint noise. The safety net is that drift
- * detection still catches a shell changing a previously observed file — the
- * bytes no longer match the recorded fingerprint and no tool claimed the
- * touch — so a shell cannot silently invalidate what the session already
- * knows; only attribution of brand-new files escapes.
+ * Shell tools remain a documented blind spot for PATHS: a command line
+ * carries no structured paths, and mining one for path-shaped words would
+ * fingerprint noise. The safety net is that drift detection still catches a
+ * shell changing a previously observed file — the bytes no longer match the
+ * recorded fingerprint and no tool claimed the touch — so a shell cannot
+ * silently invalidate what the session already knows; only attribution of
+ * brand-new files escapes. What a shell call DOES contribute is the session
+ * fact `shellUsed` (set once, never cleared), so the drift narrative never
+ * asserts "outside your tool calls" in a session where that is unknowable.
  */
 export async function applyObservation(
   session: AdapterSession,
@@ -71,7 +90,9 @@ export async function applyObservation(
   root: string,
   readFile: (abs: string) => Promise<string | undefined>,
 ): Promise<AdapterSession> {
-  if (SHELL_TOOL_RE.test(toolName)) return session
+  if (isShellToolName(toolName)) {
+    return session.shellUsed === true ? session : { ...session, shellUsed: true }
+  }
   // Observer view (no contentKeys): 'source' stays out because in tool
   // arguments it far more often carries content than a path. The evidence
   // guard in gates.ts uses its own over-detecting view on purpose.
@@ -157,9 +178,9 @@ export async function computeDrift(
 
 /**
  * Open a new drift window at a turn boundary: this-window touches reset (the
- * next turn's mutations start from zero), while fingerprints, reads and
- * fired notices survive — last-seen bytes and one-time notices are session
- * facts, not per-turn ones.
+ * next turn's mutations start from zero), while fingerprints, reads and fired
+ * notices survive — last-seen bytes and one-time notices are session facts,
+ * not per-turn ones.
  */
 export function windowStart(session: AdapterSession, nowIso: string): AdapterSession {
   return { ...session, touched: [], windowStartedAt: nowIso }
@@ -178,6 +199,21 @@ export function sessionPath(dir: string, sessionId: string): string {
   return `${dir.replace(/\/+$/, '')}/${safe}.json`
 }
 
+// ---------------------------------------------------------------------------
+// Persistence — atomic write, self-checking read (H-19)
+// ---------------------------------------------------------------------------
+
+/**
+ * The snapshot's content digest: sha256 over the canonical form of the
+ * session bound to its session id, so a file cannot be replayed into another
+ * session (or another workspace's ledger — the dir itself is workspace-keyed)
+ * without the check noticing. Tail-field discipline: everything the watcher
+ * knows, then the digest of exactly that.
+ */
+export function sessionDigest(sessionId: string, session: AdapterSession): string {
+  return sha256(canonicalJson({ sessionId, session }))
+}
+
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every(item => typeof item === 'string')
 }
@@ -191,45 +227,76 @@ function isAdapterSession(value: unknown): value is AdapterSession {
     && isStringArray(v.read)
     && isStringArray(v.firedNotices)
     && typeof v.windowStartedAt === 'string'
+    && (v.shellUsed === undefined || typeof v.shellUsed === 'boolean')
     && typeof fingerprints === 'object' && fingerprints !== null && !Array.isArray(fingerprints)
     && Object.values(fingerprints).every(h => typeof h === 'string')
 }
 
+/** Best-effort stderr — the tamper/reset announcement must be visible, never fatal. */
+function defaultAnnounce(line: string): void {
+  try {
+    process.stderr.write(`${line}\n`)
+  } catch {
+    /* a closed stderr cannot stop the reset either */
+  }
+}
+
 /**
  * Load a session snapshot; undefined when it does not exist, fails to parse,
- * or does not look like a session. The next hook process is the reader this
- * function serves — it must never crash on a half-written or foreign file,
- * it must just start over (an empty session re-learns the workspace in one
- * turn of observation).
+ * does not look like a session, or FAILS ITS OWN DIGEST (H-19: a body that
+ * does not address itself is damaged goods — reset and say so, never trust
+ * it). The next hook process is the reader this function serves — it must
+ * never crash on a half-written, foreign or forged file, it must just start
+ * over (an empty session re-learns the workspace in one turn of observation),
+ * with the reset ANNOUNCED so a tampered ledger cannot pass silently as a
+ * working one.
  */
-export async function loadSession(dir: string, sessionId: string): Promise<AdapterSession | undefined> {
+export async function loadSession(
+  dir: string,
+  sessionId: string,
+  onDamaged?: (line: string) => void,
+): Promise<AdapterSession | undefined> {
+  const announce = onDamaged ?? defaultAnnounce
   let raw: string | undefined
   try {
     raw = await fsp.readFile(sessionPath(dir, sessionId), 'utf8')
   } catch {
     return undefined
   }
+  let parsed: unknown
   try {
-    const parsed: unknown = JSON.parse(raw)
-    return isAdapterSession(parsed) ? parsed : undefined
+    parsed = JSON.parse(raw)
   } catch {
     return undefined
   }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
+  const record = parsed as Record<string, unknown>
+  const { digest, ...body } = record
+  if (!isAdapterSession(body)) return undefined
+  if (typeof digest !== 'string' || digest !== sessionDigest(sessionId, body)) {
+    announce(`dsh-proof: session snapshot ${sessionPath(dir, sessionId)} failed its integrity check `
+      + `(hand-edited, forged, or written by a pre-v0.23 build); resetting the observation ledger — `
+      + `one-time notices will re-fire and drift re-learns in one turn of observation.`)
+    return undefined
+  }
+  return body
 }
 
 /**
  * Persist a session snapshot atomically: write a temp file beside the target,
- * then rename over it. A torn write is not hypothetical here — the writer and
- * the reader are different processes racing across hook invocations, and a
- * crash mid-write would otherwise hand the next hook a truncated JSON that
- * (at best) resets the watcher blind. Rename-on-POSIX and MoveFileEx on
- * Windows both make the replace all-or-nothing, so a reader sees the old or
- * the new snapshot, never half of either.
+ * then rename over it, with the content digest as the tail field (H-19). A
+ * torn write is not hypothetical here — the writer and the reader are
+ * different processes racing across hook invocations, and a crash mid-write
+ * would otherwise hand the next hook a truncated JSON that (at best) resets
+ * the watcher blind. Rename-on-POSIX and MoveFileEx on Windows both make the
+ * replace all-or-nothing, so a reader sees the old or the new snapshot, never
+ * half of either.
  */
 export async function saveSession(dir: string, sessionId: string, session: AdapterSession): Promise<void> {
   const target = sessionPath(dir, sessionId)
   await fsp.mkdir(dir, { recursive: true })
   const temp = `${target}.${process.pid}.tmp`
-  await fsp.writeFile(temp, `${JSON.stringify(session, null, 2)}\n`, 'utf8')
+  const body = `${JSON.stringify({ ...session, digest: sessionDigest(sessionId, session) }, null, 2)}\n`
+  await fsp.writeFile(temp, body, 'utf8')
   await fsp.rename(temp, target)
 }

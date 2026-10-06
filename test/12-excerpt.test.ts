@@ -248,3 +248,97 @@ test('SPEC (M12): degenerate one-line output — no double-counted head, no lyin
     assert.ok(e.keptOriginalChars > 0, `kept nothing at budget ${budget}`)
   }
 })
+
+// ---------------------------------------------------------------------------
+// H-33 — a non-finite budget is a loud configuration error, never a silent
+// empty excerpt. `Math.max(16, NaN)` is NaN, `slice(0, NaN)` is '' — the old
+// behaviour returned an EMPTY text with NaN accounting while outputDigest
+// still addressed "something": every evidence record's outputHead quietly
+// vanished and the books lied about it. Pure-function domain discipline:
+// refuse at the boundary.
+// ---------------------------------------------------------------------------
+
+test('H-33: a non-finite budget throws TypeError instead of emptying the excerpt', () => {
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+    for (const strategy of ['head', 'balanced'] as const) {
+      assert.throws(
+        () => excerptOutput('x'.repeat(500), { budget: bad, strategy }),
+        { name: 'TypeError', message: /finite number/ },
+        `${bad} (${strategy}) must refuse loudly`,
+      )
+    }
+  }
+  // The clamp below 16 still applies (a finite budget floors at the survival
+  // minimum) — pinned here because the SPEC loops start at 16 and never saw it.
+  const clamped = excerptOutput('x'.repeat(500), { budget: 5, strategy: 'head' })
+  assert.equal(clamped.text.length, 16, 'a finite sub-16 budget clamps up to 16')
+  assert.equal(clamped.keptOriginalChars, 16)
+  assert.equal(clamped.omittedChars, 500 - 16)
+})
+
+// ---------------------------------------------------------------------------
+// M-25 — the books must close against a GROUND-TRUTH recount, not against
+// the identity `omitted := length - kept` (true by construction, so it hid a
+// systematic over-report: the synthetic newlines joining NON-adjacent salient
+// picks were booked as kept original characters — +1 per surviving salient
+// line, a wrong number written into signed evidence records).
+//
+// The recount below is independent of the implementation's accounting: the
+// text minus its marker line decomposes into verbatim runs of the original;
+// kept original characters are exactly the characters inside those runs. A
+// run never ENDS on a newline unless the run continues past it (a newline
+// inside a run is original; the character after a run is a synthetic join).
+// ---------------------------------------------------------------------------
+
+function keptGroundTruth(text: string, original: string): number {
+  const markerStart = text.indexOf('[... ')
+  if (markerStart < 0) return text.length // no marker: every char is original
+  const markerEnd = text.indexOf(']', markerStart)
+  const pre = text.slice(0, markerStart - 1) // minus the synthetic join before the marker
+  const post = text.slice(markerEnd + 2)
+  const count = (segment: string): number => {
+    let i = 0
+    let kept = 0
+    while (i < segment.length) {
+      let run = Math.min(segment.length - i, 400)
+      while (run > 0) {
+        const candidate = segment.slice(i, i + run)
+        const endsOnDanglingNewline = candidate.endsWith('\n')
+          && i + run < segment.length
+          && !original.includes(segment.slice(i, i + run + 1))
+        if (original.includes(candidate) && !endsOnDanglingNewline) break
+        run -= 1
+      }
+      assert.ok(run > 0, `text is not verbatim segments of the original: ${JSON.stringify(segment.slice(i, i + 20))}`)
+      kept += run
+      i += run + 1 // the character after a run is a synthetic join
+    }
+    return kept
+  }
+  return pre.length + count(post)
+}
+
+test('M-25: keptOriginalChars is a ground-truth recount — non-adjacent salient picks included', () => {
+  const A = 'AssertionError: expected 1 to be 2'
+  const B = 'timeout: the retry loop exceeded the deadline' // a second salient line
+  const outputs = [
+    // two NON-adjacent salient lines (the join between them is manufactured
+    // by the assembly — the exact shape the old accounting over-booked)
+    ['banner line', A, 'filler one', 'filler two', 'filler three', 'filler four', B, 'footer line'].join('\n'),
+    // adjacent salient lines (their shared newline IS original)
+    ['short', A, B, 'end'].join('\n'),
+    // no salient middle, and a degenerate one-line output
+    SPEC_OUTPUTS[2] as string,
+    SPEC_OUTPUTS[3] as string,
+  ]
+  for (const output of outputs) {
+    for (let budget = 16; budget <= 400; budget += 1) {
+      const e = excerptOutput(output, { budget, strategy: 'balanced' })
+      assert.equal(
+        e.keptOriginalChars, keptGroundTruth(e.text, output),
+        `len ${output.length} budget ${budget}: reported kept ${e.keptOriginalChars}, ground truth ${keptGroundTruth(e.text, output)}`,
+      )
+      assert.equal(e.omittedChars + e.keptOriginalChars, output.length, `books close at budget ${budget}`)
+    }
+  }
+})

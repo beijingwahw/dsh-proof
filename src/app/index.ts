@@ -17,15 +17,16 @@
 
 export {
   BUNDLE_MEDIA_TYPE, CHAIN_MODES, CHECK_STATUSES, CLAIM_KINDS, GRADE_VALUES,
-  PROOF_MEDIA_TYPE, PROTOCOL_NAME, PROTOCOL_VERSION, VERDICT_VALUES,
-  appFingerprint, protocolHeader,
-  type BundleManifest,
+  LEGACY_PROTOCOL_VERSIONS, PROOF_MEDIA_TYPE, PROTOCOL_NAME, PROTOCOL_VERSION, VERDICT_VALUES,
+  adjudicateProtocol, appFingerprint, appFingerprintOfVersion, knownDialects, protocolHeader,
+  type BundleManifest, type KnownDialect, type ProtocolAdjudication,
 } from './protocol.ts'
 
 export {
   ANCHOR_FILE, BASELINE_FILE, EVIDENCE_FILE, buildBundle, verifyBundle,
-  type BundleAnchor, type BundleInput, type BundleVerification,
-  type ManifestFileEntry, type ProofBundle,
+  type BundleAnchor, type BundleChainMode, type BundleExtras, type BundleInput,
+  type BundleVerification, type ManifestFileEntry, type ManifestTransparency,
+  type ProofBundle, type TransparentBundleManifest,
 } from './bundle.ts'
 
 // The MCP face: the frozen five-tool contract, the pure per-message

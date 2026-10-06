@@ -136,9 +136,15 @@ export async function buildDependencyGraph(
     if (content === undefined) continue
     for (const site of extractImportSites(content)) {
       // Approximate edges, by specifier kind:
-      // - relative: resolve against the filesystem (the classic case).
-      // - bare: only Python dotted modules (`from pkg.mod import x` arrives
-      //   here because kindOf only recognises `.`/`/` prefixes) get a
+      // - relative: resolve against the filesystem (the classic case). H-24:
+      //   the resolver now counts LEADING DOTS the way Python does (`.mod` is
+      //   a sibling in the source file's package, `..x` the parent package),
+      //   instead of joining the dots as JS path segments — `pkg/.mod.py`
+      //   never existed on any disk. JS relative specifiers resolve through
+      //   the same dot arithmetic (their `.`/`..` semantics agree), plus the
+      //   Python `__init__.py` candidates for mixed trees.
+      // - bare: only Python dotted modules (`from pkg.mod import x`, bare
+      //   `import pkg.mod`, and the name-list sites those mint) get a
       //   filesystem attempt. A dotted name that happens to collide with a
       //   scanned file can only add a spurious edge — over-selection, which
       //   the soundness constitution allows; a missed edge is what it forbids.
@@ -346,7 +352,21 @@ function hasGlobMeta(literal: string): boolean {
 
 export function matches(file: RelPath, pattern: string): boolean {
   if (pattern === '*') return true
-  const normalized = pattern.replace(/\/+$/, '')
+  // M-26: a RelPath never begins with `./` or `/`, but users write both in
+  // config (`paths: ['./src/**']` is the most natural spelling there is).
+  // Normalising the PATTERN (not judging it unsupported) keeps the five-form
+  // semantics while un-deathing the prefixed spellings — the old matcher
+  // literal-compared `./src/` against `src/...` and never matched anything,
+  // a dead check wearing a live one's configuration (the exact M9 failure,
+  // resurrected through a leading dot). `/**`-under-prefix and `/*` and bare
+  // literals all normalise the same way; an empty residue (pattern `./`)
+  // matches nothing a user could mean, so it falls back to match-everything
+  // like every other shape this matcher refuses to interpret.
+  const normalized = pattern
+    .replace(/^(?:\.\/)+/, '')
+    .replace(/^\/+/, '')
+    .replace(/\/+$/, '')
+  if (normalized.length === 0) return true
   // M9 conservative fallback: a pattern that LOOKS like a glob but is not one
   // of the five supported shapes matches EVERYTHING. The old matcher silently
   // treated `src/**/*.ts` (or `a?b.ts`, or `{a,b}`) as a literal prefix — a
@@ -382,16 +402,33 @@ export interface ImportSite {
   readonly kind: 'relative' | 'bare'
 }
 
-const SITE_ESM_FROM = /(?:^|[;{}])\s*(?:import|export)\b[^\n]*?\bfrom\s+(['"])([^'"]+)\1/d
-const SITE_SIDE_EFFECT = /(?:^|[;{}])\s*import\s+(['"])([^'"]+)\1/d
-const SITE_PYTHON = /^from\s+([.\w][\w.]*)\s+import\b/d
-const SITE_REQUIRE = /require\(\s*(['"])([^'"]+)\1\s*\)/d
+// H-24/M-28: the in-line patterns carry the `g` flag and are consumed through
+// `matchAll` only — a direct `.exec` on a global regex would drag shared
+// `lastIndex` state across lines and silently skip sites. `matchAll` clones,
+// so one line yielding several sites (`import a from './b'; import c from './d'`)
+// reports every specifier: the second edge used to be invisible, and a missed
+// edge is the one direction the soundness constitution forbids.
+const SITE_ESM_FROM = /(?:^|[;{}])\s*(?:import|export)\b[^\n]*?\bfrom\s+(['"])([^'"]+)\1/gd
+const SITE_SIDE_EFFECT = /(?:^|[;{}])\s*import\s+(['"])([^'"]+)\1/gd
+const SITE_REQUIRE = /require\(\s*(['"])([^'"]+)\1\s*\)/gd
 // Dynamic `import('...')`: lazy chunks are imports too, and code-split files
 // break exactly like statically imported ones.
-const SITE_DYNAMIC_IMPORT = /\bimport\s*\(\s*(['"])([^'"]+)\1\s*\)/d
+const SITE_DYNAMIC_IMPORT = /\bimport\s*\(\s*(['"])([^'"]+)\1\s*\)/gd
 // Multi-line ESM tail: `import {\n ...\n} from './x'` — the `from` lives on a
-// line of its own that starts with `}`, invisible to SITE_ESM_FROM.
+// line of its own that starts with `}`, invisible to SITE_ESM_FROM. Anchored,
+// so at most one match per line and no `g` flag is needed.
 const SITE_MULTILINE_FROM = /^\s*\}\s*from\s+(['"])([^'"]+)\1/d
+// H-24: Python `from <module> import <names>` — module in group 1, the raw
+// name list in group 2 (both for the `from pkg import mod` submodule edge,
+// where the *name* is the dependency, not the package).
+const SITE_PYTHON = /^from\s+([.\w][\w.]*)\s+import\s*([^#\n]*)/d
+// H-24: bare Python `import pkg.mod [as m][, pkg2.mod2 as m2 ...]`. No JS
+// statement has this shape (`import x from ...` needs `from`, side-effect
+// imports quote), so treating it as a Python site can only over-include.
+// Each comma segment is its own dependency statement; an `as` alias renames
+// the binding, so the dotted head before it is the specifier; a trailing
+// `# comment` is tolerated (`#` cannot occur inside a dotted name).
+const SITE_PYTHON_BARE = /^import\s+((?:[.\w][\w.]*(?:\s+as\s+[\w.]+)?\s*,\s*)*[.\w][\w.]*(?:\s+as\s+[\w.]+)?)\s*(?:#.*)?$/d
 
 /** Pull every import site (specifier + cursor position) out of source text. */
 export function extractImportSites(content: string): ImportSite[] {
@@ -401,12 +438,15 @@ export function extractImportSites(content: string): ImportSite[] {
     const trimmed = rawLine.trim()
     if (trimmed.length === 0 || trimmed.startsWith('//') || trimmed.startsWith('#') || trimmed.startsWith('*')) return
     for (const pattern of [SITE_ESM_FROM, SITE_SIDE_EFFECT, SITE_DYNAMIC_IMPORT, SITE_MULTILINE_FROM, SITE_REQUIRE]) {
-      const match = pattern.exec(rawLine)
-      const groups = match?.indices
-      const start = groups?.[2]?.[0]
-      const specifier = match?.[2]
-      if (start !== undefined && specifier !== undefined) {
-        out.push({ specifier, line: index, character: start, kind: kindOf(specifier) })
+      // Global patterns report every in-line site; the anchored multi-line
+      // tail form yields at most one — matchAll would reject it for lack of /g.
+      const matches = pattern.global ? rawLine.matchAll(pattern) : [pattern.exec(rawLine)].filter(m => m !== null)
+      for (const match of matches) {
+        const start = match.indices?.[2]?.[0]
+        const specifier = match[2]
+        if (start !== undefined && specifier !== undefined) {
+          out.push({ specifier, line: index, character: start, kind: kindOf(specifier) })
+        }
       }
     }
     const py = SITE_PYTHON.exec(trimmed)
@@ -414,6 +454,43 @@ export function extractImportSites(content: string): ImportSite[] {
     if (pyStart !== undefined && py?.[1] !== undefined) {
       const indent = rawLine.length - rawLine.trimStart().length
       out.push({ specifier: py[1], line: index, character: pyStart + indent, kind: kindOf(py[1]) })
+      // H-24(c): `from pkg import mod` binds the SUBMODULE pkg/mod.py, and
+      // `from . import x` binds pkg/x.py — the name list carries those edges.
+      // Only plain identifier names are followed (an `as` alias renames the
+      // binding, `(` opens a multi-line list the line cannot close); the
+      // resolution itself stays proof-of-existence, so a plain function import
+      // (`from pkg import helper` with no pkg/helper.py) adds nothing.
+      const listStart = py.indices?.[2]?.[0]
+      if (listStart !== undefined) {
+        let cursor = listStart
+        for (const rawName of (py[2] ?? '').split(',')) {
+          const head = /^[\s(]*([\w.]+)/.exec(rawName)
+          if (head?.[1] !== undefined) {
+            const name = head[1]
+            out.push({
+              specifier: `${py[1]}.${name}`,
+              line: index,
+              character: cursor + (head.index ?? 0) + (head[0].length - head[1].length) + indent,
+              kind: kindOf(`${py[1]}.${name}`),
+            })
+          }
+          cursor += rawName.length + 1
+        }
+      }
+    }
+    const bare = SITE_PYTHON_BARE.exec(trimmed)
+    const bareSpan = bare?.indices?.[1]
+    if (bare?.[1] !== undefined && bareSpan?.[0] !== undefined) {
+      const indent = rawLine.length - rawLine.trimStart().length
+      let cursor = bareSpan[0]
+      for (const rawName of bare[1].split(',')) {
+        const lead = rawName.length - rawName.trimStart().length
+        const name = /^([\w.]+)/.exec(rawName.trim())?.[1]
+        if (name !== undefined) {
+          out.push({ specifier: name, line: index, character: cursor + lead + indent, kind: kindOf(name) })
+        }
+        cursor += rawName.length + 1
+      }
     }
   })
   return out
@@ -427,9 +504,10 @@ function kindOf(specifier: string): 'relative' | 'bare' {
  * Pull workspace-reachable module specifiers out of source text.
  *
  * Line-based rather than one heroic regex: ESM/CJS `import`/`export ... from`,
- * bare side-effect `import '...'`, `require('...')`, and Python `from x.y import`.
- * Bare package names and `node:` builtins are dropped — those are external
- * dependencies, already covered by the lockfile rules.
+ * bare side-effect `import '...'`, `require('...')`, Python `from x.y import`
+ * (module and imported names) and bare `import x.y`. Bare package names and
+ * `node:` builtins are dropped — those are external dependencies, already
+ * covered by the lockfile rules.
  */
 export function extractImports(content: string): string[] {
   const out = new Set<string>()
@@ -449,26 +527,43 @@ function add(into: Set<string>, specifier: string): void {
   if (/^[A-Za-z_][\w]*(\.[\w_]+)+$/.test(value)) into.add(value)
 }
 
+/**
+ * Resolve a `.`-prefixed specifier against the scanned file set.
+ *
+ * H-24: the leading-dot run is walked Python-style — `.` keeps the source
+ * file's directory, each extra dot climbs one level, the remainder's dots
+ * become path separators. This is also correct for JS `./x`/`../y` (their
+ * semantics agree at one and two dots), and it replaces the old JS join,
+ * which turned Python's `.mod` into the never-existing `pkg/.mod.py` — the
+ * reason every relative Python form used to be edgeless.
+ */
 function resolveSpecifier(from: RelPath, specifier: string, known: ReadonlySet<RelPath>): RelPath | undefined {
   if (!specifier.startsWith('.')) return undefined
-  const base = dirname(from)
-  const joined = normalizePath(`${base}/${specifier}`)
+  const dots = /^\.+/.exec(specifier)?.[0]?.length ?? 0
+  const rest = specifier.slice(dots)
+  let base = dirname(from)
+  for (let i = 1; i < dots; i += 1) base = dirname(base)
+  const joined = normalizePath(rest === '' ? base : `${base}/${rest.replace(/\./g, '/')}`)
   const candidates = [
     joined,
     `${joined}.ts`, `${joined}.tsx`, `${joined}.js`, `${joined}.jsx`, `${joined}.mjs`, `${joined}.cjs`,
     `${joined}/index.ts`, `${joined}/index.tsx`, `${joined}/index.js`, `${joined}/index.py`,
-    `${joined}.py`, `${joined}.go`, `${joined}.rs`,
+    // Python candidates: a module is `pkg/mod.py`, a package is
+    // `pkg/mod/__init__.py`, and `from . import x` resolves to the enclosing
+    // package's `__init__.py` (specifier `.`, rest empty, joined = the dir).
+    `${joined}.py`, `${joined}/__init__.py`, `${joined}.go`, `${joined}.rs`,
   ]
   for (const candidate of candidates) if (known.has(candidate)) return candidate
   return undefined
 }
 
 /**
- * Python-style absolute import: `from pkg.mod import x` -> pkg/mod.py or
- * pkg/mod/__init__.py, but only when that target is genuinely in the scanned
- * set — the edge is added on proof of existence, never on speculation.
- * JS bare specifiers (`@scope/pkg`, `lodash/get`) fail the shape test and
- * stay external, as before.
+ * Python-style dotted import: `from pkg.mod import x` (absolute), bare
+ * `import pkg.mod`, and the name-list sites those forms mint (`from pkg
+ * import mod` -> pkg/mod.py) — but only when the target is genuinely in the
+ * scanned set — the edge is added on proof of existence, never on
+ * speculation. JS bare specifiers (`@scope/pkg`, `lodash/get`) fail the shape
+ * test and stay external, as before.
  */
 function resolveBarePythonModule(specifier: string, known: ReadonlySet<RelPath>): RelPath | undefined {
   if (!/^[\w.]+$/.test(specifier)) return undefined

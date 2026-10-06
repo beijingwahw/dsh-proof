@@ -26,6 +26,7 @@ import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 
 import { sha256 } from '../src/core/hash.ts'
+import { deriveProofPaths } from '../src/adapters/shared/paths.ts'
 // v0.19: the worker's half of the delegation protocol is simulated in-process
 // by minting a real APP bundle from the fixture's evidence artifacts — the
 // same builder the proof_bundle tool itself calls.
@@ -212,7 +213,7 @@ test('initialize handshake answers with the server identity and a supported prot
     serverInfo: { name: string; version: string }
   }
   assert.equal(result.serverInfo.name, 'agent-proof-protocol')
-  assert.equal(result.serverInfo.version, '0.21.0')
+  assert.equal(result.serverInfo.version, '0.22.0')
   assert.equal(result.protocolVersion, '2025-06-18', 'a requested supported version is echoed back')
   assert.equal(result.capabilities.tools.listChanged, false)
 })
@@ -552,9 +553,12 @@ const DELEGATED_ACCEPTANCE = 'the section exists, cites at least three evidence 
  * the honest export: same builder, same artifacts, as proof_bundle itself.
  */
 async function mintWorkerBundle(): Promise<{ manifest: { protocol: string }; files: Record<string, string> }> {
-  // mcp-entry's derivation, mirrored: workspaceKey = sha256(root)[:16], host
+  // mcp-entry's derivation, mirrored: the ONE shared derivation
+  // (deriveProofPaths — normalized root spelling, legacy-key probe), host
   // mode stores evidence at <trustRoot>/workspaces/<key>.
-  const workspaceKey = sha256(WORKSPACE).slice(0, 16)
+  const workspaceKey = deriveProofPaths(
+    { root: WORKSPACE, trustRoot: join(WORKSPACE, 'trust'), evidenceStore: 'host' },
+  ).workspaceKey
   const storeDir = join(WORKSPACE, 'trust', 'workspaces', workspaceKey)
   const evidenceLog = await fsp.readFile(join(storeDir, 'evidence.jsonl'), 'utf8')
   const input: { evidenceLog: string; baselineJson?: string; anchorJson?: string } = { evidenceLog }
@@ -762,9 +766,12 @@ test('proof_training_export defaults to the private tier and never ships samples
   assert.equal('writtenTo' in value, false, 'no path was given — nothing was written to disk')
 })
 
-test('proof_training_export fidelity full with path writes the JSONL dataset to disk', async () => {
-  const target = join(WORKSPACE, 'training-full.jsonl')
-  const result = await callTool('proof_training_export', { fidelity: 'full', path: target }, 60_000)
+test('proof_training_export fidelity full with path writes the JSONL dataset to disk (workspace-relative path)', async () => {
+  // v0.22 (H-16): `path` is workspace-RELATIVE on this face — the confinement
+  // test at the end of this file pins the refusals; this one pins that a
+  // relative destination writes inside the workspace and reports the
+  // workspace-absolute writtenTo.
+  const result = await callTool('proof_training_export', { fidelity: 'full', path: 'training-full.jsonl' }, 60_000)
   assert.equal(result.isError, undefined, `training export errored: ${result.content[0]?.text}`)
   const value = result.structuredContent as {
     manifest: { schema: string; fidelity: string }
@@ -774,7 +781,12 @@ test('proof_training_export fidelity full with path writes the JSONL dataset to 
   assert.equal(value.manifest.schema, 'dsh-training/1')
   assert.equal(value.manifest.fidelity, 'full', 'the explicit full tier is honored, not second-guessed')
   assert.ok(value.sampleCount >= 1)
-  assert.equal(value.writtenTo, target, 'the response names where the engine wrote the dataset')
+  const expected = `${WORKSPACE.replaceAll('\\', '/')}/training-full.jsonl`
+  assert.equal(
+    (value.writtenTo ?? '').replaceAll('\\', '/'),
+    expected,
+    'writtenTo is the confined workspace-absolute destination the engine wrote',
+  )
   // The disk is the channel for the samples: exactly sampleCount JSONL lines,
   // every one of them a JSON object (JSONL discipline).
   const onDisk = await fsp.readFile(value.writtenTo!, 'utf8')
@@ -806,9 +818,8 @@ test('proof_training_export refuses an unintelligible fidelity loudly, never sil
 // proof_sla_quote prices what a grade leaves undetected through the engine's
 // own underwriting verb (offer / denied / manual-underwriting, exclusions, a
 // chain-addressed quoteId); proof_economics reads ledgers back off the chain
-// — and this MCP face deliberately never runs a rate-carrying verification
-// (proof_verify's parameter surface stays minimal), so the honest answer
-// until one lands is the pinned no-ledger error.
+// — no earlier test in this file mints one, so the honest answer until the
+// priced-verify test below lands a ledger is the pinned no-ledger error.
 // ---------------------------------------------------------------------------
 
 test('proof_sla_quote prices a proven grade: coverage 10000 at confidence 0.97 costs exactly 300', async () => {
@@ -853,6 +864,22 @@ test('proof_sla_quote prices a proven grade: coverage 10000 at confidence 0.97 c
 })
 
 test('proof_sla_quote refuses a regressed grade honestly — denied, with the reason on the record', async () => {
+  // v0.22 (engine M-03 closure): a quote prices evidence the chain REACHED —
+  // the grade must appear on a proof/verified marker, or the engine refuses
+  // (a caller-asserted grade was a free quote forgery). So the doors are
+  // exercised the honest way: actually regress the fixture check and verify
+  // (minting a real 'regressed' marker), then ask for the quote.
+  await fsp.writeFile(join(WORKSPACE, 'check.mjs'), [
+    "import assert from 'node:assert/strict'",
+    'assert.equal(1 + 1, 3)',
+    "console.log('FAIL loudly')",
+    '',
+  ].join('\n'))
+  const regression = await callTool('proof_verify', { changed: ['check.mjs'] }, 60_000)
+  assert.equal((regression.structuredContent as { grade: string }).grade, 'regressed', 'the fixture check really broke')
+  // Restore the green fixture for every later test in this file.
+  await fsp.writeFile(join(WORKSPACE, 'check.mjs'), CHECK_SCRIPT)
+
   const result = await callTool('proof_sla_quote', { grade: 'regressed', confidence: 0.9, coverageAmount: 5000 })
   assert.equal(result.isError, undefined, `a refusal is a QUOTE (denied), not a tool error: ${result.content[0]?.text}`)
   const quote = result.structuredContent as {
@@ -864,14 +891,20 @@ test('proof_sla_quote refuses a regressed grade honestly — denied, with the re
     'the denial carries a reason — an insurer that refuses silently is indistinguishable from one that crashed')
   assert.equal(decision?.premium, undefined, 'a denied grade is never quietly priced as an offer')
 
-  // And the third door, named for completeness: a stale grade is neither
-  // priced nor refused — the evidence is not decisive enough to price
-  // mechanically, so a human underwriter takes over.
-  const stale = await callTool('proof_sla_quote', { grade: 'stale', coverageAmount: 1000 })
-  assert.equal(stale.isError, undefined)
-  const staleDecision = (stale.structuredContent as { decision?: { class?: string; reason?: unknown } }).decision
-  assert.equal(staleDecision?.class, 'manual-underwriting', 'a stale grade goes to a human, never to a formula')
-  assert.ok(typeof staleDecision?.reason === 'string' && (staleDecision!.reason as string).length > 0)
+  // The third door (stale → manual-underwriting) needs a chain that honestly
+  // reached 'stale' — an affected check that never re-ran — which this green
+  // fixture cannot mint cheaply, and the door's pricing itself is pinned
+  // engine-side (test/31: manual-underwriting with pinned reasons). What THIS
+  // face pins instead is the anchoring seam twice over: a grade the chain
+  // never reached is refused loudly by the engine, and the MCP face passes
+  // that refusal through as a tool error — never minting a quote from
+  // nothing, never silently downgrading to an offer.
+  const unanchored = await callTool('proof_sla_quote', { grade: 'no-baseline', coverageAmount: 100 })
+  assert.equal(unanchored.isError, true, 'a grade with no chain evidence prices nothing')
+  assert.match(unanchored.content[0]!.text, /no proof\/verified marker/, 'the refusal names the anchoring rule')
+  const unanchoredStale = await callTool('proof_sla_quote', { grade: 'stale', coverageAmount: 100 })
+  assert.equal(unanchoredStale.isError, true, 'the stale door also demands honestly-stale evidence first')
+  assert.match(unanchoredStale.content[0]!.text, /no proof\/verified marker/)
 })
 
 test('proof_sla_quote refuses malformed usage loudly — grade, coverage, currency', async () => {
@@ -898,17 +931,22 @@ test('proof_sla_quote refuses malformed usage loudly — grade, coverage, curren
   assert.ok(currencyText.includes('USD'), 'the error names the only priced currency')
 })
 
-test('proof_economics honestly reports the absent ledger — with the exact remedy pinned', async () => {
-  // This MCP face never runs a rate-carrying verification (proof_verify's
-  // parameter surface stays minimal by design), and no earlier test minted a
-  // ledger, so the chain holds no economics: the honest answer is the pinned
-  // absence — never a fabricated ledger, never a recomputation.
+test('proof_economics honestly reports the absent ledger — with the exact on-face remedy pinned', async () => {
+  // No earlier test in this file minted a ledger, so the chain holds no
+  // economics: the honest answer is the pinned absence — never a fabricated
+  // ledger, never a recomputation. The remedy (v0.22 flip) names the shape
+  // THIS face actually accepts, not the engine-side {rate} wrapper the old
+  // text taught — following the old text failed by construction.
   const result = await callTool('proof_economics', { computePerMs: 0.001 })
   assert.equal(result.isError, true, 'no ledger on the chain is a tool error, not an empty quote')
   const text = result.content[0]!.text
   assert.ok(
-    text.includes('no economics on the last run — pass economics:{rate} to proof_verify/proof_claim first'),
-    `the absence is pinned verbatim, remedy included: ${text}`,
+    text.includes('no economics on the last run') && text.includes('economics: {computePerMs'),
+    `the absence is pinned verbatim, with the on-face remedy: ${text}`,
+  )
+  assert.ok(
+    !text.includes('keeps proof_verify') && !text.includes('{rate}'),
+    'the fabricated "minimal parameters" tail and the engine-only {rate} shape are gone',
   )
 
   // The rate card guard is this face's own, priced against nothing: a missing
@@ -983,6 +1021,7 @@ test('a priced verify mints a ledger proof_economics replays verbatim off the ch
   assert.equal(replay.isError, undefined, 'the ledger is on the chain and replays')
   const replayed = (replay.structuredContent ?? {}) as {
     economics?: { ledger?: { computeMs?: number; cost?: number; assertions?: number } }
+    chainAudit?: { checked?: boolean; ok?: boolean }
   }
   const ledger = replayed.economics?.ledger
   assert.ok(typeof ledger?.computeMs === 'number' && ledger.computeMs >= 0)
@@ -992,4 +1031,287 @@ test('a priced verify mints a ledger proof_economics replays verbatim off the ch
     'the replayed price is exactly the measured compute at the stated rate')
   assert.ok(typeof ledger!.assertions === 'number' && ledger!.assertions >= 1,
     'a decisive run priced its assertions')
+  // v0.22 (M-51): the replay carries its own chain audit verdict — the hash
+  // chain detects rewrites, it does not prevent the write, so a replay
+  // without an audit verdict vouched for bytes it never checked.
+  assert.deepEqual(replayed.chainAudit, { checked: true, ok: true },
+    'the replay reports that the chain audit ran and passed')
+})
+
+// ---------------------------------------------------------------------------
+// v0.22 fix batch: the MCP face's own pins — confinement (H-16), claim
+// forwarding (M-50), the finite-budget gate (H-29 face half), loud array
+// narrowing (M-54), INVALID_PARAMS for malformed arguments, the protocol
+// edges (initialize gate, JSON-RPC batch, transport cap), loud startup on a
+// misspelled evidence store, and the double-counted bundle trim.
+// ---------------------------------------------------------------------------
+
+/** The fixture store dir (mcp-entry's host-mode derivation, mirrored — the one shared derivation). */
+function fixtureStoreDir(): string {
+  const workspaceKey = deriveProofPaths(
+    { root: WORKSPACE, trustRoot: join(WORKSPACE, 'trust'), evidenceStore: 'host' },
+  ).workspaceKey
+  return join(WORKSPACE, 'trust', 'workspaces', workspaceKey)
+}
+
+test('proof_claim on a green workspace proves the claim — the success path is pinned', async () => {
+  // C3-H3 closure: the MCP face's proof_claim success promise (CLAIM_DESCRIPTION)
+  // had zero coverage — only the bogus-kind error was ever exercised.
+  const result = await callTool('proof_claim', { claim: 'the workspace still passes its own check', changed: ['check.mjs'] }, 60_000)
+  assert.equal(result.isError, undefined, `claim errored: ${result.content[0]?.text}`)
+  const value = result.structuredContent as { claim: string; grade: string; proven: boolean; blockers?: string[] }
+  assert.equal(value.claim, 'the workspace still passes its own check', 'the claim rides the card verbatim')
+  assert.equal(value.grade, 'proven')
+  assert.equal(value.proven, true, 'a passing workspace proves the claim — the core promise of the card')
+  assert.deepEqual(value.blockers ?? [], [], 'nothing to fix')
+})
+
+test('proof_verify forwards the claim text onto the chain (M-50/D3 parity with the DSH face)', async () => {
+  const claimText = 'fixed the login redirect and added a regression test'
+  const result = await callTool('proof_verify', { changed: ['check.mjs'], claim: claimText }, 60_000)
+  assert.equal(result.isError, undefined, `verify errored: ${result.content[0]?.text}`)
+  // The chain is where the record belongs: read the log back and pin that the
+  // LAST proof/verified marker carries the claim text — the MCP face must not
+  // diverge from what session logs record.
+  const log = await fsp.readFile(join(fixtureStoreDir(), 'evidence.jsonl'), 'utf8')
+  const markers = log.split('\n')
+    .filter(line => line.trim().length > 0)
+    .map(line => JSON.parse(line) as { kind?: unknown; payload?: { label?: unknown; claim?: unknown } })
+    .filter(entry => entry.kind === 'marker' && entry.payload?.label === 'proof/verified')
+  const last = markers[markers.length - 1]
+  assert.ok(last !== undefined, 'a proof/verified marker landed')
+  assert.equal(typeof last.payload?.claim, 'string', 'the marker carries the claim')
+  assert.ok(
+    (last.payload?.claim as string).includes('login redirect'),
+    `the claim text is recorded on the boundary marker: ${JSON.stringify(last.payload?.claim)}`,
+  )
+
+  // A non-string claim is refused loudly, never silently dropped.
+  const bogus = await callTool('proof_verify', { claim: 42 }, 60_000)
+  assert.equal(bogus.isError, true)
+  assert.match(bogus.content[0]!.text, /claim must be a string/)
+})
+
+test('proof_claim refuses a non-finite budgetMs — 1e999 is not a budget (H-29 face half)', async () => {
+  // JSON cannot spell Infinity, but JSON.parse('1e999') produces it — so the
+  // raw line is sent directly, letting the attack vector through exactly as
+  // a hostile client would (JSON.stringify would null it first).
+  client.send('{"jsonrpc":"2.0","id":910001,"method":"tools/call","params":{"name":"proof_claim",'
+    + '"arguments":{"claim":"fast enough","kind":"perf-budget","budgetMs":1e999}}}')
+  const line = await client.nextLine()
+  const response = JSON.parse(line) as { id: number; result?: ToolCallResponse }
+  assert.equal(response.id, 910001)
+  assert.equal(response.result?.isError, true, 'an infinite budget is a tool error')
+  const text = response.result?.content?.[0]?.text ?? ''
+  assert.match(text, /budgetMs/, 'the error names the offending argument')
+  assert.match(text, /finite/, 'the error says exactly what was wrong: not a finite number')
+})
+
+test('proof_verify counts dropped non-string changed entries instead of narrowing silently', async () => {
+  const result = await callTool('proof_verify', { changed: ['check.mjs', 42, null] }, 60_000)
+  assert.equal(result.isError, undefined, `verify errored: ${result.content[0]?.text}`)
+  const value = result.structuredContent as { changed: string[]; warning?: string }
+  assert.deepEqual(value.changed, ['check.mjs'], 'only the string entry reached the engine')
+  assert.match(
+    value.warning ?? '',
+    /dropped 2 non-string entries from changed/,
+    'the drop is counted and named in a warning field (M-54)',
+  )
+})
+
+test('tools/call with a non-object arguments member is a JSON-RPC -32602 error', async () => {
+  const response = await client.request('tools/call', { name: 'proof_status', arguments: 42 })
+  const error = response.error as { code: number; message: string } | undefined
+  assert.ok(error !== undefined, 'a malformed arguments member is a protocol-level error, not a tool run')
+  assert.equal(error.code, -32602)
+  assert.match(error.message, /arguments must be an object/)
+})
+
+test('a JSON-RPC batch is answered element by element with an array', async () => {
+  const before = client.receivedLines
+  client.send(JSON.stringify([{ jsonrpc: '2.0', method: 'notifications/initialized' }]))
+  await sleep(250)
+  assert.equal(client.receivedLines, before, 'a batch of only notifications produces no output at all')
+
+  client.send(JSON.stringify([
+    { jsonrpc: '2.0', id: 920001, method: 'ping' },
+    { jsonrpc: '2.0', id: 920002, method: 'ping' },
+  ]))
+  const line = await client.nextLine()
+  const parsed = JSON.parse(line) as { id: number; result: unknown }[]
+  assert.ok(Array.isArray(parsed), 'the batch answer is an array')
+  assert.deepEqual(parsed.map(entry => entry.id), [920001, 920002], 'responses come back in request order')
+
+  client.send(JSON.stringify([]))
+  const empty = JSON.parse(await client.nextLine()) as { error: { code: number } }
+  assert.equal(empty.error.code, -32600, 'an empty batch is an invalid request')
+})
+
+test('a line over the transport cap is refused without being buffered or parsed', async () => {
+  client.send(`{"pad":"${'x'.repeat(5 * 1024 * 1024)}"}`)
+  const line = await client.nextLine()
+  const message = JSON.parse(line) as { id: unknown; error: { code: number; message: string } }
+  assert.equal(message.error.code, -32700)
+  assert.match(message.error.message, /transport limit/, 'the refusal names the cap')
+  // The server is still alive and serving normal traffic afterwards.
+  const pong = await client.request('ping')
+  assert.equal(pong.error, undefined)
+})
+
+test('tools are refused before initialize — the handshake is mandatory (protocol edge)', async () => {
+  const ephemeral = spawn(process.execPath, ['--experimental-strip-types', ENTRY], {
+    cwd: WORKSPACE,
+    env: {
+      ...process.env,
+      DSH_PROOF_ROOT: WORKSPACE,
+      DSH_PROOF_TRUST_DIR: join(WORKSPACE, 'trust'),
+      DSH_HOME: join(WORKSPACE, 'dsh-home'),
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  try {
+    const gate = new LineRpc(ephemeral)
+    const refused = await gate.request('tools/list', {})
+    const error = refused.error as { code: number; message: string }
+    assert.ok(error !== undefined, 'a pre-handshake tools request is refused')
+    assert.equal(error.code, -32600)
+    assert.match(error.message, /initialize/, 'the refusal names the missing handshake')
+    const init = await gate.request('initialize', { protocolVersion: '2025-06-18' })
+    assert.equal(init.error, undefined)
+    const listed = await gate.request('tools/list', {})
+    assert.equal(listed.error, undefined, 'after the handshake the surface answers')
+  } finally {
+    ephemeral.kill()
+  }
+})
+
+test('a misspelled DSH_PROOF_EVIDENCE_STORE fails startup loudly, never silently meaning host', async () => {
+  const ephemeral = spawn(process.execPath, ['--experimental-strip-types', ENTRY], {
+    cwd: WORKSPACE,
+    env: {
+      ...process.env,
+      DSH_PROOF_ROOT: WORKSPACE,
+      DSH_PROOF_TRUST_DIR: join(WORKSPACE, 'trust'),
+      DSH_HOME: join(WORKSPACE, 'dsh-home'),
+      DSH_PROOF_EVIDENCE_STORE: 'Workspace',
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  const { code, stderr } = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+    let text = ''
+    ephemeral.stderr!.setEncoding('utf8')
+    ephemeral.stderr!.on('data', (chunk: string) => { text += chunk })
+    ephemeral.on('exit', (exitCode: number | null) => resolve({ code: exitCode, stderr: text }))
+  })
+  assert.notEqual(code, 0, 'the server must die rather than guess where evidence lives')
+  assert.match(stderr, /DSH_PROOF_EVIDENCE_STORE/)
+  assert.match(stderr, /'host' or 'workspace'/)
+})
+
+test('H-21 env parity: DSH_PROOF_EVIDENCE_DIR steers the server\'s store like it steers the hooks', async () => {
+  // The exact H-21 scenario: an operator sets EVIDENCE_STORE=workspace with a
+  // custom EVIDENCE_DIR — the adapter hooks guard <root>/.evi, and the server
+  // this face spawns must write THE SAME directory, not the old hardcoded
+  // .proof (which left the guard watching a phantom store).
+  const ephemeral = spawn(process.execPath, ['--experimental-strip-types', ENTRY], {
+    cwd: WORKSPACE,
+    env: {
+      ...process.env,
+      DSH_PROOF_ROOT: WORKSPACE,
+      DSH_PROOF_TRUST_DIR: join(WORKSPACE, 'trust'),
+      DSH_HOME: join(WORKSPACE, 'dsh-home'),
+      DSH_PROOF_EVIDENCE_STORE: 'workspace',
+      DSH_PROOF_EVIDENCE_DIR: '.evi',
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  try {
+    const parity = new LineRpc(ephemeral)
+    const init = await parity.request('initialize', { protocolVersion: '2025-06-18' })
+    assert.equal(init.error, undefined, `initialize failed: ${JSON.stringify(init.error)}`)
+    const baseline = await parity.request('tools/call', {
+      name: 'proof_baseline',
+      arguments: {},
+    }, 60_000)
+    assert.equal(baseline.error, undefined, 'baseline over the env-configured store succeeds')
+    const logUri = await fsp.stat(join(WORKSPACE, '.evi', 'evidence.jsonl')).then(() => true, () => false)
+    assert.equal(logUri, true, 'the evidence log landed in the EVIDENCE_DIR the hooks would guard')
+    const phantom = await fsp.stat(join(WORKSPACE, '.proof', 'evidence.jsonl')).then(() => true, () => false)
+    assert.equal(phantom, false, 'the old hardcoded .proof store is not written')
+  } finally {
+    ephemeral.kill()
+  }
+})
+
+test('SIGTERM ends the server gracefully where signals are real (loop stops, process exits on its own)', async () => {
+  const ephemeral = spawn(process.execPath, ['--experimental-strip-types', ENTRY], {
+    cwd: WORKSPACE,
+    env: {
+      ...process.env,
+      DSH_PROOF_ROOT: WORKSPACE,
+      DSH_PROOF_TRUST_DIR: join(WORKSPACE, 'trust'),
+      DSH_HOME: join(WORKSPACE, 'dsh-home'),
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  const graceful = new LineRpc(ephemeral)
+  const init = await graceful.request('initialize', { protocolVersion: '2025-06-18' })
+  assert.equal(init.error, undefined)
+  ephemeral.kill('SIGTERM')
+  const { code, signal } = await new Promise<{ code: number | null; signal: string | null }>((resolve) => {
+    const timer = setTimeout(() => resolve({ code: null, signal: 'timeout' }), 5_000)
+    ephemeral.once('exit', (exitCode: number | null, exitSignal: string | null) => {
+      clearTimeout(timer)
+      resolve({ code: exitCode, signal: exitSignal })
+    })
+  })
+  assert.notEqual(signal, 'timeout', 'the server must die promptly on SIGTERM, never hang')
+  if (process.platform === 'win32') {
+    // Windows cannot deliver SIGTERM to another process: child.kill
+    // degenerates to an unconditional TerminateProcess, and no in-process
+    // handler can interpose. The graceful path (handler ends the read loop,
+    // the in-flight message finishes, the process exits with code 0 and no
+    // signal) is POSIX semantics — pinned on the POSIX side of the matrix.
+    assert.equal(signal, 'SIGTERM')
+    return
+  }
+  assert.equal(signal, null, 'the process exited on its own (loop end), not killed by the default handler')
+  assert.equal(code, 0)
+})
+
+test('proof_training_export confines `path` to the workspace — absolute, UNC and .. escapes refused loudly (H-16)', async () => {
+  const absolute = await callTool('proof_training_export', { path: join(WORKSPACE, '..', 'escape.jsonl') })
+  assert.equal(absolute.isError, true, 'an absolute path is refused on this face')
+  const absoluteText = absolute.content[0]!.text
+  assert.match(absoluteText, /workspace-RELATIVE/, 'the error names the rule')
+  assert.match(absoluteText, /absolute/, 'the error names what was refused')
+
+  const unc = await callTool('proof_training_export', { path: '\\\\server\\share\\proof\\out.jsonl' })
+  assert.equal(unc.isError, true, 'a UNC path is refused')
+  assert.match(unc.content[0]!.text, /UNC/)
+
+  const escape = await callTool('proof_training_export', { path: 'deep/../../outside.jsonl' })
+  assert.equal(escape.isError, true, 'a path that normalizes outside the root is refused')
+  assert.match(escape.content[0]!.text, /escapes the workspace root/)
+
+  // And none of the refused calls wrote anything outside the workspace.
+  assert.equal(
+    await fsp.stat(join(WORKSPACE, '..', 'escape.jsonl')).then(() => true, () => false),
+    false,
+    'the refused absolute destination must not exist',
+  )
+})
+
+test('a bundle past half the response limit is trimmed to manifest + file names (both wire copies counted)', async () => {
+  // Must run LAST in this file: it pads the evidence log with junk bytes,
+  // which the chain audit would (correctly) flag for every later reader.
+  const logPath = join(fixtureStoreDir(), 'evidence.jsonl')
+  await fsp.appendFile(logPath, `${'x'.repeat(200_000)}\n`, 'utf8')
+  const result = await callTool('proof_bundle', {}, 60_000)
+  assert.equal(result.isError, undefined, `bundle errored: ${result.content[0]?.text}`)
+  const value = result.structuredContent as { bundle: { manifest: unknown; files: string[] | Record<string, string>; note: string } }
+  assert.ok(Array.isArray(value.bundle.files), 'files is the name list, not the contents')
+  assert.ok((value.bundle.files as string[]).includes('evidence.jsonl'))
+  assert.match(value.bundle.note, /only the manifest and the file-name list/, 'the note says what rides the wire')
+  assert.match(value.bundle.note, /both wire copies/, 'the note is honest that the limit prices two copies')
 })

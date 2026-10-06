@@ -28,6 +28,7 @@ import { buildBundle } from '../src/app/bundle.ts'
 import { deriveProofPaths } from '../src/adapters/shared/paths.ts'
 import { EvidenceStore, makeEvidence, snapshotWorkspace } from '../src/core/evidence.ts'
 import type { SignerPort } from '../src/core/ports.ts'
+import { lineDigest, walkChain } from '../src/core/trust.ts'
 import { loadPtl, ptlLeafHash } from '../src/core/transparency.ts'
 import type { SignedTreeHead, TransparencyLog } from '../src/core/transparency.ts'
 import { NodeFsPort } from '../src/node-ports.ts'
@@ -36,6 +37,11 @@ import { FakeClock, spec } from './helpers.ts'
 const ENTRY = fileURLToPath(new URL('../src/app/ptl-entry.ts', import.meta.url))
 // The task's designated temp area: C:\mimoclaw_workspace\.openclaw\tmp\ptl-it-<pid>.
 const TMP = join(fileURLToPath(new URL('../../../.openclaw/tmp', import.meta.url)), `ptl-it-${process.pid}`)
+
+/** Local hex sha256 for hand-forged fixtures. */
+function sha256Hex(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex')
+}
 
 // The agent workspace whose chain gets published, and the PTL log directory.
 const WS_ROOT = join(TMP, 'ws')
@@ -163,9 +169,12 @@ test('append publishes the latest signed checkpoint, lands the entry on disk and
   assert.equal(published.workspaceKey, paths.workspaceKey, 'the leaf commits to the derived workspace identity')
   assert.ok(published.sig.startsWith('sig:'), 'the engine checkpoint signature rides along verbatim')
 
-  // The operator key was minted on first use, next to the log.
-  const keyStat = await fsp.stat(join(PTL_DIR, 'operator-key', 'proof-signing-key.pem'))
+  // v0.22 (H-07c): the operator key was minted OUTSIDE the log directory —
+  // a key sitting next to the data it notarises is self-referential. The
+  // default lives under the trust root; <logDir>/operator-key stays empty.
+  const keyStat = await fsp.stat(join(TRUST_DIR, 'ptl-operator-key', 'proof-signing-key.pem'))
   assert.ok(keyStat.isFile())
+  await assert.rejects(fsp.stat(join(PTL_DIR, 'operator-key')), 'no key is minted inside the log directory by default')
   // And the STH it signed is what head reports.
   const head = parseSingleLine((await runCli(['head', '--log', PTL_DIR])).stdout) as
     { logId: string; treeSize: number; root: string; at: string; sig: string }
@@ -361,15 +370,198 @@ test('usage errors exit 2 with the usage text and never a stack', async () => {
 })
 
 test('the operator key never materialises as a side effect of verify', async () => {
-  // A fresh log directory verified with --operator-key but never appended to:
-  // checking must not mint an identity the log will later have to honour.
+  // A fresh log directory verified against a key directory that does not
+  // exist: checking must not mint an identity the log will later have to
+  // honour. (--operator-key takes a directory since v0.22.)
   const neverAppended = join(TMP, 'ptl-never-appended')
   await fsp.mkdir(neverAppended, { recursive: true })
-  const { code, stdout } = await runCli(['verify', '--log', neverAppended, '--operator-key'])
+  const absentKeyDir = join(TMP, 'absent-operator-key')
+  const { code, stdout } = await runCli(['verify', '--log', neverAppended, '--operator-key', absentKeyDir])
   assert.equal(code, 1, 'no head at all is a failed self-check, not an empty pass')
   const out = parseSingleLine(stdout) as { ok: boolean; treeSize: number; checks: { rootMatch: boolean } }
   assert.equal(out.ok, false)
   assert.equal(out.treeSize, 0)
   assert.equal(out.checks.rootMatch, false)
-  await assert.rejects(fsp.stat(join(neverAppended, 'operator-key')), 'verify must not create the key directory')
+  await assert.rejects(fsp.stat(absentKeyDir), 'verify must not create the key directory')
+})
+
+// ---------------------------------------------------------------------------
+// v0.22 adversarial additions — publication trust root (H-06) and the
+// verify --bundle signature/absence holes (H-07).
+// ---------------------------------------------------------------------------
+
+test('H-06: a foreign-keyId checkpoint appended to the workspace log is never what gets published', async () => {
+  // The attacker appends a well-formed, self-consistent checkpoint under its
+  // own keyId at the tail of the workspace log. The old selection rule
+  // (findLast of any signed checkpoint) would publish THE ATTACKER'S
+  // checkpoint; the anchor-gated rule must publish the anchored key's.
+  const logPath = paths.logPath
+  const lines = (await fsp.readFile(logPath, 'utf8')).split('\n').filter(l => l.trim().length > 0)
+  const walk0 = walkChain(lines)
+  const lastLine = lines[lines.length - 1] as string
+  const attackerEnvelope = JSON.stringify({
+    v: 2,
+    kind: 'checkpoint',
+    at: '2026-10-06T00:00:00.000Z',
+    prev: lineDigest(lastLine),
+    payload: { count: walk0.records, head: sha256Hex('attacker-head'), workspaceKey: paths.workspaceKey, at: '2026-10-06T00:00:00.000Z' },
+    sig: 'AAAA-attacker-sig',
+    keyId: 'attacker-key',
+  })
+  await fsp.writeFile(logPath, `${[...lines, attackerEnvelope].join('\n')}\n`, 'utf8')
+  try {
+    const attackDir = join(TMP, 'ptl-attack')
+    const { code, stdout, stderr } = await runCli(['append', '--log', attackDir])
+    assert.equal(code, 0, `stderr: ${stderr}`)
+    const out = parseSingleLine(stdout) as { sequence: number; treeSize: number }
+    assert.equal(out.treeSize, 1)
+    const published = JSON.parse(
+      (await fsp.readFile(join(attackDir, 'ptl-entries.jsonl'), 'utf8')).split('\n')[0] as string,
+    ) as { keyId: string; sig: string; count: number }
+    const honest = walk0.checkpoints.findLast(cp => cp.keyId === 'fake-key')
+    assert.ok(honest !== undefined)
+    assert.equal(published.keyId, 'fake-key', 'the anchored key\'s checkpoint is the publication, not the positional tail')
+    assert.equal(published.count, honest.payload.count)
+    assert.ok(published.sig.startsWith('sig:'), 'the honest signature rode along — the attacker\'s never entered the tree')
+  } finally {
+    // Restore the honest tail so later tests see the pristine log.
+    await fsp.writeFile(logPath, `${lines.join('\n')}\n`, 'utf8')
+  }
+})
+
+test('H-06: no anchor and no engine key on hand is a loud refusal, not a best-effort publish', async () => {
+  // A workspace whose checkpoints are signed but whose anchor never landed
+  // (no anchorPath configured), audited from a trust root that holds no
+  // engine key: there is no trust root to publish under, and the CLI says
+  // so instead of notarising whoever last wrote to the log.
+  const wsRoot = join(TMP, 'ws-no-anchor')
+  const trustRoot = join(TMP, 'trust-no-anchor')
+  await fsp.mkdir(wsRoot, { recursive: true })
+  await fsp.mkdir(trustRoot, { recursive: true })
+  const noAnchorPaths = deriveProofPaths({ root: wsRoot, trustRoot, evidenceStore: 'host' })
+  const noAnchorStore = new EvidenceStore(nodeFs, noAnchorPaths.logPath, noAnchorPaths.baselinePath, new FakeClock(), {
+    signer: async () => fakeSigner,
+    workspaceKey: noAnchorPaths.workspaceKey,
+    checkpointEvery: 1000,
+  })
+  await noAnchorStore.append(evidence('n1'))
+  await noAnchorStore.checkpoint()
+  await assert.rejects(fsp.stat(join(trustRoot, 'anchors', noAnchorPaths.workspaceKey, 'anchor.json')), 'fixture: no anchor on record')
+  await assert.rejects(fsp.stat(join(trustRoot, 'keys')), 'fixture: no engine key on record')
+
+  const { code, stdout, stderr } = await runCli(
+    ['append', '--log', join(TMP, 'ptl-no-anchor')],
+    { DSH_PROOF_ROOT: wsRoot, DSH_PROOF_TRUST_DIR: trustRoot },
+  )
+  assert.equal(code, 1)
+  assert.equal(stdout.trim().length, 0, 'a refusal prints nothing on stdout')
+  assert.ok(stderr.includes('no trust root'), `stderr names the missing trust root: ${stderr}`)
+  assert.ok(!stderr.includes('at '), 'no stack traces, ever')
+})
+
+test('H-07a: a flipped byte in the bundle-pinned publishedHead.sig fails the publication-signature check', async () => {
+  const record = await recordForEntry0()
+  const tamperedSig = `x${record.publishedHead.sig.slice(1)}`
+  assert.notEqual(tamperedSig, record.publishedHead.sig)
+  const evidenceLog = await fsp.readFile(paths.logPath, 'utf8')
+  const bundle = buildBundle(
+    { evidenceLog }, paths.workspaceKey, AT,
+    { transparency: { ...record, publishedHead: { ...record.publishedHead, sig: tamperedSig } } },
+  )
+  const bundlePath = join(TMP, 'bundle-bad-head-sig.json')
+  await fsp.writeFile(bundlePath, JSON.stringify(bundle, null, 2), 'utf8')
+
+  const { code, stdout } = await runCli(['verify', '--log', PTL_DIR, '--bundle', bundlePath])
+  assert.equal(code, 1)
+  const out = parseSingleLine(stdout) as {
+    ok: boolean; checks: { leafMatch: boolean; inclusion: boolean; publishedHeadSig: boolean }
+  }
+  assert.equal(out.ok, false)
+  assert.equal(out.checks.leafMatch, true, 'the leaf itself is honest — only the publication proof is forged')
+  assert.equal(out.checks.inclusion, true)
+  assert.equal(out.checks.publishedHeadSig, false, '"the operator signed this head" is a signed claim, and the signature is checked')
+})
+
+test('H-07a: without an operator key the publication signature is reported NOT verified and the verification fails', async () => {
+  const bundlePath = join(TMP, 'bundle.json')
+  const { code, stdout } = await runCli(
+    ['verify', '--log', PTL_DIR, '--bundle', bundlePath, '--operator-key', join(TMP, 'no-such-operator-key')],
+  )
+  assert.equal(code, 1, 'uncertain = failed: a publication proof nobody verified must not pass silently')
+  const out = parseSingleLine(stdout) as {
+    ok: boolean
+    checks: { leafMatch: boolean; inclusion: boolean; publishedHeadSig: string }
+    notes: string[]
+  }
+  assert.equal(out.ok, false)
+  assert.equal(out.checks.leafMatch, true)
+  assert.equal(out.checks.inclusion, true)
+  assert.equal(out.checks.publishedHeadSig, 'not-checked (operator key absent)')
+  assert.ok(
+    out.notes.some(n => n.includes('NOT verified')),
+    `the absence is stated explicitly, got ${JSON.stringify(out.notes)}`,
+  )
+})
+
+test('H-07b: a deleted sth.json fails bundle verification — a claimed publication must reconcile with the present', async () => {
+  // Clone the log directory without sth.json: entries intact, head gone.
+  const headless = join(TMP, 'ptl-headless')
+  await fsp.mkdir(headless, { recursive: true })
+  await fsp.copyFile(join(PTL_DIR, 'ptl-entries.jsonl'), join(headless, 'ptl-entries.jsonl'))
+  const bundlePath = join(TMP, 'bundle.json')
+  const { code, stdout } = await runCli(['verify', '--log', headless, '--bundle', bundlePath])
+  assert.equal(code, 1, '"published then, promised nothing now" is a failure, not a pass')
+  const out = parseSingleLine(stdout) as {
+    ok: boolean
+    checks: { leafMatch: boolean; inclusion: boolean; consistency: boolean }
+    notes: string[]
+  }
+  assert.equal(out.ok, false)
+  assert.equal(out.checks.leafMatch, true)
+  assert.equal(out.checks.inclusion, true, 'inclusion pins the PUBLISHED head — it survives the current head\'s absence')
+  assert.equal(out.checks.consistency, false)
+  assert.ok(out.notes.some(n => n.includes('no current signed head')), JSON.stringify(out.notes))
+})
+
+test('H-07c/M-63: a sth that promises more entries than the log holds is adjudicated, and the rewind branch speaks', async () => {
+  // Clone the log, then over-commit the head: treeSize beyond the file.
+  const overcommitted = join(TMP, 'ptl-overcommitted')
+  await fsp.mkdir(overcommitted, { recursive: true })
+  await fsp.copyFile(join(PTL_DIR, 'ptl-entries.jsonl'), join(overcommitted, 'ptl-entries.jsonl'))
+  const { sth } = await logSnapshot()
+  assert.ok(sth !== undefined)
+  const bloated = { ...sth, treeSize: sth.treeSize + 500 }
+  await fsp.writeFile(join(overcommitted, 'sth.json'), JSON.stringify(bloated), 'utf8')
+
+  const bundlePath = join(TMP, 'bundle.json')
+  const over = await runCli(['verify', '--log', overcommitted, '--bundle', bundlePath])
+  assert.equal(over.code, 1)
+  const overOut = parseSingleLine(over.stdout) as { ok: boolean; checks: { consistency: boolean }; notes: string[] }
+  assert.equal(overOut.ok, false)
+  assert.equal(overOut.checks.consistency, false)
+  assert.ok(overOut.notes.some(n => n.includes('head and log are disconnected')), `got ${JSON.stringify(overOut.notes)}`)
+
+  // And the rewind branch (published head LONGER than the current head) is
+  // no longer a silent false: the note names the rewind. The scenario: a
+  // bundle pinning the CURRENT two-entry head, verified against a log whose
+  // head promises only one entry — the classic "unpublish" shape.
+  const shrunk = join(TMP, 'ptl-shrunk')
+  await fsp.mkdir(shrunk, { recursive: true })
+  const snapshot = await logSnapshot()
+  const entriesNow = (await fsp.readFile(join(PTL_DIR, 'ptl-entries.jsonl'), 'utf8')).split('\n').filter(l => l.length > 0)
+  assert.ok(snapshot.sth !== undefined && snapshot.sth.treeSize >= 2, 'fixture: the shared log has grown past one entry')
+  await fsp.writeFile(join(shrunk, 'ptl-entries.jsonl'), `${entriesNow.slice(0, 1).join('\n')}\n`, 'utf8')
+  await fsp.writeFile(join(shrunk, 'sth.json'), JSON.stringify({ ...snapshot.sth, treeSize: 1 }), 'utf8')
+  const pinnedCurrent = await recordForEntry0()
+  const shrunkBundle = buildBundle(
+    { evidenceLog: await fsp.readFile(paths.logPath, 'utf8') }, paths.workspaceKey, AT,
+    { transparency: pinnedCurrent },
+  )
+  const shrunkBundlePath = join(TMP, 'bundle-pins-current.json')
+  await fsp.writeFile(shrunkBundlePath, JSON.stringify(shrunkBundle, null, 2), 'utf8')
+  const rewind = await runCli(['verify', '--log', shrunk, '--bundle', shrunkBundlePath])
+  assert.equal(rewind.code, 1)
+  const rewindOut = parseSingleLine(rewind.stdout) as { checks: { consistency: boolean }; notes: string[] }
+  assert.equal(rewindOut.checks.consistency, false)
+  assert.ok(rewindOut.notes.some(n => n.includes('rewound')), `got ${JSON.stringify(rewindOut.notes)}`)
 })

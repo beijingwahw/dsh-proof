@@ -317,8 +317,9 @@ const claimParams: ParameterSchemaSpec = {
   entryPoints: {
     type: 'array',
     items: { type: 'string' },
-    description: 'API-face entry points (workspace-relative files) the surface check covers; omit to let the engine '
-      + 'derive them from package.json. Advanced usage.',
+    description: 'Reserved, currently not consumed: the api-surface obligation derives its entry points from '
+      + 'package.json (or the deployment-level apiEntryPoints config) regardless of this parameter. '
+      + 'Omit it; the values are recorded on the contract object only.',
   },
   changed: {
     type: 'array',
@@ -430,6 +431,39 @@ const conjureRunParams: ParameterSchemaSpec = {
 /** ζ: narrow an untrusted `kind` argument to the four-value union, or nothing. */
 function isClaimKind(value: unknown): value is ClaimKind {
   return typeof value === 'string' && CLAIM_KINDS.includes(value)
+}
+
+/**
+ * M-80 (v0.23): no unbounded string rides from a tool argument straight onto
+ * the evidence chain — one misuse used to freeze megabytes into a marker every
+ * later checkpoint re-hashes. Strings longer than the cap are truncated WITH a
+ * visible flag baked into the stored text, so the truncation itself is a chain
+ * fact rather than a silent rewrite.
+ */
+const STRING_ARG_CAP = 4096
+
+function capToolString(value: string): string {
+  if (value.length <= STRING_ARG_CAP) return value
+  return `${value.slice(0, STRING_ARG_CAP)}…[truncated from ${value.length} chars]`
+}
+
+/**
+ * M-54 (v0.23): `changed` must be a string array — a non-string element used
+ * to ride to the engine and die in `path.replace` (or, on the MCP face, get
+ * silently dropped, narrowing attribution in exactly the direction the engine
+ * forbids). A parameter error names the fix instead.
+ */
+function checkedChanged(value: unknown, toolName: string): string[] | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value)) {
+    throw new Error(`${toolName}: changed must be an array of workspace-relative file paths (got ${typeof value})`)
+  }
+  for (let i = 0; i < value.length; i += 1) {
+    if (typeof value[i] !== 'string') {
+      throw new Error(`${toolName}: changed[${i}] must be a string path (got ${typeof value[i]} — dropping it would silently narrow change attribution)`)
+    }
+  }
+  return value as string[]
 }
 
 /**
@@ -684,15 +718,18 @@ function createVerifyTool(engine: ProofEngine, touched?: () => readonly string[]
     async execute(args, exec: ToolRunContext) {
       assertActive(exec)
       const parsed = (args ?? {}) as { changed?: string[]; all?: boolean; claim?: string }
+      // M-54: element-level validation — a non-string entry is a parameter
+      // error, never a silently narrowed change set.
+      const changedList = checkedChanged(parsed.changed, 'proof_verify')
       const outcome = await engine.verify({
-        ...(Array.isArray(parsed.changed) ? { changed: parsed.changed } : {}),
+        ...(changedList !== undefined ? { changed: changedList } : {}),
         ...(parsed.all === true ? { all: true } : {}),
         // D3 (tools side): the `claim` parameter's description says "for the
         // record" — forward it to the engine so the record actually happens
         // (the engine side attaches it to the verification's chain evidence).
         // Type-safe spread: absent/blank forwards nothing, keeping the
         // no-claim options shape byte-identical.
-        ...(typeof parsed.claim === 'string' && parsed.claim.trim() !== '' ? { claim: parsed.claim } : {}),
+        ...(typeof parsed.claim === 'string' && parsed.claim.trim() !== '' ? { claim: capToolString(parsed.claim) } : {}),
         ...(touched !== undefined ? { touched: touched() } : {}),
         // H9b: once a shell ran, "not in the touched set" no longer proves
         // "changed outside the agent" — the engine demotes those to 'unknown'.
@@ -807,22 +844,43 @@ function createClaimTool(engine: ProofEngine, touched?: () => readonly string[],
         throw new Error(`proof_claim: kind must be one of ${CLAIM_KINDS.join(' | ')} — or omit it to verify without a contract `
           + `(got ${typeof parsed.kind === 'string' ? JSON.stringify(parsed.kind) : 'nothing usable'})`)
       }
+      // H-29: a non-finite budget is not a budget. `JSON.parse('1e999')`
+      // yields Infinity, which passed the old typeof check and made
+      // within-budget comparisons vacuously true (`durationMs > Infinity` is
+      // always false) — a perf claim could carry an unviolable budget to
+      // proven, with "Infinityms" printed in the obligation detail. NaN is
+      // the same disease on the other branch. F7 adds the twin gate at the
+      // contract-parsing layer; this is the tool-boundary one.
+      if (parsed.budgetMs !== undefined
+        && (typeof parsed.budgetMs !== 'number' || !Number.isFinite(parsed.budgetMs) || parsed.budgetMs <= 0)) {
+        throw new Error(`proof_claim: budgetMs must be a finite positive number of milliseconds `
+          + `(got ${typeof parsed.budgetMs === 'number' ? String(parsed.budgetMs) : `a ${typeof parsed.budgetMs}`}) — an infinite or NaN budget can never be exceeded, which is not a budget at all`)
+      }
+      // M-54: element-level validation, same discipline as proof_verify.
+      const changedList = checkedChanged(parsed.changed, 'proof_claim')
+      // M-49/L7 (v0.23): `entryPoints` is not consumed by the surface check
+      // (see its schema description) — forwarded onto the contract object
+      // only, and an all-non-string list forwards NOTHING rather than `[]`:
+      // once the parameter goes live, "override with the empty set" and
+      // "derive from package.json" must never share a shape.
+      const entryPoints = Array.isArray(parsed.entryPoints)
+        ? parsed.entryPoints.filter((e): e is string => typeof e === 'string')
+        : undefined
+      const claim = capToolString(parsed.claim)
       // ζ typed-contract path: a `kind` binds the claim to its obligations via
       // engine.verifyContract. Everything else (no kind) keeps the legacy
       // verify() path byte-for-byte.
       if (isClaimKind(parsed.kind)) {
         const contract: ClaimContract = {
           kind: parsed.kind,
-          claim: parsed.claim,
+          claim,
           ...(typeof parsed.budgetMs === 'number' ? { budgetMs: parsed.budgetMs } : {}),
-          ...(typeof parsed.review === 'string' ? { review: parsed.review } : {}),
-          ...(Array.isArray(parsed.entryPoints)
-            ? { entryPoints: parsed.entryPoints.filter((e): e is string => typeof e === 'string') }
-            : {}),
+          ...(typeof parsed.review === 'string' ? { review: capToolString(parsed.review) } : {}),
+          ...(entryPoints !== undefined && entryPoints.length > 0 ? { entryPoints } : {}),
         }
         const outcome = await engine.verifyContract({
           contract,
-          ...(Array.isArray(parsed.changed) ? { changed: parsed.changed } : {}),
+          ...(changedList !== undefined ? { changed: changedList } : {}),
           ...(touched !== undefined ? { touched: touched() } : {}),
           ...(shellUsed !== undefined && shellUsed() ? { shellUsedSince: true } : {}),
           signal: exec.signal,
@@ -831,10 +889,10 @@ function createClaimTool(engine: ProofEngine, touched?: () => readonly string[],
           outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
           outcome.schedule, outcome.coverage, outcome.scriptDrift, outcome.vanished,
         )
-        return toClaimValue(parsed.claim, outcome.report, verified, outcome.contract) as unknown as JsonValue
+        return toClaimValue(claim, outcome.report, verified, outcome.contract) as unknown as JsonValue
       }
       const outcome = await engine.verify({
-        ...(Array.isArray(parsed.changed) ? { changed: parsed.changed } : {}),
+        ...(changedList !== undefined ? { changed: changedList } : {}),
         ...(touched !== undefined ? { touched: touched() } : {}),
         ...(shellUsed !== undefined && shellUsed() ? { shellUsedSince: true } : {}),
         signal: exec.signal,
@@ -843,7 +901,7 @@ function createClaimTool(engine: ProofEngine, touched?: () => readonly string[],
         outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
         outcome.schedule, outcome.coverage, outcome.scriptDrift, outcome.vanished,
       )
-      return toClaimValue(parsed.claim, outcome.report, verified) as unknown as JsonValue
+      return toClaimValue(claim, outcome.report, verified) as unknown as JsonValue
     },
   }
 }
@@ -904,11 +962,17 @@ function createJuryTool(engine: ProofEngine): ToolDefinition {
       if (typeof parsed.claim !== 'string' || parsed.claim.trim().length === 0) {
         throw new Error('proof_jury: claim is required — the exact text the jury deliberates on')
       }
+      // M-80: the prompt (claim + context) is frozen verbatim on the chain —
+      // an unbounded context used to freeze whole megabyte contexts into a
+      // marker. Both sides of the cap are applied BEFORE the freeze, so the
+      // digest and the replayed prompt stay consistent — and the claimId
+      // hashes the same capped bytes the prompt froze.
+      const claim = capToolString(parsed.claim)
       const prompt = juryPrompt(
-        parsed.claim,
-        typeof parsed.context === 'string' ? parsed.context : '<no additional context>',
+        claim,
+        typeof parsed.context === 'string' ? capToolString(parsed.context) : '<no additional context>',
       )
-      const claimId = claimIdOf(parsed.claim)
+      const claimId = claimIdOf(claim)
       // The request marker is the on-chain pre-image of the deliberation. The
       // prompt rides verbatim (a digest alone cannot be replayed), so the
       // later submit binds its verdict to exactly these bytes — and anyone
@@ -996,6 +1060,7 @@ function createJurySubmitTool(engine: ProofEngine, evidenceLogPath?: string): To
       if (typeof parsed.reasoning !== 'string' || parsed.reasoning.trim().length === 0) {
         throw new Error('proof_jury_submit: reasoning is required — the verbatim deliberation output that lands on the chain')
       }
+      const reasoning = capToolString(parsed.reasoning)
       // The verdict must bind to a pending on-chain request: no request, no
       // record; a claimId that is not the latest request's is a mismatch (the
       // model may be several requests behind — the fix is a fresh proof_jury).
@@ -1032,7 +1097,7 @@ function createJurySubmitTool(engine: ProofEngine, evidenceLogPath?: string): To
         independence: 'same-session',
         verdict: parsed.verdict,
         probability: parsed.probability,
-        output: parsed.reasoning,
+        output: reasoning,
         at: Date.now(),
       }
       await engine.storeView.mark('attest/jury', { ...attestation })
@@ -1116,8 +1181,9 @@ function createEndorseTool(engine: ProofEngine, evidenceLogPath?: string): ToolD
         throw new Error(`proof_endorse: decision must be 'endorse' | 'reject' `
           + `(got ${typeof parsed.decision === 'string' ? JSON.stringify(parsed.decision) : 'nothing usable'})`)
       }
+      const claim = capToolString(parsed.claim)
       const approver = typeof parsed.approver === 'string' && parsed.approver.trim().length > 0
-        ? parsed.approver
+        ? capToolString(parsed.approver)
         : 'host-approver'
       // v0.1 best-effort evidence root: the audit report exposes no chain-head
       // digest, so the scope names the baseline root the decision rides on —
@@ -1133,7 +1199,7 @@ function createEndorseTool(engine: ProofEngine, evidenceLogPath?: string): ToolD
       }
       // A re-endorsement (or retraction) supersedes by generation, exactly like
       // a jury appeal: gen + 1, readers resolve to the highest gen.
-      const claimId = claimIdOf(parsed.claim)
+      const claimId = claimIdOf(claim)
       const gen = (await maxAttestationGen(engine, evidenceLogPath, 'attest/human', claimId)) + 1
       const attestation: HumanAttestation = {
         kind: 'attest/human',
@@ -1141,7 +1207,7 @@ function createEndorseTool(engine: ProofEngine, evidenceLogPath?: string): ToolD
         gen,
         approver,
         approvedAt: Date.now(),
-        scope: { claim: parsed.claim, evidenceRoot },
+        scope: { claim, evidenceRoot },
         decision: parsed.decision,
       }
       await engine.storeView.mark('attest/human', { ...attestation })
@@ -1242,7 +1308,7 @@ function createConjureTool(engine: ProofEngine): ToolDefinition {
           + `must exercise (got ${Array.isArray(parsed.paths) ? 'an empty list' : 'nothing usable'})`)
       }
       const { request, template, instruction } = await engine.conjureRequest({
-        claim: parsed.claim,
+        claim: capToolString(parsed.claim),
         paths: parsed.paths as string[],
       })
       return {
@@ -1326,7 +1392,9 @@ function createConjureRunTool(engine: ProofEngine): ToolDefinition {
       if (typeof parsed.entry !== 'string' || parsed.entry.trim().length === 0) {
         throw new Error('proof_conjure_run: entry is required — the sandbox script name proof_conjure returned')
       }
-      const run = await engine.conjureRun({ claim: parsed.claim, entry: parsed.entry })
+      // The same cap proof_conjure applied when it minted the request — the
+      // run binds by claimId, so both sides must hash identical bytes.
+      const run = await engine.conjureRun({ claim: capToolString(parsed.claim), entry: parsed.entry })
       // A screening refusal is a protocol-internal outcome, not a tool error:
       // returning it as the canonical value (isError stays false) is what tells
       // the model "edit the script and call me again" instead of "the tool

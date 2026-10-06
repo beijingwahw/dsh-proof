@@ -30,6 +30,27 @@ import { dirname, join } from 'node:path'
 import { ccAdapterEnv, handlePostToolUse, handlePreToolUse, handleSessionStart, handleStop } from '../src/adapters/claude-code/hooks.ts'
 import type { CcAdapterEnv, CcHookPayload } from '../src/adapters/claude-code/hooks.ts'
 import { loadSession } from '../src/adapters/shared/session.ts'
+import { addressOf, merkleRoot } from '../src/core/hash.ts'
+
+/**
+ * A self-addressing baseline.json — the only shape hasBaselineOnDisk accepts
+ * since H-20. Built exactly the way buildBaseline mints one: the merkle root
+ * over the check evidence addresses, id = address of that material. A bare
+ * `{"baselineId":"x"}` is a forgery and must not release any gate.
+ */
+function realBaselineJson(): string {
+  const checks = [{ checkId: 'package.json:test', evidenceId: 'e1', status: 'pass' }]
+  const workspace = { head: null, dirty: [], dirtDigest: merkleRoot([]) }
+  const createdAt = '2026-10-06T10:00:00.000Z'
+  const root = merkleRoot(checks.map(c => c.evidenceId))
+  return JSON.stringify({
+    baselineId: addressOf({ createdAt, workspace, checkIds: checks.map(c => c.checkId), root }),
+    createdAt,
+    workspace,
+    checks,
+    root,
+  })
+}
 
 const ENTRY = fileURLToPath(new URL('../src/adapters/claude-code/entry.ts', import.meta.url))
 // The task's designated temp area, one scratch tree per test run.
@@ -74,11 +95,12 @@ before(async () => {
   for (const root of [ROOT_GATES, ROOT_DRIFT, ROOT_NOTICE, ROOT_START, ROOT_E2E]) {
     await fsp.mkdir(join(root, 'src'), { recursive: true })
   }
-  // The drift family isolates drift from the baseline reminder: a baseline on
-  // disk (the minimal shape a baseline.json parse-check accepts) means Stop
-  // can only be blocking on drift there.
+  // The drift family isolates drift from the baseline reminder: a REAL
+  // baseline on disk (self-addressing, the only shape the probe accepts
+  // since H-20 — the fixture is built the way buildBaseline mints one) means
+  // Stop can only be blocking on drift or the verify reminder there.
   await fsp.mkdir(dirname(driftEnv.paths.baselinePath), { recursive: true })
-  await fsp.writeFile(driftEnv.paths.baselinePath, JSON.stringify({ baselineId: 'cc-it', checks: [] }))
+  await fsp.writeFile(driftEnv.paths.baselinePath, realBaselineJson())
 })
 
 after(async () => {
@@ -161,6 +183,42 @@ test('PreToolUse: Bash is allowed under default warn (and never crashes the hand
   assert.equal(out, undefined)
 })
 
+test('PreToolUse: MultiEdit and NotebookEdit are denied into the store — real host mutators, not a name gap (H-01)', async () => {
+  const multi = await handlePreToolUse({
+    session_id: 's', hook_event_name: 'PreToolUse', tool_name: 'MultiEdit',
+    tool_input: { file_path: '.proof/evidence.jsonl', edits: [{ old_string: 'a', new_string: 'b' }] }, cwd: ROOT_GATES,
+  }, gatesEnv)
+  assert.equal((multi?.hookSpecificOutput as { permissionDecision?: string })?.permissionDecision, 'deny',
+    'MultiEdit carries file_path straight into the log — pre-v0.23 the name regex could not see it')
+
+  const notebook = await handlePreToolUse({
+    session_id: 's', hook_event_name: 'PreToolUse', tool_name: 'NotebookEdit',
+    tool_input: { notebook_path: '.proof/evidence.jsonl', new_source: 'tamper' }, cwd: ROOT_GATES,
+  }, gatesEnv)
+  assert.equal((notebook?.hookSpecificOutput as { permissionDecision?: string })?.permissionDecision, 'deny',
+    'NotebookEdit + its notebook_path key (a key PATH_KEYS did not know) is denied')
+})
+
+test('PreToolUse: Bash redirecting into the evidence store is denied — the H-02 channel (v0.13 H9③)', async () => {
+  const out = await handlePreToolUse({
+    session_id: 's', hook_event_name: 'PreToolUse', tool_name: 'Bash',
+    tool_input: { command: 'echo x > .proof/evidence.jsonl', description: 'innocent-looking' }, cwd: ROOT_GATES,
+  }, gatesEnv)
+  assert.ok(out !== undefined, 'a shell command naming the store must produce a decision')
+  const hso = out.hookSpecificOutput as { permissionDecision?: string; permissionDecisionReason?: string }
+  assert.equal(hso.permissionDecision, 'deny')
+  assert.match(hso.permissionDecisionReason ?? '', /command names the verification evidence store/i)
+
+  // The same shell with an honest command stays allowed (see the npm test
+  // case above) — the sweep is about mentions of the store, not about Bash.
+  const forgeBaseline = await handlePreToolUse({
+    session_id: 's', hook_event_name: 'PreToolUse', tool_name: 'Bash',
+    tool_input: { command: 'echo "{\\"baselineId\\":\\"x\\"}" > .proof/baseline.json' }, cwd: ROOT_GATES,
+  }, gatesEnv)
+  assert.equal((forgeBaseline?.hookSpecificOutput as { permissionDecision?: string })?.permissionDecision, 'deny',
+    'the self-forged-baseline route through Bash is closed too (H-20\'s write side)')
+})
+
 // ---------------------------------------------------------------------------
 // PostToolUse — provenance observation into the persisted session
 // ---------------------------------------------------------------------------
@@ -226,7 +284,7 @@ test('Stop: the same session with the drift resolved no longer blocks', async ()
   assert.equal(out, undefined, 'no drift, no unmet gate — the turn may end')
 })
 
-test('Stop: mutations with a baseline but no verification block once (verify notice)', async () => {
+test('Stop: unverified mutations block EVERY mutating turn — the verify notice re-arms per turn (M-45)', async () => {
   await writeFile(ROOT_DRIFT, 'src/v.ts', 'v1')
   await handlePostToolUse({
     session_id: 'verify-notice', hook_event_name: 'PostToolUse', tool_name: 'Write',
@@ -238,15 +296,23 @@ test('Stop: mutations with a baseline but no verification block once (verify not
   assert.equal((first as { decision?: string }).decision, 'block')
   assert.match((first as { reason?: string }).reason ?? '', /proof_verify/i)
   const after = await loadSession(driftEnv.paths.sessionDir, 'verify-notice')
-  assert.deepEqual(after?.firedNotices, ['verify'], 'the one-time notice was recorded')
+  assert.ok(after?.firedNotices.includes('verify'), 'the notice was recorded in the ledger')
 
-  // The turn continues, mutates again, stops again: the reminder must not repeat.
+  // The turn continues, mutates again, stops again: the reminder RE-ARMS —
+  // pre-v0.23 one burnable notice made enforceOnTurnEnd "once per session",
+  // and ignoring it once was a permanent exemption (index.ts fires every
+  // turn; the adapter now agrees).
   await handlePostToolUse({
     session_id: 'verify-notice', hook_event_name: 'PostToolUse', tool_name: 'Write',
-    tool_input: { file_path: 'src/v.ts', content: 'v1' }, cwd: ROOT_DRIFT,
+    tool_input: { file_path: 'src/v.ts', content: 'v2' }, cwd: ROOT_DRIFT,
   }, driftEnv)
   const second = await handleStop({ session_id: 'verify-notice', hook_event_name: 'Stop', cwd: ROOT_DRIFT }, driftEnv)
-  assert.equal(second, undefined, 'firedNotices makes the verify reminder one-shot per session')
+  assert.ok(second !== undefined, 'a second mutating turn owes its own verification')
+  assert.match((second as { reason?: string }).reason ?? '', /proof_verify/i)
+
+  // A turn that mutated nothing (the window advanced at the last stop) ends clean.
+  const quiet = await handleStop({ session_id: 'verify-notice', hook_event_name: 'Stop', cwd: ROOT_DRIFT }, driftEnv)
+  assert.equal(quiet, undefined, 'no mutations this window — nothing owed, nothing said')
 })
 
 test('Stop: touched>0 without a baseline blocks once, and firedNotices dedupes it', async () => {
@@ -291,6 +357,12 @@ test('SessionStart: additionalContext carries the policy section and the five MC
     assert.ok(context.includes(tool), `the context names ${tool}`)
   }
   assert.ok(context.includes('proof_verify'), 'the context tells the model when to verify')
+  // H-22: the context states wiring as DETECTED, never as guaranteed — the
+  // hook itself cannot verify its own registration, and a project-scope
+  // settings file can silently drop the PreToolUse hook.
+  assert.match(context, /DETECTED, not guaranteed/, 'enforcement is phrased as a detection')
+  assert.match(context, /cannot\s+verify/, 'the context admits what it cannot verify')
+  assert.match(context, /\.proof\/evidence\.jsonl/, 'the self-check names the concrete falsifying write')
 })
 
 test('SessionStart: seeds the session file, and never wipes an existing one', async () => {
@@ -372,6 +444,30 @@ test('e2e pre-tool-use: the deny answer is a single-line PreToolUse hookSpecific
   assert.ok(typeof hso.permissionDecisionReason === 'string' && hso.permissionDecisionReason.length > 0)
 })
 
+test('e2e pre-tool-use: MultiEdit and Bash-redirect into the store are denied across the real process boundary', async () => {
+  const multi = await runHook('pre-tool-use', JSON.stringify({
+    session_id: 'e2e', hook_event_name: 'PreToolUse', tool_name: 'MultiEdit',
+    tool_input: { file_path: '.proof/evidence.jsonl', edits: [] }, cwd: ROOT_E2E,
+  }), ROOT_E2E)
+  assert.equal(multi.code, 0)
+  assert.equal(
+    ((singleLineJson(multi.stdout).hookSpecificOutput ?? {}) as { permissionDecision?: string }).permissionDecision,
+    'deny',
+    'the camelCase mutator takes the deny path through the real entry point',
+  )
+
+  const bash = await runHook('pre-tool-use', JSON.stringify({
+    session_id: 'e2e', hook_event_name: 'PreToolUse', tool_name: 'Bash',
+    tool_input: { command: 'echo x > .proof/evidence.jsonl' }, cwd: ROOT_E2E,
+  }), ROOT_E2E)
+  assert.equal(bash.code, 0)
+  assert.equal(
+    ((singleLineJson(bash.stdout).hookSpecificOutput ?? {}) as { permissionDecision?: string }).permissionDecision,
+    'deny',
+    'the shell redirect channel (v0.13 H9③) is closed at the real entry point',
+  )
+})
+
 test('e2e pre-tool-use: an allowed call is exit 0 with empty stdout', async () => {
   const { code, stdout } = await runHook('pre-tool-use', JSON.stringify({
     session_id: 'e2e', hook_event_name: 'PreToolUse', tool_name: 'Edit',
@@ -450,6 +546,42 @@ test('e2e bad input: an unknown event name is silent exit 0 (forward compatibili
   const { code, stdout } = await runHook('Notification', JSON.stringify({ session_id: 'x', cwd: ROOT_E2E }), ROOT_E2E)
   assert.equal(code, 0)
   assert.equal(stdout, '', 'unknown events cost nothing and break nothing')
+})
+
+test('e2e bad input: a stdin flood beyond the size cap answers ask instead of buffering forever (B3-L2)', async () => {
+  // Feed 5MB and never close the pipe: the cap must cut the read short, the
+  // truncated payload must fail parsing, and pre-tool-use must answer `ask`.
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(process.execPath, ['--experimental-strip-types', ENTRY, 'pre-tool-use'], {
+      cwd: ROOT_E2E,
+      env: { ...process.env, DSH_PROOF_ROOT: ROOT_E2E, DSH_PROOF_TRUST_DIR: join(WORKSPACE, 'trust-e2e'), DSH_PROOF_EVIDENCE_STORE: 'workspace' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    const timer = setTimeout(() => {
+      child.kill()
+      reject(new Error('entry did not answer within 20s of the size cap'))
+    }, 20_000)
+    child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
+      stdout += chunk
+      try {
+        child.stdin.end()
+        child.kill()
+      } catch { /* already gone */ }
+    })
+    child.on('error', (error) => { clearTimeout(timer); reject(error) })
+    child.on('exit', () => {
+      clearTimeout(timer)
+      const lines = stdout.split('\n').filter(l => l.trim().length > 0)
+      assert.equal(lines.length, 1, `one answer line, got ${JSON.stringify(stdout)}`)
+      const hso = (JSON.parse(lines[0] ?? '{}') as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput
+      assert.equal(hso?.permissionDecision, 'ask', 'a gate that can only read half its input must not wave the mutation through')
+      resolve()
+    })
+    child.stdin.on('error', () => { /* killed with the pipe open */ })
+    child.stdin.write(`{"pad":"${'x'.repeat(5 * 1024 * 1024)}"}`)
+    // deliberately NO child.stdin.end(): the cap, not the writer, ends the read
+  })
 })
 
 // ---------------------------------------------------------------------------

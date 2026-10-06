@@ -20,14 +20,17 @@
  *
  * Transport note: MCP stdio is newline-delimited JSON (one JSON-RPC 2.0
  * message per line), NOT LSP-style Content-Length framing. Protocol-level
- * problems (unknown method, unparseable line, malformed request) answer as
- * JSON-RPC errors; a tool that ran but failed answers as a normal result with
- * `isError: true` — MCP tool-error semantics, never mapped onto the RPC layer.
+ * problems (unknown method, unparseable line, malformed request, a request
+ * before `initialize`, a line over the transport cap) answer as JSON-RPC
+ * errors; a tool that ran but failed answers as a normal result with
+ * `isError: true` — MCP tool-error semantics, never mapped onto the RPC
+ * layer. JSON-RPC 2.0 batches (an array of messages) are processed element
+ * by element and answered with an array, per the specification.
  *
  * @module dsh-proof/app/mcp-server
  */
 
-import { createInterface } from 'node:readline'
+import { homedir } from 'node:os'
 
 import type { ProofEngine } from '../engine.ts'
 import { NodeEd25519Signer, SystemClock } from '../node-ports.ts'
@@ -98,6 +101,20 @@ export interface McpEngineDeps {
   ptlDir?: string
   /** Reported as serverInfo.version (entry injects from env or the constant). */
   serverVersion: string
+  /**
+   * v0.22: opt-out of the initialize-before-tools gate for embedders that
+   * drive `createMcpHandler` directly (unit tests, in-process hosts). The
+   * stdio server itself never sets it — there the handshake is mandatory.
+   */
+  allowUninitializedTools?: boolean
+  /**
+   * v0.22: the host-side trust root, when the caller knows it — the PTL
+   * operator key resolves under it first (`<trustRoot>/ptl-operator-key`,
+   * the engine's and the CLI's default) before the log-dir spellings, so a
+   * key that notarises a log is never loaded from inside the directory the
+   * log's own writer can rewrite.
+   */
+  trustRoot?: string
 }
 
 export interface McpServerOptions extends McpEngineDeps {
@@ -112,7 +129,7 @@ export interface McpServerOptions extends McpEngineDeps {
 // ---------------------------------------------------------------------------
 
 export const MCP_SERVER_NAME = 'agent-proof-protocol'
-export const MCP_DEFAULT_VERSION = '0.21.0'
+export const MCP_DEFAULT_VERSION = '0.22.0'
 
 /**
  * Protocol versions this server speaks, newest first. A client asking for a
@@ -126,9 +143,19 @@ const LATEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0] as string
 const PARSE_ERROR = -32700
 const INVALID_REQUEST = -32600
 const METHOD_NOT_FOUND = -32601
+const INVALID_PARAMS = -32602
 
 /** A serialized bundle at or above this size is trimmed to manifest + names. */
 const BUNDLE_INLINE_LIMIT_BYTES = 256 * 1024
+
+/**
+ * v0.22: the largest stdin line the stdio loop will buffer (4 MiB). A longer
+ * line is refused with a parse error WITHOUT being buffered to completion or
+ * parsed — one JSON-RPC message per line is the transport contract, and a
+ * foreign client that sends an unbounded "line" must not get to size the
+ * server's memory by violating it.
+ */
+const MAX_LINE_BYTES = 4 * 1024 * 1024
 
 /**
  * The clock the entry injects into the engine is private to the engine, so the
@@ -229,16 +256,20 @@ const DELEGATE_SUBMIT_DESCRIPTION =
   'WORKER TOOL. Submit your completed work for a delegated obligation: the APP bundle you exported with '
   + 'proof_bundle in your own workspace, addressed to the taskId the orchestrator\'s proof_delegate returned. '
   + 'The bundle is adjudicated from its own bytes — manifest digests recomputed, chain walked, nothing you assert '
-  + 'is trusted; `claimedGrade` (optional, one of the five grades) is what YOU claim and is checked against what '
-  + 'the artifacts actually support. Returns the recorded submission and the `composed` verdict the submission '
-  + 'produced: a forged or regressed bundle is attributed by taskId, never silently absorbed.'
+  + 'is trusted. `claimedGrade` (optional, one of the five grades) is YOUR self-claim, recorded verbatim and then '
+  + 'adjudicated: a "proven" the artifacts cannot back is recorded as forged and composes regressed; any other '
+  + 'grade passes through as the recorded claim — it is attributed, not independently verified, and never '
+  + 'silently rounded. Returns the recorded submission and the `composed` verdict the submission produced: a '
+  + 'forged or regressed bundle is attributed by taskId, never silently absorbed.'
 
 const TASK_DESCRIPTION =
   'ORCHESTRATOR TOOL. Inspect the responsibility DAG. Without a taskId: the whole-task overview — every delegated '
   + 'task with its parent, an 80-character claim summary and whether a submission has landed. With a taskId: the '
   + 'full composed verdict for that task\'s subtree ({composed, nodes, cycles}) — own grade, forged/regressed/'
-  + 'unproven children, waived obligations and blockers. `ownGrade` (optional, one of the five grades) folds this '
-  + 'workspace\'s own local verdict into the composition. Roles in one line: the orchestrator speaks '
+  + 'unproven children, waived obligations and blockers. `ownGrade` (optional, one of the five grades) is the '
+  + 'caller\'s SELF-REPORT about this workspace\'s own local work — advisory input only: the composed verdict '
+  + 'derives from child evidence and bundle verification, never from this claim, and an ownGrade the evidence '
+  + 'contradicts is recorded, not trusted. Roles in one line: the orchestrator speaks '
   + 'proof_delegate and proof_task; the worker speaks proof_verify, proof_bundle and proof_delegate_submit; a '
   + 'third-party auditor verifies the published log with proof_log_verify.'
 
@@ -258,12 +289,14 @@ const TRAINING_EXPORT_DESCRIPTION =
 
 const ECONOMICS_DESCRIPTION =
   'Read the economics ledger of the most recent verification this workspace ran — WHAT THE PROOF COST, read back '
-  + 'off the tamper-evident evidence chain, never recomputed here and never taken on the caller\'s word. A ledger '
-  + 'exists only when the verification ran WITH a rate card: pass `economics: {computePerMs, humanReviewPerItem?}` '
+  + 'off the evidence log\'s own boundary marker, never recomputed here and never taken on the caller\'s word. A '
+  + 'ledger exists only when the verification ran WITH a rate card: pass `economics: {computePerMs, humanReviewPerItem?}` '
   + 'to proof_verify (this MCP face accepts it directly), and the boundary marker records the ledger (computeMs, '
   + 'cost, assertions, costPerAssertion, purchased confidence, info nats) plus the prior probability it moved '
   + 'from. This tool then scans the chain and REPLAYS the most recent proof/claim marker that carries one, '
-  + 'verbatim — grade and all. The arguments here are the rate card you are asking under (computePerMs required, '
+  + 'verbatim — grade and all — after running a chain audit whose verdict rides the response: the hash chain '
+  + 'detects rewrites, it does not prevent a writer who can touch the log, so a failing audit means the replayed '
+  + 'ledger may be forged. The arguments here are the rate card you are asking under (computePerMs required, '
   + '> 0; humanReviewPerItem optional): they are validated and echoed, but they price nothing new and change no '
   + 'future run — this is a PURE QUERY over evidence that already exists. If the chain holds no economics yet, '
   + 'the error says exactly how to mint one.'
@@ -346,8 +379,10 @@ const MCP_TOOL_LIST: ToolDescriptor[] = [
         entryPoints: {
           type: 'array',
           items: { type: 'string' },
-          description: 'API-face entry points (workspace-relative files) the surface check covers; omit to let the '
-            + 'engine derive them from package.json. Advanced usage.',
+          description: 'Reserved, currently not consumed: the api-surface obligation derives its entry points '
+            + 'from package.json (or the deployment-level apiEntryPoints config) regardless of this parameter. '
+            + 'Omit it; the values are recorded on the contract object only. (Same wording as the DSH tool '
+            + 'face — the two faces do not diverge on what a parameter promises.)',
         },
         changed: {
           type: 'array',
@@ -439,8 +474,10 @@ const MCP_TOOL_LIST: ToolDescriptor[] = [
         claimedGrade: {
           type: 'string',
           enum: ['proven', 'regressed', 'stale', 'unproven', 'no-baseline'],
-          description: 'Optional: the grade you claim for your own work. Checked against what the bundle\'s '
-            + 'artifacts actually support — claiming above the evidence is refused, not rounded down silently.',
+          description: 'Optional: the grade you claim for your own work. Recorded verbatim and adjudicated: a '
+            + '"proven" the bundle\'s artifacts cannot back is recorded as forged (composing regressed and '
+            + 'attributed by taskId); any other grade is recorded as the claim — attributed, not independently '
+            + 'verified. Claiming above the evidence is named, never silently rounded down.',
         },
         byWorkspace: {
           type: 'string',
@@ -464,8 +501,9 @@ const MCP_TOOL_LIST: ToolDescriptor[] = [
         ownGrade: {
           type: 'string',
           enum: ['proven', 'regressed', 'stale', 'unproven', 'no-baseline'],
-          description: 'Optional: fold this workspace\'s own local grade into the composed verdict. One of the '
-            + 'five grades — anything else is refused loudly, never silently dropped.',
+          description: 'Optional SELF-REPORT of this workspace\'s own local grade — advisory input, never '
+            + 'authoritative: the composed verdict derives from child evidence and bundle verification, not from '
+            + 'this claim. One of the five grades — anything else is refused loudly, never silently dropped.',
         },
       },
     },
@@ -497,9 +535,11 @@ const MCP_TOOL_LIST: ToolDescriptor[] = [
         },
         path: {
           type: 'string',
-          description: 'Write the samples to this path as JSONL instead of holding them in memory only. When '
-            + 'given, the engine writes the file and the response carries `writtenTo` — the samples still never '
-            + 'ride the response itself.',
+          description: 'Write the samples to this path as JSONL instead of holding them in memory only. Must be '
+            + 'WORKSPACE-RELATIVE: absolute paths (including UNC) and any path that escapes the workspace root '
+            + 'are refused loudly — this face never hands a foreign caller an arbitrary host write. When given, '
+            + 'the engine writes under the workspace and the response carries the absolute `writtenTo` — the '
+            + 'samples still never ride the response itself.',
         },
       },
     },
@@ -608,7 +648,23 @@ function freshSignal(): AbortSignal {
   return new AbortController().signal
 }
 
-/** Narrow an untrusted `arguments` object; non-objects degrade to no arguments. */
+/**
+ * v0.22: fold $HOME-absolute host paths in outbound error text to '~'-relative
+ * form. An MCP client is a foreign agent: error messages that quote the
+ * server's physical layout (username, trust-root placement) hand it targeting
+ * information it has no business having. Best-effort by design — the fold is
+ * textual, never a security boundary.
+ */
+function sanitizeHostText(text: string): string {
+  const home = homedir()
+  return home.length > 0 ? text.split(home).join('~') : text
+}
+
+/**
+ * Narrow an untrusted `arguments` object. The DISPATCHER has already refused a
+ * non-object `arguments` member as INVALID_PARAMS (v0.22) — this narrows the
+ * tool-call params themselves, degrading absent `arguments` to no arguments.
+ */
 function callArguments(params: unknown): Record<string, unknown> {
   if (typeof params !== 'object' || params === null || Array.isArray(params)) return {}
   const args = (params as { arguments?: unknown }).arguments
@@ -616,10 +672,32 @@ function callArguments(params: unknown): Record<string, unknown> {
   return args as Record<string, unknown>
 }
 
-/** Keep only the string entries of an untrusted array-valued argument. */
-function stringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined
-  return value.filter((entry): entry is string => typeof entry === 'string')
+/**
+ * Keep only the string entries of an untrusted array-valued argument — and
+ * COUNT what was dropped (v0.22). A silently narrowed `changed` list is
+ * under-attribution: the engine verifies fewer checks than the caller thinks
+ * it declared, so the drop is surfaced in the response instead of hidden.
+ */
+interface NarrowedStrings {
+  values: string[] | undefined
+  droppedNonString: number
+}
+
+function stringArray(value: unknown): NarrowedStrings {
+  if (!Array.isArray(value)) return { values: undefined, droppedNonString: 0 }
+  const values: string[] = []
+  let dropped = 0
+  for (const entry of value) {
+    if (typeof entry === 'string') values.push(entry)
+    else dropped += 1
+  }
+  return { values, droppedNonString: dropped }
+}
+
+/** The warning a narrowed array argument carries into the successful result. */
+function droppedWarning(tool: string, arg: string, dropped: number): string {
+  return `${tool}: dropped ${dropped} non-string ${dropped === 1 ? 'entry' : 'entries'} from ${arg} — `
+    + 'array arguments must be arrays of strings; the engine only sees the string entries'
 }
 
 /** v0.21: narrow a tool argument into a rate card; an Error means loud usage failure. */
@@ -660,22 +738,32 @@ async function callBaselineTool(deps: McpEngineDeps): Promise<McpToolResult> {
 }
 
 async function callVerifyTool(deps: McpEngineDeps, args: Record<string, unknown>): Promise<McpToolResult> {
-  // `claim` is accepted for the record (schema parity with the DSH face); the
-  // engine's verify() takes no claim text, exactly like dsh/tools.ts.
-  void args.claim
+  // M50/D3 parity (v0.22): `claim` is the text this verification answers, and
+  // the ENGINE records it — VerifyOptions.claim rides the proof/verified
+  // boundary marker (bounded to 200 chars), byte-for-byte the same record the
+  // DSH tool face forwards. The MCP face must not diverge from what session
+  // logs record, so it forwards instead of dropping.
+  if (args.claim !== undefined && typeof args.claim !== 'string') {
+    return toolError({ error: `proof_verify: claim must be a string (got ${JSON.stringify(args.claim)})` })
+  }
   const changed = stringArray(args.changed)
   const rate = rateCardOf(args.economics)
   if (rate instanceof Error) return toolError({ error: `proof_verify: ${rate.message}` })
   const outcome = await deps.engine.verify({
-    ...(changed !== undefined ? { changed } : {}),
+    ...(changed.values !== undefined ? { changed: changed.values } : {}),
     ...(args.all === true ? { all: true } : {}),
+    ...(typeof args.claim === 'string' && args.claim.trim() !== '' ? { claim: args.claim } : {}),
     ...(rate !== undefined ? { economics: { rate } } : {}),
     signal: freshSignal(),
   })
-  return toolResult(toVerifyValue(
+  const verified = toVerifyValue(
     outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
     outcome.schedule, outcome.coverage,
-  ))
+  )
+  if (changed.droppedNonString > 0) {
+    return toolResult({ ...verified, warning: droppedWarning('proof_verify', 'changed', changed.droppedNonString) })
+  }
+  return toolResult(verified)
 }
 
 async function callClaimTool(deps: McpEngineDeps, args: Record<string, unknown>): Promise<McpToolResult> {
@@ -696,35 +784,58 @@ async function callClaimTool(deps: McpEngineDeps, args: Record<string, unknown>)
         + 'omitted kind verifies without a contract — a wrong kind is never silently downgraded',
     })
   }
+  // v0.22 (H-29 face half): a perf budget that is not a finite number is a
+  // hole, not a budget — `JSON.parse('1e999')` yields Infinity, `typeof` says
+  // number, and a within-budget obligation compared against Infinity is
+  // satisfied by any benchmark whatsoever. Every numeric argument on this
+  // face is finite-checked; budgetMs joins them.
+  if (args.budgetMs !== undefined
+    && (typeof args.budgetMs !== 'number' || !Number.isFinite(args.budgetMs) || args.budgetMs < 0)) {
+    return toolError({
+      error: `proof_claim: budgetMs must be a finite number >= 0 (got ${typeof args.budgetMs === 'number' ? String(args.budgetMs) : JSON.stringify(args.budgetMs) ?? 'a non-number value'}) `
+        + '— an infinite budget satisfies any benchmark and is therefore not a budget',
+    })
+  }
+  if (args.review !== undefined && typeof args.review !== 'string') {
+    return toolError({ error: `proof_claim: review must be a string (got ${JSON.stringify(args.review)})` })
+  }
   const changed = stringArray(args.changed)
+  const entryPoints = stringArray(args.entryPoints)
+  const warnings: string[] = []
+  if (changed.droppedNonString > 0) warnings.push(droppedWarning('proof_claim', 'changed', changed.droppedNonString))
+  if (entryPoints.droppedNonString > 0) warnings.push(droppedWarning('proof_claim', 'entryPoints', entryPoints.droppedNonString))
   if (isClaimKind(args.kind)) {
     const contract: ClaimContract = {
       kind: args.kind,
       claim,
       ...(typeof args.budgetMs === 'number' ? { budgetMs: args.budgetMs } : {}),
       ...(typeof args.review === 'string' ? { review: args.review } : {}),
-      ...(stringArray(args.entryPoints) !== undefined ? { entryPoints: stringArray(args.entryPoints) } : {}),
+      ...(entryPoints.values !== undefined ? { entryPoints: entryPoints.values } : {}),
     }
     const outcome = await deps.engine.verifyContract({
       contract,
-      ...(changed !== undefined ? { changed } : {}),
+      ...(changed.values !== undefined ? { changed: changed.values } : {}),
       signal: freshSignal(),
     })
     const verified = toVerifyValue(
       outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
       outcome.schedule, outcome.coverage,
     )
-    return toolResult(toClaimValue(claim, outcome.report, verified, outcome.contract))
+    const claimed = toClaimValue(claim, outcome.report, verified, outcome.contract)
+    if (warnings.length > 0) return toolResult({ ...claimed, warnings })
+    return toolResult(claimed)
   }
   const outcome = await deps.engine.verify({
-    ...(changed !== undefined ? { changed } : {}),
+    ...(changed.values !== undefined ? { changed: changed.values } : {}),
     signal: freshSignal(),
   })
   const verified = toVerifyValue(
     outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
     outcome.schedule, outcome.coverage,
   )
-  return toolResult(toClaimValue(claim, outcome.report, verified))
+  const claimed = toClaimValue(claim, outcome.report, verified)
+  if (warnings.length > 0) return toolResult({ ...claimed, warnings })
+  return toolResult(claimed)
 }
 
 /**
@@ -759,7 +870,8 @@ async function callBundleTool(deps: McpEngineDeps): Promise<McpToolResult> {
   const evidenceLog = await fs.readFile(deps.evidenceLogPath)
   if (evidenceLog === undefined) {
     return toolError({
-      error: `proof_bundle: no evidence log at ${deps.evidenceLogPath} — establish a baseline with proof_baseline first`,
+      error: 'proof_bundle: no evidence log in this workspace\'s store — establish a baseline with '
+        + 'proof_baseline first (storeDir-relative: evidence.jsonl)',
     })
   }
   const baselineJson = await fs.readFile(deps.baselinePath)
@@ -775,15 +887,20 @@ async function callBundleTool(deps: McpEngineDeps): Promise<McpToolResult> {
   )
   const serialized = JSON.stringify(bundle)
   const size = new TextEncoder().encode(serialized).length
-  if (size < BUNDLE_INLINE_LIMIT_BYTES) {
+  // v0.22: the limit prices the WHOLE wire payload, not one of its two copies.
+  // An MCP result carries the value twice — the pretty-printed text content
+  // and structuredContent — so a bundle near 256KB actually rode ~512KB+ and
+  // the advertised ceiling was fiction. Count both copies against the limit.
+  if (size * 2 < BUNDLE_INLINE_LIMIT_BYTES) {
     return toolResult({ bundle })
   }
   return toolResult({
     bundle: {
       manifest: bundle.manifest,
       files: bundleFileNames(bundle.files),
-      note: `bundle serialized to ${size} bytes (>= ${BUNDLE_INLINE_LIMIT_BYTES}); only the manifest and the `
-        + 'file-name list ride this response — re-export on the host for full contents',
+      note: `bundle serialized to ${size} bytes (>= half the ${BUNDLE_INLINE_LIMIT_BYTES}-byte response limit, `
+        + 'which counts both wire copies); only the manifest and the file-name list ride this response '
+        + '— re-export on the host for full contents',
     },
   })
 }
@@ -818,18 +935,43 @@ async function callPublishTool(deps: McpEngineDeps): Promise<McpToolResult> {
  * right for publishing, exactly wrong for a verify tool: minting a key as a
  * side effect of auditing would write to the very tree under audit and
  * "verify" against a key that never signed anything.
+ *
+ * v0.22 candidate chain, matching the engine's and the ptl CLI's resolution:
+ * `<trustRoot>/ptl-operator-key` first (outside the published log dir — a key
+ * beside the log it notarises can be rewritten together with that log), then
+ * `<ptlDir>/ptl-operator-key`, then the legacy `<ptlDir>/operator-key` so an
+ * existing deployment's heads keep verifying after an upgrade.
  */
-async function operatorSignerFor(fs: FsPort, ptlDir: string): Promise<SignerPort | undefined> {
-  const dir = `${ptlDir.replace(/[\/]+$/, '')}/operator-key`
-  try {
-    const names = await fs.readDir(dir)
-    if (names === undefined || !names.some(name => name.endsWith('proof-signing-key.pem'))) return undefined
-    return await NodeEd25519Signer.load(dir)
-  } catch {
-    // A key directory we cannot even probe is a missing capability, not an
-    // accusation — reported as not-checked by the caller.
-    return undefined
+async function operatorSignerFor(
+  fs: FsPort,
+  ptlDir: string,
+  trustRoot: string | undefined,
+): Promise<SignerPort | undefined> {
+  const candidates = [
+    ...(trustRoot !== undefined && trustRoot.length > 0 ? [`${trustRoot.replace(/[\/]+$/, '')}/ptl-operator-key`] : []),
+    `${ptlDir.replace(/[\/]+$/, '')}/ptl-operator-key`,
+    `${ptlDir.replace(/[\/]+$/, '')}/operator-key`,
+  ]
+  for (const dir of candidates) {
+    try {
+      const names = await fs.readDir(dir)
+      if (names !== undefined && names.some(name => name.endsWith('proof-signing-key.pem'))) {
+        if (dir.endsWith('/operator-key')) {
+          // N-8: the legacy in-log-dir spelling — kept so an upgraded
+          // deployment's heads keep verifying, said out loud because a key
+          // beside the log it notarises is the self-reference H-07 closed
+          // for new deployments.
+          process.stderr.write('[agent-proof-protocol] note: operator key loaded from the legacy log-dir '
+            + `location ${dir} — move it under the trust root so it does not live inside the directory it notarises\n`)
+        }
+        return await NodeEd25519Signer.load(dir)
+      }
+    } catch {
+      // A key directory we cannot even probe is a missing capability, not an
+      // accusation — reported as not-checked by the caller.
+    }
   }
+  return undefined
 }
 
 /** 64-character lowercase hex (a sha256 digest on the wire). */
@@ -875,12 +1017,13 @@ async function callLogVerifyTool(deps: McpEngineDeps, args: Record<string, unkno
   const { log, sth: head, badLines } = await loadPtl(fs, deps.ptlDir)
   if (log.size === 0) {
     return toolError({
-      error: `proof_log_verify: the transparency log at ${deps.ptlDir} holds no entries — publish with proof_publish first`,
+      error: 'proof_log_verify: the configured transparency log (ptlDir) holds no entries — publish with '
+        + 'proof_publish first',
     })
   }
   const problems: string[] = []
   if (badLines > 0) {
-    problems.push(`${badLines} malformed entry line(s) skipped while loading ${deps.ptlDir} — the readable prefix was audited, but the log is not sound`)
+    problems.push(`${badLines} malformed entry line(s) skipped while loading the transparency log — the readable prefix was audited, but the log is not sound`)
   }
   const treeSize = log.size
   // The root is recomputed from the published leaves before anything else is
@@ -891,7 +1034,7 @@ async function callLogVerifyTool(deps: McpEngineDeps, args: Record<string, unkno
   // -- the signed tree head: present, honest about the tree, genuinely signed --
   let treeHead: Record<string, unknown> | undefined
   if (head === undefined) {
-    problems.push(`no signed tree head in ${deps.ptlDir} — the published tree carries no operator commitment`)
+    problems.push('no signed tree head in the transparency log — the published tree carries no operator commitment')
   } else {
     const sizeMatches = head.treeSize === treeSize
     const rootMatches = head.root === root
@@ -901,7 +1044,7 @@ async function callLogVerifyTool(deps: McpEngineDeps, args: Record<string, unkno
     if (!rootMatches) {
       problems.push(`tree head root ${head.root} does not match the root recomputed from the log (${root})`)
     }
-    const operator = await operatorSignerFor(fs, deps.ptlDir)
+    const operator = await operatorSignerFor(fs, deps.ptlDir, deps.trustRoot)
     let signature: 'verified' | 'invalid' | 'not-checked (operator key absent)'
     if (operator === undefined) {
       signature = 'not-checked (operator key absent)'
@@ -1193,22 +1336,21 @@ function summarizeClaim(claim: string): string {
 /**
  * The whole-task overview, read back off the evidence chain the way the DSH
  * attestation tools read markers (dsh/tools.ts's markerPayloads precedent):
- * parse each line, keep `delegation/` markers, and classify by label — the
- * engine mints `delegation/created` when an obligation is opened and
- * `delegation/verdict` when a submission lands (`delegation/waive` is a risk
- * acceptance, NOT a submission, so it is deliberately not matched). Defensive
- * by construction: an unreadable log degrades to an empty overview, never a
- * throw, and any field with the wrong shape is skipped, not guessed at.
+ * parse each line, keep the engine's own `delegation/created` and
+ * `delegation/verdict` labels (matched EXACTLY — the engine mints exactly
+ * those two, and a loose `includes()` would fold any future label into a
+ * submission signal). Defensive by construction against bad shapes: a field
+ * with the wrong shape is skipped, not guessed at. Absence is distinguished
+ * from content (v0.22): a missing log reports `logPresent: false` so the
+ * caller sees "nothing recorded yet", never a silent fake-empty chain.
  */
-async function taskOverview(deps: McpEngineDeps): Promise<TaskOverviewEntry[]> {
+async function taskOverview(deps: McpEngineDeps): Promise<{ tasks: TaskOverviewEntry[]; logPresent: boolean }> {
   const tasks = new Map<string, TaskOverviewEntry>()
-  let lines: readonly string[]
-  try {
-    lines = await deps.engine.fsView.readLines(deps.evidenceLogPath)
-  } catch {
-    return []
-  }
+  const raw = await deps.engine.fsView.readFile(deps.evidenceLogPath)
+  if (raw === undefined) return { tasks: [], logPresent: false }
+  const lines = raw.split('\n')
   for (const line of lines) {
+    if (line.trim().length === 0) continue
     let envelope: { kind?: unknown; payload?: unknown }
     try {
       envelope = JSON.parse(line) as { kind?: unknown; payload?: unknown }
@@ -1220,23 +1362,22 @@ async function taskOverview(deps: McpEngineDeps): Promise<TaskOverviewEntry[]> {
     if (typeof payload !== 'object' || payload === null) continue
     const record = payload as Record<string, unknown>
     const label = typeof record.label === 'string' ? record.label : ''
-    if (!label.startsWith('delegation/')) continue
+    if (label !== 'delegation/created' && label !== 'delegation/verdict') continue
     const taskId = record.taskId
     if (typeof taskId !== 'string') continue
-    if (label.includes('created')) {
+    if (label === 'delegation/created') {
       const claim = record.claim
       if (typeof claim !== 'string') continue
       const parentTaskId = typeof record.parentTaskId === 'string' ? record.parentTaskId : null
       tasks.set(taskId, { taskId, parentTaskId, claim: summarizeClaim(claim), submitted: false })
-    } else if ((label.includes('verdict') || label.includes('submit')) && tasks.has(taskId)) {
-      // A landed submission (`delegation/verdict` in the engine's dialect);
-      // 'submit' is matched too so a future engine renaming the label keeps
-      // the overview honest.
+    } else if (tasks.has(taskId)) {
+      // A landed submission (`delegation/verdict` — the engine's exact label
+      // for "a submission was adjudicated").
       const entry = tasks.get(taskId)!
       tasks.set(taskId, { ...entry, submitted: true })
     }
   }
-  return [...tasks.values()]
+  return { tasks: [...tasks.values()], logPresent: true }
 }
 
 async function callTaskTool(deps: McpEngineDeps, args: Record<string, unknown>): Promise<McpToolResult> {
@@ -1254,11 +1395,15 @@ async function callTaskTool(deps: McpEngineDeps, args: Record<string, unknown>):
   if (verbs === undefined) return delegationUnavailable('proof_task')
   const taskId = args.taskId as string | undefined
   if (taskId === undefined) {
-    const tasks = await taskOverview(deps)
+    const overview = await taskOverview(deps)
     return toolResult({
-      tasks,
-      ...(tasks.length === 0
-        ? { note: 'no delegations recorded on this chain yet — create one with proof_delegate' }
+      tasks: overview.tasks,
+      ...(overview.tasks.length === 0
+        ? {
+            note: overview.logPresent
+              ? 'no delegations recorded on this chain yet — create one with proof_delegate'
+              : 'no evidence log exists yet — nothing is recorded on this chain (proof_baseline or proof_delegate creates it)',
+          }
         : {}),
     })
   }
@@ -1347,6 +1492,45 @@ function isProvenanceFilter(value: unknown): value is 'agent-only' | 'all' {
   return typeof value === 'string' && PROVENANCE_FILTERS.includes(value)
 }
 
+/**
+ * H-16 (v0.22, face-layer confinement — the engine's exportRelPath gate is
+ * the second layer, and the two are aligned): `path` hands the engine a write
+ * destination, and the engine's write goes through mkdirp + writeFile with
+ * the fs port's full authority. An MCP caller is a foreign agent, so the
+ * destination is confined to THIS workspace: absolute paths (drive-rooted,
+ * slash-rooted, UNC — both `\\srv\share` and `//srv/share`) and any path
+ * whose `.`/`..` segments normalize outside the root are refused loudly.
+ * The returned `rel` is what the engine receives (its own contract is
+ * workspace-relative, and IT anchors the write at the workspace root);
+ * `abs` is the workspace-absolute destination reported back as `writtenTo`.
+ */
+function confinedExportPath(raw: string, root: string): { rel: string; abs: string } | Error {
+  if (/^\\\\/.test(raw) || /^\/\//.test(raw)) {
+    return new Error('proof_training_export: path refuses UNC paths — the export valve writes inside this workspace only (name a workspace-relative path)')
+  }
+  if (/^([A-Za-z]:[\\/]|[\\/])/.test(raw)) {
+    return new Error('proof_training_export: path must be workspace-RELATIVE — absolute paths are refused on this face (the deployer exports to host paths through the engine API on the host)')
+  }
+  const segments: string[] = []
+  for (const segment of raw.replace(/\\/g, '/').split('/')) {
+    if (segment === '' || segment === '.') continue
+    if (segment === '..') {
+      if (segments.length === 0) {
+        return new Error('proof_training_export: path escapes the workspace root after normalization — the export valve writes inside this workspace only')
+      }
+      segments.pop()
+      continue
+    }
+    segments.push(segment)
+  }
+  if (segments.length === 0) {
+    return new Error('proof_training_export: path normalizes to the workspace root itself — name a file inside the workspace')
+  }
+  const rel = segments.join('/')
+  const abs = `${root.replace(/\\/g, '/').replace(/\/+$/, '')}/${rel}`
+  return { rel, abs }
+}
+
 async function callTrainingExportTool(deps: McpEngineDeps, args: Record<string, unknown>): Promise<McpToolResult> {
   // Same loud-argument discipline as proof_claim's kind guard: an optional
   // enum that arrived with a value the scale does not name is an ERROR — a
@@ -1371,6 +1555,17 @@ async function callTrainingExportTool(deps: McpEngineDeps, args: Record<string, 
   if (args.path !== undefined && typeof args.path !== 'string') {
     return toolError({ error: `proof_training_export: path must be a string (got ${JSON.stringify(args.path)})` })
   }
+  // H-16: the face gate. The path is confined to the workspace BEFORE the
+  // engine sees it — the engine's own exportRelPath gate (workspace-relative
+  // only, root-anchored write) is the second layer, not the only one. The
+  // engine receives the normalized RELATIVE path (its contract); `writtenTo`
+  // reports the workspace-absolute destination the engine wrote.
+  let exportPath: { rel: string; abs: string } | undefined
+  if (typeof args.path === 'string') {
+    const confined = confinedExportPath(args.path, deps.engine.root)
+    if (confined instanceof Error) return toolError({ error: confined.message })
+    exportPath = confined
+  }
   const verbs = trainingExportVerbs(deps.engine)
   if (verbs === undefined) return trainingExportUnavailable()
   const fidelity = args.fidelity as 'full' | 'private' | undefined
@@ -1381,16 +1576,17 @@ async function callTrainingExportTool(deps: McpEngineDeps, args: Record<string, 
     ...(fidelity !== undefined ? { fidelity } : {}),
     ...(provenanceFilter !== undefined ? { provenanceFilter } : {}),
     ...(typeof args.license === 'string' ? { license: args.license } : {}),
-    ...(typeof args.path === 'string' ? { path: args.path } : {}),
+    ...(exportPath !== undefined ? { path: exportPath.rel } : {}),
   })
   // The samples NEVER ride the response — manifest, anchor and count only.
   // A caller that wants the dataset itself passes `path` (the engine wrote
-  // the JSONL; writtenTo says where) or reads the engine API directly.
+  // the JSONL; writtenTo says where, workspace-absolute) or reads the engine
+  // API directly.
   return toolResult({
     manifest: outcome.manifest,
     anchor: outcome.anchor,
     sampleCount: outcome.samples.length,
-    ...(typeof args.path === 'string' ? { writtenTo: args.path } : {}),
+    ...(exportPath !== undefined ? { writtenTo: exportPath.abs } : {}),
   })
 }
 
@@ -1465,21 +1661,18 @@ interface EconomicsMarker {
  * The most recent proof/claim boundary marker on the evidence chain whose
  * payload carries an `economics` object — the ledger a rate-carrying
  * verification recorded. Same defensive read as `taskOverview`: the raw log
- * lines are parsed through the engine's own fs port, an unreadable log
- * degrades to "no economics found" rather than a throw, and any line with the
- * wrong shape is skipped, not guessed at. Newest wins: the chain is an
- * append-only log, so the LAST matching marker in file order is the last one
- * minted.
+ * is read through the engine's own fs port, a missing log is distinguished
+ * from a scanned-but-empty one (v0.22 — a read failure must not masquerade
+ * as "this chain never priced anything"), and any line with the wrong shape
+ * is skipped, not guessed at. Newest wins: the chain is an append-only log,
+ * so the LAST matching marker in file order is the last one minted.
  */
-async function latestEconomicsMarker(deps: McpEngineDeps): Promise<EconomicsMarker | undefined> {
-  let lines: readonly string[]
-  try {
-    lines = await deps.engine.fsView.readLines(deps.evidenceLogPath)
-  } catch {
-    return undefined
-  }
+async function latestEconomicsMarker(deps: McpEngineDeps): Promise<{ marker?: EconomicsMarker; logPresent: boolean }> {
+  const raw = await deps.engine.fsView.readFile(deps.evidenceLogPath)
+  if (raw === undefined) return { logPresent: false }
   let found: EconomicsMarker | undefined
-  for (const line of lines) {
+  for (const line of raw.split('\n')) {
+    if (line.trim().length === 0) continue
     let envelope: { kind?: unknown; at?: unknown; payload?: unknown }
     try {
       envelope = JSON.parse(line) as { kind?: unknown; at?: unknown; payload?: unknown }
@@ -1502,7 +1695,7 @@ async function latestEconomicsMarker(deps: McpEngineDeps): Promise<EconomicsMark
       economics: economics as Record<string, unknown>,
     }
   }
-  return found
+  return { marker: found, logPresent: true }
 }
 
 async function callEconomicsTool(deps: McpEngineDeps, args: Record<string, unknown>): Promise<McpToolResult> {
@@ -1525,26 +1718,45 @@ async function callEconomicsTool(deps: McpEngineDeps, args: Record<string, unkno
     })
   }
   // The read itself: the chain's own bytes, never a recomputation. No match =
-  // the honest absence, with the exact remedy pinned.
-  const found = await latestEconomicsMarker(deps)
+  // the honest absence, with the exact remedy pinned (and a missing log named
+  // as a missing log, never as "this chain never priced anything").
+  const { marker: found, logPresent } = await latestEconomicsMarker(deps)
   if (found === undefined) {
     return toolError({
-      error: 'proof_economics: no economics on the last run — pass economics:{rate} to proof_verify/proof_claim '
-        + 'first (the engine or DSH tool face; this MCP face keeps proof_verify\'s parameters minimal), '
-        + 'then query this tool to replay the ledger',
+      error: !logPresent
+        ? 'proof_economics: no evidence log exists yet — nothing is recorded on this chain (run proof_baseline '
+        + 'and a rate-carrying proof_verify first)'
+        : 'proof_economics: no economics on the last run — no proof/claim marker on this chain carries a '
+        + 'ledger yet. Mint one: pass economics: {computePerMs, humanReviewPerItem?} to proof_verify on this '
+        + 'MCP face (it accepts the rate card directly) or to proof_claim, then query this tool to replay '
+        + 'the ledger',
     })
   }
+  // v0.22 (M-51): replaying a marker is quoting LOG BYTES, and a writer who
+  // can touch evidence.jsonl can forge one — the hash chain detects rewrites
+  // after the fact, it does not prevent the write. So the replay is guarded
+  // by a real chain audit whose verdict rides the response; a failing audit
+  // names the tools that adjudicate (proof_status for the workspace chain,
+  // proof_log_verify for the published mirror) instead of vouching for bytes
+  // it did not check.
+  const audit = await deps.engine.audit()
+  const chainOk = audit.ok
   return toolResult({
     label: found.label,
     ...(found.at !== null ? { at: found.at } : {}),
     economics: found.economics,
+    chainAudit: { checked: true, ok: chainOk },
     rate: {
       currency: 'USD',
       computePerMs,
       ...(typeof humanReviewPerItem === 'number' ? { humanReviewPerItem } : {}),
     },
-    note: 'replayed verbatim from the evidence chain — the ledger is a fact the hash chain protects, '
-      + 'not a recomputation; the rate above is the card you asked under, priced against nothing',
+    note: 'replayed verbatim from the evidence log\'s boundary marker — never recomputed, never taken from the '
+      + `caller's word. The hash chain does not make these bytes facts by itself: a writer who can touch the log `
+      + `can forge a marker, so this call ran a chain audit first (ok: ${chainOk}). On failure treat the ledger as `
+      + 'suspect and adjudicate with proof_status (workspace chain) or proof_log_verify (published mirror). The '
+      + 'rate above is the card you asked under, priced against nothing',
+    ...(chainOk ? {} : { warning: `chain audit FAILED (ok: false) — the replayed ledger may be forged; run proof_status / proof_log_verify before trusting it` }),
   })
 }
 
@@ -1648,21 +1860,31 @@ async function callTool(deps: McpEngineDeps, params: unknown): Promise<McpToolRe
     }
   } catch (error) {
     // The tool ran and failed: same-shaped result with isError (MCP spec —
-    // internal tool errors are NOT protocol-level JSON-RPC errors).
+    // internal tool errors are NOT protocol-level JSON-RPC errors). The name
+    // already carries its proof_ prefix (v0.22: no doubled "proof_proof_"),
+    // and host-absolute paths fold to '~' before they reach a foreign agent.
     const message = error instanceof Error ? error.message : String(error)
-    return toolError({ error: `proof_${String(name)} failed: ${message}` })
+    return toolError({ error: `${String(name)} failed: ${sanitizeHostText(message)}` })
   }
 }
 
 // ---------------------------------------------------------------------------
-// The dispatcher — pure: one parsed message in, {response} or nothing out.
-// Never touches stdio; notifications (no id) never produce a response.
+// The dispatcher — pure per message: one parsed message in, {response} or
+// nothing out. Never touches stdio; notifications (no id) never produce a
+// response. Two pieces of protocol edge (v0.22):
+//   * a tools/* request BEFORE `initialize` is answered with a JSON-RPC
+//     INVALID_REQUEST naming the missing handshake — not silently served
+//     (an un-handshaked client is exactly the foreign caller most likely to
+//     be speaking the wrong dialect);
+//   * a JSON-RPC 2.0 batch (an array of messages) is processed element by
+//     element and answered with an array of the responses, in order; a batch
+//     of only notifications produces no output at all.
 // ---------------------------------------------------------------------------
 
 export function createMcpHandler(
   deps: McpEngineDeps,
 ): (message: unknown) => Promise<{ response?: unknown }> {
-  return async function handleMessage(message: unknown): Promise<{ response?: unknown }> {
+  async function handleOne(message: unknown): Promise<{ response?: unknown }> {
     if (typeof message !== 'object' || message === null || Array.isArray(message)) {
       // Not even an object: cannot be a notification, so the invalid-request
       // reply is safe (id null — the message carried none we could read).
@@ -1688,8 +1910,24 @@ export function createMcpHandler(
     if (!hasId) return {}
 
     const params = record.params
+    if (params !== undefined && (typeof params !== 'object' || params === null || Array.isArray(params))) {
+      return { response: rpcError(id, INVALID_PARAMS, `invalid params: params of ${method} must be an object`) }
+    }
+    // The handshake gate: initialize, ping and notifications answer before
+    // it; every other method — the whole tools/* surface — requires a
+    // completed initialize first.
+    if (method !== 'initialize' && method !== 'ping' && !deps.allowUninitializedTools && !initialized) {
+      return {
+        response: rpcError(
+          id,
+          INVALID_REQUEST,
+          `server not initialized — send an initialize request before ${method}`,
+        ),
+      }
+    }
     switch (method) {
       case 'initialize': {
+        initialized = true
         const requested = typeof params === 'object' && params !== null
           ? (params as { protocolVersion?: unknown }).protocolVersion
           : undefined
@@ -1709,11 +1947,42 @@ export function createMcpHandler(
         return { response: rpcResult(id, {}) }
       case 'tools/list':
         return { response: rpcResult(id, { tools: MCP_TOOL_LIST }) }
-      case 'tools/call':
+      case 'tools/call': {
+        // A tool call's params carry `arguments`; a malformed one is a
+        // malformed REQUEST (protocol-level), not a tool failure — the tool
+        // never got arguments it could adjudicate.
+        if (params !== undefined) {
+          const callArgs = (params as { arguments?: unknown }).arguments
+          if (callArgs !== undefined
+            && (typeof callArgs !== 'object' || callArgs === null || Array.isArray(callArgs))) {
+            return {
+              response: rpcError(id, INVALID_PARAMS, 'invalid params: tools/call arguments must be an object'),
+            }
+          }
+        }
         return { response: rpcResult(id, await callTool(deps, params)) }
+      }
       default:
         return { response: rpcError(id, METHOD_NOT_FOUND, `method not found: ${method}`) }
     }
+  }
+
+  let initialized = false
+
+  return async function handleMessage(message: unknown): Promise<{ response?: unknown }> {
+    if (Array.isArray(message)) {
+      if (message.length === 0) {
+        return { response: rpcError(null, INVALID_REQUEST, 'invalid request: a batch must carry at least one message') }
+      }
+      const responses: unknown[] = []
+      for (const entry of message) {
+        const handled = await handleOne(entry)
+        if (handled.response !== undefined) responses.push(handled.response)
+      }
+      // A batch of nothing but notifications gets no output at all.
+      return responses.length > 0 ? { response: responses } : {}
+    }
+    return handleOne(message)
   }
 }
 
@@ -1722,34 +1991,134 @@ export function createMcpHandler(
 // ---------------------------------------------------------------------------
 
 /**
+ * One buffered line of input, or the marker of a line that blew the cap.
+ * An oversized line is reported, never delivered — the stdio contract is one
+ * JSON-RPC message per line, and a client violating it by orders of magnitude
+ * must not size this server's memory.
+ */
+type CappedLine = { text: string } | { oversized: true }
+
+/**
+ * Read newline-delimited text from a stream with a hard per-line byte cap.
+ * Bytes of an over-cap line are DISCARDED as they arrive (only the first
+ * cap-crossing chunk is inspected), so neither a giant single line nor a
+ * giant unterminated tail can grow the buffer without bound.
+ */
+function readCappedLines(input: NodeJS.ReadableStream, capBytes: number): AsyncIterable<CappedLine> {
+  type Pending = { item: CappedLine | undefined; error?: Error }
+  const queue: Pending[] = []
+  let wake: ((entry: Pending) => void) | undefined
+  let finished = false
+  let buffer = ''
+  let discarding = false
+
+  const push = (entry: Pending): void => {
+    if (wake !== undefined) {
+      const waiter = wake
+      wake = undefined
+      waiter(entry)
+    } else {
+      queue.push(entry)
+    }
+  }
+  const onChunk = (chunk: unknown): void => {
+    const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk as Uint8Array).toString('utf8')
+    if (discarding) {
+      const nl = text.indexOf('\n')
+      if (nl < 0) return // still inside the oversized line — keep discarding
+      discarding = false
+      push({ item: { oversized: true } }) // the discarded line is complete
+      buffer = text.slice(nl + 1)
+    } else {
+      buffer += text
+    }
+    let nl = buffer.indexOf('\n')
+    while (nl >= 0) {
+      const line = buffer.slice(0, nl)
+      buffer = buffer.slice(nl + 1)
+      push({ item: Buffer.byteLength(line, 'utf8') > capBytes ? { oversized: true } : { text: line } })
+      nl = buffer.indexOf('\n')
+    }
+    // An unterminated tail already past the cap: start discarding now — the
+    // single {oversized} marker is pushed when its newline (or the stream's
+    // end) eventually arrives.
+    if (!discarding && buffer.length > 0 && Buffer.byteLength(buffer, 'utf8') > capBytes) {
+      discarding = true
+      buffer = ''
+    }
+  }
+  const onEnd = (): void => {
+    if (finished) return
+    finished = true
+    if (discarding) push({ item: { oversized: true } })
+    else if (buffer.length > 0) push({ item: { text: buffer } })
+    push({ item: undefined })
+  }
+  const onError = (error: Error): void => {
+    if (finished) return
+    finished = true
+    push({ item: undefined, error })
+  }
+  input.on('data', onChunk)
+  input.on('end', onEnd)
+  input.on('close', onEnd)
+  input.on('error', onError)
+
+  return {
+    [Symbol.asyncIterator](): AsyncIterator<CappedLine> {
+      return {
+        async next(): Promise<IteratorResult<CappedLine>> {
+          const entry = queue.length > 0
+            ? queue.shift()!
+            : await new Promise<Pending>((resolve) => { wake = resolve })
+          if (entry.error !== undefined) throw entry.error
+          if (entry.item === undefined) return { done: true, value: undefined }
+          return { done: false, value: entry.item }
+        },
+      }
+    },
+  }
+}
+
+/**
  * Run the MCP server over newline-delimited JSON-RPC 2.0: one message per
  * line on stdin, one response per line on stdout. Resolves when the input
- * stream ends. Protocol-level failures (an unparseable line) are emitted as
- * JSON-RPC error responses with id null, because the offending line carried
- * no readable id to echo.
+ * stream ends. Protocol-level failures (an unparseable line, a line over the
+ * 4 MiB cap) are emitted as JSON-RPC error responses with id null, because
+ * the offending line carried no readable id to echo. Writes respect
+ * backpressure, and a dead output stream (EPIPE) ends the loop instead of
+ * crashing the process.
  */
 export async function runMcpServer(options: McpServerOptions): Promise<void> {
   const input = options.input ?? process.stdin
   const output = options.output ?? process.stdout
   const handleMessage = createMcpHandler(options)
-  const lines = createInterface({ input, crlfDelay: Infinity })
-  for await (const line of lines) {
-    const text = line.trim()
-    if (text.length === 0) continue
-    let parsed: unknown
-    let parseFailed = false
-    try {
-      parsed = JSON.parse(text)
-    } catch {
-      parseFailed = true
-    }
+  let outputBroken = false
+  output.on('error', () => { outputBroken = true })
+  const writeResponse = async (response: unknown): Promise<void> => {
+    if (outputBroken) return
+    const flushed = output.write(`${JSON.stringify(response)}\n`)
+    if (!flushed) await new Promise<void>((resolve) => { output.once('drain', () => resolve()) })
+  }
+  for await (const line of readCappedLines(input, MAX_LINE_BYTES)) {
     let response: unknown
-    if (parseFailed) {
-      response = rpcError(null, PARSE_ERROR, `parse error: line is not valid JSON: ${text.slice(0, 80)}`)
+    if ('oversized' in line) {
+      response = rpcError(null, PARSE_ERROR, `parse error: line exceeds the ${MAX_LINE_BYTES}-byte transport limit — refused without buffering or parsing`)
     } else {
-      const handled = await handleMessage(parsed)
-      response = handled.response
+      const text = line.text.trim()
+      if (text.length === 0) continue
+      let parsed: unknown
+      let parseFailed = false
+      try {
+        parsed = JSON.parse(text)
+      } catch {
+        parseFailed = true
+      }
+      response = parseFailed
+        ? rpcError(null, PARSE_ERROR, `parse error: line is not valid JSON: ${text.slice(0, 80)}`)
+        : (await handleMessage(parsed)).response
     }
-    if (response !== undefined) output.write(`${JSON.stringify(response)}\n`)
+    if (response !== undefined) await writeResponse(response)
+    if (outputBroken) break
   }
 }

@@ -30,7 +30,7 @@ import { fileURLToPath } from 'node:url'
 import {
   BUNDLE_MEDIA_TYPE, CHAIN_MODES, CHECK_STATUSES, CLAIM_KINDS, GRADE_VALUES,
   PROOF_MEDIA_TYPE, PROTOCOL_NAME, PROTOCOL_VERSION, VERDICT_VALUES,
-  appFingerprint, protocolHeader,
+  adjudicateProtocol, appFingerprint, appFingerprintOfVersion, knownDialects, protocolHeader,
 } from '../src/app/protocol.ts'
 import { canonicalJson, sha256 } from '../src/core/hash.ts'
 import {
@@ -185,6 +185,46 @@ test('the fingerprint is sensitive to the vocabulary and to the rules it names',
   const otherChainRule = sha256(canonicalJson({ ...material, chain: 'prev=sha256(currentLine)' }))
   assert.notEqual(otherChainRule, appFingerprint())
   assert.notEqual(extraVerdict, otherChainRule)
+})
+
+test('v0.22 fingerprint-match negotiation: knownDialects recomputes the pinned ancestors, and adjudicateProtocol accepts only coherent pairs', () => {
+  // The dialect table this verifier accepts is derived from the LIVE
+  // vocabulary with only the version swapped — every pinned ancestor
+  // fingerprint must be reproducible from it, in both directions.
+  assert.deepEqual(knownDialects().map(d => d.version), ['APP/1.4', 'APP/1.0', 'APP/1.1', 'APP/1.2', 'APP/1.3'])
+  const byVersion = new Map(knownDialects().map(d => [d.version, d.fingerprint]))
+  assert.equal(byVersion.get('APP/1.0'), APP_1_0_FINGERPRINT, 'APP/1.0 recomputes to its pinned literal')
+  assert.equal(byVersion.get('APP/1.1'), APP_1_1_FINGERPRINT, 'APP/1.1 recomputes to its pinned literal')
+  assert.equal(byVersion.get('APP/1.2'), APP_1_2_FINGERPRINT, 'APP/1.2 recomputes to its pinned literal')
+  assert.equal(byVersion.get('APP/1.3'), APP_1_3_FINGERPRINT, 'APP/1.3 recomputes to its pinned literal')
+  assert.equal(byVersion.get('APP/1.4'), APP_1_4_FINGERPRINT, 'the current dialect heads the table')
+  assert.equal(appFingerprintOfVersion('APP/1.3'), APP_1_3_FINGERPRINT)
+  assert.equal(appFingerprintOfVersion(PROTOCOL_VERSION), appFingerprint())
+
+  // The fast path: exact current pair.
+  assert.deepEqual(adjudicateProtocol(PROTOCOL_VERSION, appFingerprint()), { kind: 'current' })
+  // A coherent legacy pair accepts as legacy.
+  const legacy = adjudicateProtocol('APP/1.2', APP_1_2_FINGERPRINT)
+  assert.equal(legacy.kind, 'legacy')
+  if (legacy.kind === 'legacy') assert.equal(legacy.version, 'APP/1.2')
+  // Incoherent pairs refuse, naming both digests: a current version wearing
+  // a foreign fingerprint, a known version wearing another era's
+  // fingerprint, a future version, and garbage shapes alike.
+  for (const [protocol, fingerprint] of [
+    [PROTOCOL_VERSION, APP_1_3_FINGERPRINT],
+    ['APP/1.0', APP_1_3_FINGERPRINT],
+    ['APP/9.9', appFingerprint()],
+    ['APP/1.4', '0'.repeat(64)],
+    [undefined, appFingerprint()],
+    ['APP/1.3', undefined],
+    [null, null],
+  ] as [unknown, unknown][]) {
+    const verdict = adjudicateProtocol(protocol, fingerprint)
+    assert.equal(verdict.kind, 'unknown', `${JSON.stringify(protocol)}/${JSON.stringify(fingerprint)} must be unknown`)
+    if (verdict.kind === 'unknown') {
+      assert.equal(verdict.currentFingerprint, appFingerprint(), 'the refusal carries the current fingerprint for the migration story')
+    }
+  }
 })
 
 test('protocolHeader stamps the manifest skeleton every bundle starts from', () => {

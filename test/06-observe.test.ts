@@ -1,7 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { WorkspaceWatch, driftNarrative, isMutationToolName, MUTATION_TOOL_RE, SHELL_TOOL_RE, toWorkspaceRelative } from '../src/dsh/observe.ts'
+import {
+  MUTATION_TOOL_NAMES, MUTATION_TOOL_RE, READ_ONLY_TOOL_NAMES, SHELL_TOOL_NAMES, SHELL_TOOL_RE,
+  WorkspaceWatch, driftNarrative, isMutationToolName, shellCommandMentionsPath, toWorkspaceRelative,
+} from '../src/dsh/observe.ts'
 import { MemoryFs } from './helpers.ts'
 
 const ROOT = '/ws'
@@ -320,9 +323,123 @@ test('H9b: read-only and non-shell mutation tools do not flip the flag', async (
   await watch.observe(exec('read_file', { path: 'src/a.ts' }), OK)
   await watch.observe(exec('write', { path: 'src/a.ts', content: 'v2\n' }), OK)
   await watch.observe(exec('mystery_analyzer', { path: 'src/a.ts' }), OK)
-  assert.equal(watch.sessionShellUsed(), false, 'only SHELL_TOOL_RE names flip it')
+  assert.equal(watch.sessionShellUsed(), false, 'only shell-class names flip it')
   // The anchored pattern, not a substring sniff: a name merely containing a
   // shell word never flips the flag.
   await watch.observe(exec('npm_audit_viewer', { path: 'src/a.ts' }), OK)
   assert.equal(watch.sessionShellUsed(), false)
+})
+
+// ---------------------------------------------------------------------------
+// H-01: anchored name-list classification. The pre-v0.23 delimited-verb
+// pattern was blind to camelCase host names — `MultiEdit`/`NotebookEdit`
+// (documented Claude Code mutators) matched nothing, and because every
+// pre-execute gate is allowlist-shaped they walked straight through while
+// carrying a `file_path` into the evidence store; in the other direction a
+// camelCase `Read` missed the case-sensitive read-only set, fell to the
+// default mutation charge, and permanently silenced drift detection for the
+// files it read. Unknown names default to mutation (the conservative charge).
+// ---------------------------------------------------------------------------
+
+test('H-01: camelCase mutators classify as mutations — no gate walks around the classifier', () => {
+  for (const name of ['MultiEdit', 'NotebookEdit', 'Write', 'Edit', 'SafeWrite', 'writeFile', 'applyPatch',
+    'createFile', 'ExecuteCommand', 'execute_command', 'run_shell_command', 'shell_exec']) {
+    assert.ok(isMutationToolName(name), `${name} must classify as a mutation — it can move workspace state`)
+  }
+  // The exported lists are the contract (both adapter layers import the
+  // functions; the lists pin the anchor names the functions consult).
+  assert.ok(MUTATION_TOOL_NAMES.includes('multiedit'), 'the CC camel mutators are on the explicit list')
+  assert.ok(SHELL_TOOL_NAMES.includes('run_shell_command'), 'host shell spellings are on the shell list')
+  // Unknown names keep the conservative default: mutation.
+  assert.ok(isMutationToolName('mystery_analyzer'), 'an unknown name is charged as a mutation')
+  assert.ok(isMutationToolName('brand_new_editor_9000'), 'no name escapes the gate by being novel')
+})
+
+test('H-01: camelCase readers classify as reads — drift detection keeps working for them', async () => {
+  for (const name of ['Read', 'Grep', 'View', 'Glob', 'LS', 'WebFetch']) {
+    assert.ok(!isMutationToolName(name), `${name} only reads`)
+  }
+  assert.ok(READ_ONLY_TOOL_NAMES.includes('webfetch'), 'camelCase host readers fold onto the read-only list')
+  // The C7 scenario end-to-end: a camelCase Read must land in the read set,
+  // so a later external edit of the same file still reports as drift.
+  const fs = MemoryFs.of({ [`${ROOT}/src/a.ts`]: 'v1\n' })
+  const watch = new WorkspaceWatch(fs, ROOT)
+  await watch.observe(exec('Read', { path: 'src/a.ts' }), OK)
+  assert.deepEqual(watch.touchedPaths(), [], 'a camelCase read is not an edit')
+  fs.mutate(`${ROOT}/src/a.ts`, 'v2 — the user rewrote this\n')
+  const dirty = await watch.detectDrift()
+  assert.deepEqual(dirty.drifted, ['src/a.ts'], 'the file the camelCase reader saw still reports drift')
+  assert.deepEqual(dirty.staleReads, ['src/a.ts'])
+})
+
+test('H-01: NotebookEdit paths are extracted — notebook_path joins the path keys', async () => {
+  assert.deepEqual(
+    WorkspaceWatch.pathsIn({ notebook_path: 'notebooks/analysis.ipynb' }),
+    ['notebooks/analysis.ipynb'],
+    'a notebook edit names its file under notebook_path',
+  )
+  const fs = MemoryFs.of({ [`${ROOT}/notebooks/analysis.ipynb`]: '{}\n' })
+  const watch = new WorkspaceWatch(fs, ROOT)
+  await watch.observe(exec('NotebookEdit', { notebook_path: 'notebooks/analysis.ipynb', new_source: 'x' }), OK)
+  assert.deepEqual(watch.touchedPaths(), ['notebooks/analysis.ipynb'], 'the notebook edit is charged to the agent')
+  assert.deepEqual(watch.sessionTouchedPaths(), ['notebooks/analysis.ipynb'])
+})
+
+test('H-01: host shell spellings flip the session shell fact', async () => {
+  const fs = MemoryFs.of({ [`${ROOT}/src/a.ts`]: 'v1\n' })
+  const watch = new WorkspaceWatch(fs, ROOT)
+  await watch.observe(exec('execute_command', { command: 'prettier -w src/a.ts' }), OK)
+  assert.equal(watch.sessionShellUsed(), true, 'execute_command is a shell-class name (H9b must see it)')
+})
+
+// ---------------------------------------------------------------------------
+// H-02: the shell command string is the one argument shape path extraction
+// structurally cannot see. The guard's conservative textual sweep lives here
+// so both gate layers (index.ts and adapters/shared/gates.ts) consult the
+// same one.
+// ---------------------------------------------------------------------------
+
+test('H-02: shellCommandMentionsPath catches command strings naming guarded targets', () => {
+  const targets = ['.proof', 'evidence.jsonl', 'baseline.json', 'anchor.json']
+  const hits = [
+    'echo x > .proof/evidence.jsonl',
+    'echo x > .PROOF/EVIDENCE.jsonl',           // case folding (H10's discipline)
+    'echo x > .proof\\evidence.jsonl',           // backslash spelling
+    'rm -rf .proof',
+    'cd .proof && rm -f *',
+    'cat baseline.json | head -1',
+    'printf "%s" x >> ./anchor.json',
+  ]
+  for (const command of hits) {
+    assert.ok(shellCommandMentionsPath(command, targets), `a shell naming the store must hit: ${command}`)
+  }
+  // Ordinary commands pass: over-blocking every shell call would teach the
+  // model to avoid the verifier, so only store-naming strings hit.
+  const misses = ['npm test', 'node scripts/build.ts', 'git status --porcelain', 'echo done > ok.txt']
+  for (const command of misses) {
+    assert.ok(!shellCommandMentionsPath(command, targets), `an ordinary command must pass: ${command}`)
+  }
+  // Degenerate shapes never throw and never hit.
+  assert.equal(shellCommandMentionsPath('', targets), false)
+  assert.equal(shellCommandMentionsPath('npm test', []), false)
+})
+
+// ---------------------------------------------------------------------------
+// M2 (H9② narrative half): once a shell ran this session, "changed outside
+// your tool calls" is a false accusation in the plugin's authoritative voice
+// — the narrative must demote to what is actually known.
+// ---------------------------------------------------------------------------
+
+test('M2: driftNarrative stops accusing "outside your tool calls" once a shell ran this session', () => {
+  const report = { drifted: ['src/a.ts'], touched: [], staleReads: ['src/a.ts'], scanned: 1 }
+  const legacy = driftNarrative(report)
+  assert.match(legacy ?? '', /outside your tool calls/, 'no shell fact: the legacy accusation stands')
+
+  const withShell = driftNarrative(report, { shellUsed: true })
+  assert.ok(withShell)
+  assert.ok(!withShell.includes('outside your tool calls'), 'the false accusation is withdrawn')
+  assert.match(withShell, /shell ran this session/)
+  assert.match(withShell, /indistinguishable/)
+  assert.match(withShell, /src\/a\.ts/, 'the drifted file is still named')
+  assert.match(withShell, /proof_verify/, 'the remedy line is unchanged')
 })

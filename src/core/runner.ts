@@ -32,10 +32,14 @@ export interface RunnerOptions {
   /** Called as each check settles, for streaming UIs. */
   readonly onEvidence?: (evidence: Evidence, index: number, total: number) => void
   /**
-   * υ: base directory for V8 execution-coverage collection. When set, every
-   * spec executes with `NODE_V8_COVERAGE=<coverageDir>/<sanitised specId>` in
-   * its environment — see `coverageSubdir` for why the id is hashed. Absent
-   * (the default) injects nothing and the batch is byte-for-byte pre-υ.
+   * υ: base directory for V8 execution-coverage collection, OWNED by the
+   * engine: it prepares one fresh staging directory per run, passes it here,
+   * and re-derives the same per-spec subdirectories when harvesting — the
+   * runner never invents or persists a directory of its own (H-17: keep the
+   * anti-forgery fencing with the collector). When set, every spec executes
+   * with `NODE_V8_COVERAGE=<coverageDir>/<sanitised specId>` in its
+   * environment — see `coverageSubdir` for why the id is hashed. Absent (the
+   * default) injects nothing and the batch is byte-for-byte pre-υ.
    */
   readonly coverageDir?: string
 }
@@ -46,6 +50,16 @@ export interface BatchResult {
   readonly ranIds: readonly string[]
   readonly skippedIds: readonly string[]
   readonly aborted: boolean
+  /**
+   * M-08: set when a check that had already STARTED finished AFTER the
+   * wall-clock budget elapsed. The budget is cooperative by contract — an
+   * in-flight check is never hard-killed mid-run (its evidence is real, its
+   * own timeoutMs is its only ceiling) — so an overrun is a fact the batch
+   * must be able to name rather than silently absorb. Absent when the batch
+   * fit its budget (or no budget was set); budget-exhaustion skipping is
+   * reported separately through `skippedIds`.
+   */
+  readonly budgetExceeded?: true
   readonly totalDurationMs: number
 }
 
@@ -77,6 +91,7 @@ export class VerificationRunner {
     const queue = [...specs]
     const total = queue.length
     let index = 0
+    let budgetExceeded = false
 
     const worker = async (): Promise<void> => {
       for (;;) {
@@ -101,6 +116,15 @@ export class VerificationRunner {
         records.push(evidence)
         ranIds.push(spec.id)
         options.onEvidence?.(evidence, index++, total)
+        // M-08: the budget only gates which checks START. A check admitted
+        // just before exhaustion may still land past the line (its own
+        // timeoutMs is its only ceiling) — record the overrun instead of
+        // pretending the batch fit. No hard kill: the evidence it produced
+        // is real, and the flag lets the narrative say so.
+        if (options.totalBudgetMs !== undefined
+          && this.clock.now() - started > options.totalBudgetMs) {
+          budgetExceeded = true
+        }
       }
     }
 
@@ -124,6 +148,7 @@ export class VerificationRunner {
       ranIds: orderedRanIds,
       skippedIds: orderedSkippedIds,
       aborted: aborted || options.signal?.aborted === true,
+      ...(budgetExceeded ? { budgetExceeded: true as const } : {}),
       totalDurationMs: this.clock.now() - started,
     }
   }
@@ -168,12 +193,19 @@ export class VerificationRunner {
         // spawns through npm/.cmd shims or scripts, because the overlay merges
         // into the child's full inherited environment at the port — writes its
         // raw V8 coverage profile to <dir>/coverage-<pid>-<seq>.json on exit.
-        // No mocks, no babel hooks, no import rewriting: the evidence of what
-        // the check executed is produced by the same V8 instance that executed
-        // it, which is precisely what makes it hard to fake from inside the
-        // checked code. Command ports that ignore `env` (the test fakes)
-        // simply produce no coverage directory — the engine's observe mode
-        // treats that as "no data" and declines to gate on it, so this
+        // No mocks, no babel hooks, no import rewriting: the profile is
+        // produced by the same V8 instance that executed the check. H-17
+        // honesty note: that is provenance, NOT unforgeability — the checked
+        // code can read this variable out of its own environment and write a
+        // forged profile into the directory, so the actual anti-forgery
+        // defences (filename shape, pid attribution, run fencing) must live
+        // with the collector in the engine, not here. This runner's duty is
+        // exactly two things: inject the engine-chosen per-run directory
+        // verbatim (never invent one of its own), and let the port strip any
+        // inherited NODE_V8_COVERAGE so the injection is the only source
+        // (node-ports B8-L2). Command ports that ignore `env` (the test
+        // fakes) simply produce no coverage directory — the engine's observe
+        // mode treats that as "no data" and declines to gate on it, so this
         // injection is invisible to every pre-υ consumer.
         ...(coverageDir !== undefined
           ? { env: { NODE_V8_COVERAGE: this.coverageSubdir(coverageDir, spec.id) } as Readonly<Record<string, string>> }

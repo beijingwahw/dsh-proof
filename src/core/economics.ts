@@ -19,7 +19,12 @@
  *    effort. What was not measured is not invented: with no prior,
  *    `confidencePurchased` is `null` (never zero — do not pretend a purchase
  *    nobody priced), and with zero cost both per-dollar ratios are `null`
- *    (never Infinity — a free run did not buy anything *per dollar*).
+ *    (never Infinity — a free run did not buy anything *per dollar*). What
+ *    was measured WRONG is not folded into the arithmetic either: a record
+ *    whose `durationMs` is negative or non-finite books as unknown (counted,
+ *    never summed), an out-of-domain factor is refused outright, and every
+ *    priced input sits under the money ceiling (1e15) so no input, however
+ *    finite, can overflow the money spec's rounding into an Infinity.
  * 2. **Prices are injected, never embedded.** This module contains no price.
  *    The deployer supplies a `RateCard`; swap the card and the same evidence
  *    reprices. A hardcoded rate would be a lie with a decimal point.
@@ -49,18 +54,49 @@ import type { Evidence, ProofGrade } from './evidence.ts'
 const MONEY_DECIMALS = 6
 
 /**
+ * H-15: the magnitude ceiling every priced input shares. An amount at or
+ * below 1e15 survives the ×10^6 money rounding without overflow AND still
+ * has all six of its decimals representable in a double (float-53 integer
+ * dust begins near 9e15). The v0.21 audit's overflow PoC came through
+ * exactly this door: `coverageAmount = 1e308` is finite, passed every
+ * finite-check, then `roundMoney`'s `×10^6` rounded it to Infinity — an
+ * Infinity that landed in the decision AND, via canonical JSON's non-finite
+ * fold, made three DIFFERENT coverages mint one identical quoteId. What the
+ * money spec cannot round, this module never prices.
+ */
+const MONEY_CEILING = 1e15
+
+/**
  * Round an amount to the money spec: six decimal places, half up. Applied to
  * every monetary field the module emits (ledger cost, cost-per-assertion,
  * premium, deductible, coverage) so float dust can never appear on a
  * statement — `7400ms × 0.0001` must read `0.74`, not `0.7400000000000001`.
+ *
+ * H-15: the exit is guarded — an amount whose rounding overflows the double
+ * range throws instead of returning Infinity. "Infinity on a financial
+ * statement is never an answer" is enforced at the last arithmetic exit as
+ * well as at every input gate, so no combination of individually-legal
+ * inputs (huge Σduration × a huge-but-legal rate) can smuggle one through.
  */
 function roundMoney(amount: number): number {
-  return Math.round(amount * 10 ** MONEY_DECIMALS) / 10 ** MONEY_DECIMALS
+  const rounded = Math.round(amount * 10 ** MONEY_DECIMALS) / 10 ** MONEY_DECIMALS
+  if (!Number.isFinite(rounded)) {
+    throw new TypeError(`amount ${amount} overflows the money spec — Infinity on a financial statement is never an answer`)
+  }
+  return rounded
 }
 
-/** Finite and non-negative — the shared shape of every legal rate/amount field. */
-function isFiniteNonNegative(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+/**
+ * Finite, non-negative and inside the money ceiling — the shared shape of
+ * every legal rate/amount field (H-15's input gate; see `MONEY_CEILING`).
+ */
+function isPricedField(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= MONEY_CEILING
+}
+
+/** A probability this module will fold into information arithmetic: finite and in [0,1]. */
+function isProbability(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1
 }
 
 // ---------------------------------------------------------------------------
@@ -87,9 +123,10 @@ function rateFieldError(field: string): TypeError {
 
 /**
  * One validation, two consumers (ledger and pricer share the card): a rate
- * that is not a finite, non-negative USD card is rejected loudly, because a
- * negative or NaN price silently corrupts every downstream statement — the
- * ledger would report negative cost, the pricer would mint nonsense quotes.
+ * that is not a finite, non-negative USD card inside the money ceiling is
+ * rejected loudly, because a negative or NaN price silently corrupts every
+ * downstream statement — the ledger would report negative cost, the pricer
+ * would mint nonsense quotes.
  */
 function validateRate(rate: RateCard): void {
   if (typeof rate !== 'object' || rate === null) {
@@ -98,8 +135,8 @@ function validateRate(rate: RateCard): void {
   if (rate.currency !== 'USD') {
     throw new TypeError("rate.currency must be 'USD' — this ledger prices exactly one currency")
   }
-  if (!isFiniteNonNegative(rate.computePerMs)) throw rateFieldError('computePerMs')
-  if (rate.humanReviewPerItem !== undefined && !isFiniteNonNegative(rate.humanReviewPerItem)) {
+  if (!isPricedField(rate.computePerMs)) throw rateFieldError('computePerMs')
+  if (rate.humanReviewPerItem !== undefined && !isPricedField(rate.humanReviewPerItem)) {
     throw rateFieldError('humanReviewPerItem')
   }
 }
@@ -142,9 +179,12 @@ function binaryEntropy(p: number): number {
  * - `factors` — per-check prior→posterior pairs, for the information sum.
  *   The run-level probabilities alone cannot reconstruct Σ[H(prior)−H(posterior)]
  *   (entropy does not distribute over products), so the per-check moves are
- *   supplied directly by whoever folded them.
+ *   supplied directly by whoever folded them. Each side must be a finite
+ *   probability in [0,1]; anything else is a `TypeError` (M23), never a
+ *   silently entropy-folded endpoint.
  * - `humanReviewItems` — human review items (B/C attestations) the run
- *   consumed; priced only when the card prices them.
+ *   consumed; priced only when the card prices them. Counted in whole items:
+ *   a non-integer (or non-finite, negative, >1e15) count is a `TypeError`.
  */
 export interface RunLedgerInput {
   readonly records: readonly Evidence[]
@@ -162,13 +202,30 @@ export interface RunLedger {
   readonly humanReviewItems: number
   /** computeMs×computePerMs + humanReviewItems×humanReviewPerItem (absent ⇒ 0), at the 6-decimal money spec. */
   readonly cost: number
-  /** Decisive records: each decisive check answer is one verified assertion. */
+  /**
+   * Decisive records: each decisive check answer is one verified assertion.
+   * @deprecated one number under two names — always equal to
+   * `decisiveCount`; read `decisiveCount` (kept so existing consumers keep
+   * compiling while they migrate).
+   */
   readonly assertions: number
   readonly decisiveCount: number
   /** Non-decisive records — sunk cost made visible, not hidden. */
   readonly skippedCount: number
-  /** cost / max(1, assertions): what one verified assertion cost. */
-  readonly costPerAssertion: number
+  /**
+   * Records whose `durationMs` was not a finite non-negative number: the
+   * time is booked as unknown — it contributes NOTHING to `computeMs`/`cost`
+   * (never a negative or NaN on a statement) — and this count is the
+   * narrative that says so, instead of the milliseconds silently vanishing.
+   */
+  readonly rejectedDurationRecords: number
+  /**
+   * cost / decisiveCount: what one verified assertion cost. `null` when
+   * nothing was verified — a "per X" with no X is not the total cost
+   * wearing a divisor's clothes (same three-state law as the per-dollar
+   * ratios: zero assertions ≠ one assertion).
+   */
+  readonly costPerAssertion: number | null
   /** posterior − prior; `null` when either side was never measured. */
   readonly confidencePurchased: number | null
   /** confidencePurchased / cost; `null` when cost ≤ 0 or nothing was purchased — never Infinity. */
@@ -184,34 +241,54 @@ export interface RunLedger {
  *
  * Field semantics (pinned by test/31):
  *
- * - `computeMs` sums `durationMs` over **every** record. A timed-out check
- *   burned the milliseconds all the same; `skippedCount` exists so the
- *   statement shows that spend bought no assertion rather than hiding it.
+ * - `computeMs` sums `durationMs` over **every** record whose duration is a
+ *   finite non-negative number. A timed-out check burned the milliseconds
+ *   all the same; `skippedCount` exists so the statement shows that spend
+ *   bought no assertion rather than hiding it. A record whose `durationMs`
+ *   is negative, NaN or ±Infinity contributes NOTHING to computeMs — the
+ *   time is booked as unknown and `rejectedDurationRecords` says how many
+ *   were (M22: an unmeasured duration never reaches a statement as a
+ *   number, and decisiveness is judged on `status`, which the bad duration
+ *   cannot poison).
  * - `assertions === decisiveCount`: `isDecisiveStatus` decides (pass/fail
  *   settle the check's question; error/timeout/aborted/skipped never did).
  * - `cost`, `costPerAssertion` and every other amount are rounded to six
  *   decimals — the money spec shared by everything this module emits.
+ * - `costPerAssertion` is `null` when `decisiveCount === 0`: a per-unit
+ *   price with no units is not the total cost (M24 — the same three-state
+ *   law as the per-dollar ratios).
  * - `confidencePurchased` is exactly `posterior − prior` and only when both
  *   sides were measured; a negative value is reported as-is (a run that
  *   *lost* confidence is a real outcome, not a rounding problem).
  * - `infoNats` is the signed entropy drop per factor, summed in array order
  *   (deterministic for a given input). A factor folding toward failure
  *   (posterior < prior, entropy rising) contributes negatively — honest
- *   bookkeeping counts information gained, not news enjoyed.
+ *   bookkeeping counts information gained, not news enjoyed. Every factor
+ *   must be a finite probability in [0,1] — an out-of-domain prior is
+ *   REFUSED (M23), never entropy-folded into a plausible-looking negative
+ *   information gain.
  * - Both per-dollar ratios are `null` whenever `cost ≤ 0`: a free run bought
  *   confidence, but it bought nothing *per dollar*, and `Infinity` on a
  *   financial statement is never an answer.
  */
 export function summarizeRunLedger(input: RunLedgerInput): RunLedger {
   validateRate(input.rate)
-  if (input.humanReviewItems !== undefined && !isFiniteNonNegative(input.humanReviewItems)) {
-    throw new TypeError('humanReviewItems must be a finite non-negative number when provided')
+  if (input.humanReviewItems !== undefined
+    && (!isPricedField(input.humanReviewItems) || !Number.isInteger(input.humanReviewItems))) {
+    throw new TypeError('humanReviewItems must be a finite non-negative integer no greater than 1e15 when provided — review items are counted, not weighed')
   }
 
   let computeMs = 0
   let decisive = 0
+  let rejectedDurationRecords = 0
   for (const record of input.records) {
-    computeMs += record.durationMs
+    if (Number.isFinite(record.durationMs) && record.durationMs >= 0) {
+      computeMs += record.durationMs
+    } else {
+      // M22: unmeasured time is booked as unknown (null accounting), never
+      // summed into the statement — the count below is the narrative.
+      rejectedDurationRecords += 1
+    }
     if (isDecisiveStatus(record.status)) decisive += 1
   }
   const humanReviewItems = input.humanReviewItems ?? 0
@@ -225,6 +302,9 @@ export function summarizeRunLedger(input: RunLedgerInput): RunLedger {
 
   let infoNats = 0
   for (const factor of input.factors ?? []) {
+    if (!isProbability(factor.prior) || !isProbability(factor.posterior)) {
+      throw new TypeError('factors must carry finite probabilities in [0,1] — an out-of-domain factor is refused, never folded into the information sum')
+    }
     infoNats += binaryEntropy(factor.prior) - binaryEntropy(factor.posterior)
   }
 
@@ -235,7 +315,8 @@ export function summarizeRunLedger(input: RunLedgerInput): RunLedger {
     assertions: decisive,
     decisiveCount: decisive,
     skippedCount: input.records.length - decisive,
-    costPerAssertion: roundMoney(cost / Math.max(1, decisive)),
+    rejectedDurationRecords,
+    costPerAssertion: decisive > 0 ? roundMoney(cost / decisive) : null,
     confidencePurchased: purchased,
     confidencePerDollar: purchased !== null && cost > 0 ? purchased / cost : null,
     infoNats,
@@ -275,6 +356,18 @@ const REASON_NO_CONFIDENCE =
   'no confidence was measured for this proof — an unknown posterior cannot be priced into a premium'
 const REASON_CONFIDENCE_OUT_OF_RANGE =
   'confidence is outside [0,1] — not a probability this policy can convert into a premium'
+const REASON_FOREIGN_GRADE =
+  'the grade is not one of the five proof grades this policy prices — a word the formula cannot read never reaches the proven branch, a human underwriter reads it instead'
+
+/**
+ * H-15: the `ProofGrade` vocabulary as a runtime set — a grade this policy
+ * prices is admitted BY VALUE. The engine boundary already refuses foreign
+ * grades outright; this core-level gate makes the same refusal total, because
+ * before it, anything that failed the four known-grade checks fell into the
+ * `proven` branch — `'Proven'`, `'nonsense'` and the empty string all minted
+ * full offers, the most privileged path a typo could buy.
+ */
+const SLA_GRADES: ReadonlySet<string> = new Set(['proven', 'regressed', 'stale', 'unproven', 'no-baseline'])
 
 /**
  * The underwriting decision. Three outcomes, no fourth:
@@ -294,6 +387,11 @@ export type SlaDecision =
 
 /** What the pricer needs: a graded proof, the coverage sought, and the rate card. */
 export interface SlaQuoteInput {
+  /**
+   * The grade being priced. Runtime values outside the `ProofGrade`
+   * vocabulary (foreign callers, JSON round-trips) route to manual
+   * underwriting — refused BY VALUE, never fallen through to `proven`.
+   */
   readonly grade: ProofGrade
   /** Posterior claim probability at issue time; absent or outside [0,1] routes to manual underwriting. */
   readonly confidence?: number
@@ -330,6 +428,10 @@ export interface SlaQuote {
  *
  * Grading:
  *
+ * - Any grade outside the five-value vocabulary (`proven`, `regressed`,
+ *   `stale`, `unproven`, `no-baseline`) → manual underwriting (H-15): a
+ *   foreign string never reaches the proven branch, whatever confidence it
+ *   brought with it.
  * - `proven` + a confidence in **[0,1]** (endpoints included — P=0 and P=1
  *   are degenerate but mathematically legal, and priced at their face) → an
  *   offer. Confidence absent, non-finite, or outside [0,1] → manual
@@ -356,21 +458,26 @@ export interface SlaQuote {
  * in here would discount the discount and quietly under-price the book —
  * the one way this formula is forbidden from being clever.
  *
- * Defense: `coverageAmount` must be finite and strictly positive; the rate
- * card must pass `validateRate`; optional money fields must be finite and
- * non-negative. Anything else throws a `TypeError` — a bad price is never
- * computed, it is refused.
+ * Defense: `coverageAmount` must be finite, strictly positive and no greater
+ * than the money ceiling (1e15 — H-15: an amount whose `×10^6` rounding
+ * would overflow is refused at the gate, so no Infinity can reach a decision
+ * or, through canonical JSON's non-finite fold, collapse three different
+ * coverages onto one `quoteId`); the rate card must pass `validateRate`;
+ * optional money fields must be finite, non-negative and inside the ceiling.
+ * A grade outside the five-value vocabulary routes to manual underwriting —
+ * refused, never priced. Anything else throws a `TypeError` — a bad price is
+ * never computed, it is refused.
  */
 export function priceSla(input: SlaQuoteInput): SlaQuote {
   validateRate(input.rate)
-  if (!Number.isFinite(input.coverageAmount) || input.coverageAmount <= 0) {
-    throw new TypeError('coverageAmount must be a finite positive USD amount')
+  if (!Number.isFinite(input.coverageAmount) || input.coverageAmount <= 0 || input.coverageAmount > MONEY_CEILING) {
+    throw new TypeError('coverageAmount must be a finite positive USD amount no greater than 1e15 — an amount the money spec cannot round is never priced')
   }
-  if (input.deductible !== undefined && !isFiniteNonNegative(input.deductible)) {
-    throw new TypeError('deductible must be a finite non-negative number when provided')
+  if (input.deductible !== undefined && !isPricedField(input.deductible)) {
+    throw new TypeError('deductible must be a finite non-negative number no greater than 1e15 when provided')
   }
-  if (input.minPremium !== undefined && !isFiniteNonNegative(input.minPremium)) {
-    throw new TypeError('minPremium must be a finite non-negative number when provided')
+  if (input.minPremium !== undefined && !isPricedField(input.minPremium)) {
+    throw new TypeError('minPremium must be a finite non-negative number no greater than 1e15 when provided')
   }
 
   // A non-finite confidence cannot be attested on a quote (and must never
@@ -401,6 +508,15 @@ export function priceSla(input: SlaQuoteInput): SlaQuote {
 }
 
 function decide(input: SlaQuoteInput): SlaDecision {
+  // H-15: vocabulary first. Before this gate, everything that was not one of
+  // the four known non-proven grades fell through to the proven branch —
+  // 'Proven', 'nonsense' and '' all minted offers. A foreign grade is a word
+  // this formula cannot read: manual underwriting (the refusal door for
+  // "evidence exists but this formula honestly cannot price it"), aligned
+  // with the engine boundary, which refuses the same values by value.
+  if (!SLA_GRADES.has(input.grade)) {
+    return { class: 'manual-underwriting', reason: REASON_FOREIGN_GRADE }
+  }
   if (input.grade === 'regressed') return { class: 'denied', reason: REASON_REGRESSED }
   if (input.grade === 'stale') return { class: 'manual-underwriting', reason: REASON_STALE }
   if (input.grade === 'unproven') return { class: 'manual-underwriting', reason: REASON_UNPROVEN }

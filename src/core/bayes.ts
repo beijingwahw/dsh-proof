@@ -126,6 +126,23 @@ export const BAYES_CONSTANTS: {
  */
 const SYNTHETIC_FALSE_PASS_DEFAULT = 0.15
 
+/**
+ * H-03: β for a check whose script body DRIFTED from the body the baseline
+ * digested — an *unreviewed* body. Higher than the synthetic tier (0.15)
+ * because a drifted body is not merely self-authored, it is a body that
+ * replaced one the baseline had already vouched for, chosen by the same hand
+ * that owns the claim and never screened by anyone: at 0.5 a single pass
+ * under it moves a cold prior (≤0.9) to ≈0.94 — visibly short of the default
+ * 0.97 target, so a rewritten `"test": "node -e \"\""` cannot certify on one
+ * forged green. Exported (unlike its synthetic sibling) because the ENGINE
+ * applies it as a map rewrite over drifted ids — `computePriors` cannot know
+ * which bodies drifted — and the engine's option default must be this one
+ * number, not a second copy of it. Same discipline otherwise: NOT in
+ * BAYES_CONSTANTS, overridable per deployment (`EngineOptions.driftedFalsePass`),
+ * an admitted modelling guess rather than a law.
+ */
+export const DRIFTED_FALSE_PASS_DEFAULT = 0.5
+
 function clamp(value: number, low: number, high: number): number {
   return Math.min(high, Math.max(low, value))
 }

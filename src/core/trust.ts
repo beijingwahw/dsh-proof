@@ -68,6 +68,16 @@ export interface WalkedCheckpoint {
   /** Detached signature over `canonicalJson(payload)`, when signed. */
   readonly sig: string | null
   readonly keyId: string | null
+  /**
+   * Why this checkpoint carries no signature, as recorded by the writer at
+   * append time: a transient signing failure, or a refusal under the
+   * `SIG_REFUSED_PREFIX` banner (the writer's own audit found the physical
+   * chain tampered and declined to lend the forged bytes its key). The
+   * distinction is the only signal that separates an honest unsigned boundary
+   * from an attacker's stripped signature — the walk surfaces it so the audit
+   * layer (M-33/H-32) can adjudicate instead of guessing.
+   */
+  readonly sigError: string | null
   /** Chain head the walker expected at this position. */
   readonly expectedHead: string
   /**
@@ -101,6 +111,12 @@ export interface ChainWalk {
    * count, a non-string head) stay in `corruptLines` — this list is for counts
    * that are well-shaped but *lying* (`1e999` parses to `Infinity` and passes
    * any `typeof` check, which is exactly the laundering trick).
+   *
+   * v0.22 (L-A1-11): v2 lines of an *unknown kind* are listed here too. No
+   * honest writer emits a kind outside {evidence, marker, checkpoint}; a line
+   * that parses, chains, and then claims a kind the protocol never defined is
+   * smuggling payload through the walk's counting rules, and the audit must
+   * see it rather than let it ride the chain silently.
    */
   readonly malformedCheckpoints: readonly number[]
   /** Records appended after the last well-formed checkpoint (0 when the tail is covered). */
@@ -134,7 +150,7 @@ export function walkChain(lines: readonly string[]): ChainWalk {
       prevDigest = lineDigest(line)
       return
     }
-    const envelope = parsed as { v?: unknown; kind?: unknown; prev?: unknown; sig?: unknown; keyId?: unknown; payload?: unknown }
+    const envelope = parsed as { v?: unknown; kind?: unknown; prev?: unknown; sig?: unknown; keyId?: unknown; sigError?: unknown; payload?: unknown }
     if (envelope !== null && typeof envelope === 'object' && envelope.v === 1) {
       sawV1 = true
       if (envelope.kind === 'evidence' || envelope.kind === 'marker') records += 1
@@ -162,6 +178,7 @@ export function walkChain(lines: readonly string[]): ChainWalk {
             },
             sig: typeof envelope.sig === 'string' ? envelope.sig : null,
             keyId: typeof envelope.keyId === 'string' ? envelope.keyId : null,
+            sigError: typeof envelope.sigError === 'string' ? envelope.sigError : null,
             expectedHead: prevDigest,
             expectedCount,
           })
@@ -171,6 +188,11 @@ export function walkChain(lines: readonly string[]): ChainWalk {
         }
       } else if (envelope.kind === 'evidence' || envelope.kind === 'marker') {
         records += 1
+      } else {
+        // A v2 envelope of a kind no honest writer emits (L-A1-11): it chains
+        // and parses, but nothing in the protocol vouches for what it is or
+        // how it counts. Named as malformed — loud, not silent.
+        malformedCheckpoints.push(index)
       }
       prevDigest = lineDigest(line)
       return
@@ -205,27 +227,90 @@ function isWellFormedCount(count: number, expectedCount: number): boolean {
   return Number.isSafeInteger(count) && count >= 0 && count === expectedCount
 }
 
-/** Parse and validate an anchor file's contents; `undefined` when unreadable. */
-export function parseAnchor(raw: string | undefined): AnchorFile | undefined {
+/**
+ * v0.22 (H-32/M-33): the `sigError` banner under which the store records that
+ * it *refused* to sign a checkpoint because its own pre-sign audit found the
+ * physical chain tampered (H-27) — as opposed to a transient signing failure
+ * ("key directory locked by a scanner"). The walk carries the string; the
+ * audit splits the two into different channels with different `ok` semantics.
+ */
+export const SIG_REFUSED_PREFIX = 'refused-to-sign'
+
+/**
+ * v0.22 (H-09): the discriminated result of reading an anchor document.
+ *
+ * - no outcome at all (`undefined`) — no anchor file exists: a deployment
+ *   fact, silent as ever.
+ * - `problem: 'unparseable'` — a file exists but is not an anchor shape
+ *   (garbage JSON, wrong version, missing/mistyped required fields). The
+ *   out-of-band line of defence cannot be consulted: an auditor-side
+ *   capability gap, surfaced as `anchorUnreadable`, never an accusation.
+ * - `problem: 'invalid'` — anchor-shaped but in a state **no honest writer
+ *   produces**: an empty `keyId`, a `count` outside the non-negative safe
+ *   integers, or an empty/absent `sig` (the four-line disarm family — an
+ *   honest anchor is only ever written after a successful `sign()`, so it
+ *   always carries a non-empty signature and a count the writer actually
+ *   walked). Such a file is tampering until proven otherwise: surfaced as
+ *   `anchorInvalid` and a failing `ok`, never silently tolerated.
+ * - `anchor` — a fully well-formed anchor; adjudicate it.
+ */
+export interface AnchorParseOutcome {
+  readonly anchor?: AnchorFile
+  readonly problem?: 'unparseable' | 'invalid'
+}
+
+/**
+ * Parse an anchor document into a {@link AnchorParseOutcome}; `undefined`
+ * means "no document at all" (no file / nothing to read).
+ */
+export function parseAnchorEx(raw: string | undefined): AnchorParseOutcome | undefined {
   if (raw === undefined) return undefined
+  let value: Partial<AnchorFile>
   try {
-    const value = JSON.parse(raw) as Partial<AnchorFile>
-    if (value?.v !== 1) return undefined
-    if (typeof value.keyId !== 'string' || typeof value.count !== 'number' || typeof value.head !== 'string') return undefined
-    return {
+    value = JSON.parse(raw) as Partial<AnchorFile>
+  } catch {
+    return { problem: 'unparseable' }
+  }
+  if (value === null || typeof value !== 'object' || value.v !== 1) return { problem: 'unparseable' }
+  // Shape: the fields every anchor carries must be present with the right
+  // type. `sig` is the exception — an absent signature is shape-legal text
+  // but domain-dishonest (see below), so it is normalised here and charged
+  // as `invalid`, keeping "cannot parse" and "parses but lies" separable.
+  if (typeof value.keyId !== 'string' || typeof value.count !== 'number' || typeof value.head !== 'string') {
+    return { problem: 'unparseable' }
+  }
+  if (value.workspaceKey !== undefined && typeof value.workspaceKey !== 'string') return { problem: 'unparseable' }
+  const sig = typeof value.sig === 'string' ? value.sig : ''
+  // Domain: no honest writer can produce these values (H-09). `-5`, `1e999`
+  // and `2.5` counts, an empty keyId, a stripped signature — each is the
+  // documented disarm recipe, and each now fails loudly instead of
+  // silently switching the anchor's checks off.
+  if (value.keyId === '' || sig === '' || !Number.isSafeInteger(value.count) || value.count < 0) {
+    return { problem: 'invalid' }
+  }
+  return {
+    anchor: {
       v: 1,
       keyId: value.keyId,
       count: value.count,
       head: value.head,
-      sig: typeof value.sig === 'string' ? value.sig : '',
+      sig,
       at: typeof value.at === 'string' ? value.at : '',
       // Present only on newer anchors; absence is tolerated (older anchor,
-      // sig check skipped by the audit layer, data checks still apply).
+      // sig check reconstructed against workspaceKey: null by the audit
+      // layer, data checks still apply).
       ...(typeof value.workspaceKey === 'string' ? { workspaceKey: value.workspaceKey } : {}),
-    }
-  } catch {
-    return undefined
+    },
   }
+}
+
+/**
+ * Parse and validate an anchor file's contents; `undefined` when unreadable
+ * *or* when the document is a domain-invalid disarm shape (see
+ * {@link parseAnchorEx} — callers that need the distinction use that).
+ */
+export function parseAnchor(raw: string | undefined): AnchorFile | undefined {
+  return parseAnchorEx(raw)?.anchor
 }
 
 /** The exact bytes a checkpoint signature commits to. */

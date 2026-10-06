@@ -33,13 +33,30 @@
  *   punished like a regression is worse data than no data. (The table still
  *   carries `indeterminate: 0` so `Record<CheckVerdict, number>` is
  *   exhaustive and a manifest snapshot never meets a missing key.)
- * - **Causal purity is session-level.** Under `provenanceFilter:
- *   'agent-only'`, a single changed path attributed `external` voids the
- *   whole session's verification labels: reward 1.0 asserts "the agent's
- *   edit kept the suite green", and that sentence is false when a human was
- *   also editing the workspace. Flip-pairs survive the void — pass-then-fail
- *   within one chain is a temporal fact about the check whatever hand moved
- *   the files. Better an empty dataset than a mislabeled one.
+ * - **Causal purity is session-level — and never silent.** Under
+ *   `provenanceFilter: 'agent-only'`, a single changed path attributed
+ *   `external` voids the whole session's verification labels: reward 1.0
+ *   asserts "the agent's edit kept the suite green", and that sentence is
+ *   false when a human was also editing the workspace. Flip-pairs survive
+ *   the void — pass-then-fail within one chain is a temporal fact about the
+ *   check whatever hand moved the files. Better an empty dataset than a
+ *   mislabeled one.
+ *   The filter can only fire on attribution it can SEE (H-13): when a
+ *   changed path's attribution cannot be decided — no provenance map, a path
+ *   missing from it, or an `unknown` label (uncertain, not external) — the
+ *   session is NOT silently kept as if the filter had held. Verification
+ *   samples still ride out (information preserved), each carrying
+ *   `provenanceDegraded: true`, while the manifest declares
+ *   `provenanceUnresolved` and counts `unknownAttributed`. A manifest that
+ *   says `agent-only` now means the filter *executed*, or says why it could
+ *   not. An empty change set is pure by vacuity: no edits, no hidden hand.
+ * - **Repeats are not supervision.** A green workspace can re-run `verify`
+ *   forever; each re-run used to mint a fresh reward-1.0 sample with a fresh
+ *   timestamp (H-14). Distillation now folds homomorphic re-runs: a second
+ *   record with the same `(checkId, status, outputDigest)` mints nothing
+ *   (the first observation stands) and the manifest counts
+ *   `dedupedCount`. The flywheel's "ground truth nobody labeled" must not
+ *   be self-dilutable by a shell loop.
  * - **`private` fidelity leaks no text.** Output prose can carry secrets;
  *   digests cannot (they are one-way content addresses). A `private` export
  *   carries zero output characters — structure, labels and digests only —
@@ -127,12 +144,28 @@ export interface VerificationSample {
   readonly verdict: CheckVerdict
   /** The record's own status — always `'pass' | 'fail'` here (decisive-only filter). */
   readonly status: string
-  readonly durationMs: number
+  /**
+   * The record's measured duration; `null` when the record's `durationMs`
+   * was not a finite number (a forged `1e999` off the chain, a corrupt
+   * ledger read) — unmeasured, and folded to the SAME canonical null the
+   * content address would have folded Infinity into anyway (H-28's fold
+   * meets its new consumer one layer early, so the sample says what it
+   * means instead of two different-looking inputs sharing one address).
+   */
+  readonly durationMs: number | null
   readonly reward: number
   /** Present only under `full` fidelity: the record's excerpt, truncated to 200 characters. */
   readonly outputExcerpt?: string
   readonly outputDigest: string
   readonly recordedAt: string
+  /**
+   * Present only when `agent-only` was requested but the change set's
+   * attribution could not be decided (H-13): the reward still rides out —
+   * with the causal claim it stands on visibly downgraded, never silently
+   * kept as if the filter had held. A dataset consumer discounts (or drops)
+   * flagged samples; the flywheel does not get to pretend it filtered.
+   */
+  readonly provenanceDegraded?: true
 }
 
 /** The rejected half of a flip-pair — the failing observation. Always `fail`. */
@@ -187,6 +220,50 @@ export interface TrainingManifest {
   readonly license?: string
   /** Which filter was applied — recorded honestly even (especially) when it emptied the dataset. */
   readonly provenanceFilter: ProvenanceFilter
+  /**
+   * H-13: present exactly when `agent-only` was requested but the change
+   * set's attribution could not be decided (no provenance map, or changed
+   * paths missing from it). Verification samples were still minted — each
+   * flagged `provenanceDegraded` — instead of silently kept as if the
+   * filter had held. Absent means the requested filter either executed or
+   * had nothing to decide.
+   */
+  readonly provenanceUnresolved?: true
+  /**
+   * H-13: changed paths whose recorded attribution is `unknown` (the
+   * attributor could not tell agent from external) under `agent-only`. Not
+   * voided like `external` — the label IS uncertainty, not an external
+   * verdict — and not silently passed either: every verification sample
+   * carries the degraded flag and this count says why. Absent when zero.
+   */
+  readonly unknownAttributed?: number
+  /**
+   * H-14: homomorphic re-runs folded away — verification records repeating
+   * an already-sampled `(checkId, status, outputDigest)` (and byte-identical
+   * flip-pairs) minted nothing; the first observation stands. Always
+   * present: `0` is the statement "nothing folded", not "nobody counted".
+   */
+  readonly dedupedCount: number
+  /**
+   * M3: decisive records EXCLUDED because their `baselineVerdicts` entry was
+   * not a self-comparison encoding (`still-passing` / `still-failing` /
+   * `indeterminate`) — an undecodable differential is excluded and counted,
+   * never decoded into a weaker label. Always present.
+   */
+  readonly excludedUnverifiable: number
+  /**
+   * checkIds whose records disagree on `kind` (the check was reconfigured
+   * mid-log): pairs still carry the first-seen kind, and this counter makes
+   * the drift visible instead of assuming one kind per checkId. Always
+   * present.
+   */
+  readonly checkKindDrift: number
+  /**
+   * Decisive records whose `durationMs` was not finite: the sample carries
+   * `durationMs: null` (unmeasured) — one canonical null, never an Infinity
+   * the content address would fold to that same null anyway. Always present.
+   */
+  readonly unmeasuredDuration: number
   readonly root: string
 }
 
@@ -214,15 +291,27 @@ export interface DistillInput {
    * - `'indeterminate'`   ⇔ the baseline ran but produced no decisive answer,
    *
    * and an absent entry ⇔ no baseline record for the check. Any other value
-   * is treated as "no usable baseline" — the defensive default, never an
-   * invented comparison.
+   * (`fixed`, `regression`, `new-failure`, `new-check`, `not-run`) means the
+   * caller encoded a DIFFERENTIAL instead of the self-comparison the
+   * contract specifies: such records are EXCLUDED from the dataset and
+   * counted in `excludedUnverifiable` (M3) — the defensive direction is
+   * "exclude, never relabel", not "decode into a weaker label".
    */
   readonly baselineVerdicts: ReadonlyMap<string, CheckVerdict>
   /** The session's change set; passed through verbatim onto verification samples. */
   readonly changedPaths: readonly string[]
   readonly workspaceKey: string
   readonly fidelity: SampleFidelity
-  /** Path → attribution; consulted only under `provenanceFilter: 'agent-only'`. */
+  /**
+   * Path → attribution; consulted only under `provenanceFilter:
+   * 'agent-only'`. `external` voids the session's verification labels;
+   * `unknown` and paths with NO entry (or no map at all) degrade them — see
+   * `provenanceUnresolved` / `unknownAttributed` on the manifest. An absent
+   * map under a non-empty change set is the deployed engine's default shape
+   * today (its markers record the attribution method, not a per-path map),
+   * which is exactly why the degradation is declared rather than assumed
+   * pure.
+   */
   readonly provenance?: ReadonlyMap<string, ProvenanceLabel>
   /** Default `'all'`. Under `'agent-only'`, an `external` path in `changedPaths` voids all verification labels. */
   readonly provenanceFilter?: ProvenanceFilter
@@ -255,9 +344,12 @@ export function sampleHash(sample: TrainingSample): string {
 
 /**
  * What `baselineVerdicts.get(checkId)` says about the baseline side, decoded.
- * Only the three self-comparison verdicts carry a usable answer; everything
- * else (including an absent entry) means "no baseline this record can be
- * diffed against".
+ * Only the three self-comparison verdicts carry a usable answer;
+ * `regression`/`fixed`/`new-failure`/`new-check`/`not-run` mean the caller
+ * encoded a DIFFERENTIAL instead of the specified self-comparison — the
+ * distillery EXCLUDES those records and counts them (`excludedUnverifiable`,
+ * M3) before `verdictFor` ever runs. An absent entry is a different fact —
+ * no baseline record exists — and honestly mints `new-check`/`new-failure`.
  */
 const BASELINE_ANSWER_OF: Readonly<Record<CheckVerdict, 'pass' | 'fail' | 'no-answer' | 'none'>> = {
   'still-passing': 'pass',
@@ -277,6 +369,9 @@ const BASELINE_ANSWER_OF: Readonly<Record<CheckVerdict, 'pass' | 'fail' | 'no-an
  * paid for the differential. `status` is always decisive here; the
  * non-decisive arms of `verdictOf` are structurally unreachable and the
  * `no-answer` arm yields `indeterminate`, which the sample filter excludes.
+ * The `none` arm is reachable only for an ABSENT entry (a brand-new check) —
+ * non-self-comparison values are excluded by the distillery before this
+ * function runs (M3), so no mis-encoded differential is ever decoded.
  */
 function verdictFor(baseline: CheckVerdict | undefined, status: 'pass' | 'fail'): CheckVerdict {
   switch (BASELINE_ANSWER_OF[baseline ?? 'new-check']) {
@@ -300,8 +395,35 @@ function asDecisive(record: Evidence): DecisiveObservation | undefined {
 // Distillation
 // ---------------------------------------------------------------------------
 
+/**
+ * Absolute-path roots this module redacts from `full` excerpts (A4-L3): the
+ * evidence layer folds the two roots it knows (`$WORKSPACE`, `$HOME`) before
+ * the record is ever addressed, but `full` excerpts still carried every
+ * OTHER absolute root verbatim — another drive, another user's home,
+ * `/etc`, a UNC share. Here such a root is replaced by the `$ABSPATH`
+ * placeholder; the basename survives (it is usually the diagnostic), the
+ * location does not. Relative paths ride out untouched — they ARE the
+ * workspace context the sample exists to carry.
+ *
+ * Shape: a Windows drive root (`C:\` / `C:/`), a UNC double backslash, or a
+ * POSIX leading slash — each only at a token boundary (not glued to a word,
+ * digit, slash or colon, so `t/one`, timestamps and `https://` URLs do not
+ * match), consuming to the first whitespace, quote or common prose
+ * delimiter.
+ */
+const ABSOLUTE_ROOT =
+  /(?<![A-Za-z0-9_$@.\\\/:])(?:[A-Za-z]:[\\/]|\\{2}|\/)[^\s'"`;,()<>]*/g
+
+/** Replace one matched absolute root with its placeholder form. */
+function redactAbsoluteRoot(token: string): string {
+  const cut = Math.max(token.lastIndexOf('/'), token.lastIndexOf('\\'))
+  const base = cut >= 0 ? token.slice(cut + 1) : token
+  return base.length > 0 ? `$ABSPATH/${base}` : '$ABSPATH'
+}
+
 function excerptOf(head: string): string {
-  return head.length > EXCERPT_CHARS ? head.slice(0, EXCERPT_CHARS) : head
+  const redacted = head.replace(ABSOLUTE_ROOT, redactAbsoluteRoot)
+  return redacted.length > EXCERPT_CHARS ? redacted.slice(0, EXCERPT_CHARS) : redacted
 }
 
 function rejectedSide(record: DecisiveObservation, fidelity: SampleFidelity): RejectedSide {
@@ -354,32 +476,78 @@ function sortKeyOf(sample: TrainingSample): readonly string[] {
  * - One `verification` sample per decisive record whose verdict is not
  *   `indeterminate` (decisive run, undecided baseline → excluded, not
  *   mislabeled — see the module doc), unless the provenance filter voided
- *   the session.
+ *   the session. A baselineVerdicts entry that is not a self-comparison
+ *   encoding excludes its records too (counted, never relabeled — M3).
  * - One `flip-pair` per adjacent disagreement in each check's decisive
  *   subsequence (bayes.ts pairing semantics: `error`/`timeout`/`aborted`/
  *   `skipped` records neither break adjacency nor mint a pair).
+ * - Homomorphic re-runs fold (H-14): a verification record repeating an
+ *   already-sampled `(checkId, status, outputDigest)` mints nothing, and
+ *   `dedupedCount` on the manifest says how many folded.
  * - Empty input is a legal dataset: zero counts and `root = sha256('')`.
  */
 export function distillTrainingSet(input: DistillInput): TrainingSet {
   const fidelity = input.fidelity
   const provenanceFilter: ProvenanceFilter = input.provenanceFilter ?? 'all'
-  // Session-level causal purity. Under 'agent-only', ONE externally-attributed
-  // path in the change set voids EVERY verification label this session could
-  // mint — "the agent kept the suite green" is a causal claim about the
-  // agent's edits alone. Flip-pairs are temporal facts about the check and
-  // are voided by nothing here.
-  const causallyPure = provenanceFilter !== 'agent-only'
-    || !input.changedPaths.some(path => input.provenance?.get(path) === 'external')
+
+  // Session-level causal purity — with the H-13 honesty gates. Under
+  // 'agent-only', ONE externally-attributed path in the change set voids
+  // EVERY verification label this session could mint ("the agent kept the
+  // suite green" is a causal claim about the agent's edits alone;
+  // flip-pairs are temporal facts about the check and are voided by nothing
+  // here). But the filter can only fire on attribution it can SEE:
+  //
+  // - `external`          → resolved: the session voids;
+  // - `agent` / `explicit`→ resolved: pure ('explicit' is the caller-harness's
+  //                        own declared change set — declared authorship,
+  //                        not an external hand);
+  // - `unknown`           → degraded: uncertainty is NOT an external verdict,
+  //                        but it is not agent purity either — samples ride
+  //                        out flagged, and `unknownAttributed` counts them;
+  // - no map / no entry   → degraded: undecidable, samples ride out flagged,
+  //                        the manifest declares `provenanceUnresolved`.
+  //
+  // An empty change set is pure by vacuity (no edits, no hidden hand) — the
+  // deployed engine's own default, which cannot invent attributions, lands
+  // there rather than degrading every export it makes.
+  let externalPresent = false
+  let provenanceUnresolved = false
+  let unknownAttributed = 0
+  if (provenanceFilter === 'agent-only') {
+    for (const path of input.changedPaths) {
+      const label = input.provenance?.get(path)
+      if (label === 'external') externalPresent = true
+      else if (label === 'unknown') unknownAttributed += 1
+      else if (label !== 'agent' && label !== 'explicit') provenanceUnresolved = true
+    }
+  }
+  const causallyPure = !externalPresent
+  const provenanceDegraded = !externalPresent && (provenanceUnresolved || unknownAttributed > 0)
 
   const changedPaths = [...input.changedPaths]
   const verifications: TrainingSample[] = []
+  let excludedUnverifiable = 0
+  let unmeasuredDuration = 0
 
   if (causallyPure) {
     for (const record of input.records) {
       const decisive = asDecisive(record)
       if (decisive === undefined) continue // ran, but no conclusion — not sample material
-      const verdict = verdictFor(input.baselineVerdicts.get(record.checkId), decisive.status)
+      // M3: a baselineVerdicts entry that is not a self-comparison encoding
+      // carries a differential this module never paid for — exclude and
+      // count, never decode it into a weaker label.
+      const baseline = input.baselineVerdicts.get(record.checkId)
+      if (baseline !== undefined && BASELINE_ANSWER_OF[baseline] === 'none') {
+        excludedUnverifiable += 1
+        continue
+      }
+      const verdict = verdictFor(baseline, decisive.status)
       if (verdict === 'indeterminate') continue // honest unknown — excluded, never labeled 0
+      // H-28 fold met one layer early: a non-finite duration becomes the
+      // canonical null it would have addressed to anyway — the sample then
+      // SAYS unmeasured instead of pretending two different inputs differ.
+      const durationMs = Number.isFinite(record.durationMs) ? record.durationMs : null
+      if (durationMs === null) unmeasuredDuration += 1
       verifications.push({
         kind: 'verification',
         checkId: record.checkId,
@@ -388,27 +556,55 @@ export function distillTrainingSet(input: DistillInput): TrainingSet {
         changedPaths,
         verdict,
         status: decisive.status,
-        durationMs: record.durationMs,
+        durationMs,
         reward: VERDICT_REWARD[verdict],
         ...(fidelity === 'full' ? { outputExcerpt: excerptOf(record.outputHead) } : {}),
         outputDigest: record.outputDigest,
         recordedAt: record.recordedAt,
+        ...(provenanceDegraded ? { provenanceDegraded: true as const } : {}),
       })
     }
   }
 
+  // H-14: homomorphic re-runs fold. A green workspace can mint unlimited
+  // reward-1.0 samples by re-running verify — every repeat carries a fresh
+  // recordedAt, so full-sample addressing saw each as new supervision. The
+  // outcome identity is (checkId, status, outputDigest): one check, one
+  // verdict, one output. Repeats mint nothing; the FIRST observation stands
+  // (chain order), and `dedupedCount` makes the folding auditable.
+  const seenOutcome = new Set<string>()
+  const keptVerifications: VerificationSample[] = []
+  let dedupedCount = 0
+  for (const sample of verifications) {
+    if (sample.kind !== 'verification') continue // structurally unreachable; keeps the narrowing honest
+    const key = `${sample.checkId}\u0000${sample.status}\u0000${sample.outputDigest}`
+    if (seenOutcome.has(key)) {
+      dedupedCount += 1
+      continue
+    }
+    seenOutcome.add(key)
+    keptVerifications.push(sample)
+  }
+
   // Per-check decisive subsequences, in chain order (the given order), for
-  // flip pairing. The kind is the check's first-seen record's kind — records
-  // of one checkId agree on it in every real log.
-  const groups = new Map<string, { kind: Evidence['kind']; decisive: DecisiveObservation[] }>()
+  // flip pairing. The kind is the check's first-seen record's kind; a checkId
+  // whose records disagree on it is no longer assumed away — `checkKindDrift`
+  // counts the drift (first-seen kind still rides the pairs).
+  const groups = new Map<string, { kind: Evidence['kind']; kindDrifted: boolean; decisive: DecisiveObservation[] }>()
   for (const record of input.records) {
     let group = groups.get(record.checkId)
     if (group === undefined) {
-      group = { kind: record.kind, decisive: [] }
+      group = { kind: record.kind, kindDrifted: false, decisive: [] }
       groups.set(record.checkId, group)
+    } else if (record.kind !== group.kind) {
+      group.kindDrifted = true
     }
     const decisive = asDecisive(record)
     if (decisive !== undefined) group.decisive.push(decisive)
+  }
+  let checkKindDrift = 0
+  for (const group of groups.values()) {
+    if (group.kindDrifted) checkKindDrift += 1
   }
 
   const flipPairs: TrainingSample[] = []
@@ -431,13 +627,28 @@ export function distillTrainingSet(input: DistillInput): TrainingSet {
     }
   }
 
-  const samples: TrainingSample[] = [...verifications, ...flipPairs].sort(compareSamples)
+  // Byte-identical pairs (a duplicated adjacent record, not a genuinely new
+  // temporal observation — different stamps mean different facts and fold
+  // nothing) collapse by their full content address.
+  const seenPairAddress = new Set<string>()
+  const keptPairs: TrainingSample[] = []
+  for (const pair of flipPairs) {
+    const address = sampleHash(pair)
+    if (seenPairAddress.has(address)) {
+      dedupedCount += 1
+      continue
+    }
+    seenPairAddress.add(address)
+    keptPairs.push(pair)
+  }
+
+  const samples: TrainingSample[] = [...keptVerifications, ...keptPairs].sort(compareSamples)
   const manifest: TrainingManifest = {
     schema: TRAINING_SCHEMA,
     fidelity,
     workspaceKey: input.workspaceKey,
     generatedAt: input.generatedAt,
-    counts: { verification: verifications.length, 'flip-pair': flipPairs.length },
+    counts: { verification: keptVerifications.length, 'flip-pair': keptPairs.length },
     // Snapshot, not reference: the manifest states the law as it stood when
     // the dataset was minted, and mutating a manifest cannot rewrite it.
     rewardTable: { ...VERDICT_REWARD },
@@ -445,6 +656,16 @@ export function distillTrainingSet(input: DistillInput): TrainingSet {
     // Recorded honestly even when the filter emptied the dataset: an honest
     // zero is part of the data, not an embarrassment to hide.
     provenanceFilter,
+    // ...and so is a filter that could not execute: the degradation flags
+    // ride the manifest only when verification samples actually rode out
+    // under a downgraded causal claim (a voided session executed its filter
+    // — there is nothing left to degrade).
+    ...(provenanceDegraded && provenanceUnresolved ? { provenanceUnresolved: true as const } : {}),
+    ...(provenanceDegraded && unknownAttributed > 0 ? { unknownAttributed } : {}),
+    dedupedCount,
+    excludedUnverifiable,
+    checkKindDrift,
+    unmeasuredDuration,
     root: merkleRoot(samples.map(sampleHash)),
   }
   return { manifest, samples }

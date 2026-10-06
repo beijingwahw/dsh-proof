@@ -147,8 +147,35 @@ export interface NormalizeOptions {
   readonly home?: string
 }
 
+/**
+ * H-28: the placeholder shapes the folds themselves produce. Output that
+ * ALREADY carries one of these literals is not honest input for the fold: an
+ * author who can shape a check's stdout could pre-print `$WORKSPACE/src/a.ts`
+ * (or a literal `<duration>`) and mint the digest of a *different* real
+ * output, breaking the content-addressing promise that same digest implies
+ * same observable outcome. When any of these appear in the raw text, the
+ * normalized result is prefixed with `RAW_PLACEHOLDER_MARKER` (once), so a
+ * literal-bearing output can never byte-equal a folded honest one.
+ *
+ * Residual, documented: the marker separates the literal-bearing class from
+ * the folded class; two DIFFERENT literal-bearing outputs can still agree
+ * where the underlying folds already equate them (the pre-existing
+ * equivalence class of this function). Digests of outputs that contain none
+ * of these literals are byte-for-byte unchanged.
+ */
+const LITERAL_PLACEHOLDER_SHAPES: readonly RegExp[] = [
+  /\$(?:WORKSPACE|HOME)(?![\w$-])/,
+  /<(?:duration|timestamp)>/,
+]
+
+/** H-28: one-line escape prefix stating the raw output carried placeholder literals. */
+const RAW_PLACEHOLDER_MARKER = '[raw output contained literal placeholders]\n'
+
 export function normalizeOutput(raw: string, opts: NormalizeOptions = {}): string {
   let text = raw.replace(/\r\n/g, '\n')
+  // H-28: detect BEFORE folding — after substitution, real paths and
+  // pre-printed literals are indistinguishable by construction.
+  const carriesLiteral = LITERAL_PLACEHOLDER_SHAPES.some(re => re.test(text))
   const foldRoot = foldsSeparators(opts.root)
   const foldHome = foldsSeparators(opts.home)
   for (const variant of pathVariants(opts.root)) text = substituteLiteral(text, variant, '$WORKSPACE', foldRoot)
@@ -159,7 +186,7 @@ export function normalizeOutput(raw: string, opts: NormalizeOptions = {}): strin
     .map(line => line.replace(/\b\d+(\.\d+)?\s?(ms|s|sec|secs|seconds|minutes|min)\b/gi, '<duration>'))
     .map(line => line.replace(/\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?\b/g, '<timestamp>'))
   while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
-  return lines.join('\n')
+  return (carriesLiteral ? RAW_PLACEHOLDER_MARKER : '') + lines.join('\n')
 }
 
 /**
@@ -205,13 +232,18 @@ function foldsSeparators(path: string | undefined): boolean {
 /**
  * A root always appears in output as a *complete path prefix*, so a match is
  * only meaningful when it ends at a path boundary: separator, quote,
- * whitespace, or end of line/text. Without the anchor, root `/app` would chew
- * into `/application` and mint `$WORKSPACElication` — a false equivalence (or
- * false diff) between two different locations in a content-addressed digest.
- * The lookahead consumes nothing, so every legitimately-prefixed path
- * substitutes exactly as it did before the guard existed.
+ * whitespace, end of line/text — or (B6-L2) the punctuation a path is
+ * routinely glued to without whitespace: `(`/`)` (linter and stack-frame
+ * renderings), `:` (line numbers right after a bare root), `,`/`;` (lists).
+ * Without the anchor, root `/app` would chew into `/application` and mint
+ * `$WORKSPACElication` — a false equivalence (or false diff) between two
+ * different locations in a content-addressed digest; with only the original
+ * anchor set, `(/app)` and `/app:` failed to substitute AT ALL — the false
+ * INEQUALITY direction, breaking cross-machine dedupe. The lookahead consumes
+ * nothing, so every legitimately-prefixed path substitutes exactly as it did
+ * before the guard existed.
  */
-const PATH_BOUNDARY = "(?=[/\\\\'\"`\\s]|$)"
+const PATH_BOUNDARY = "(?=[/\\\\'\"`():,;\\s]|$)"
 
 /** The path continuation after a root match: separator-led segments, greedily up to the next boundary. */
 const PATH_TAIL = '((?:[/\\\\][^/\\\\\'"`\\s]+)*)'

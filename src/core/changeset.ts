@@ -156,6 +156,18 @@ export async function resolveChangeSet(input: ChangeSetInput): Promise<ChangeSet
   // downstream, which is exactly the net a lost dimension (committed
   // changes the diff never reported, untracked files ls-files never
   // listed) falls into.
+  // M-27: an optional capability that the host never implemented is NOT the
+  // same as a query that answered "nothing". A missing `changedSince` (with a
+  // baseline head to compare against) means every committed change since the
+  // baseline is invisible; a missing `untracked` means every new file is.
+  // Both blind a dimension the resolution would otherwise narrow on, so both
+  // set the same `degraded` flag a failed query does (H6): capability
+  // absence and query failure must have equal weight — the flag, not a
+  // quietly thinner candidate set, is what downstream forces the full run on.
+  let capabilityMissing = false
+  if (git && input.baseline.head !== null && input.workspace.changedSince === undefined) capabilityMissing = true
+  if (git && input.workspace.untracked === undefined) capabilityMissing = true
+
   let gitQueryFailed = false
   let trackedDiff: readonly string[] = []
   let untrackedNow: readonly string[] = []
@@ -217,7 +229,7 @@ export async function resolveChangeSet(input: ChangeSetInput): Promise<ChangeSet
     method: digests !== undefined ? 'baseline-content' : 'git-head',
     preExistingExcluded: excluded,
     baselineHead: input.baseline.head,
-    ...(git && !gitQueryFailed ? {} : { degraded: true as const }),
+    ...(git && !gitQueryFailed && !capabilityMissing ? {} : { degraded: true as const }),
   }
 }
 

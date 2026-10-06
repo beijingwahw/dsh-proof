@@ -16,6 +16,20 @@ export interface PromptFacts {
   readonly requireBaseline: 'off' | 'warn' | 'ask'
 }
 
+/**
+ * B8-L7: `label` and `command` come from package.json discovery — workspace-
+ * writable data injected into the system prompt's authoritative voice. Newlines
+ * could forge extra rule lines, backticks could break the code spans; both are
+ * flattened to spaces and the result capped, so a check's name may only ever
+ * arrive as one inert line of text.
+ */
+const SPEC_TEXT_CAP = 120
+
+function sanitizeSpecText(value: string): string {
+  const flattened = value.replace(/[\r\n`]+/g, ' ').trim()
+  return flattened.length > SPEC_TEXT_CAP ? `${flattened.slice(0, SPEC_TEXT_CAP)}…` : flattened
+}
+
 export function buildPolicySection(facts: PromptFacts): string {
   const lines: string[] = [
     '# Completion proof (proof:policy)',
@@ -40,7 +54,7 @@ export function buildPolicySection(facts: PromptFacts): string {
   } else {
     lines.push(`Objective checks available (${facts.discovered.length}):`)
     for (const spec of facts.discovered.slice(0, 12)) {
-      lines.push(`  · [${spec.kind}] ${spec.label} — \`${spec.command.join(' ')}\``)
+      lines.push(`  · [${sanitizeSpecText(spec.kind)}] ${sanitizeSpecText(spec.label)} — \`${sanitizeSpecText(spec.command.join(' '))}\``)
     }
     if (facts.discovered.length > 12) lines.push(`  · …and ${facts.discovered.length - 12} more (see proof_status)`)
   }

@@ -15,8 +15,12 @@
  * 2. **Append-only** — the log never rewrote itself: every older signed tree
  *    head (STH) is still derivable from every newer one
  *    (`consistencyProof` / `verifyConsistency`).
- * 3. **Monotonic time** — sequence numbers only grow, and `savePtlHead`
- *    refuses to sign a head that rewinds size or timestamp.
+ * 3. **Monotonic time & governance** — sequence numbers only grow, and
+ *    `savePtlHead` refuses every dishonest successor to a published head:
+ *    size rewinds, same-size root swaps, timestamp rewinds (parsed as
+ *    instants, refusing unparseable stamps), operator-identity flips, and
+ *    — since v0.22 — any larger tree whose old→new prefix consistency
+ *    cannot be proven from the entries on disk.
  *
  * The log is a *dumb notary*: it does NOT verify the workspace signatures it
  * carries (that is the auditor's job, done with the workspace public key);
@@ -539,64 +543,174 @@ function parseSthFile(raw: string | undefined): SignedTreeHead | undefined {
 
 /**
  * Load a log from `dir`. Malformed entry lines are skipped and reported in
- * `badLines` (the surviving prefix still verifies — a torn tail is not a
- * veto on the readable history); a missing or malformed `sth.json` loads as
- * `undefined`, meaning "no signed head on record yet" rather than "head
- * absent is an error".
+ * `badLines` — a line reduced to whitespace by damage counts as bad, not as
+ * "not there", so the corruption report cannot under-count (the loader
+ * splits the raw file itself for exactly this reason: a port-level blank
+ * filter would have deleted the evidence of the deletion). The surviving
+ * prefix still verifies — a torn tail is not a veto on the readable
+ * history. A missing or malformed `sth.json` loads as `undefined`, meaning
+ * "no signed head on record yet" rather than "head absent is an error".
+ *
+ * `headOvercommits` is present and `true` exactly when the loaded head
+ * promises more entries than the file holds (`sth.treeSize > entries`) —
+ * the signature of a truncated or disconnected log, stated loudly instead
+ * of being discovered as a producer-side `RangeError` by whoever asks for a
+ * proof next.
  */
 export async function loadPtl(
   fs: FsPort, dir: string,
-): Promise<{ log: TransparencyLog; sth: SignedTreeHead | undefined; badLines: number }> {
-  const lines = await fs.readLines(under(dir, ENTRIES_FILENAME))
+): Promise<{ log: TransparencyLog; sth: SignedTreeHead | undefined; badLines: number; headOvercommits?: boolean }> {
+  const raw = await fs.readFile(under(dir, ENTRIES_FILENAME))
   const entries: PtlEntry[] = []
   let badLines = 0
-  for (const line of lines) {
-    const entry = parseEntryLine(line)
-    if (entry === undefined) {
-      badLines += 1
-      continue
+  if (raw !== undefined) {
+    const lines = raw.split('\n')
+    if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop() // the newline-terminated file's trailing empty segment
+    for (const line of lines) {
+      const entry = parseEntryLine(line)
+      if (entry === undefined) {
+        badLines += 1
+        continue
+      }
+      entries.push(entry)
     }
-    entries.push(entry)
   }
   const sth = parseSthFile(await fs.readFile(under(dir, HEAD_FILENAME)))
-  return { log: new TransparencyLog(entries), sth, badLines }
+  const headOvercommits = sth !== undefined && sth.treeSize > entries.length
+  return {
+    log: new TransparencyLog(entries),
+    sth,
+    badLines,
+    ...(headOvercommits ? { headOvercommits: true } : {}),
+  }
 }
+
+/**
+ * Serialise appends to one log directory within THIS process: the
+ * load→dedupe→write section is a read-modify-write, and two in-flight calls
+ * must not interleave their reads (the engine's own `ptlQueue` serialises
+ * its publishes; this queue covers every other caller, including tests).
+ * Cross-process races are closed by the write itself — see
+ * `appendPtlEntryInternal`.
+ */
+const appendQueues = new Map<string, Promise<unknown>>()
 
 /**
  * Append one entry to the log in `dir` (load, dedupe by leaf hash, write the
  * line only when it is genuinely new). The line written is
  * `canonicalJson(entry)` — the same bytes the leaf hash committed to, so
  * what is stored is exactly what is proved.
+ *
+ * Two storage disciplines (v0.22):
+ *
+ * - **Torn tails refuse appends** (M-61). A previous crash can leave the
+ *   file ending mid-line; appending behind it would splice the new entry
+ *   onto the torn remainder — physically one line, parseable as neither —
+ *   while reporting success. That silent publication loss is the exact
+ *   failure a transparency log exists to prevent, so the append REFUSES,
+ *   naming the repair (remove the partial final line or restore a
+ *   known-good copy). `EvidenceStore.ensureTail` performs the analogous
+ *   repair for the workspace chain; here refusal is the honest choice
+ *   because the PTL has no chain of its own to record a repair on.
+ * - **Atomic whole-file commit** (M-62). The write is a single
+ *   `writeFile` of the full new contents — temp file + rename under
+ *   `NodeFsPort`, the same pattern every atomic write in this package
+ *   uses — so no interleaving of two writers can tear a line or leave a
+ *   half-written file. A racing writer whose view went stale cannot corrupt
+ *   the log either: its subsequent `savePtlHead` demands a consistency
+ *   proof grounded in the entries on disk and refuses the stale view loudly
+ *   instead of letting a rewritten history wear a fresh signature.
  */
 export async function appendPtlEntry(
   fs: FsPort, dir: string, entry: PtlEntry,
 ): Promise<{ sequence: number; duplicate: boolean }> {
+  const previous = appendQueues.get(dir) ?? Promise.resolve()
+  const next = previous.then(() => appendPtlEntryInternal(fs, dir, entry))
+  appendQueues.set(dir, next.then(() => undefined, () => undefined))
+  return next
+}
+
+async function appendPtlEntryInternal(
+  fs: FsPort, dir: string, entry: PtlEntry,
+): Promise<{ sequence: number; duplicate: boolean }> {
+  const entriesPath = under(dir, ENTRIES_FILENAME)
   const { log } = await loadPtl(fs, dir)
   const { sequence, duplicate } = log.append(entry)
-  if (!duplicate) await fs.appendLine(under(dir, ENTRIES_FILENAME), canonicalJson(entry))
+  if (duplicate) return { sequence, duplicate }
+  const raw = await fs.readFile(entriesPath)
+  if (raw !== undefined && raw.length > 0 && !raw.endsWith('\n')) {
+    throw new Error(
+      `${entriesPath} ends in a torn (unterminated) line — refusing to append behind a partial write.`
+      + ' Repair the tail (delete the partial final line, or restore the file from a known-good copy) and re-run the publish.',
+    )
+  }
+  await fs.writeFile(entriesPath, `${raw ?? ''}${canonicalJson(entry)}\n`)
   return { sequence, duplicate }
 }
 
 /**
- * Persist a signed tree head, refusing every rewind of the published head:
+ * Persist a signed tree head, refusing every way a new head could fail to
+ * be an honest extension of the published one:
  *
+ * - a different `logId` — the operator's public identity is part of what
+ *   auditors pin; a silent identity flip mid-log would let a rewritten
+ *   history wear a "fresh" operator's signature (M-60/A2-M3);
  * - `treeSize` smaller than the stored one (a truncated log);
  * - same `treeSize` but a different `root` (a rewritten log);
- * - an `at` earlier than the stored one (timestamps must not go backwards;
- *   compared lexicographically, which orders same-format ISO-8601 stamps).
+ * - an `at` earlier than the stored one — timestamps are compared as
+ *   PARSED instants (`Date.parse`), and a timestamp that does not parse is
+ *   refused outright: a garbage `at` could wedge every later honest append
+ *   behind a comparison that cannot be made;
+ * - a LARGER `treeSize` whose old→new prefix consistency cannot be PROVEN
+ *   from the entries on disk: a longer, rewritten history is precisely the
+ *   forgery the consistency proof exists to catch, and signing it fresh
+ *   would launder it (M-60). The proof is computed from the stored entries
+ *   — a head over more entries than the file holds is refused before any
+ *   producer-side `RangeError` can surface.
  *
- * Re-saving the identical head is allowed (idempotent). Any rewind throws:
- * once an operator has signed a head, the only honest next head extends it.
+ * Re-saving the identical head is allowed (idempotent). A log's FIRST head
+ * (no stored head at all) is accepted without a consistency proof — there
+ * is no prior commitment to extend. Any refusal throws, loudly: once an
+ * operator has signed a head, the only honest next head extends it.
  */
 export async function savePtlHead(fs: FsPort, dir: string, sth: SignedTreeHead): Promise<void> {
-  const existing = parseSthFile(await fs.readFile(under(dir, HEAD_FILENAME)))
-  if (
-    existing !== undefined
-    && (sth.treeSize < existing.treeSize
+  const headPath = under(dir, HEAD_FILENAME)
+  const existing = parseSthFile(await fs.readFile(headPath))
+  if (existing !== undefined) {
+    if (sth.logId !== existing.logId) {
+      throw new Error(
+        `refusing to change the transparency log operator (logId ${JSON.stringify(existing.logId)} -> ${JSON.stringify(sth.logId)})`
+        + ' — operator rotation requires explicitly retiring this log directory and starting a new one',
+      )
+    }
+    const sthAt = Date.parse(sth.at)
+    const existingAt = Date.parse(existing.at)
+    if (!Number.isFinite(sthAt) || !Number.isFinite(existingAt)) {
+      throw new Error(
+        `refusing a head whose timestamp cannot be parsed as an instant (stored ${JSON.stringify(existing.at)}, new ${JSON.stringify(sth.at)})`,
+      )
+    }
+    const rewinds = sth.treeSize < existing.treeSize
       || (sth.treeSize === existing.treeSize && sth.root !== existing.root)
-      || sth.at < existing.at)
-  ) {
-    throw new Error('refusing to rewind the transparency head')
+      || sthAt < existingAt
+    if (rewinds) {
+      throw new Error('refusing to rewind the transparency head')
+    }
+    if (sth.treeSize > existing.treeSize) {
+      const { log } = await loadPtl(fs, dir)
+      if (log.size < sth.treeSize) {
+        throw new Error(
+          `refusing to sign a head over ${sth.treeSize} entries while the log holds ${log.size} — the head and the log are disconnected`,
+        )
+      }
+      const proof = log.consistencyProof(existing.treeSize, sth.treeSize)
+      if (!verifyConsistency(existing.treeSize, existing.root, sth.treeSize, sth.root, proof)) {
+        throw new Error(
+          `refusing to sign a head that does not extend the published history`
+          + ` (no consistency proof from tree size ${existing.treeSize} to ${sth.treeSize} over the entries on disk)`,
+        )
+      }
+    }
   }
-  await fs.writeFile(under(dir, HEAD_FILENAME), canonicalJson(sth))
+  await fs.writeFile(headPath, canonicalJson(sth))
 }

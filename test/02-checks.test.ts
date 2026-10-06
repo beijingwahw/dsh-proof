@@ -189,6 +189,53 @@ test('checks inherit the configured timeout', async () => {
   assert.equal(checks[0]?.timeoutMs, 777)
 })
 
+test('B6-L3: a quoted config command string splits shell-words style, not on raw whitespace', () => {
+  // `pytest -k "foo bar"` used to shred into [..., '"foo', 'bar"'] — quote
+  // fragments riding into argv, the label AND the checkId material.
+  return (async () => {
+    const fs = MemoryFs.of({})
+    const quoted = await discoverChecks(fs, '/ws', { checks: [{ label: 't', command: 'pytest -k "foo bar"' }] })
+    assert.deepEqual(quoted[0]?.command, ['pytest', '-k', 'foo bar'])
+    const single = await discoverChecks(MemoryFs.of({}), '/ws', { checks: [{ label: 't', command: "eslint 'src/**/*.{ts,tsx}' --max-warnings 0" }] })
+    assert.deepEqual(single[0]?.command, ['eslint', 'src/**/*.{ts,tsx}', '--max-warnings', '0'])
+    // Quote-free strings are byte-identical to the legacy splitter, so every
+    // existing id stays put (the compatibility red line).
+    const plain = await discoverChecks(MemoryFs.of({}), '/ws', { checks: [{ label: 't', command: 'make   all ' }] })
+    assert.deepEqual(plain[0]?.command, ['make', 'all'])
+    // An unterminated quote keeps the rest as one token — never an invented
+    // split the author did not write.
+    const open = await discoverChecks(MemoryFs.of({}), '/ws', { checks: [{ label: 't', command: "echo 'unclosed argument" }] })
+    assert.deepEqual(open[0]?.command, ['echo', 'unclosed argument'])
+    // Array commands pass through untouched.
+    const arr = await discoverChecks(MemoryFs.of({}), '/ws', { checks: [{ label: 't', command: ['a', 'b c'] }] })
+    assert.deepEqual(arr[0]?.command, ['a', 'b c'])
+  })()
+})
+
+test('B6-L4: perf script names are not promoted to benchmark checks by name alone', () => {
+  return (async () => {
+    // A script merely NAMED bench/benchmark/perf:bench is usually a
+    // long-running local helper; name-key discovery used to promote it to a
+    // must-pass benchmark check under the default 120s timeout — a red check
+    // the project never opted into. The default name map stays test/verify
+    // semantics only; perf coverage arrives via explicit config.
+    const fs = MemoryFs.of({
+      '/ws/package.json': JSON.stringify({ scripts: { test: 'vitest run', bench: 'autocannon table', benchmark: 'hyperfine' } }),
+    })
+    const checks = await discoverChecks(fs, '/ws')
+    assert.deepEqual(checks.map(c => c.label), ['npm script "test"'], 'no name-keyed benchmark promotion')
+
+    // The opt-in still works: explicit config with kind benchmark, or a
+    // scriptKinds override, is where perf evidence comes from.
+    const withKind = await discoverChecks(MemoryFs.of({ '/ws/package.json': JSON.stringify({ scripts: { bench: 'hyperfine' } }) }), '/ws', {
+      checks: [{ label: 'perf', command: ['node', 'bench/run.ts'], kind: 'benchmark' }],
+    })
+    assert.equal(withKind.find(c => c.label === 'perf')?.kind, 'benchmark')
+    const overridden = await discoverChecks(fs, '/ws', { scriptKinds: { bench: 'benchmark' } })
+    assert.equal(overridden.find(c => c.label === 'npm script "bench"')?.kind, 'benchmark')
+  })()
+})
+
 // ---------------------------------------------------------------------------
 // scriptDigest (H5a) — the discovery half of check-definition drift.
 //

@@ -9,6 +9,7 @@
 
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
+import { execSync } from 'node:child_process'
 import { promises as fsp } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
@@ -653,20 +654,33 @@ test('ClaimValue no longer lies: regressions are named regressions, and `verifie
 // ---------------------------------------------------------------------------
 
 test('a pre-existing baseline on disk reaches the prompt section after the prewarm probe', async () => {
-  const proofDir = join(ROOT, '.proof')
-  await fsp.mkdir(proofDir, { recursive: true })
-  // Everything loadBaseline() needs to recognise the document: an id and a
-  // check table.
-  await fsp.writeFile(join(proofDir, 'baseline.json'), JSON.stringify({
-    baselineId: 'b'.repeat(32),
-    root: 'r'.repeat(64),
-    checks: [],
+  // H-23 made loadBaseline recompute the document's digest and refuse one
+  // that does not reproduce byte-for-byte — the old fixture hand-wrote
+  // `{"baselineId":"bbbb…","checks":[]}`, which is exactly the shape-only
+  // forgery that loader used to accept. The honest fixture is a baseline the
+  // engine itself wrote: mint one with a real ProofEngine over a scratch
+  // workspace, then point apply()'s prewarm probe at it.
+  const dir = join(WORKSPACE, '.openclaw', 'tmp', `proof-prewarm-${process.pid}`)
+  await fsp.rm(dir, { recursive: true, force: true })
+  await fsp.mkdir(dir, { recursive: true })
+  await fsp.writeFile(join(dir, 'package.json'), JSON.stringify({
+    name: 'prewarm-fixture',
+    scripts: { test: 'node -e "process.exit(0)"' },
   }))
+  const minter = new ProofEngine({
+    root: dir,
+    evidenceDir: '.proof',
+    fs: new NodeFsPort(),
+    commands: new FakeCommands(),
+    workspace: new FakeWorkspace(dir),
+  })
+  const { baseline } = await minter.establishBaseline()
+  assert.equal(baseline.checks.length, 1, 'fixture setup: one discovered check anchored')
 
   const harness = makeHarness()
-  process.env.DSH_PROOF_ROOT = ROOT
+  process.env.DSH_PROOF_ROOT = dir
   try {
-    plugin.apply(harness.ctx, config({ evidenceStore: 'workspace', requireBaseline: 'off' }))
+    plugin.apply(harness.ctx, config({ evidenceStore: 'workspace', evidenceDir: '.proof', requireBaseline: 'off' }))
   } finally {
     delete process.env.DSH_PROOF_ROOT
   }
@@ -692,7 +706,7 @@ test('a pre-existing baseline on disk reaches the prompt section after the prewa
     assert.match(text, /A baseline is already established for this workspace\./)
     assert.ok(!/No baseline is established/.test(text), 'once the probe lands, the lie must stop')
   } finally {
-    await fsp.rm(proofDir, { recursive: true, force: true })
+    await fsp.rm(dir, { recursive: true, force: true })
   }
 })
 
@@ -2034,9 +2048,11 @@ test('agent-team: createTeamBridge delegates and injects the instruction into a 
   await capBridge.onEvent({ claim: 'a'.repeat(600) })
   assert.equal(String(calls[1]!.claim).length, 500, 'an event prompt is not a spec — the obligation claim is capped')
 
-  // An event with a parent edge forwards it (a string one only).
+  // H-12: a host parent id is NOT cast into the engine's task-N namespace —
+  // an unmapped parent (even one that looks like task-1) mints a root, never
+  // a guessed edge. A non-string parent id is dropped, not guessed at.
   await capBridge.onEvent({ claim: 'child work', parentTaskId: 'task-1' })
-  assert.equal((calls[2]! as { parentTaskId?: unknown }).parentTaskId, 'task-1')
+  assert.ok(!('parentTaskId' in calls[2]!), 'an unmapped host parent is never forwarded as an engine parent')
   await capBridge.onEvent({ claim: 'bad parent', parentTaskId: 42 })
   assert.ok(!('parentTaskId' in calls[3]!), 'a non-string parent id is dropped, not guessed at')
 
@@ -2067,6 +2083,58 @@ test('agent-team: createTeamBridge delegates and injects the instruction into a 
   await failing.onEvent({ claim: 'will not record' })
   assert.equal(lines.length, 2)
   assert.match(lines[1]!, /chain unavailable/)
+})
+
+test('agent-team: H-12 — host parentTaskId is translated through a mapping, never shape-guessed', async () => {
+  const delegated: Record<string, unknown>[] = []
+  const stderrLines: string[] = []
+  const markers: { label: string; payload: Record<string, unknown> }[] = []
+  let seq = 0
+  const bridge = createTeamBridge({
+    delegate: async input => {
+      delegated.push(input)
+      seq += 1
+      return { taskId: `task-${seq}`, obligationId: `obl-${seq}`, obligation: {} }
+    },
+    instructionOf: () => 'x',
+    stderr: line => { stderrLines.push(line) },
+    mark: async (label, payload) => { markers.push({ label, payload }) },
+  })
+
+  // (a) A host parent id nobody delegated through the bridge is unmapped: the
+  // obligation still mints — as a ROOT — and the lost edge is recorded on
+  // stderr AND as an observation marker, with the host's own id spelled out.
+  await bridge.onEvent({ claim: 'orphaned child', parentTaskId: 'session-abc-123', taskId: 'host-child-1' })
+  assert.equal(delegated.length, 1)
+  assert.ok(!('parentTaskId' in delegated[0]!), 'an unmapped parent never reaches the engine namespace')
+  assert.ok(stderrLines.some(l => l.includes('session-abc-123')), 'the degradation names the host parent id')
+  assert.equal(markers[0]?.label, 'agent-team/parent-unmapped')
+  assert.equal(markers[0]?.payload.hostParentTaskId, 'session-abc-123')
+
+  // The mint recorded the namespace mapping — on-chain, not bridge-private.
+  assert.equal(markers[1]?.label, 'agent-team/delegated')
+  assert.deepEqual(
+    { host: markers[1]?.payload.hostTaskId, engine: markers[1]?.payload.engineTaskId },
+    { host: 'host-child-1', engine: 'task-1' },
+  )
+
+  // (b) A later host event referencing that host child translates through the
+  // mapping: the parent edge lands on the ENGINE id the bridge minted.
+  await bridge.onEvent({ claim: 'grandchild', parentTaskId: 'host-child-1' })
+  assert.equal(delegated.length, 2)
+  assert.equal((delegated[1]! as { parentTaskId?: unknown }).parentTaskId, 'task-1',
+    'the host id is translated to the engine id this bridge minted for it')
+
+  // (c) Coincidence defense: a host parent id that merely LOOKS like the
+  // engine vocabulary, while that engine id was minted for a different host
+  // task, must not mint a wrong signed parent edge — the marker says why.
+  await bridge.onEvent({ claim: 'shape collision', parentTaskId: 'task-1' })
+  assert.equal(delegated.length, 3)
+  assert.ok(!('parentTaskId' in delegated[2]!), 'a task-N-shaped host id is still a host id — no guessed edge')
+  const collisionMarker = markers.find(m => m.label === 'agent-team/parent-unmapped'
+    && m.payload.hostParentTaskId === 'task-1')
+  assert.ok(collisionMarker, 'the collision is recorded')
+  assert.match(String(collisionMarker?.payload.reason), /coincides with the engine id minted for host task/)
 })
 
 test('agent-team: attachTeamBridge probes every seam and degrades without a usable on()', () => {
@@ -2171,4 +2239,359 @@ test('agent-team: the handoff instruction carries the claim, the ids and the wor
   assert.match(text, /proof_delegate_submit \{ taskId: "task-3"/)
   // The precondition sentence that makes the DAG legible to the child.
   assert.match(text, /precondition/)
+  // M-67: steps 4/5 used to teach the worker to CALL tools that are not on
+  // the nine-tool DSH face this plugin registers — the instruction must say
+  // where those tools live and what to do when they are out of reach.
+  assert.match(text, /MCP tool face/, 'proof_bundle/proof_delegate_submit are named as MCP-face tools')
+  assert.match(text, /ask the orchestrator/, 'a worker without the MCP face gets a reachable fallback')
+  assert.ok(!text.includes('proof_bundle    — export the tamper-evident APP bundle of your evidence chain.\n'),
+    'the old step 4 implied the tool is unconditionally callable')
 })
+
+// ---------------------------------------------------------------------------
+// H-01/H-02 (v0.23): the two pre-execute-guard escapes the audit found in
+// shipped paths — camelCase mutator names the delimited-verb classifier never
+// matched (MultiEdit/NotebookEdit walked every gate while carrying a
+// file_path into the evidence store), and the shell command string path
+// extraction structurally cannot see (`bash {command:'echo x >
+// .proof/evidence.jsonl'}` passed with nothing asked).
+// ---------------------------------------------------------------------------
+
+test('H-01/H-02: camelCase mutators and store-naming shell commands cannot reach the evidence store', async () => {
+  const harness = makeHarness()
+  process.env.DSH_PROOF_ROOT = ROOT
+  try {
+    plugin.apply(harness.ctx, config({ evidenceStore: 'workspace', requireBaseline: 'off' }))
+  } finally {
+    delete process.env.DSH_PROOF_ROOT
+  }
+  const gate = harness.listeners.get('tools/pre-execute')![0] as (
+    exec: unknown, next: () => Promise<unknown>,
+  ) => Promise<{ kind: string; reason?: string }>
+
+  // H-01: the Claude Code camel mutators (documented in the CC adapter's own
+  // header) must hit the structured-path guard exactly like `write` does.
+  const camelMutators: [string, Record<string, unknown>][] = [
+    ['MultiEdit', { file_path: '.proof/evidence.jsonl', edits: [] }],
+    ['NotebookEdit', { notebook_path: '.proof/evidence.jsonl' }],
+  ]
+  for (const [name, args] of camelMutators) {
+    const denied = await gate(
+      { name, arguments: args, signal: new AbortController().signal },
+      async () => ({ kind: 'allow' }),
+    )
+    assert.equal(denied.kind, 'ask', `${name} naming the evidence store must be routed through approval`)
+    assert.match(denied.reason ?? '', /evidence/i)
+  }
+
+  // H-02: the shell command string names no path key — the guard sweeps it
+  // conservatively and REFUSES (a shell can rewrite anything; "was that
+  // redirect really a write?" is not for a parser to guess).
+  const shellForges = [
+    'echo x > .proof/evidence.jsonl',
+    'echo x >> .PROOF\evidence.jsonl', // backslash + case variant
+    'rm -rf .proof',
+    'cat .proof/baseline.json | sha256sum',
+  ]
+  for (const command of shellForges) {
+    const denied = await gate(
+      { name: 'bash', arguments: { command }, signal: new AbortController().signal },
+      async () => ({ kind: 'allow' }),
+    )
+    assert.equal(denied.kind, 'deny', `a store-naming shell command must be refused: ${command}`)
+    assert.match(denied.reason ?? '', /shell can rewrite anything/)
+  }
+  // The CC camel spelling of the shell tool is caught by the same sweep.
+  const camelShell = await gate(
+    { name: 'Bash', arguments: { command: 'echo forged >> .proof/evidence.jsonl' }, signal: new AbortController().signal },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(camelShell.kind, 'deny')
+
+  // Ordinary shell calls pass — over-blocking every shell would teach the
+  // model to route its work around the verifier.
+  const ordinary = await gate(
+    { name: 'bash', arguments: { command: 'npm test' }, signal: new AbortController().signal },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(ordinary.kind, 'allow')
+  // Reading the log back through a read-class tool stays legitimate (the
+  // proof tools themselves do exactly that).
+  const read = await gate(
+    { name: 'Read', arguments: { file_path: '.proof/evidence.jsonl' }, signal: new AbortController().signal },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(read.kind, 'allow')
+})
+
+// ---------------------------------------------------------------------------
+// H-29 / M-49 / M-54 (v0.23): proof_claim's parameter boundary. A non-finite
+// budgetMs (`JSON.parse('1e999')` yields Infinity) used to pass the typeof
+// check and make the within-budget obligation vacuously satisfiable; the
+// entryPoints parameter is now honestly described as not consumed (and an
+// all-non-string list forwards nothing rather than []); a non-string changed
+// element is a parameter error, never a silently narrowed change set.
+// ---------------------------------------------------------------------------
+
+test('H-29/M-49/M-54: proof_claim rejects non-finite budgets, forwards entryPoints honestly, validates changed', async () => {
+  const contracts: Record<string, unknown>[] = []
+  const outcome = {
+    report: fakeReport({ grade: 'proven' }),
+    changed: [],
+    checks: [],
+    selection: { untouched: [], precision: 'approximate' as const },
+  }
+  const engine = {
+    verify: async () => outcome,
+    verifyContract: async (options: { contract: unknown }) => {
+      contracts.push(options.contract as Record<string, unknown>)
+      return { ...outcome, contract: { kind: 'perf-budget' as const, obligations: [] } }
+    },
+  } as unknown as ProofEngine
+  const tools = createProofTools(engine)
+  const claimTool = tools.find(t => t.name === 'proof_claim')!
+  const verifyTool = tools.find(t => t.name === 'proof_verify')!
+
+  // H-29: Infinity / NaN / non-positive budgets are refused loudly, naming
+  // the value — nothing reaches the engine on a refusal.
+  await assert.rejects(
+    claimTool.execute({ claim: 'fast enough', kind: 'perf-budget', budgetMs: Infinity }, execution('proof_claim', {})),
+    /finite positive number of milliseconds \(got Infinity\)/,
+  )
+  await assert.rejects(
+    claimTool.execute({ claim: 'fast enough', kind: 'perf-budget', budgetMs: NaN }, execution('proof_claim', {})),
+    /finite positive number of milliseconds \(got NaN\)/,
+  )
+  await assert.rejects(
+    claimTool.execute({ claim: 'fast enough', kind: 'perf-budget', budgetMs: -1 }, execution('proof_claim', {})),
+    /finite positive number of milliseconds \(got -1\)/,
+  )
+  assert.deepEqual(contracts, [], 'a refused budget never mints a contract')
+
+  // A finite positive budget still reaches the contract.
+  await claimTool.execute(
+    { claim: 'fast enough', kind: 'perf-budget', budgetMs: 200 },
+    execution('proof_claim', {}),
+  )
+  assert.equal((contracts[0]! as { budgetMs?: number }).budgetMs, 200)
+
+  // M-49: the schema tells the model the truth — the surface check derives
+  // its entries from package.json, this parameter is recorded, not consumed.
+  const params = claimTool.parameters as Record<string, Record<string, unknown>>
+  assert.match(String(params.entryPoints?.description), /not consumed/)
+  assert.match(String(params.entryPoints?.description), /package\.json/)
+
+  // A string list rides the contract object…
+  await claimTool.execute(
+    { claim: 'stable surface', kind: 'behavior-preserving', entryPoints: ['src/public-api.ts'] },
+    execution('proof_claim', {}),
+  )
+  assert.deepEqual((contracts[1]! as { entryPoints?: string[] }).entryPoints, ['src/public-api.ts'])
+  // …but an all-non-string list forwards NOTHING — once the parameter goes
+  // live, "override with the empty set" and "derive from package.json" must
+  // never share a shape.
+  await claimTool.execute(
+    { claim: 'stable surface', kind: 'behavior-preserving', entryPoints: [42, {}] },
+    execution('proof_claim', {}),
+  )
+  assert.ok(!('entryPoints' in (contracts[2]! as object)), 'a filtered-empty list forwards no key at all')
+
+  // M-54: non-string changed elements are parameter errors on both tools.
+  await assert.rejects(
+    claimTool.execute({ claim: 'did things', changed: [42, 'src/a.ts'] }, execution('proof_claim', {})),
+    /proof_claim: changed\[0\] must be a string path/,
+  )
+  await assert.rejects(
+    verifyTool.execute({ changed: ['src/a.ts', null] }, execution('proof_verify', {})),
+    /proof_verify: changed\[1\] must be a string path/,
+  )
+})
+
+// ---------------------------------------------------------------------------
+// M-80 (v0.23): unbounded strings no longer ride onto the evidence chain —
+// the cap bakes a visible truncation flag into the stored text.
+// ---------------------------------------------------------------------------
+
+test('M-80: an oversized jury context is capped with a visible truncation flag', async () => {
+  const { tools, dir } = await attestFixture('cap')
+  try {
+    const jury = tools.find(t => t.name === 'proof_jury')!
+    const huge = 'z'.repeat(10_000)
+    const value = valueOf(await jury.execute({ claim: 'capped context', context: huge }, execution('proof_jury', {})))
+    const prompt = String(value.prompt)
+    assert.ok(prompt.length < 10_000, 'the frozen prompt cannot carry the whole payload')
+    assert.match(prompt, /\[truncated from 10000 chars\]/, 'the truncation itself is a chain fact')
+  } finally {
+    await fsp.rm(dir, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// M-70 (v0.23): the endorsement approval must show the DIRECTION the record
+// will carry — endorse has unlock power a reject does not, so "approving the
+// recording" while the agent swapped the decision is approving the wrong act.
+// ---------------------------------------------------------------------------
+
+test('M-70: the endorsement ask names the decision the record will carry', async () => {
+  const harness = makeHarness()
+  process.env.DSH_PROOF_ROOT = ROOT
+  try {
+    plugin.apply(harness.ctx, config({ requireBaseline: 'off' }))
+  } finally {
+    delete process.env.DSH_PROOF_ROOT
+  }
+  const gate = harness.listeners.get('tools/pre-execute')![0] as (
+    exec: unknown, next: () => Promise<unknown>,
+  ) => Promise<{ kind: string; reason?: string; displayReason?: Record<string, string> }>
+
+  const asked = await gate(
+    {
+      name: 'proof_endorse',
+      arguments: { claim: 'the retry is safe', decision: 'reject', approver: 'Li Si' },
+      signal: new AbortController().signal,
+    },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(asked.kind, 'ask')
+  assert.match(String(asked.reason), /decision \(as declared by the agent\): reject/)
+  assert.match(asked.displayReason?.en ?? '', /decision \(as declared by the agent\): reject/)
+  assert.match(asked.displayReason?.['zh-CN'] ?? '', /方向（由 agent 自报）：reject（否决）/)
+
+  // A bogus decision is shown as exactly that — the human must not be led to
+  // believe a usable decision is on its way in.
+  const bogus = await gate(
+    {
+      name: 'proof_endorse',
+      arguments: { claim: 'the retry is safe', decision: 'maybe' },
+      signal: new AbortController().signal,
+    },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.match(String(bogus.reason), /no usable decision — the tool will refuse/)
+})
+
+// ---------------------------------------------------------------------------
+// M-65 (v0.23): index.ts derives the evidence-log path with a mirror of the
+// engine's own private rule, and the comment used to claim a wiring test
+// pinned it — none did. This one pins it end-to-end: proof_jury_submit only
+// succeeds by reading the request marker back THROUGH the mirrored path, so a
+// drift between the two derivations refuses the submission.
+// ---------------------------------------------------------------------------
+
+test('the evidenceLogPath mirror stays glued to the engine own derivation (M-65)', async () => {
+  const harness = makeHarness()
+  process.env.DSH_PROOF_ROOT = ROOT
+  try {
+    plugin.apply(harness.ctx, config())
+  } finally {
+    delete process.env.DSH_PROOF_ROOT
+  }
+  const jury = harness.registered.find(t => t.name === 'proof_jury')!
+  const submit = harness.registered.find(t => t.name === 'proof_jury_submit')!
+
+  const request = valueOf(await jury.execute(
+    { claim: 'mirror pin: markers must read back through the derived path' },
+    execution('proof_jury', {}),
+  ))
+  const verdict = valueOf(await submit.execute(
+    {
+      claimId: request.claimId,
+      verdict: 'uphold',
+      probability: 0.9,
+      reasoning: 'deliberated; the read-back through the mirrored path is itself the pin',
+    },
+    execution('proof_jury_submit', {}),
+  ))
+  assert.equal(verdict.recorded, true, 'a drifted mirror degrades to refusal — success pins the derivation')
+  assert.equal(verdict.claimId, request.claimId)
+  assert.equal(verdict.gen, 0)
+})
+
+// ---------------------------------------------------------------------------
+// M-66 (v0.23): the H9b shell fact is wired at apply level — a shell tool
+// result must demote proof_verify's external accusation to unknown through
+// the 4th createProofTools parameter, which nothing previously pinned.
+// ---------------------------------------------------------------------------
+
+test('H9b wiring: a shell tool result carries the session shell fact into proof_verify (M-66)', async () => {
+  const ws = join(ROOT, 'shell-git-ws')
+  await fsp.rm(ws, { recursive: true, force: true })
+  await fsp.mkdir(ws, { recursive: true })
+  await fsp.writeFile(join(ws, 'a.ts'), 'v1\n')
+  const git = (args: string): void => {
+    execSync(`git ${args}`, { cwd: ws, stdio: 'ignore' })
+  }
+  git('init')
+  git('-c user.email=t@example.com -c user.name=t add a.ts')
+  git('-c user.email=t@example.com -c user.name=t commit -m base')
+  // Dirty the committed file from OUTSIDE any tool call: the git-derived
+  // change set must charge it to an external editor while no shell ran.
+  await fsp.writeFile(join(ws, 'a.ts'), 'v2 — an external edit\n')
+
+  const harness = makeHarness()
+  process.env.DSH_PROOF_ROOT = ws
+  try {
+    plugin.apply(harness.ctx, config({ requireBaseline: 'off' }))
+  } finally {
+    delete process.env.DSH_PROOF_ROOT
+  }
+  const onResult = harness.listeners.get('tools/result')![0]! as (exec: unknown, result: unknown) => void
+  const verify = harness.registered.find(t => t.name === 'proof_verify')!
+
+  const before = valueOf(await verify.execute({}, execution('proof_verify', {})))
+  assert.deepEqual(before.externalChanged, ['a.ts'], 'no shell yet: the untouched dirty file reads as external')
+
+  onResult({ name: 'bash', arguments: { command: 'ls' } }, { isError: false, content: [] })
+  await new Promise(resolve => setImmediate(resolve))
+
+  const after = valueOf(await verify.execute({}, execution('proof_verify', {})))
+  assert.deepEqual(after.externalChanged, [], 'once a shell ran, the external accusation is demoted to unknown (H9b)')
+})
+
+// ---------------------------------------------------------------------------
+// M2 (v0.23): the drift narrative's output line consumes the session shell
+// fact — a file changed behind the FILE tools while a shell ran must not be
+// injected as "changed outside your tool calls" in the plugin's voice.
+// ---------------------------------------------------------------------------
+
+test('M2 wiring: the turn-end drift narrative stops accusing once a shell ran', async () => {
+  const ws = join(ROOT, 'drift-ws')
+  await fsp.rm(ws, { recursive: true, force: true })
+  await fsp.mkdir(ws, { recursive: true })
+  await fsp.writeFile(join(ws, 'package.json'), '{"name":"drift-ws"}\n')
+  await fsp.writeFile(join(ws, 'ok.txt'), 'v1\n')
+
+  const harness = makeHarness()
+  process.env.DSH_PROOF_ROOT = ws
+  try {
+    plugin.apply(harness.ctx, config({ requireBaseline: 'off', enforceOnTurnEnd: false, driftDetection: true }))
+  } finally {
+    delete process.env.DSH_PROOF_ROOT
+  }
+  const onResult = harness.listeners.get('tools/result')![0]! as (exec: unknown, result: unknown) => Promise<void>
+  const turnStop = harness.listeners.get('agent/turn-stopping')![0]! as (payload: unknown) => Promise<void>
+
+  // The agent reads the file (its fingerprint is recorded); the file then
+  // changes outside the FILE tools (here directly on disk — a bash edit is
+  // the same blind spot); and a shell ran this session. The read observation
+  // is AWAITED via the listener's returned promise: the v1 fingerprint must
+  // be on record before this test mutates the file, or the watcher reads the
+  // post-mutation bytes and finds no drift — a cold-cache solo run loses
+  // that race, so determinism lives here, not in event-loop luck.
+  await onResult({ name: 'read_file', arguments: { path: 'ok.txt' } }, { isError: false, content: [] })
+  await fsp.writeFile(join(ws, 'ok.txt'), 'v2 — changed behind the file tools\n')
+  await onResult({ name: 'bash', arguments: { command: 'ls' } }, { isError: false, content: [] })
+
+  const injected: string[] = []
+  await turnStop({
+    agent: { inject: (message: unknown) => { injected.push((message as { content: { text: string }[] }).content[0]!.text) } },
+    turn: 1,
+    signal: new AbortController().signal,
+  })
+  assert.equal(injected.length, 1, 'the drift narrative is injected once')
+  const text = injected[0]!
+  assert.ok(!text.includes('outside your tool calls'), 'the false accusation is withdrawn at the output line too')
+  assert.match(text, /shell ran this session/)
+  assert.match(text, /ok\.txt/, 'the drifted file is still named')
+})
+

@@ -432,6 +432,44 @@ test('perf-budget: a missing budgetMs fails within-budget even with green eviden
   assert.match(o.detail, /budgetMs/)
 })
 
+test('H-29: a non-finite or non-positive budgetMs is refused — the budget must be able to bind', () => {
+  // `1e999` parses to Infinity and used to sail through: `durationMs >
+  // Infinity` is always false, so "the benchmark stayed in budget" was
+  // vacuously met for ANY duration — a performance claim's budget component
+  // was decorative, and the detail even printed "Infinityms". A budget that
+  // cannot bind is a misdelivery of the contract: not-met, with the fix.
+  const bench = spec({ id: 'bench1', kind: 'benchmark' })
+  for (const bad of [
+    Number.POSITIVE_INFINITY, // JSON.parse('1e999')
+    Number.NaN,
+    0,
+    -100,
+  ]) {
+    const v = evaluateContract(input({
+      contract: contract('perf-budget', { budgetMs: bad }),
+      records: [ev(bench, 'pass', 999_999)],
+    }))
+    const o = byId(v, 'within-budget')
+    assert.equal(o.met, false, `budgetMs ${bad} must not be met`)
+    assert.match(o.detail, /finite positive/, `budgetMs ${bad}: ${o.detail}`)
+    assert.equal(byId(v, 'benchmark-evidence').met, true, 'the measurement itself still counts')
+  }
+})
+
+test('H-29: a benchmark record with a NaN duration cannot be "within" any budget', () => {
+  // `durationMs > budget` is false for NaN — a broken-clock record slipped
+  // through as within-budget. The comparison is now NaN-safe: only a real
+  // `<= budget` counts as inside.
+  const bench = spec({ id: 'bench1', kind: 'benchmark' })
+  const v = evaluateContract(input({
+    contract: contract('perf-budget', { budgetMs: 200 }),
+    records: [ev(bench, 'pass', Number.NaN)],
+  }))
+  const o = byId(v, 'within-budget')
+  assert.equal(o.met, false, 'a NaN duration is not within anything')
+  assert.match(o.detail, /NaN/)
+})
+
 // ---------------------------------------------------------------------------
 // evaluateContract — docs-only
 // ---------------------------------------------------------------------------

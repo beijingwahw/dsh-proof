@@ -34,6 +34,24 @@
  *    label moves).
  * 8. **The empty log is a legal dataset** — zero counts, `sha256('')` root,
  *    honest manifest.
+ * 9. **H-13 — the filter that cannot execute is declared.** `agent-only`
+ *    with no decidable attribution (no map, missing paths, `unknown`
+ *    labels) keeps the samples but flags every one `provenanceDegraded` and
+ *    declares it on the manifest; resolved, vacuous and voided sessions
+ *    carry no such flags.
+ * 10. **H-14 — homomorphic re-runs fold.** Repeating a decisive outcome
+ *     (same check, status and output) mints nothing; a different output is
+ *     new supervision; duplicate adjacent records collapse by content
+ *     address; `dedupedCount` audits every fold.
+ * 11. **M3 — non-self-comparison baseline encodings are excluded**, never
+ *     decoded into weaker labels; the honest three (and absence) still
+ *     decode.
+ * 12. **Kind drift** — a reconfigured checkId keeps its first-seen kind on
+ *     pairs and the manifest counts the drift.
+ * 13. **`$ABSPATH`** — `full` excerpts redact foreign absolute roots; the
+ *     workspace-relative context, URLs and timestamps ride untouched.
+ * 14. **Non-finite durationMs** folds to the canonical `null` — one
+ *     address, counted, never an Infinity pretending to be a measurement.
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -515,4 +533,248 @@ test('the empty log is a legal dataset', () => {
   // merkleRoot over no leaves is sha256('') — the empty dataset still
   // addresses itself.
   assert.equal(set.manifest.root, sha256(''))
+})
+
+// ---------------------------------------------------------------------------
+// 9. H-13: the filter that cannot execute is declared, never silently kept
+// ---------------------------------------------------------------------------
+
+test('H-13: agent-only with undecidable attribution degrades loudly — flagged samples, declared manifest', () => {
+  const records = [
+    rec({ checkId: 't/a', status: 'pass', at: at(0) }),
+    rec({ checkId: 't/b', status: 'fail', at: at(1) }),
+  ]
+  const changedPaths = ['src/a.ts', 'src/b.ts']
+  const base = {
+    records,
+    baselineVerdicts: new Map<string, CheckVerdict>(),
+    workspaceKey: 'ws-h13',
+    fidelity: 'full' as const,
+    generatedAt: at(9),
+  }
+
+  // (a) No provenance map at all — the deployed engine's own default shape
+  // (its markers record the attribution method, not a per-path map). Before
+  // H-13 this silently kept every label while the manifest claimed
+  // 'agent-only'; now every verification sample carries the degraded flag
+  // and the manifest declares provenanceUnresolved.
+  const blind = distillTrainingSet({ ...base, changedPaths, provenanceFilter: 'agent-only' })
+  assert.equal(blind.manifest.provenanceFilter, 'agent-only')
+  assert.equal(blind.manifest.provenanceUnresolved, true)
+  assert.equal(blind.manifest.counts.verification, 2, 'information is preserved…')
+  for (const s of verificationsOf(blind)) {
+    assert.equal(s.provenanceDegraded, true, '…flagged, never silently kept')
+  }
+  // The flag is an additive key — the sample surface is otherwise unchanged.
+  assert.deepEqual(Object.keys(verificationsOf(blind)[0] as VerificationSample).sort(), [
+    'changedPaths', 'checkId', 'checkKind', 'durationMs', 'kind',
+    'outputDigest', 'outputExcerpt', 'provenanceDegraded', 'recordedAt', 'reward', 'source', 'status', 'verdict',
+  ])
+
+  // (b) A map that misses one changed path is equally undecidable.
+  const partial = distillTrainingSet({
+    ...base, changedPaths,
+    provenance: new Map([['src/a.ts', 'agent']]),
+    provenanceFilter: 'agent-only',
+  })
+  assert.equal(partial.manifest.provenanceUnresolved, true)
+  assert.ok(verificationsOf(partial).every(s => s.provenanceDegraded === true))
+
+  // (c) A fully-attributed agent change set resolves: no flags, no declaration.
+  const resolved = distillTrainingSet({
+    ...base, changedPaths,
+    provenance: new Map([['src/a.ts', 'agent'], ['src/b.ts', 'agent']]),
+    provenanceFilter: 'agent-only',
+  })
+  assert.ok(!('provenanceUnresolved' in resolved.manifest))
+  assert.ok(verificationsOf(resolved).every(s => s.provenanceDegraded === undefined))
+
+  // (d) An empty change set is pure by vacuity: no edits, no hidden hand —
+  // the engine's no-context default does not degrade every export it makes.
+  const vacuous = distillTrainingSet({ ...base, changedPaths: [], provenanceFilter: 'agent-only' })
+  assert.ok(!('provenanceUnresolved' in vacuous.manifest))
+  assert.ok(verificationsOf(vacuous).every(s => s.provenanceDegraded === undefined))
+
+  // (e) 'unknown' attribution (uncertain — the attributor could not tell
+  // agent from external) neither voids nor silently passes: flagged samples
+  // + the count on the manifest.
+  const uncertain = distillTrainingSet({
+    ...base, changedPaths,
+    provenance: new Map([['src/a.ts', 'agent'], ['src/b.ts', 'unknown']]),
+    provenanceFilter: 'agent-only',
+  })
+  assert.equal(uncertain.manifest.counts.verification, 2, 'unknown is uncertainty, not an external verdict — no void')
+  assert.equal(uncertain.manifest.unknownAttributed, 1)
+  assert.ok(!('provenanceUnresolved' in uncertain.manifest))
+  assert.ok(verificationsOf(uncertain).every(s => s.provenanceDegraded === true))
+
+  // (f) A voided session executed its filter — nothing is left to degrade.
+  const voided = distillTrainingSet({
+    ...base, changedPaths,
+    provenance: new Map([['src/a.ts', 'agent'], ['src/b.ts', 'external']]),
+    provenanceFilter: 'agent-only',
+  })
+  assert.equal(voided.manifest.counts.verification, 0)
+  assert.ok(!('provenanceUnresolved' in voided.manifest))
+  assert.ok(!('unknownAttributed' in voided.manifest))
+})
+
+// ---------------------------------------------------------------------------
+// 10. H-14: homomorphic re-runs fold
+// ---------------------------------------------------------------------------
+
+test('H-14: homomorphic re-runs fold — repeating verify mints no new supervision', () => {
+  const first = rec({ checkId: 't/redo', status: 'pass', at: at(0), output: 'same green output' })
+  const repeat = rec({ checkId: 't/redo', status: 'pass', at: at(30), output: 'same green output', durationMs: 99 })
+  const baselineVerdicts = new Map<string, CheckVerdict>([['t/redo', 'still-passing']])
+
+  // The re-run carries a fresh timestamp and a fresh duration — the only two
+  // things that used to make it look like new supervision. Same check, same
+  // status, same output ⇒ same outcome ⇒ no new sample; the FIRST
+  // observation stands, and the fold is counted, not silent.
+  const once = distill({ records: [first], baselineVerdicts })
+  const twice = distill({ records: [first, repeat], baselineVerdicts })
+  assert.deepEqual(twice.samples, once.samples)
+  assert.equal(twice.manifest.counts.verification, 1)
+  assert.equal(twice.manifest.dedupedCount, 1)
+  assert.equal(once.manifest.dedupedCount, 0)
+  assert.equal((verificationsOf(twice)[0] as VerificationSample).recordedAt, at(0))
+
+  // A genuinely different output is genuinely new supervision.
+  const changedOutput = rec({ checkId: 't/redo', status: 'pass', at: at(60), output: 'a different green' })
+  const thrice = distill({ records: [first, repeat, changedOutput], baselineVerdicts })
+  assert.equal(thrice.manifest.counts.verification, 2)
+  assert.equal(thrice.manifest.dedupedCount, 1)
+
+  // Repeats fold from the SAMPLES, not the record stream: a later status
+  // flip still pairs against the most recent observation.
+  const broke = rec({ checkId: 't/redo', status: 'fail', at: at(90), output: 'now red' })
+  const zig = distill({ records: [first, repeat, changedOutput, broke], baselineVerdicts })
+  assert.equal(zig.manifest.counts['flip-pair'], 1)
+  const pair = pairsOf(zig)[0]
+  assert.ok(pair)
+  assert.equal(pair.rejected.recordedAt, at(90))
+  assert.equal(pair.chosen.recordedAt, at(60))
+
+  // Byte-identical adjacent-record duplicates collapse by full content
+  // address: a duplicated (fail, pass) sequence is one temporal fact, not
+  // two — 2 unique verification outcomes and 1 pair survive, 2 sample dups
+  // + 2 pair dups fold.
+  const f0 = rec({ checkId: 't/dup', status: 'fail', at: at(0), output: 'f' })
+  const p1 = rec({ checkId: 't/dup', status: 'pass', at: at(1), output: 'p' })
+  const duplicated = distill({ records: [f0, p1, f0, p1] })
+  assert.deepEqual(duplicated.manifest.counts, { verification: 2, 'flip-pair': 1 })
+  assert.equal(duplicated.manifest.dedupedCount, 4)
+})
+
+// ---------------------------------------------------------------------------
+// 11. M3: non-self-comparison baseline encodings are excluded, never decoded
+// ---------------------------------------------------------------------------
+
+test('M3: non-self-comparison baseline encodings exclude their records and count themselves', () => {
+  const record = rec({ checkId: 't/x', status: 'pass', at: at(0) })
+  // The natural misuse: a differential where the self-comparison belongs.
+  // 'fixed' used to decode as "no usable baseline" → new-check/0.5 — a
+  // silently weaker label for knowledge the caller actually had. Now the
+  // record is excluded, loudly counted.
+  for (const encoding of ['fixed', 'regression', 'new-failure', 'new-check', 'not-run'] as CheckVerdict[]) {
+    const set = distill({ records: [record], baselineVerdicts: new Map([['t/x', encoding]]) })
+    assert.deepEqual(set.samples, [], `${encoding}: excluded, never decoded`)
+    assert.equal(set.manifest.excludedUnverifiable, 1, `${encoding}: counted on the manifest`)
+    assert.equal(set.manifest.counts.verification, 0)
+  }
+  // The honest three (and absence) still decode exactly as before.
+  assert.equal(verificationsOf(distill({ records: [record], baselineVerdicts: new Map([['t/x', 'still-failing']]) }))[0]?.verdict, 'fixed')
+  assert.equal(verificationsOf(distill({ records: [record], baselineVerdicts: new Map([['t/x', 'still-passing']]) }))[0]?.verdict, 'still-passing')
+  const noAnswer = distill({ records: [record], baselineVerdicts: new Map([['t/x', 'indeterminate']]) })
+  assert.equal(noAnswer.samples.length, 0)
+  assert.equal(noAnswer.manifest.excludedUnverifiable, 0, 'indeterminate is the honest no-answer, not a caller misuse')
+  assert.equal(verificationsOf(distill({ records: [record] }))[0]?.verdict, 'new-check')
+})
+
+// ---------------------------------------------------------------------------
+// 12. Kind drift
+// ---------------------------------------------------------------------------
+
+test('a checkId reconfigured mid-log keeps its first kind on pairs — and the manifest counts the drift', () => {
+  const drifted = distill({
+    records: [
+      rec({ checkId: 't/mixed', status: 'fail', at: at(0), kind: 'test' }),
+      rec({ checkId: 't/mixed', status: 'pass', at: at(1), kind: 'typecheck' }),
+      rec({ checkId: 't/steady', status: 'fail', at: at(2), kind: 'test' }),
+      rec({ checkId: 't/steady', status: 'pass', at: at(3), kind: 'test' }),
+    ],
+  })
+  assert.equal(drifted.manifest.checkKindDrift, 1, 'exactly the one reconfigured checkId')
+  const mixedPair = pairsOf(drifted).find(p => p.checkId === 't/mixed')
+  assert.ok(mixedPair)
+  assert.equal(mixedPair.checkKind, 'test', 'the first-seen kind rides the pair')
+  assert.equal(pairsOf(drifted).find(p => p.checkId === 't/steady')?.checkKind, 'test')
+  // A clean log states zero — the counter is exhaustive law, not decoration.
+  assert.equal(distill({ records: [rec({ checkId: 't/a', status: 'pass', at: at(0) })] }).manifest.checkKindDrift, 0)
+})
+
+// ---------------------------------------------------------------------------
+// 13. $ABSPATH — foreign absolute roots never leave the machine verbatim
+// ---------------------------------------------------------------------------
+
+test('full excerpts redact foreign absolute roots to $ABSPATH — context, URLs and timestamps ride untouched', () => {
+  const head = [
+    'wrote C:\\Users\\someone-else\\proj\\debug.log and read /etc/hosts,',
+    'share \\\\srv\\share\\metrics.json; see https://example.com/docs and src/a.ts',
+    'at 2026-10-06T09:00:00.000Z nothing else matches',
+  ].join('\n')
+  const set = distill({ records: [rec({ checkId: 't/paths', status: 'pass', at: at(0), output: head })] })
+  const excerpt = verificationsOf(set)[0]?.outputExcerpt ?? ''
+  // The three foreign roots collapse to their placeholder form — basename
+  // kept (it is the diagnostic), location gone.
+  assert.ok(excerpt.includes('$ABSPATH/debug.log'))
+  assert.ok(excerpt.includes('$ABSPATH/hosts'))
+  assert.ok(excerpt.includes('$ABSPATH/metrics.json'))
+  // What must NOT be redacted: workspace-relative context, URLs, timestamps.
+  assert.ok(excerpt.includes('src/a.ts'))
+  assert.ok(excerpt.includes('https://example.com/docs'))
+  assert.ok(excerpt.includes('2026-10-06T09:00:00.000Z'))
+  // No trace of the foreign locations survives.
+  assert.ok(!excerpt.includes('Users'))
+  assert.ok(!excerpt.includes('/etc/hosts'))
+  assert.ok(!excerpt.includes('srv'))
+
+  // Private fidelity still leaks zero text of any kind.
+  const priv = distillTrainingSet({
+    records: [rec({ checkId: 't/paths', status: 'pass', at: at(0), output: head })],
+    baselineVerdicts: new Map<string, CheckVerdict>(),
+    changedPaths: [],
+    workspaceKey: 'ws-abspath',
+    fidelity: 'private',
+    generatedAt: at(9),
+  })
+  assert.ok(!JSON.stringify(priv.samples).includes('someone-else'))
+  assert.ok(!JSON.stringify(priv.samples).includes('$ABSPATH'))
+})
+
+// ---------------------------------------------------------------------------
+// 14. Non-finite durationMs — the canonical null, one address
+// ---------------------------------------------------------------------------
+
+test('a non-finite durationMs folds to the canonical null — counted, never an Infinity', () => {
+  const forged = rec({ checkId: 't/timer', status: 'pass', at: at(0), durationMs: Number.POSITIVE_INFINITY })
+  // Same record with an honest null duration (rec()'s `?? 42` default would
+  // swallow a null, so override post-construction).
+  const nullish: Evidence = { ...forged, durationMs: null as unknown as number }
+  const fromForged = distill({ records: [forged] })
+  const fromNull = distill({ records: [nullish] })
+  const sample = verificationsOf(fromForged)[0]
+  assert.ok(sample)
+  assert.equal(sample.durationMs, null, 'unmeasured, never Infinity')
+  assert.equal(fromForged.manifest.unmeasuredDuration, 1)
+  // The canonical-JSON fold (Infinity ≡ null) met its consumer one layer
+  // early: the forged Infinity and an honest null are the SAME fact —
+  // identical bytes, identical address — instead of two different-looking
+  // inputs silently sharing one hash.
+  assert.equal(JSON.stringify(fromForged.samples), JSON.stringify(fromNull.samples))
+  assert.equal(fromForged.manifest.root, fromNull.manifest.root)
+  // Finite durations still ride as numbers, and clean logs state zero.
+  assert.equal(verificationsOf(distill({ records: [rec({ checkId: 't/ok', status: 'pass', at: at(0) })] }))[0]?.durationMs, 42)
+  assert.equal(distill({ records: [] }).manifest.unmeasuredDuration, 0)
 })

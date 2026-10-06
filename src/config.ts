@@ -184,9 +184,19 @@ export interface Config {
 
 export const Config: Schema<Config> = Schema.object({
   evidenceStore: Schema.union(['host', 'workspace']).default('host'),
-  evidenceDir: Schema.string().default('.proof'),
+  // M-48: a segment that collapses to nothing ('.', './', '') parks the log
+  // at the workspace root where the guard's prefix comparison can never
+  // match — rejected here rather than silently disarming workspace mode.
+  evidenceDir: Schema.string().pattern(/^(?![./\\]+$)(?!\/).+$/).default('.proof'),
+  // "Must stay outside every agent-writable workspace" (see the interface
+  // comment) is enforced as a loud containment warn at derivation time
+  // (adapters/shared/paths.ts), where the workspace root is finally known —
+  // a schema field cannot see both values at once.
   trustDir: Schema.string(),
-  checkpointEvery: Schema.number().default(25),
+  // Positive domains (M-46): a zero/negative checkpoint cadence, timeout,
+  // budget or worker count silently changes engine behaviour (never vs every
+  // record checkpoints; checks that cannot be dispatched at all).
+  checkpointEvery: Schema.number().step(1).min(1).default(25),
   autoDiscover: Schema.boolean().default(true),
   checks: Schema.array(Schema.object({
     label: Schema.string(),
@@ -196,9 +206,9 @@ export const Config: Schema<Config> = Schema.object({
     timeoutMs: Schema.number(),
     exclusive: Schema.boolean(),
   })).default([]),
-  checkTimeoutMs: Schema.number().default(120_000),
-  verifyBudgetMs: Schema.number().default(300_000),
-  concurrency: Schema.number().default(2),
+  checkTimeoutMs: Schema.number().min(1).default(120_000),
+  verifyBudgetMs: Schema.number().min(1).default(300_000),
+  concurrency: Schema.number().step(1).min(1).max(64).default(2),
   scheduler: Schema.union(['bayesian', 'set']).default('bayesian'),
   // 0–1 posterior displayed as a percentage by schema-aware hosts; the
   // meaningful band is 0.5–0.999 (below 0.5 certifies nothing, 1.0 is
@@ -232,7 +242,7 @@ export const Config: Schema<Config> = Schema.object({
   // much an interested party's own test is worth.
   syntheticDir: Schema.string().default('.proof-synthetic'),
   syntheticFalsePass: Schema.percent().default(0.15),
-  syntheticTimeoutMs: Schema.number().default(60_000),
+  syntheticTimeoutMs: Schema.number().min(1).default(60_000),
   // υ: coverage-aware proof gating — observe by default so real Node check
   // processes get execution-coverage honesty while data-less environments
   // (fakes, non-Node toolchains) degrade visibly to basis 'none' instead of

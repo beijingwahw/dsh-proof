@@ -55,7 +55,7 @@ import { promises as fsp } from 'node:fs'
 import { buildPolicySection } from '../../dsh/prompt.ts'
 import { MCP_TOOLS } from '../../app/mcp-server.ts'
 import { asAfter, asBefore, asPluginContext, directoryOf } from './vendor.ts'
-import { deriveProofPaths } from '../shared/paths.ts'
+import { deriveProofPaths, resolveAdapterEnv } from '../shared/paths.ts'
 import type { ProofPaths } from '../shared/paths.ts'
 import { applyObservation, computeDrift, emptySession, loadSession, saveSession, windowStart } from '../shared/session.ts'
 import { decidePreToolUse, evaluateStop, hasBaselineOnDisk } from '../shared/gates.ts'
@@ -93,8 +93,9 @@ export interface OcAdapterOptions {
  * knobs. `hasBaseline` is a cache (refreshed before every gate decision and
  * after any `proof_*` tool call, so the injected prompt stays truthful without
  * an fs read per prompt render); `surfacedDrift` dedupes before-time drift
- * holds. Structurally the same record the Claude Code adapter builds, defined
- * here so this layer imports nothing from the claude-code directory.
+ * holds (and re-arms when the disk comes back clean — M-42). Structurally the
+ * same record the Claude Code adapter builds, defined here so this layer
+ * imports nothing from the claude-code directory.
  */
 export interface OcAdapterEnv {
   readonly paths: ProofPaths
@@ -106,13 +107,14 @@ export interface OcAdapterEnv {
   readonly stderr: (line: string) => void
   /** Cached `baseline.json exists on disk` flag — see interface comment above. */
   hasBaseline: boolean
-  /** Drift sets already held once at before-time, per plugin lifetime. */
+  /**
+   * Drift CONTENT fingerprints already held once at before-time. A drift set
+   * is held once per plugin lifetime WHILE IT PERSISTS; once computeDrift
+   * comes back clean (every member resolved), the set clears and the same
+   * drift shape blocks again on recurrence — ignoring a hold is never a
+   * permanent exemption.
+   */
   readonly surfacedDrift: Set<string>
-}
-
-function envString(name: string): string | undefined {
-  const value = process.env[name]
-  return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
 function normalizeStore(value: string | undefined): 'host' | 'workspace' {
@@ -139,19 +141,24 @@ const defaultStderr = (line: string): void => {
 
 /**
  * Assemble the adapter environment. Environment variables honor the SAME
- * precedence the MCP entry (`src/app/mcp-entry.ts`) applies, so the plugin's
- * gates and the MCP server's tools always agree on where evidence lives —
- * a guard pointing at a different `.proof` than the server reads would be
- * decorative.
+ * names and semantics as the Claude Code hooks and the MCP entry — parsed by
+ * the shared `resolveAdapterEnv` (H-21/M-44): pre-v0.23 this adapter read
+ * only ROOT/TRUST_DIR/EVIDENCE_STORE/REQUIRE_BASELINE from the host process
+ * environment while the README promised one shared set, so `DSH_PROOF_DRIFT`,
+ * `DSH_PROOF_ENFORCE_TURN_END` and `DSH_PROOF_EVIDENCE_DIR` silently did
+ * nothing here. Options (opencode.json plugin options) still beat the
+ * environment, which beats the code default.
  */
 export function ocAdapterEnv(options: OcAdapterOptions, cwd: string): OcAdapterEnv {
-  const root = options.root ?? envString('DSH_PROOF_ROOT') ?? cwd
-  const evidenceStore = normalizeStore(options.evidenceStore ?? envString('DSH_PROOF_EVIDENCE_STORE'))
+  const values = resolveAdapterEnv(process.env)
+  const root = options.root ?? values.root ?? cwd
+  const evidenceStore = normalizeStore(options.evidenceStore ?? values.evidenceStore)
+  const evidenceDir = options.evidenceDir ?? values.evidenceDir
   const paths = deriveProofPaths({
     root,
-    trustRoot: options.trustRoot ?? envString('DSH_PROOF_TRUST_DIR'),
+    trustRoot: options.trustRoot ?? values.trustRoot,
     evidenceStore,
-    evidenceDir: options.evidenceDir,
+    ...(evidenceDir !== undefined ? { evidenceDir } : {}),
   })
   return {
     paths,
@@ -159,11 +166,14 @@ export function ocAdapterEnv(options: OcAdapterOptions, cwd: string): OcAdapterE
       evidenceStore: paths.evidenceStore,
       evidenceDir: paths.evidenceDir,
       requireBaseline: normalizeRequireBaseline(
-        options.requireBaseline ?? envString('DSH_PROOF_REQUIRE_BASELINE'),
+        options.requireBaseline ?? values.requireBaseline,
       ),
+      // The trust root rides along so the shell-command sweep (H-02) guards
+      // the trust-side artifacts on this host too.
+      trustRoot: paths.trustRoot,
     },
-    driftDetection: options.driftDetection ?? true,
-    enforceTurnEnd: options.enforceOnTurnEnd ?? true,
+    driftDetection: options.driftDetection ?? values.driftDetection ?? true,
+    enforceTurnEnd: options.enforceOnTurnEnd ?? values.enforceTurnEnd ?? true,
     now: options.now ?? defaultNow,
     readFile: options.readFile ?? defaultReadFile,
     stderr: options.stderr ?? defaultStderr,
@@ -221,7 +231,7 @@ export function guessToolCall(input: unknown): GuessedToolCall {
 // ---------------------------------------------------------------------------
 
 function driftKey(drift: { readonly drifted: readonly string[] }): string {
-  return drift.drifted.join(' ')
+  return drift.drifted.join('\x00')
 }
 
 /**
@@ -253,6 +263,14 @@ export async function ocBeforeHandler(env: OcAdapterEnv, input: unknown): Promis
         const drift = env.driftDetection
           ? await computeDrift(session, env.paths.root, env.readFile)
           : undefined
+        // M-42: a clean disk re-arms the once-per-lifetime cap. While a drift
+        // set PERSISTS, its hold stays spent (a host whose only anchor is the
+        // next tool call would otherwise hold every call hostage); once every
+        // member is resolved the cap clears, and the same shape recurring
+        // blocks again — ignoring a hold is never a permanent exemption.
+        if (drift !== undefined && drift.drifted.length === 0 && drift.staleReads.length === 0) {
+          env.surfacedDrift.clear()
+        }
         const facts: StopFacts = {
           drift,
           touchedCount: session.touched.length,
@@ -280,7 +298,7 @@ export async function ocBeforeHandler(env: OcAdapterEnv, input: unknown): Promis
             // The shared gate blocks on drift EVERY time; on a host whose
             // only anchor is the next tool call that holds every subsequent
             // call hostage once the message is ignored. Each distinct drift
-            // set is held exactly once per plugin lifetime. (The Claude Code
+            // set is held exactly once while it persists. (The Claude Code
             // Stop hook needs no such cap — it fires once per real turn
             // boundary.)
             if (!env.surfacedDrift.has(driftKey(drift))) {
@@ -297,17 +315,26 @@ export async function ocBeforeHandler(env: OcAdapterEnv, input: unknown): Promis
     }
   }
 
-  // (2) the gate.
+  // (2) the gate. Fail-CLOSED (M-40): this is the evidence-store door, and a
+  //     door whose errors swing it open is decoration. The Claude Code
+  //     adapter answers `ask` on any internal error; the OpenCode posture is
+  //     the same conservatism in this host's vocabulary — hold the call and
+  //     say why. (The drift block above stays advisory: a broken observation
+  //     must never wedge the door, a broken GATE must never open it.)
   let gateBlock: string | undefined
   if (call.tool !== undefined) {
     try {
-      env.hasBaseline = await hasBaselineOnDisk(env.paths, env.readFile)
-    } catch {
-      /* keep the cached flag; a failed stat is not a policy input */
+      try {
+        env.hasBaseline = await hasBaselineOnDisk(env.paths, env.readFile)
+      } catch {
+        /* keep the cached flag; a failed stat is not a policy input */
+      }
+      const decision = decidePreToolUse(call.tool, call.args, env.paths.root, env.gate, env.hasBaseline)
+      if (decision.action === 'deny') gateBlock = `denied — ${decision.reason}`
+      else if (decision.action === 'ask') gateBlock = decision.reason
+    } catch (error) {
+      gateBlock = `denied — dsh-proof: gate internal error (${errorMessage(error)}); the call is held rather than waved through`
     }
-    const decision = decidePreToolUse(call.tool, call.args, env.paths.root, env.gate, env.hasBaseline)
-    if (decision.action === 'deny') gateBlock = `denied — ${decision.reason}`
-    else if (decision.action === 'ask') gateBlock = decision.reason
   }
 
   if (heldNotice === undefined && gateBlock === undefined) return undefined
@@ -426,6 +453,11 @@ export function buildSystemPromptAddition(env: OcAdapterEnv): string {
     '',
     'Before editing: `proof_baseline`. Before saying work is done: `proof_claim` — a prose assertion is not evidence.',
     'If a tool call is held with a dsh-proof reason, act on the reason instead of retrying the same call.',
+    '',
+    'Enforcement wiring: the gates above ride host plugin hooks (tool.execute.before / after) that this prompt '
+    + 'cannot verify are registered — plugin wiring supplied by the repository travels with the repository. '
+    + 'Treat enforcement as DETECTED, not guaranteed: if a write into the evidence store (.proof/evidence.jsonl) '
+    + 'is not held, report the guard as absent instead of assuming oversight.',
   ]
   return lines.join('\n')
 }
@@ -503,8 +535,13 @@ export function createOpencodePlugin(options: OcAdapterOptions = {}): (ctx: unkn
         }
         return undefined
       } catch (error) {
-        stderr(`dsh-proof: before hook failed (${errorMessage(error)}); allowing the call`)
-        return undefined
+        // M-40: the before wrapper is the evidence-store door. A door whose
+        // unexpected failures swing it OPEN is decoration — pre-v0.23 this
+        // arm said "allowing the call", the exact inverse of the Claude Code
+        // adapter's `ask` on internal error. Hold, say why, fail closed.
+        const message = `denied — dsh-proof: gate internal error (${errorMessage(error)}); the call is held rather than waved through`
+        stderr(`dsh-proof: before hook failed; holding the call (${errorMessage(error)})`)
+        return { error: { message } }
       }
     }
 

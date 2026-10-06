@@ -10,7 +10,10 @@
       config:
         # Where the evidence log lives:
         #   host      = under the host trust root ($DSH_HOME/proof), outside
-        #               the agent's writable workspace (default, recommended)
+        #               the workspace (default, recommended; the host-adapter
+        #               gates deny absolute-path writes into it when the trust
+        #               root is known — placement alone is a host property,
+        #               not an enforcement)
         #   workspace = at `evidenceDir` inside the project (legacy; still
         #               chain- and checkpoint-protected, but agent-readable)
         evidenceStore: host

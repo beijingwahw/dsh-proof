@@ -37,6 +37,22 @@ import {
 } from '../src/adapters/opencode/plugin.ts'
 import opencodePluginDefault from '../src/adapters/opencode/plugin.ts'
 import { loadSession } from '../src/adapters/shared/session.ts'
+import { addressOf, merkleRoot } from '../src/core/hash.ts'
+
+/** A self-addressing baseline.json — the only shape hasBaselineOnDisk accepts (H-20). */
+function realBaselineJson(): string {
+  const checks = [{ checkId: 'package.json:test', evidenceId: 'e1', status: 'pass' }]
+  const workspace = { head: null, dirty: [], dirtDigest: merkleRoot([]) }
+  const createdAt = '2026-10-06T10:00:00.000Z'
+  const root = merkleRoot(checks.map(c => c.evidenceId))
+  return JSON.stringify({
+    baselineId: addressOf({ createdAt, workspace, checkIds: checks.map(c => c.checkId), root }),
+    createdAt,
+    workspace,
+    checks,
+    root,
+  })
+}
 
 // The workspace root one level above the repo — the designated scratch area.
 const WORKSPACE = fileURLToPath(new URL('../../', import.meta.url))
@@ -181,12 +197,124 @@ test('before: ask mode with a real baseline on disk lets mutation tools through'
   const root = await freshWorkspace()
   const { env } = makeEnv(root, { requireBaseline: 'ask' })
   await fsp.mkdir(env.paths.logDir, { recursive: true })
-  await fsp.writeFile(env.paths.baselinePath, JSON.stringify({ baselineId: 'b1', checks: [] }))
+  // A REAL baseline (self-addressing — H-20: a bare {"baselineId":"x"} is a
+  // forgery and must NOT release the ask gate on this host either).
+  await fsp.writeFile(env.paths.baselinePath, realBaselineJson())
   const decision = await ocBeforeHandler(
     env,
     { tool: 'write', args: { file_path: 'src/a.ts' }, sessionID: 's1' },
   )
   assert.equal(decision, undefined)
+})
+
+test('before: a forged 20-byte baseline does NOT release the ask gate (H-20)', async () => {
+  const root = await freshWorkspace()
+  const { env } = makeEnv(root, { requireBaseline: 'ask' })
+  await fsp.mkdir(env.paths.logDir, { recursive: true })
+  await fsp.writeFile(env.paths.baselinePath, JSON.stringify({ baselineId: 'forged' }))
+  const decision = await ocBeforeHandler(
+    env,
+    { tool: 'write', args: { file_path: 'src/a.ts' }, sessionID: 's1' },
+  )
+  assert.ok(decision !== undefined && decision.block !== undefined, 'the gate stays armed against a shape-only forgery')
+  assert.match(decision.block, /baseline/i)
+})
+
+test('before: MultiEdit and Bash-redirect into the store are held (H-01/H-02 on this host)', async () => {
+  const root = await freshWorkspace()
+  const { env } = makeEnv(root, { evidenceStore: 'workspace' })
+  const multi = await ocBeforeHandler(
+    env,
+    { tool: 'MultiEdit', args: { file_path: '.proof/evidence.jsonl', edits: [] }, sessionID: 's1' },
+  )
+  assert.ok(multi !== undefined && multi.block !== undefined, 'the camelCase mutator is held')
+  assert.match(multi.block, /evidence/i)
+
+  const bash = await ocBeforeHandler(
+    env,
+    { tool: 'bash', args: { command: 'cp evil.jsonl .proof/evidence.jsonl' }, sessionID: 's1' },
+  )
+  assert.ok(bash !== undefined && bash.block !== undefined, 'the shell redirect channel is held')
+  assert.match(bash.block, /command names the verification evidence store/i)
+
+  const honest = await ocBeforeHandler(
+    env,
+    { tool: 'bash', args: { command: 'npm test' }, sessionID: 's1' },
+  )
+  assert.equal(honest, undefined, 'an honest shell command still passes')
+})
+
+test('before: a gate evaluation that THROWS holds the call — fail-closed, never decorative (M-40)', async () => {
+  const root = await freshWorkspace()
+  const { env } = makeEnv(root, { evidenceStore: 'workspace' })
+  // Poison one gate input so the evaluation itself throws (a number where a
+  // string segment is expected — the kind of thing a future refactor or a
+  // hostile host option can produce). The gate section must convert the
+  // throw into a HOLD; pre-v0.23 the wrapper caught everything and said
+  // "allowing the call" — the exact inverse of the Claude Code adapter's
+  // ask-on-error posture.
+  const poisoned = { ...env, gate: { ...env.gate, evidenceDir: 42 as unknown as string } }
+  const decision = await ocBeforeHandler(
+    poisoned,
+    { tool: 'bash', args: { command: 'npm test' }, sessionID: 's1' },
+  )
+  assert.ok(decision !== undefined && decision.block !== undefined, 'a broken gate holds the call, never allows it')
+  assert.match(decision.block, /denied — dsh-proof: gate internal error/)
+  assert.match(decision.block, /held rather than waved through/)
+})
+
+test('surfacedDrift: an ignored hold is not a permanent exemption — a resolved-then-recurred drift blocks again (M-42)', async () => {
+  const root = await freshWorkspace()
+  await write(root, 'src/a.ts', 'const a = 1\n')
+  const { env } = makeEnv(root)
+  await ocAfterHandler(env, { tool: 'read', args: { file_path: 'src/a.ts' }, sessionID: 're-arm' })
+  await write(root, 'src/a.ts', 'const a = 2\n')
+  const first = await ocBeforeHandler(env, { tool: 'read', args: { file_path: 'src/a.ts' }, sessionID: 're-arm' })
+  assert.ok(first !== undefined && first.block !== undefined, 'the drift is held once')
+  // The model ignores the hold and calls again — still suppressed (a host
+  // whose only anchor is the next call must not hold every call hostage).
+  const ignored = await ocBeforeHandler(env, { tool: 'read', args: { file_path: 'src/b.ts' }, sessionID: 're-arm' })
+  assert.equal(ignored, undefined, 'the SAME persisting drift set stays spent')
+  // Recovery: the file is re-read through the tool, the disk comes back clean.
+  await ocAfterHandler(env, { tool: 'read', args: { file_path: 'src/a.ts' }, sessionID: 're-arm' })
+  assert.equal(await ocBeforeHandler(env, { tool: 'read', args: { file_path: 'src/a.ts' }, sessionID: 're-arm' }), undefined)
+  // Recurrence: the SAME shape drifts again — the hold re-arms.
+  await write(root, 'src/a.ts', 'const a = 3\n')
+  const again = await ocBeforeHandler(env, { tool: 'read', args: { file_path: 'src/a.ts' }, sessionID: 're-arm' })
+  assert.ok(again !== undefined && again.block !== undefined,
+    'the same drift shape recurring after resolution holds again — ignoring a hold buys nothing permanent')
+})
+
+test('ocAdapterEnv: the DSH_PROOF_* knobs work on this host too — one contract, two faces (H-21/M-44)', async () => {
+  const root = await freshWorkspace()
+  const names = ['DSH_PROOF_ROOT', 'DSH_PROOF_TRUST_DIR', 'DSH_PROOF_EVIDENCE_STORE',
+    'DSH_PROOF_EVIDENCE_DIR', 'DSH_PROOF_REQUIRE_BASELINE', 'DSH_PROOF_DRIFT', 'DSH_PROOF_ENFORCE_TURN_END'] as const
+  const saved = Object.fromEntries(names.map(n => [n, process.env[n]]))
+  try {
+    process.env.DSH_PROOF_ROOT = root
+    process.env.DSH_PROOF_EVIDENCE_STORE = 'workspace'
+    process.env.DSH_PROOF_EVIDENCE_DIR = '.evi'
+    process.env.DSH_PROOF_REQUIRE_BASELINE = 'ask'
+    process.env.DSH_PROOF_DRIFT = '0'
+    process.env.DSH_PROOF_ENFORCE_TURN_END = '0'
+    const env = ocAdapterEnv({}, '/nowhere')
+    assert.equal(env.paths.root, root.replace(/\\/g, '/').replace(/\/+$/, ''))
+    assert.equal(env.paths.evidenceStore, 'workspace')
+    assert.equal(env.gate.evidenceDir, '.evi')
+    assert.equal(env.paths.logDir, `${env.paths.root}/.evi`, 'README\'s shared-variable promise is now true')
+    assert.equal(env.gate.requireBaseline, 'ask')
+    assert.equal(env.driftDetection, false, 'DSH_PROOF_DRIFT=0 turns drift off on OpenCode as documented')
+    assert.equal(env.enforceTurnEnd, false, 'DSH_PROOF_ENFORCE_TURN_END=0 works here too')
+    // Options still beat the environment.
+    const overridden = ocAdapterEnv({ driftDetection: true }, '/nowhere')
+    assert.equal(overridden.driftDetection, true)
+  } finally {
+    for (const n of names) {
+      const v = saved[n]
+      if (v === undefined) delete process.env[n]
+      else process.env[n] = v
+    }
+  }
 })
 
 test('before: garbage payloads pass through untouched', async () => {

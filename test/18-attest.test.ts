@@ -245,14 +245,38 @@ test('fuseConfidence: a decisive jury verdict pulls the number toward its probab
   // Both mixture endpoints are p and current: the fused value can never
   // overshoot the witness's own assertion, in either direction.
   assert.ok(fused > 0.94 && fused < 0.99, 'strictly between the machine number and the assertion')
-  // Direction lives in p: the same weights at p=0.1 crash the number.
+  // H-30: an UPHOLD mixture-pulls toward p; a REJECT books the discount
+  // multiplicatively instead — the same factor the claim product would apply.
+  // A rejecting jury pulls the number DOWN hard, never toward any number it
+  // happens to carry.
   const crashed = fuseConfidence(0.94, jury({ verdict: 'reject', probability: 0.1 }), DEFAULT_TRUST_WEIGHTS)
-  assert.ok(Math.abs(crashed - (0.3 * 0.94 + 0.7 * 0.1)) < 1e-12, `expected 0.3*0.94+0.7*0.1 = 0.352, got ${crashed}`)
-  assert.ok(crashed < 0.36, 'a rejecting jury pulls the number most of the way down to its assertion')
+  assert.ok(Math.abs(crashed - 0.94 * 0.1 ** 0.7) < 1e-12, `expected 0.94 * 0.1^0.7, got ${crashed}`)
+  assert.ok(crashed < 0.2, 'a rejection collapses the number multiplicatively')
 
   // Pull strength is exactly w: at w=0 the number stands, at w=1 it is replaced.
   assert.equal(fuseConfidence(0.94, jury({ probability: 0.99 }), weights({ classB: 0 })), 0.94)
   assert.equal(fuseConfidence(0.94, jury({ probability: 0.99 }), weights({ classB: 1 })), 0.99)
+})
+
+test('H-30: a self-contradictory rejection can never RAISE the fused confidence', () => {
+  // The adversarial shape: verdict 'reject' at probability 0.99. On the chain
+  // it is parse-refused (see activeAttestations tests below); constructed
+  // directly it still cannot do damage here — a rejection enters as the
+  // multiplicative discount, so 0.94 becomes 0.94 * 0.99^0.7 ≈ 0.933.
+  const before = 0.94
+  const fused = fuseConfidence(before, jury({ verdict: 'reject', probability: 0.99 }), DEFAULT_TRUST_WEIGHTS)
+  assert.ok(fused < before, `reject@0.99 must LOWER the number, got ${fused}`)
+  assert.ok(fused < 0.97, 'and it must not clear the default 0.97 certify target — a sworn rejection cannot carry a claim across it')
+  assert.ok(Math.abs(fused - 0.94 * 0.99 ** 0.7) < 1e-12, 'the multiplicative closed form, exactly')
+  // Across the whole probability range and weight grid: reject never raises.
+  for (let i = 0; i <= 10; i += 1) {
+    const p = i / 10
+    for (let j = 0; j <= 10; j += 1) {
+      const w = weights({ classB: j / 10 })
+      const out = fuseConfidence(0.94, jury({ verdict: 'reject', probability: p }), w)
+      assert.ok(out <= 0.94 + 1e-12, `reject@${p} w=${j / 10} raised the number to ${out}`)
+    }
+  }
 })
 
 test('fuseConfidence: an abstaining jury leaves the machine number untouched', () => {
@@ -368,6 +392,40 @@ test('parseJury: a probability outside [0,1] makes the whole record unusable —
   assert.equal((active[1] as JuryAttestation).probability, 1)
 })
 
+test('H-30: a self-contradictory (verdict, probability) pair is refused at parse — no layer can cherry-pick the half that suits it', () => {
+  // `reject @ 0.99` and `uphold @ 0.01` are a witness contradicting its own
+  // delivery: the obligation layer reads the verdict, the fusion algebra
+  // reads the number, and one payload used to make them rule opposite ways —
+  // worst case, a sworn rejection CARRYING a machine certification across a
+  // 0.97 target (engine denial lock only fires when fused < target). Same
+  // channel as an out-of-domain probability: skipped, no verdict on record.
+  const contradictory: Attestation[] = [
+    jury({ verdict: 'reject', probability: 0.99 }),
+    jury({ verdict: 'reject', probability: 0.8 }),
+    jury({ verdict: 'uphold', probability: 0.01 }),
+    jury({ verdict: 'uphold', probability: 0.3 }),
+  ]
+  assert.equal(activeAttestations(contradictory).length, 0, 'no self-contradictory record may enter the active set')
+
+  // The obligation layer reads the same absence — not a "delivered rejection".
+  const v = evaluateContract(cInput({ attestations: contradictory }))
+  assert.equal(byId(v.obligations, 'jury-delivered').met, false, 'a contradictory record is not a delivered verdict')
+  assert.equal(byId(v.obligations, 'jury-upholds').met, false)
+
+  // The coherent boundaries parse: reject at exactly 0.5 and uphold at
+  // exactly 0.5 both carry (0.5 is the shared coherence edge), and an
+  // abstention carries any probability — it asserts nothing either way.
+  const edges = [
+    jury({ claimId: claimIdOf('reject at half'), verdict: 'reject', probability: 0.5 }),
+    jury({ claimId: claimIdOf('uphold at half'), verdict: 'uphold', probability: 0.5 }),
+    jury({ claimId: claimIdOf('abstain at high'), verdict: 'abstain', probability: 0.99 }),
+  ]
+  assert.equal(activeAttestations(edges).length, 3, 'the coherence boundaries are legal records')
+
+  // Chain order is irrelevant: the contradiction is judged per record.
+  assert.equal(activeAttestations([contradictory[0] as Attestation, ...edges]).length, 3)
+})
+
 test('an appeal at higher gen supersedes the original deliberation', () => {
   const gen0 = jury({ gen: 0, verdict: 'uphold', probability: 0.9 })
   const gen1 = jury({ gen: 1, verdict: 'reject', probability: 0.15 })
@@ -466,11 +524,20 @@ test('llm-jury: an abstention is delivered evidence but never an upholding', () 
   assert.match(o.detail, /0\.5/)
 })
 
-test('llm-jury: uphold below the 0.5 threshold is not an upholding — probability in the detail', () => {
-  const v = evaluateContract(cInput({ attestations: [jury({ verdict: 'uphold', probability: 0.3 })] }))
-  const o = byId(v.obligations, 'jury-upholds')
-  assert.equal(o.met, false)
-  assert.match(o.detail, /0\.3/)
+test('llm-jury: uphold below the 0.5 threshold is a refused record, not a weak uphold', () => {
+  // H-30: an uphold at probability < 0.5 contradicts itself (the ruling says
+  // supported, the number says less-likely-than-not) and is parse-refused —
+  // so the contract sees NO verdict, exactly like the out-of-domain case.
+  // The 0.5 obligation threshold remains as defense for callers that hand
+  // evaluateContract pre-parsed records through other doors.
+  const v = evaluateContract(cInput({ attestations: [jury({ verdict: 'uphold', probability: 0.49 })] }))
+  assert.equal(byId(v.obligations, 'jury-delivered').met, false, 'a contradictory uphold is not on record at all')
+  assert.equal(byId(v.obligations, 'jury-upholds').met, false)
+  // The boundary itself stays legal: uphold at exactly 0.5 is the weakest
+  // coherent uphold, and it satisfies the obligation at its threshold.
+  const edge = evaluateContract(cInput({ attestations: [jury({ verdict: 'uphold', probability: 0.5 })] }))
+  assert.equal(byId(edge.obligations, 'jury-delivered').met, true)
+  assert.equal(byId(edge.obligations, 'jury-upholds').met, true)
 })
 
 test('llm-jury: no attestation fails jury-delivered with the tooling hint', () => {

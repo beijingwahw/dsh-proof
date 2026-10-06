@@ -74,6 +74,34 @@ export const PROTOCOL_NAME = 'agent-proof-protocol' as const
  */
 export const PROTOCOL_VERSION = 'APP/1.4' as const
 
+/**
+ * The ancestor dialects this implementation's genealogy has spoken, oldest
+ * first. Every one of them differs from `APP/1.4` ONLY in the version byte
+ * that `appFingerprint` digests — the vocabularies, the three rule strings,
+ * the chain/checkpoint formats and the bundle layout are byte-identical
+ * across all five generations (each bump's own comment says so, and
+ * test/21 pins it by reproducing every old fingerprint from the CURRENT
+ * vocabulary with only the version swapped).
+ *
+ * That fact is what makes fingerprint-match acceptance safe (v0.22, closing
+ * the "years later" gap M-58 flagged): a verifier that recognises a
+ * fingerprint can interpret the payload EXACTLY as the producer wrote it,
+ * because every other byte the fingerprint commits to is unchanged. A
+ * future bump that touches a vocabulary or a rule moves the fingerprint of
+ * every dialect computed from the then-current constants, and those old
+ * bundles are refused again — automatically, which is the correct refusal:
+ * a verifier whose vocabulary genuinely differs cannot interpret the record.
+ */
+export const LEGACY_PROTOCOL_VERSIONS = ['APP/1.0', 'APP/1.1', 'APP/1.2', 'APP/1.3'] as const
+
+/** One entry of the dialect table: a version and the fingerprint it digests to. */
+export interface KnownDialect {
+  /** The dialect's wire version string (e.g. `APP/1.3`). */
+  readonly version: string
+  /** `appFingerprintOfVersion(version)` — recomputed, never a stale literal. */
+  readonly fingerprint: string
+}
+
 /** Media type of a single proof document (a `ProofReport`-shaped value). */
 export const PROOF_MEDIA_TYPE = 'application/vnd.app.proof+json' as const
 
@@ -167,9 +195,22 @@ export interface BundleManifest {
  * payload rather than guess at the dialect.
  */
 export function appFingerprint(): string {
+  return appFingerprintOfVersion(PROTOCOL_VERSION)
+}
+
+/**
+ * The fingerprint material of THIS module with only the version swapped —
+ * the exact bytes every ancestor dialect digested, because the vocabularies
+ * and rule strings never changed across the five generations (see
+ * `LEGACY_PROTOCOL_VERSIONS`). Recomputed from the live constants, never
+ * pinned as a literal, so a future vocabulary edit moves every legacy
+ * fingerprint too — and old bundles are refused by a verifier that can no
+ * longer interpret them, which is the refusal PROTOCOL.md §8 demands.
+ */
+export function appFingerprintOfVersion(version: string): string {
   return sha256(canonicalJson({
     name: PROTOCOL_NAME,
-    version: PROTOCOL_VERSION,
+    version,
     verdict: VERDICT_VALUES,
     grade: GRADE_VALUES,
     chainModes: CHAIN_MODES,
@@ -179,6 +220,68 @@ export function appFingerprint(): string {
     chain: 'prev=sha256(prevLine)',
     signature: 'ed25519(canonicalJson(checkpointPayload))',
   }))
+}
+
+/**
+ * Every dialect this verifier can interpret: the current one plus every
+ * ancestor whose fingerprint the current vocabulary still reproduces.
+ * Fingerprint-match acceptance (v0.22) consults exactly this table.
+ */
+export function knownDialects(): readonly KnownDialect[] {
+  return [
+    { version: PROTOCOL_VERSION, fingerprint: appFingerprint() },
+    ...LEGACY_PROTOCOL_VERSIONS.map(version => ({ version, fingerprint: appFingerprintOfVersion(version) })),
+  ]
+}
+
+/**
+ * The dialect-negotiation verdict a bundle consumer needs before
+ * interpreting a single record:
+ *
+ * - `current` — the fast path: the manifest speaks this module's exact
+ *   `PROTOCOL_VERSION` and carries this implementation's exact
+ *   `appFingerprint()`.
+ * - `legacy` — the manifest's (version, fingerprint) pair matches a KNOWN
+ *   ancestor dialect exactly. Because every ancestor differs from the
+ *   current dialect only in the digested version byte, the payload is
+ *   interpretable byte-for-byte; the consumer should still surface that it
+ *   verified an older dialect, not the current one.
+ * - `unknown` — the pair matches nothing this genealogy ever spoke (a
+ *   future dialect, a foreign implementation, or an incoherent mix of a
+ *   known version with some other fingerprint). The consumer MUST refuse to
+ *   interpret the payload; the verdict carries both digests so the refusal
+ *   can say exactly what diverged and how to migrate.
+ */
+export type ProtocolAdjudication =
+  | { readonly kind: 'current' }
+  | { readonly kind: 'legacy'; readonly version: string; readonly fingerprint: string }
+  | {
+    readonly kind: 'unknown'
+    readonly protocol: unknown
+    readonly fingerprint: unknown
+    readonly currentFingerprint: string
+  }
+
+/**
+ * Adjudicate a manifest's `(protocol, appFingerprint)` pair against
+ * `knownDialects()`. Strict equality with the current dialect is only the
+ * fast path; a coherent match with any known ancestor dialect accepts, and
+ * anything else refuses — including a CURRENT version string wearing a
+ * fingerprint this genealogy never produced under that version.
+ */
+export function adjudicateProtocol(protocol: unknown, fingerprint: unknown): ProtocolAdjudication {
+  const currentFingerprint = appFingerprint()
+  if (protocol === PROTOCOL_VERSION && fingerprint === currentFingerprint) return { kind: 'current' }
+  if (typeof fingerprint === 'string') {
+    for (const dialect of knownDialects()) {
+      if (fingerprint === dialect.fingerprint && protocol === dialect.version) {
+        return dialect.version === PROTOCOL_VERSION
+          ? { kind: 'current' }
+          : { kind: 'legacy', version: dialect.version, fingerprint: dialect.fingerprint }
+      }
+    }
+  }
+  return { kind: 'unknown', protocol, fingerprint, currentFingerprint }
 }
 
 /**

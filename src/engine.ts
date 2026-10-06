@@ -22,17 +22,24 @@ import type {
 import {
   DEFAULT_IGNORE_DIRS, EvidenceStore, VerificationRunner, addressOf, assembleBaseline,
   assembleProof, buildDependencyGraph, canonicalJson, discoverChecks, isDecisiveStatus,
-  resolveChangeSet, selectAffectedChecks, sha256, snapshotWorkspace,
+  parseAnchor, resolveChangeSet, selectAffectedChecks, sha256, snapshotWorkspace,
   claimProbability, computePriors, posteriorHealthy, rankByInformationGain,
   summarizeHistory, verdictOf, walkChain,
 } from './core/index.ts'
+import { checkpointSignedData } from './core/trust.ts'
 import type {
   CheckPrior, ClaimModel, ConfidenceBasis, ConfidenceInput, GradedProofReport,
 } from './core/index.ts'
+// H-03: the drifted-body β default rides the engine's option the same way
+// `syntheticFalsePass` does, consumed straight from its module — the core
+// barrel is not this batch's to edit, and a direct import keeps the one
+// number one number.
+import { DRIFTED_FALSE_PASS_DEFAULT } from './core/bayes.ts'
 // core/index.ts re-exports the stable surface; `forcedSelection` is consumed
 // here straight from its module (the core barrel is not this batch's to edit).
 import { forcedSelection, extractImportSites } from './core/impact.ts'
 import type { AuditReport } from './core/evidence.ts'
+import { isSuspectMarker } from './core/evidence.ts'
 import type { AttributedCheck } from './core/regression.ts'
 import type { CheckConfigEntry, DiscoverOptions } from './core/checks.ts'
 // ζ: the typed claim contract (ε's core/contract.ts) and the jury report
@@ -109,7 +116,7 @@ import type { RateCard, RunLedger, SlaQuote } from './core/economics.ts'
 // engine growing a second, drift-prone copy of the same rules. No cycle:
 // app/bundle.ts depends only on src/core/* and its sibling protocol.ts —
 // never on the engine.
-import { verifyBundle } from './app/bundle.ts'
+import { EVIDENCE_FILE, verifyBundle } from './app/bundle.ts'
 import type { ProofBundle } from './app/bundle.ts'
 import { NodeCommandPort, NodeEd25519Signer, NodeFsPort, GitWorkspace, SystemClock } from './node-ports.ts'
 
@@ -215,6 +222,16 @@ export interface EngineOptions {
    * party. Mirrors the plugin config's `syntheticFalsePass` (default 0.15).
    */
   readonly syntheticFalsePass?: number
+  /**
+   * H-03: false-pass rate priced into checks whose script body DRIFTED from
+   * the body the baseline digested — an unreviewed body replacing one the
+   * baseline had vouched for. Default `DRIFTED_FALSE_PASS_DEFAULT` (0.5),
+   * deliberately above the synthetic tier for the same reason the synthetic
+   * tier is above the organic one: the hand that owns the claim chose these
+   * bytes, and nobody screened them. Overridable modelling guess, never a
+   * `BAYES_CONSTANTS` law (see core/bayes.ts).
+   */
+  readonly driftedFalsePass?: number
   /** π: cooperative timeout for one conjured-test run (default 60s). */
   readonly syntheticTimeoutMs?: number
   /**
@@ -326,6 +343,16 @@ export interface VerifyOutcome {
   readonly scriptDrift?: readonly string[]
   /** H5②: baseline checks whose definitions vanished from discovery. */
   readonly vanished?: readonly string[]
+  /**
+   * H-23: the run consumed an audit that found the baseline file no longer
+   * matches the digest the chain recorded under `baseline/saved` — every
+   * comparison this run made against that baseline (change-set resolution,
+   * script digests, the API surface) judged suspect bytes. Present only on
+   * the tampered path: the run forced the full check set AND its grade is
+   * capped at `stale`; the boundary marker carries the same flag so the
+   * degradation is a chain fact, not just a return value.
+   */
+  readonly baselineTampered?: true
   /**
    * v0.21: what this run cost and what it bought — present exactly when the
    * caller supplied `economics.rate`. `ledger` prices the run (compute ms,
@@ -488,6 +515,15 @@ export interface TaskVerdictResult {
   readonly composed: ComposedVerdict
   readonly nodes: readonly DagNode[]
   readonly cycles: string[]
+  /**
+   * H-11: ownGrade self-reports that exceeded what this chain's evidence
+   * supports (the latest `proof/verified` marker's grade), one line each.
+   * A self-report is testimony, never measurement: the composed verdict
+   * rides the chain-derived grade, and an inflated claim is recorded here
+   * and echoed into the composed blockers rather than silently ignored —
+   * or worse, believed.
+   */
+  readonly discrepancies?: readonly string[]
 }
 
 /**
@@ -558,12 +594,19 @@ export interface TrainingExportResult {
  * `SyntheticRequest`. Malformed payloads (older chains, foreign writes)
  * return `undefined` and are skipped by every consumer — a marker that
  * cannot prove its own shape cannot mint a spec or authorise a run.
+ *
+ * M-01/L3 hardening: `entry` must be a name this engine could have minted
+ * (`sandboxEntryFor`'s exact shape — `synthetic-<hex claimId>-<seq>.mjs`), so
+ * a foreign marker can never smuggle `../../evil.mjs` or an absolute path
+ * into the spec pool's `node <entry>` command line.
  */
+const SYNTHETIC_ENTRY_RE = /^synthetic-[0-9a-f]+-\d+\.mjs$/
 function syntheticRequestOf(payload: Record<string, unknown>): SyntheticRequest | undefined {
   const { claimId, claim, paths, entry, requestedAt } = payload as Record<string, unknown>
   if (typeof claimId !== 'string' || typeof claim !== 'string' || typeof entry !== 'string' || typeof requestedAt !== 'number') {
     return undefined
   }
+  if (!SYNTHETIC_ENTRY_RE.test(entry)) return undefined
   if (!Array.isArray(paths) || !paths.every(p => typeof p === 'string')) return undefined
   return { claimId, claim, paths, entry, requestedAt }
 }
@@ -669,10 +712,25 @@ function delegationBundleOf(value: unknown): ProofBundle {
   return value as ProofBundle
 }
 
-/** Directory part of an arbitrary export path ('' when the path is bare). */
-function exportDirOf(path: string): string {
-  const idx = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
-  return idx <= 0 ? '' : path.slice(0, idx)
+/**
+ * H-16: how strongly a grade speaks, for "does this claim exceed its
+ * evidence" comparisons (submission `claimedGrade` caps, `taskVerdict`
+ * self-report caps). `proven` outranks everything; `stale` (a finished but
+ * unproving run) outranks the never-proven pair; `unproven`, `no-baseline`
+ * and `regressed` are all "no green claim" and never cap each other — an
+ * explicitly declared bad state is honest news, never an inflation.
+ */
+function gradeRank(grade: ProofGrade): number {
+  if (grade === 'proven') return 3
+  if (grade === 'stale') return 2
+  return 1
+}
+
+/** H-05: split a bundle's evidence log into walkable lines (trailing blank dropped). */
+function bundleLogLines(log: string): string[] {
+  const lines = log.split('\n')
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
+  return lines
 }
 
 /**
@@ -734,7 +792,11 @@ function hasSyntheticProtocolPassLine(outputHead: string): boolean {
 }
 
 function isAbsolutePath(p: string): boolean {
-  return /^([A-Za-z]:[\\/]|\/)/.test(p)
+  // M-35: `\\server\share\...` (backslash UNC) is an absolute path too —
+  // without this branch a UNC evidenceDir folded into `<root>\server\...`
+  // and the log silently landed back inside the agent-writable workspace,
+  // the exact inversion of the "hosts keep the log outside" promise.
+  return /^([A-Za-z]:[\\/]|\\\\|\/)/.test(p)
 }
 
 /**
@@ -883,6 +945,22 @@ export class ProofEngine {
   private readonly verbose: boolean
   /** v0.18: the stable workspace identity checkpoints (and PTL entries) carry. */
   private readonly workspaceKey: string
+  /**
+   * H-05/H-10: the out-of-band anchor file this engine's store consults
+   * (`<trustDir>/anchors/<workspaceKey>/anchor.json`), retained so the
+   * delegation verbs can read the obligation minter's trust root directly.
+   */
+  private readonly trustDir: string | undefined
+  private readonly anchorPath: string | undefined
+  /**
+   * H-10: the (watched) signer provider the store was configured with.
+   * `waiveDelegation`'s anchor-key authorization resolves it to ask "does
+   * THIS host hold the key the anchor names?" — an absent provider answers
+   * no, which is the conservative direction for a risk-acceptance verb.
+   */
+  private readonly signerProvider: (() => Promise<SignerPort | undefined>) | undefined
+  /** H-17: per-run sequence for coverage staging directory names (physical only, never hash material). */
+  private coverageRunSeq = 0
   /** κ: where the evidence log physically lives — marker payloads (attestations) are read back through it. */
   private readonly logPath: string
   /** κ: trust weights for Class B/C evidence, synthesised from config passthrough. */
@@ -907,6 +985,7 @@ export class ProofEngine {
     juryConfidenceCap: number
     syntheticDir: string
     syntheticFalsePass: number
+    driftedFalsePass: number
     syntheticTimeoutMs: number
     coverage: 'observe' | 'require' | 'off'
   }
@@ -937,15 +1016,18 @@ export class ProofEngine {
     }
     const workspaceKey = options.workspaceKey ?? 'default'
     // v0.18: transparency-log wiring. `ptlDir` is normalised once (trailing
-    // slashes folded — every composition below is `${ptlDir}/...`); the
-    // operator-signer default loads an Ed25519 key from `<ptlDir>/operator-key`
-    // (NodeEd25519Signer.load bootstraps it on first use, the same rule the
-    // workspace chain key follows under trustDir).
+    // slashes folded — every composition below is `${ptlDir}/...`). The
+    // operator-signer default lives OUTSIDE the published log dir (H-07's
+    // self-reference lesson: a key stored beside the log it notarises can be
+    // rewritten together with it): `<trustDir>/ptl-operator-key` first — the
+    // same default the ptl CLI resolves — with the legacy `<ptlDir>/operator-key`
+    // honoured when only that exists, so an existing deployment's STHs keep
+    // their identity. NodeEd25519Signer.load bootstraps on first use.
     this.workspaceKey = workspaceKey
     this.ptlDir = options.ptlDir !== undefined ? options.ptlDir.replace(/[\/]+$/, '') : undefined
     this.ptlSignerProvider = options.ptlSigner
       ?? (this.ptlDir !== undefined
-        ? () => NodeEd25519Signer.load(`${this.ptlDir}/operator-key`)
+        ? () => this.loadPtlOperatorKey()
         : undefined)
     // E2: whichever provider wins (host-injected or trustDir-derived), it is
     // wrapped so a load failure can never pass silently — the downgrade itself
@@ -953,6 +1035,14 @@ export class ProofEngine {
     const rawSignerProvider = options.signer
       ?? (options.trustDir !== undefined ? () => this.loadSigner(`${options.trustDir}/keys`) : undefined)
     const signerProvider = rawSignerProvider !== undefined ? () => this.watchSigner(rawSignerProvider) : undefined
+    // H-05/H-10: the delegation verbs need the minter's trust root; the store
+    // keeps its own copy private, so the engine retains the derivation. The
+    // bare dir is kept too — the PTL operator-key default resolves under it.
+    this.trustDir = options.trustDir
+    this.anchorPath = options.trustDir !== undefined
+      ? `${options.trustDir}/anchors/${workspaceKey}/anchor.json`
+      : undefined
+    this.signerProvider = signerProvider
     this.store = new EvidenceStore(
       this.fs,
       this.logPath,
@@ -960,7 +1050,7 @@ export class ProofEngine {
       this.clock,
       {
         ...(signerProvider !== undefined ? { signer: signerProvider } : {}),
-        ...(options.trustDir !== undefined ? { anchorPath: `${options.trustDir}/anchors/${workspaceKey}/anchor.json` } : {}),
+        ...(this.anchorPath !== undefined ? { anchorPath: this.anchorPath } : {}),
         workspaceKey,
         checkpointEvery: options.checkpointEvery ?? 25,
       },
@@ -1001,6 +1091,8 @@ export class ProofEngine {
       // for the directory name both sides must agree on.
       syntheticDir: options.syntheticDir ?? SYNTHETIC_DIR_DEFAULT,
       syntheticFalsePass: options.syntheticFalsePass ?? 0.15,
+      // H-03: the unreviewed-body tier — see EngineOptions.driftedFalsePass.
+      driftedFalsePass: options.driftedFalsePass ?? DRIFTED_FALSE_PASS_DEFAULT,
       syntheticTimeoutMs: options.syntheticTimeoutMs ?? 60_000,
       // υ: coverage gating mode — observe by default: real Node check processes
       // get execution-coverage honesty, data-less environments degrade visibly
@@ -1012,6 +1104,27 @@ export class ProofEngine {
   /** Host-held Ed25519 signer under the trust root; rejects when unavailable. */
   private loadSigner(dir: string): Promise<SignerPort | undefined> {
     return NodeEd25519Signer.load(dir)
+  }
+
+  /**
+   * The PTL operator key, resolved where the ptl CLI resolves it:
+   * `<trustDir>/ptl-operator-key` (outside the published log dir — a key that
+   * lives beside the log it notarises can be rewritten together with that
+   * log), falling back to the legacy `<ptlDir>/operator-key` when only that
+   * exists so an existing deployment's STH signatures keep their keyId. With
+   * neither on disk the preferred location bootstraps on first use.
+   */
+  private async loadPtlOperatorKey(): Promise<SignerPort | undefined> {
+    if (this.ptlDir === undefined) return undefined
+    const candidates = [
+      ...(this.trustDir !== undefined ? [`${this.trustDir}/ptl-operator-key`] : []),
+      `${this.ptlDir}/ptl-operator-key`,
+      `${this.ptlDir}/operator-key`,
+    ]
+    for (const dir of candidates) {
+      if (await this.fs.stat(dir) !== undefined) return NodeEd25519Signer.load(dir)
+    }
+    return NodeEd25519Signer.load(candidates[0]!)
   }
 
   /**
@@ -1189,6 +1302,22 @@ export class ProofEngine {
         + '(publishCheckpoint mirrors the latest SIGNED checkpoint; an unsigned chain has nothing publishable)',
       )
     }
+    // N-5 (red team): the engine face notarises only what it can stand
+    // behind — the CLI face verifies the selected checkpoint's own signature
+    // before publishing, and this face must not be the weaker twin. When the
+    // workspace signer is loadable and the checkpoint claims THIS engine's
+    // keyId, the signature is adjudicated: a garbage-signature checkpoint (a
+    // log-writer's forgery riding the anchor-key filter) is refused
+    // publication instead of being notarised into the public tree.
+    if (this.signerProvider !== undefined) {
+      const signer = await this.signerProvider().catch(() => undefined)
+      if (signer !== undefined && signer.keyId === checkpoint.keyId
+        && !(await signer.verify(checkpointSignedData(checkpoint.payload), checkpoint.sig))) {
+        throw new Error(
+          `refusing to publish: the selected checkpoint's signature does not verify under its own keyId (${checkpoint.keyId}) — the evidence chain carries a forged signature`,
+        )
+      }
+    }
     // Precondition before any mutation: a publish that cannot end in a signed
     // tree head must not leave a headless entry on the public log.
     const operator = await this.resolvePtlSigner()
@@ -1290,6 +1419,22 @@ export class ProofEngine {
     /** M19b: why this anchor was taken (≤200 characters), recorded on the `baseline/established` marker when non-empty. */
     reason?: string
   } = {}): Promise<{ baseline: EngineBaseline; records: readonly Evidence[] }> {
+    // H-23: consume the chain's own audit BEFORE anchoring over it. A
+    // tampered predecessor baseline is exactly what a fresh anchor heals —
+    // but the healing must be a loud chain fact, not a silent overwrite:
+    // the marker below records that this anchor superseded suspect bytes.
+    const supersededTampered = (await this.store.audit()).chain.baselineTampered
+    if (supersededTampered && this.verbose && this.logger !== undefined) {
+      this.logger('[dsh-proof] baseline superseded: the previous baseline file failed its chain-recorded digest — this anchor replaces it')
+    }
+    // N-6 (red team): a re-anchor can launder a mutated script body into a
+    // fresh trust identity — drift dies with the old baseline and the new one
+    // inherits the check id's earned history wholesale. Whether to GATE that
+    // is a design decision this batch does not make; the FACT is not
+    // optional: a check id anchoring under a different script body than the
+    // prior baseline recorded becomes a chain fact any reviewer can see.
+    const priorBaseline = await this.store.loadBaseline()
+    const priorScriptDigests = (priorBaseline as EngineBaseline | undefined)?.scriptDigests
     // M7: an anchoring run re-discovers — the baseline must reflect the
     // checks the workspace declares NOW, not whatever an earlier verb cached.
     const specs = await this.loadChecks(true)
@@ -1316,6 +1461,18 @@ export class ProofEngine {
         ? { onEvidence: (ev, i, total) => options.onProgress!(ev.label, i, total) }
         : {}),
     })
+    // M-08: a cooperative-budget overrun is a fact the chain can name — an
+    // in-flight check that finished after the wall-clock budget is real
+    // evidence, but a baseline assembled under an exceeded budget says so,
+    // instead of absorbing the overrun silently. (The bayesian wave loop
+    // deliberately does NOT mark this: per-wave remaining-budget overruns are
+    // the scheduler's normal cooperative behaviour, not an exception.)
+    if (batch.budgetExceeded) {
+      if (this.verbose && this.logger !== undefined) {
+        this.logger('[dsh-proof] budget exceeded: checks finished after the wall-clock budget — the evidence is real, the schedule was not')
+      }
+      await this.store.mark('budget/exceeded', { ran: batch.ranIds.length, budgetMs: this.options.verifyBudgetMs })
+    }
     // Facts first: whatever was observed is appended, abort or not.
     for (const record of batch.records) await this.store.append(record)
     const baseline = assembleBaseline(specs, batch.records, snapshot, this.clock)
@@ -1345,11 +1502,14 @@ export class ProofEngine {
     // cancelled run — some checks were never even attempted), any record that
     // came back `aborted` (a check whose process was killed mid-flight), and
     // (H12) any record that never got its turn or never finished answering —
-    // `skipped` on a drained budget, `timeout` past the per-check clock. A
-    // half-observed baseline would silently become THE truth later judgments
-    // regress against, which is exactly what E1 exists to prevent.
+    // `skipped` on a drained budget, `timeout` past the per-check clock. M-36:
+    // `error` joins them — a spawn failure is "no answer" in exactly the sense
+    // DECISIVE_STATUSES says so, and an environment-dead suite (every command
+    // ENOENT) must not anchor a "healthy" baseline the way a starved one
+    // cannot. A half-observed baseline would silently become THE truth later
+    // judgments regress against, which is exactly what E1 exists to prevent.
     const aborted = batch.aborted === true
-      || batch.records.some(r => r.status === 'aborted' || r.status === 'skipped' || r.status === 'timeout')
+      || batch.records.some(r => r.status === 'aborted' || r.status === 'skipped' || r.status === 'timeout' || r.status === 'error')
     if (aborted) {
       await this.store.mark('baseline/aborted', {
         baselineId: baseline.baselineId,
@@ -1365,6 +1525,17 @@ export class ProofEngine {
     }
     // saveBaseline records the file digest into the chain and checkpoints.
     await this.store.saveBaseline(anchored)
+    // N-6: the script-body mutation fact itself — ids whose body changed
+    // under this anchor, on the record where the identity swap happened.
+    const scriptMutations = priorScriptDigests === undefined ? [] : Object.keys(scriptDigests)
+      .filter(id => priorScriptDigests[id] !== undefined && priorScriptDigests[id] !== scriptDigests[id])
+    if (scriptMutations.length > 0) {
+      await this.store.mark('baseline/script-mutation', {
+        baselineId: baseline.baselineId,
+        mutated: scriptMutations.length,
+        ids: scriptMutations.slice(0, 20),
+      })
+    }
     // M19b: the caller's reason for anchoring (bounded, only when said).
     const reason = markerText(options.reason)
     await this.store.mark('baseline/established', {
@@ -1380,6 +1551,9 @@ export class ProofEngine {
       // degradation synthesis downstream rest on them.
       scriptDigests: Object.keys(scriptDigests).length,
       ...(dirtyQueryFailed ? { snapshotDegraded: true as const } : {}),
+      // H-23: this anchor replaced a baseline the audit found tampered —
+      // the healing is itself a chain fact.
+      ...(supersededTampered ? { supersededTampered: true as const } : {}),
     })
     await this.store.checkpoint()
     return { baseline: anchored, records: batch.records }
@@ -1400,8 +1574,20 @@ export class ProofEngine {
     // with none on chain gets the empty union and behaves bit-for-bit as
     // before; one with them gets them selected, priced (raised β) and
     // re-executed exactly like an organic check (P5).
-    const specs = unionChecks(discovered, await this.syntheticSpecs())
+    const syntheticPool = await this.syntheticSpecs()
+    const specs = unionChecks(discovered, syntheticPool)
     const baseline = await this.store.loadBaseline()
+    // H-23: the run is about to judge the workspace against this baseline —
+    // consult the chain's own audit first. A baseline whose bytes no longer
+    // match the digest recorded under `baseline/saved` makes every
+    // comparison against it suspect (change resolution, script digests, the
+    // API surface), so the run forces the full set AND caps its grade: the
+    // degradation is visible on the outcome, the marker and the verbose
+    // channel, never silently absorbed.
+    const baselineTampered = (await this.store.audit()).chain.baselineTampered
+    if (baselineTampered && this.verbose && this.logger !== undefined) {
+      this.logger('[dsh-proof] baseline degraded: the baseline file failed its chain-recorded digest — comparisons against it are suspect; re-establish the baseline')
+    }
     // H5: which discovered checks now answer under a DIFFERENT script body than
     // the one the baseline greened. Independent of the change set on purpose —
     // the agent's report of what it touched cannot veto what the manifest says.
@@ -1424,9 +1610,11 @@ export class ProofEngine {
     // structural. The three legs: the resolution's own degraded flag (B1),
     // the baseline's snapshot-degraded attachment (H6 — anchored blind), and a
     // lost HEAD with git still claimed available (H6 — `changedSince` is
-    // wholly blind without a ref to diff against).
+    // wholly blind without a ref to diff against). H-23 adds the fourth: a
+    // baseline the audit found tampered.
     const degraded = resolutionDegraded(attribution)
       || baselineSnapshotDegraded(baseline)
+      || baselineTampered
       || await this.gitFactsUnavailable()
       || await this.gitHeadMissing()
     const forceAll = options.all === true || degraded
@@ -1462,10 +1650,12 @@ export class ProofEngine {
 
     // υ: this run's coverage scratch tree — created before the machine checks
     // run, read and removed after they settle. The directory name (a clock
-    // nonce) is physical staging only: it never enters any hash material, so
-    // the same verification re-run against a different clock still addresses
-    // its evidence identically.
-    const coverageDir = await this.prepareCoverageDir()
+    // nonce plus a per-run sequence, H-17) is physical staging only: it never
+    // enters any hash material, so the same verification re-run against a
+    // different clock still addresses its evidence identically. The staging
+    // object carries `spawnedAt` — the mtime floor every collected profile
+    // must clear (H-17's forgery defense, enforced in `collectRunCoverage`).
+    const coverageStaging = await this.prepareCoverageDir()
 
     const records: Evidence[] = []
     let schedule: VerifyOutcome['schedule']
@@ -1478,7 +1668,7 @@ export class ProofEngine {
     let priorProbability: number | null = null
     let posteriorProbability: number | null = null
     if (bayesian && runSet.length > 0) {
-      const plan = await this.runBayesianSchedule(runSet, changed, graph, snapshot, options, coverageDir, scriptDrifted)
+      const plan = await this.runBayesianSchedule(runSet, changed, graph, snapshot, options, coverageStaging?.dir, scriptDrifted)
       records.push(...plan.records)
       schedule = plan.schedule
       confidence = plan.confidence
@@ -1494,13 +1684,21 @@ export class ProofEngine {
         concurrency: this.options.concurrency,
         totalBudgetMs: this.options.verifyBudgetMs,
         workspace: snapshot,
-        ...(coverageDir !== undefined ? { coverageDir } : {}),
+        ...(coverageStaging !== undefined ? { coverageDir: coverageStaging.dir } : {}),
         ...(options.signal !== undefined ? { signal: options.signal } : {}),
         ...(options.onProgress !== undefined
           ? { onEvidence: (ev, i, total) => options.onProgress!(ev.label, i, total) }
           : {}),
       })
       records.push(...batch.records)
+      // M-08: whole-batch overrun is the exception worth naming on-chain (see
+      // the baseline site for the wave-loop carve-out).
+      if (batch.budgetExceeded) {
+        if (this.verbose && this.logger !== undefined) {
+          this.logger('[dsh-proof] budget exceeded: checks finished after the wall-clock budget — the evidence is real, the schedule was not')
+        }
+        await this.store.mark('budget/exceeded', { ran: batch.ranIds.length, budgetMs: this.options.verifyBudgetMs })
+      }
       // Even the whole-batch path earns its confidence number — display only:
       // grading on this path stays binary (requireFullCoverage below).
       confidence = this.updateFactors(priors, batch.records, runSet.length > 0)
@@ -1511,7 +1709,11 @@ export class ProofEngine {
     // precedent), so the chain must never first see a plain record and then
     // its enriched twin. With no data (or mode 'off') the records pass through
     // untouched and this is exactly the pre-υ append.
-    const collected = await this.collectRunCoverage(records, changed, coverageDir)
+    // M-01: same discipline one layer down — the synthetic body digest is
+    // pinned on before the coverage attachment re-addresses on top of it, so
+    // the chain only ever sees the fully self-addressing record.
+    const syntheticallyAddressed = await this.reattachSyntheticMeta(records, syntheticPool)
+    const collected = await this.collectRunCoverage(syntheticallyAddressed, changed, coverageStaging)
     for (const record of collected.records) await this.store.append(record)
 
     const { report: machineReport, checks } = assembleProof({
@@ -1537,7 +1739,13 @@ export class ProofEngine {
     // mounts on the report either way — `basis: 'none'` stays visible rather
     // than silently absent, because "could not measure" is a fact a reader of
     // a proof deserves to see.
-    const report = this.gateByCoverage(machineReport, collected.summary)
+    let report = this.gateByCoverage(machineReport, collected.summary)
+    // H-23: a run that judged suspect bytes may not certify. `proven` caps at
+    // `stale` ("re-establish and re-verify"); worse grades keep their more
+    // honest verdict untouched.
+    if (baselineTampered && report.grade === 'proven') {
+      report = { ...report, grade: 'stale' as const }
+    }
 
     // M19b: what the caller claims this run proves, when they said so.
     const claimText = markerText(options.claim)
@@ -1585,6 +1793,10 @@ export class ProofEngine {
       ...(scriptDrifted.size > 0 ? { scriptDrift: [...scriptDrifted].sort() } : {}),
       // H5②: which anchored checks lost their definitions — same visibility.
       ...(vanished.length > 0 ? { vanished } : {}),
+      // H-23: the run's baseline failed its chain-recorded digest — the
+      // grade above is capped and the run was forced; both facts are the
+      // chain's to know.
+      ...(baselineTampered ? { baselineTampered: true as const } : {}),
       // v0.21: the priced run rides the marker — a priced run is a chain
       // fact (proof_economics replays exactly these bytes).
       ...(economics !== undefined ? { economics } : {}),
@@ -1594,6 +1806,7 @@ export class ProofEngine {
     return {
       report, checks, selection, changed, attribution,
       ...(degraded ? { degraded: true as const } : {}),
+      ...(baselineTampered ? { baselineTampered: true as const } : {}),
       ...(economics !== undefined ? { economics } : {}),
       ...(schedule !== undefined ? { schedule } : {}),
       ...(collected.summary !== undefined
@@ -1652,6 +1865,16 @@ export class ProofEngine {
     // obligations are judged against the workspace's current check pool.
     const specs = await this.loadChecks(true)
     const baseline = await this.store.loadBaseline()
+    // H-23: same audit gate as verify() — the claim is about to be judged
+    // against this baseline's bytes, and a baseline the chain's own audit
+    // refutes (recorded digest ≠ file bytes) makes every path below suspect.
+    // Every path consumes the flag: the jury paths degrade visibly (M-04's
+    // missing `degraded` semantics ride along), the machine path degrades,
+    // caps `proven` at `stale`, and keeps endorsement from paying for it.
+    const baselineTampered = (await this.store.audit()).chain.baselineTampered
+    if (baselineTampered && this.verbose && this.logger !== undefined) {
+      this.logger('[dsh-proof] baseline degraded: the baseline file failed its chain-recorded digest — comparisons against it are suspect; re-establish the baseline')
+    }
     // H5: drift detection runs for every contract kind (cheap, pure), though
     // only the machine path below can act on it — the jury paths run no
     // checks, so there is nothing to re-run and nothing to discount.
@@ -1686,13 +1909,27 @@ export class ProofEngine {
         this.options.juryConfidenceCap,
       )
       const confidence = verdict.juryCappedConfidence ?? this.options.juryConfidenceCap
-      const report = assembleJuryReport({
+      let report = assembleJuryReport({
         contract,
         obligations: verdict.obligations,
         confidence,
         workspace: await this.workspaceSnapshot(),
         clock: this.clock,
       })
+      // M-04: the jury paths owe the same degraded honesty the machine path
+      // pays — a git-blind resolution (or an H-23 tampered baseline) under a
+      // `docs-only-changes` obligation would otherwise judge an unobservable
+      // change set and hand back a capped-proven verdict with no flag at all.
+      // H-23: and a tampered baseline caps `proven` at `stale` here too —
+      // "the change set is documentary" was decided against suspect bytes.
+      const degraded = resolutionDegraded(attribution)
+        || baselineSnapshotDegraded(baseline)
+        || baselineTampered
+        || await this.gitFactsUnavailable()
+        || await this.gitHeadMissing()
+      if (baselineTampered && report.grade === 'proven') {
+        report = { ...report, grade: 'stale' as const }
+      }
       // docs-only never goes through check selection. The `selection` below is
       // a legal minimal placeholder that says exactly that: nothing affected,
       // everything untouched, no graph consulted — `precision: 'forced'`
@@ -1713,6 +1950,11 @@ export class ProofEngine {
         review: (contract.review ?? '').slice(0, 200),
         grade: report.grade,
         unmet: verdict.obligations.filter(o => !o.met).map(o => o.id),
+        // M-04/H-23: the jury path's honesty flags ride the marker — a
+        // degraded resolution or a tampered baseline is a fact about what
+        // this verdict was judged against.
+        ...(degraded ? { degraded: true as const } : {}),
+        ...(baselineTampered ? { baselineTampered: true as const } : {}),
       })
       await this.store.checkpoint()
       // v0.21: a docs-only verdict consumed no machine compute and no B/C
@@ -1728,6 +1970,8 @@ export class ProofEngine {
         selection,
         changed,
         attribution,
+        ...(degraded ? { degraded: true as const } : {}),
+        ...(baselineTampered ? { baselineTampered: true as const } : {}),
         ...(economics !== undefined ? { economics } : {}),
         contract: {
           kind: verdict.kind,
@@ -1753,7 +1997,11 @@ export class ProofEngine {
     // veto weight.
     if (contract.kind === 'llm-jury') {
       const claimId = claimIdOf(contract.claim)
-      const active = attestationsFor(await this.activeAttestationsAll(), claimId)
+      // H-32: the κ fusion consumes only attestations the evidence layer has
+      // NOT flagged suspect; the flag count rides the boundary marker so a
+      // reader sees how much testimony was withheld and why.
+      const { active: allActive, suspect: suspectAttestations } = await this.activeAttestationsAll()
+      const active = attestationsFor(allActive, claimId)
       // `changed` is resolved honestly (context for the evaluator), and
       // `specs`/`baseline` are handed over — but no command ever runs.
       const attribution = await this.resolveChanges(rest, baseline)
@@ -1774,8 +2022,16 @@ export class ProofEngine {
       )
       const fused = this.attestationProduct(active)
       const unmet = verdict.obligations.filter(o => !o.met)
+      // M-04: the jury path's degraded honesty; H-23: a tampered baseline
+      // caps the jury grade at `stale` — the obligations were judged against
+      // suspect bytes.
+      const degraded = resolutionDegraded(attribution)
+        || baselineSnapshotDegraded(baseline)
+        || baselineTampered
+        || await this.gitFactsUnavailable()
+        || await this.gitHeadMissing()
       const grade: GradedProofReport['grade'] =
-        unmet.length === 0 && fused >= this.options.certifyTarget ? 'proven' : 'stale'
+        unmet.length === 0 && fused >= this.options.certifyTarget && !baselineTampered ? 'proven' : 'stale'
       // Basis: nothing machine-made speaks, so an active Class B witness makes
       // this jury-only; a human witness alone (or none at all) keeps the
       // jury-report default rather than claiming a machine factor it never had.
@@ -1807,6 +2063,11 @@ export class ProofEngine {
         claimId,
         grade,
         unmet: unmet.map(o => o.id),
+        // M-04/H-23/H-32: what this verdict was judged against, and how much
+        // testimony the suspect channel withheld.
+        ...(degraded ? { degraded: true as const } : {}),
+        ...(baselineTampered ? { baselineTampered: true as const } : {}),
+        ...(suspectAttestations > 0 ? { suspectAttestations } : {}),
         // κ: attestation summary for the boundary marker — the full
         // prompt/output text already lives in the attest marker itself, so
         // this records only what the grade rode on.
@@ -1843,6 +2104,8 @@ export class ProofEngine {
         selection,
         changed,
         attribution,
+        ...(degraded ? { degraded: true as const } : {}),
+        ...(baselineTampered ? { baselineTampered: true as const } : {}),
         ...(economics !== undefined ? { economics } : {}),
         contract: {
           kind: verdict.kind,
@@ -1858,7 +2121,8 @@ export class ProofEngine {
     // ordinary specs, so a behavior-adding claim can cover its new paths
     // with them (the contract's new-paths-covered fallback consumes the
     // chain's latest synthetic evidence through `latestByCheckId` below).
-    const pool = unionChecks(specs, await this.syntheticSpecs())
+    const syntheticPool = await this.syntheticSpecs()
+    const pool = unionChecks(specs, syntheticPool)
     const attribution = await this.resolveChanges(rest, baseline)
     const changed = attribution.changed
     const provenance = new Map<RelPath, ChangeProvenance>(
@@ -1866,6 +2130,7 @@ export class ProofEngine {
     )
     const degraded = resolutionDegraded(attribution)
       || baselineSnapshotDegraded(baseline)
+      || baselineTampered
       || await this.gitFactsUnavailable()
       || await this.gitHeadMissing()
     const forceAll = rest.all === true || degraded
@@ -1892,8 +2157,9 @@ export class ProofEngine {
 
     const snapshot = await this.workspaceSnapshot()
     // υ: same coverage staging as verify() — the machine legs of a contract
-    // claim are ordinary checks and earn the same execution-coverage honesty.
-    const coverageDir = await this.prepareCoverageDir()
+    // claim are ordinary checks and earn the same execution-coverage honesty
+    // (and the same H-17 per-run staging + mtime window).
+    const coverageStaging = await this.prepareCoverageDir()
     // Whole-batch over the (possibly benchmark-extended, possibly
     // drift-extended) run set, with the same priors/confidence display the
     // 'set' path uses — see method note.
@@ -1902,14 +2168,23 @@ export class ProofEngine {
       concurrency: this.options.concurrency,
       totalBudgetMs: this.options.verifyBudgetMs,
       workspace: snapshot,
-      ...(coverageDir !== undefined ? { coverageDir } : {}),
+      ...(coverageStaging !== undefined ? { coverageDir: coverageStaging.dir } : {}),
       ...(rest.signal !== undefined ? { signal: rest.signal } : {}),
       ...(rest.onProgress !== undefined
         ? { onEvidence: (ev, i, total) => rest.onProgress!(ev.label, i, total) }
         : {}),
     })
-    // υ: collect + re-address before the first append — see verify().
-    const collected = await this.collectRunCoverage(batch.records, changed, coverageDir)
+    // M-08: same whole-batch overrun naming as verify()/establishBaseline().
+    if (batch.budgetExceeded) {
+      if (this.verbose && this.logger !== undefined) {
+        this.logger('[dsh-proof] budget exceeded: checks finished after the wall-clock budget — the evidence is real, the schedule was not')
+      }
+      await this.store.mark('budget/exceeded', { ran: batch.ranIds.length, budgetMs: this.options.verifyBudgetMs })
+    }
+    // υ: collect + re-address before the first append — see verify(). M-01:
+    // the synthetic body digest is pinned on first, same order as verify().
+    const syntheticallyAddressed = await this.reattachSyntheticMeta(batch.records, syntheticPool)
+    const collected = await this.collectRunCoverage(syntheticallyAddressed, changed, coverageStaging)
     for (const record of collected.records) await this.store.append(record)
     const confidence = this.updateFactors(priors, batch.records, runSpecs.length > 0)
 
@@ -1991,6 +2266,13 @@ export class ProofEngine {
     if (graded.grade === 'proven' && unmet.length > 0) {
       graded = { ...graded, grade: 'stale' as const }
     }
+    // H-23: a claim judged against a tampered baseline may not certify —
+    // `proven` caps at `stale` (re-anchor and re-verify), and the cap sits
+    // BEFORE the κ fusion below so neither a witness nor the endorsement
+    // unlock can pay a claim whose baseline bytes the chain itself refutes.
+    if (baselineTampered && graded.grade === 'proven') {
+      graded = { ...graded, grade: 'stale' as const }
+    }
 
     // κ: attestation fusion for machine kinds. The machine grade and
     // confidence are already on the table; active B/C witnesses for this
@@ -2004,7 +2286,11 @@ export class ProofEngine {
     // Grades the machine run did not earn regressions for stay exactly what
     // they were: no witness unlocks a regressed claim. Plain `verify()` never
     // consults attestations at all (v0.9 semantics locked).
-    const claimActive = attestationsFor(await this.activeAttestationsAll(), claimIdOf(contract.claim))
+    // H-32: suspect attestations are excluded from the fusion (the channel is
+    // position test — see `isSuspectMarker`); the count rides the boundary
+    // marker so a reader sees the withheld testimony.
+    const { active: allActive, suspect: suspectAttestations } = await this.activeAttestationsAll()
+    const claimActive = attestationsFor(allActive, claimIdOf(contract.claim))
     // v0.21: the ledger's `humanReviewItems` counts the B/C witnesses that
     // actually fused into this verdict's confidence — zero when no active
     // witness exists or the machine run earned no confidence number to fuse
@@ -2024,14 +2310,15 @@ export class ProofEngine {
       // is missing work too — see the H3 note above), every obligation met,
       // nothing regressed, nothing newly failing. That leaves exactly the
       // machine's own words: "0.94, and I cannot cross 0.97" — and the human
-      // took the remainder. Under the current full-coverage contract wiring
-      // (`requireFullCoverage: true` on the machine run above) a stale grade
-      // coincides with `unverified > 0`, so this branch is in fact
-      // unreachable today; it is kept because it is the honest *shape* of
-      // the rule — the day a confidence-tiered contract path lets a fully
-      // completed run land just under the target, this is the seam where a
-      // human may accept it — and as regression armor against ever widening
-      // the unlock again.
+      // took the remainder. H-04 closes the two completeness doors the
+      // enumeration missed: `vanished` (a baseline check whose definition
+      // was deleted is a hole in the pool, not residual risk — report.ts
+      // caps its grade at `stale`, and one endorsement used to lift it back
+      // to `proven` while the report still listed the vanished id) and
+      // `scriptDrifted` (a check answering under a body the baseline never
+      // vouched for is exactly the missing-work shape the drift discount
+      // prices; an un-re-anchored body is not residual risk either). H-23
+      // adds the integrity door: a tampered baseline is not residual risk.
       const endorsementUnlock = endorsed
         && graded.grade === 'stale'
         && unmet.length === 0
@@ -2039,6 +2326,9 @@ export class ProofEngine {
         && !coverageBlocked
         && graded.summary.regressions === 0
         && !checks.some(c => c.verdict === 'new-failure')
+        && vanished.length === 0
+        && scriptDrifted.size === 0
+        && !baselineTampered
       graded = {
         ...graded,
         confidence: fused,
@@ -2099,6 +2389,9 @@ export class ProofEngine {
         : {}),
       // H5: which definitions drifted, when any did.
       ...(scriptDrifted.size > 0 ? { scriptDrift: [...scriptDrifted].sort() } : {}),
+      // H-23/H-32: the integrity flags this verdict was judged under.
+      ...(baselineTampered ? { baselineTampered: true as const } : {}),
+      ...(suspectAttestations > 0 ? { suspectAttestations } : {}),
     })
     await this.store.checkpoint()
     return {
@@ -2108,6 +2401,7 @@ export class ProofEngine {
       changed,
       attribution,
       ...(degraded ? { degraded: true as const } : {}),
+      ...(baselineTampered ? { baselineTampered: true as const } : {}),
       ...(economics !== undefined ? { economics } : {}),
       ...(collected.summary !== undefined
         ? {
@@ -2183,6 +2477,21 @@ export class ProofEngine {
       throw new Error('slaQuote: minPremium must be a finite non-negative number when provided')
     }
     this.assertRateCard(input.rate, 'slaQuote')
+    // M-03: a quote prices evidence that EXISTS. `grade`/`confidence` are
+    // caller inputs, so before anything is priced or written, the chain must
+    // carry a `proof/verified` marker that actually reached this grade —
+    // otherwise the `economics/quote` marker is a free forgery: "proven at
+    // p=0.999" minted by whoever called the verb, underwritten by nothing.
+    // The anchor is the LATEST marker carrying the quoted grade (a grade is
+    // quotable as long as the chain once honestly reached it; recency of the
+    // evidence itself is the underwriter's judgement, priced by confidence).
+    const graded = (await this.markersWith('proof/verified'))
+      .filter(m => m.grade === input.grade)
+    if (graded.length === 0) {
+      throw new Error(
+        `slaQuote: no proof/verified marker on this chain carries grade "${input.grade}" — an SLA prices evidence the chain reached, not a grade the caller asserts (run a verification first)`,
+      )
+    }
     const quote = priceSla({
       grade: input.grade,
       ...(input.confidence !== undefined ? { confidence: input.confidence } : {}),
@@ -2396,16 +2705,21 @@ export class ProofEngine {
   private async markersWith(label: string): Promise<Record<string, unknown>[]> {
     try {
       const out: Record<string, unknown>[] = []
-      for (const line of await this.fs.readLines(this.logPath)) {
+      // H-32/N-4: position-based suspect test (see activeAttestationsAll) —
+      // a marker the chain no longer corroborates is not read as fact here.
+      const lines = await this.fs.readLines(this.logPath)
+      for (let i = 0; i < lines.length; i += 1) {
         let envelope: { kind?: unknown; payload?: unknown }
         try {
-          envelope = JSON.parse(line) as { kind?: unknown; payload?: unknown }
+          envelope = JSON.parse(lines[i]!) as { kind?: unknown; payload?: unknown }
         } catch {
           continue
         }
         if (envelope?.kind !== 'marker') continue
         const payload = envelope.payload as { label?: unknown } | undefined
-        if (payload?.label === label) out.push(payload as Record<string, unknown>)
+        if (payload?.label !== label) continue
+        if (isSuspectMarker(lines, i)) continue
+        out.push(payload as Record<string, unknown>)
       }
       return out
     } catch {
@@ -2433,32 +2747,110 @@ export class ProofEngine {
       const request = syntheticRequestOf(payload)
       if (request === undefined) continue
       if (!ran.has(`${request.claimId}\0${request.entry}`)) continue
+      // M-01: the re-dispatch gate re-screens the CURRENT bytes. Screening
+      // ran once, at conjureRun, over the bytes that existed then; a script
+      // rewritten since (the forbidden import added after the fact) must be
+      // refused HERE too — "a script importing … is refused at screening and
+      // never runs" is a promise about every execution, not the first one.
+      // The refusal is a chain fact, loudly: the spec simply does not join
+      // the pool, and the marker says why.
+      const source = await this.fs.readFile(`${this.syntheticRoot()}/${request.entry}`)
+      if (source !== undefined) {
+        const screening = screenScript(source)
+        if (!screening.ok) {
+          await this.store.mark('synthetic/refused', {
+            claimId: request.claimId,
+            entry: request.entry,
+            findings: [...screening.findings],
+          })
+          continue
+        }
+      }
       out.push(syntheticSpec(request, this.options.syntheticDir, this.options.syntheticTimeoutMs))
     }
     return out
+  }
+
+  /**
+   * M-01: pin the executed script's digest onto a re-dispatched synthetic
+   * record. `conjureRun` addresses its record over the script's own bytes
+   * (`Evidence.synthetic`); the verify re-dispatch path used to lose that —
+   * the record joined the chain without saying WHICH body produced it, and
+   * the content-addressing guarantee ("two runs with the same outcome but
+   * different scripts are two different pieces of evidence") silently held
+   * only for the first execution. This re-reads the entry at collection time
+   * and re-addresses exactly like `conjureRun`/`attachEvidenceCoverage` do.
+   */
+  private async reattachSyntheticMeta(
+    records: readonly Evidence[],
+    pool: readonly CheckSpec[],
+  ): Promise<Evidence[]> {
+    const syntheticIds = new Set(pool.filter(s => s.source === 'synthetic').map(s => s.id))
+    const recordsToAttach = records.filter(r => syntheticIds.has(r.checkId))
+    if (recordsToAttach.length === 0) return [...records]
+    // The synthetic specs carry their entry as part of the command — re-derive
+    // it from the spec pool rather than re-reading the marker channel.
+    const entryByCheckId = new Map<string, string>()
+    for (const s of pool) {
+      if (s.source !== 'synthetic') continue
+      const entry = s.command[s.command.length - 1]
+      if (typeof entry === 'string') entryByCheckId.set(s.id, entry)
+    }
+    const metaByCheckId = new Map<string, SyntheticEvidenceMeta>()
+    for (const record of recordsToAttach) {
+      const entry = entryByCheckId.get(record.checkId)
+      if (entry === undefined) continue
+      const source = await this.fs.readFile(`${this.syntheticRoot()}/${entry}`)
+      if (source === undefined) continue
+      metaByCheckId.set(record.checkId, {
+        scriptDigest: sha256(source),
+        sandbox: 'screened-subprocess',
+        screened: [],
+        author: 'agent',
+      })
+    }
+    if (metaByCheckId.size === 0) return [...records]
+    return records.map(record => {
+      const meta = metaByCheckId.get(record.checkId)
+      if (meta === undefined || record.synthetic !== undefined) return record
+      const { evidenceId: plainAddress, ...body } = record
+      void plainAddress
+      return { ...body, synthetic: meta, evidenceId: addressOf({ ...body, synthetic: meta }) }
+    })
   }
 
   // -- execution coverage (υ) ----------------------------------------------------
 
   /**
    * υ: create this run's coverage scratch directory — `${storeDir}/coverage/<clock
-   * nonce>` — or `undefined` when the mode injects nothing (`off`). The nonce
-   * only keeps concurrent/sequential runs from sharing subdirectories; it is
-   * physical staging and deliberately never enters any hash material, so run
-   * identity stays a function of the evidence alone. An mkdirp failure is
-   * swallowed: the children then fail to write their profiles, collection
-   * finds no data, and observe mode degrades to basis `'none'` — the honest
-   * answer, not a crashed verification.
+   * nonce>-<run sequence>` — or `undefined` when the mode injects nothing
+   * (`off`). H-17: the directory is named per-run (clock nonce + a monotonic
+   * sequence, so two same-millisecond runs cannot share staging) and CLEARED
+   * before the run: any file that survives into collection was either written
+   * during this run's window or is dropped with the whole run's coverage
+   * (see `collectRunCoverage`). Staging identity is physical only — never any
+   * hash material — so run identity stays a function of the evidence alone.
+   * An mkdirp failure is swallowed: the children then fail to write their
+   * profiles, collection finds no data, and observe mode degrades to basis
+   * `'none'` — the honest answer, not a crashed verification.
+   *
+   * `spawnedAt` is the run's mtime floor: the clock reading taken before the
+   * checked processes were dispatched, against which every collected profile
+   * file's mtime is judged (H-17's forgery defense — a profile that predates
+   * the run was planted, not produced).
    */
-  private async prepareCoverageDir(): Promise<string | undefined> {
+  private async prepareCoverageDir(): Promise<{ dir: string; spawnedAt: number } | undefined> {
     if (this.options.coverage === 'off') return undefined
-    const dir = `${this.storeDir}/coverage/${this.clock.now()}`
+    const dir = `${this.storeDir}/coverage/${this.clock.now()}-${++this.coverageRunSeq}`
     try {
+      // H-17: clear-before-use. A leftover (or attacker-planted) tree from a
+      // previous run must not survive into this run's collection window.
+      await this.fs.removeDir?.(dir).catch(() => { /* staging; regeneration is cheap */ })
       await this.fs.mkdirp(dir)
     } catch {
       /* unwritable staging → no coverage data this run */
     }
-    return dir
+    return { dir, spawnedAt: this.clock.now() }
   }
 
   /**
@@ -2471,7 +2863,9 @@ export class ProofEngine {
    *   2. parse every `coverage-*.json` and union the workspace-relative
    *      executed files into ONE set per record — `summarizeCoverage`'s
    *      executedSets unit is "what this check executed", not "what this one
-   *      profile happened to contain";
+   *      profile happened to contain"; a URL repeated across or within
+   *      profiles enters the set once (a `Set` from the first line — the
+   *      duplicate entry a forger pads a profile with buys nothing);
    *   3. attach the per-record coverage view (changed ∩ executed / changed −
    *      executed) by RE-ADDRESSING the record — π's synthetic precedent: the
    *      attachment is content-addressing material, so the enriched record is
@@ -2480,6 +2874,19 @@ export class ProofEngine {
    *   4. remove the scratch tree (best effort — `removeDir` is an optional
    *      FsPort capability; a MemoryFs without it is fine, `?.` and on we go);
    *   5. summarise the whole change set against the collected executed sets.
+   *
+   * H-17 forgery defense, before step 2 touches a single byte: the checked
+   * process can read `NODE_V8_COVERAGE` from its own environment and write a
+   * forged profile itself, so "a file in the directory" is not evidence. Two
+   * windows bound what collection admits — the profile's mtime must fall in
+   * [spawnedAt, collectedAt] (a file stamped before the run was dispatched
+   * was planted, not produced; one stamped after collection is not this
+   * run's either) — and the staging tree was cleared before the run, so a
+   * pre-existing file had to be written DURING this run's window to count.
+   * ONE untrusted profile poisons the whole run's coverage (dropped entire,
+   * records pass through unattached, the summary degrades to basis 'none')
+   * and the fact lands on the chain as `coverage/untrusted`: half-trusted
+   * coverage is exactly the shape a forger would want to keep.
    *
    * The empty-set subtlety in step 2 is the blind-spot detector: a check that
    * produced real coverage data naming NO workspace file still contributes a
@@ -2491,11 +2898,13 @@ export class ProofEngine {
   private async collectRunCoverage(
     records: readonly Evidence[],
     changed: readonly RelPath[],
-    coverageDir: string | undefined,
+    staging: { dir: string; spawnedAt: number } | undefined,
   ): Promise<{ records: Evidence[]; summary: CoverageSummary | undefined }> {
-    if (coverageDir === undefined) return { records: [...records], summary: undefined }
+    if (staging === undefined) return { records: [...records], summary: undefined }
+    const collectedAt = this.clock.now()
     const executedSets: string[][] = []
     const out: Evidence[] = []
+    let untrustedProfiles = 0
     for (const record of records) {
       // Only a decisively passing check speaks for execution coverage: a fail
       // already sank the grade on its own, and non-decisive outcomes may have
@@ -2504,12 +2913,33 @@ export class ProofEngine {
         out.push(record)
         continue
       }
-      const dir = `${coverageDir}/${sha256(record.checkId).slice(0, 16)}`
+      // N-3 (red team): under `require` — the strict tier — coverage vouched
+      // by a SYNTHETIC check does not satisfy the gate. In-run profile
+      // forgery is undetectable in general (H-17's honest limit: the window
+      // bounds its ends, not its interior); what `require` can refuse is the
+      // compounding interested party — a check the claiming agent authored
+      // vouching for its own execution. The strict tier accepts execution
+      // witnesses it did not have to trust the claim's author for. Observe
+      // mode keeps counting synthetic coverage — it only narrates.
+      if (this.options.coverage === 'require' && record.synthetic !== undefined) {
+        out.push(record)
+        continue
+      }
+      const dir = `${staging.dir}/${sha256(record.checkId).slice(0, 16)}`
       const executed = new Set<string>()
       let dataFound = false
       for (const name of (await this.fs.readDir(dir)) ?? []) {
         if (!/^coverage-.*\.json$/.test(name)) continue
-        const content = await this.fs.readFile(`${dir}/${name}`)
+        const path = `${dir}/${name}`
+        // H-17: the mtime window — see the method note. `stat` is a mandatory
+        // FsPort capability; a file whose stat cannot even be read was not
+        // produced by an honest V8 flush either.
+        const stat = await this.fs.stat(path)
+        if (stat === undefined || stat.mtimeMs < staging.spawnedAt || stat.mtimeMs > collectedAt) {
+          untrustedProfiles += 1
+          continue
+        }
+        const content = await this.fs.readFile(path)
         if (content === undefined) continue
         try {
           const parsed = parseV8CoverageReport(content, this.root)
@@ -2532,10 +2962,26 @@ export class ProofEngine {
           })
         : record)
     }
+    // H-17: one untrusted profile drops the WHOLE run's coverage — the
+    // re-addressed attachments above are unwound, the summary degrades to
+    // basis 'none', and the marker names the fact. (Basis 'none' under
+    // `observe` gates nothing, under `require` it is the disqualification —
+    // the conservative direction either way.)
+    if (untrustedProfiles > 0) {
+      await this.store.mark('coverage/untrusted', {
+        reason: 'profile file mtime outside this run\'s window — coverage untrusted, collection dropped',
+        rejected: untrustedProfiles,
+        windowMs: collectedAt - staging.spawnedAt,
+      })
+      // Staging is disposable by contract: collected, then removed. A failure
+      // here costs nothing — the next run re-creates the tree.
+      await this.fs.removeDir?.(staging.dir).catch(() => { /* staging; nothing to salvage */ })
+      return { records: [...records], summary: summarizeCoverage({ changed: [...changed], executedSets: [] }) }
+    }
     // Staging is disposable by contract: collected, then removed. A failure
     // here costs nothing — the next run re-creates the tree. `removeDir` is an
     // optional FsPort capability; a MemoryFs without it is fine, `?.` and on.
-    await this.fs.removeDir?.(coverageDir).catch(() => { /* staging; nothing to salvage */ })
+    await this.fs.removeDir?.(staging.dir).catch(() => { /* staging; nothing to salvage */ })
     const summary = summarizeCoverage({ changed: [...changed], executedSets })
     return { records: out, summary }
   }
@@ -2637,19 +3083,32 @@ export class ProofEngine {
    * anchors to, what grade the child CLAIMS, and whether the artifact itself
    * verified.
    *
+   * H-05 trust root: `verifyBundle`'s six checks are all self-consistency
+   * checks, so the engine additionally demands the bundle's evidence chain
+   * carry a SIGNED checkpoint — naming the obligation minter's anchor key
+   * when this chain has one (the minter's anchor is the root the child's
+   * proof must answer to), or at least any well-formed signed checkpoint
+   * when the minter never anchored (an anchor-less deployment still refuses
+   * wholly unsigned evidence, which an empty-log forger cannot supply).
+   * Unanchored evidence caps the derived grade at 'unproven' and the
+   * submission carries the pinned problem 'bundle evidence not anchored'.
+   *
    * `claimedGrade` honesty boundary: the engine cannot re-run the child's
    * checks (they ran in another workspace, against another baseline), so the
-   * default derivation is deliberately two-valued — a clean bundle carrying
-   * a baseline is what the child CALLS 'proven', anything else defaults to
-   * 'no-baseline'. Every finer grade ('unproven', 'stale', 'regressed') is a
-   * workspace-local judgment the submitter must DECLARE explicitly; the
-   * composer (core/obligations.ts) then treats a declared grade the artifact
-   * cannot back as forgery, which is exactly where an inflated claim belongs.
+   * default derivation is deliberately two-valued — an anchored, clean
+   * bundle carrying a baseline is what the child CALLS 'proven'; anything
+   * less derives 'no-baseline' (or 'unproven' unanchored). Every finer grade
+   * ('unproven', 'stale', 'regressed') is a workspace-local judgment the
+   * submitter may DECLARE explicitly; a declared grade the artifact's
+   * evidence exceeds is capped to what the evidence derives, with the
+   * discrepancy recorded on the submission, and a declared 'proven' over an
+   * artifact that FAILED verification is left for the composer (core/
+   * obligations.ts) to charge as forgery — the harsher, more honest verdict.
    *
    * The returned `composed` verdict is pure delegation synthesis — the
    * own-workspace grade map is EMPTY. The parent's own evidence (its local
-   * `verify()` outcome) enters through `taskVerdict`'s `ownGrade`, whose
-   * consumer owns that judgment.
+   * `verify()` outcome) enters through `taskVerdict`, which derives it from
+   * the chain rather than believing the caller.
    */
   async submitDelegation(input: {
     taskId: string
@@ -2680,15 +3139,55 @@ export class ProofEngine {
     const artifactVerified = verification.problems.length === 0
       && verification.manifestOk
       && verification.chainBreaks.length === 0
-    const claimedGrade: ProofGrade = input.claimedGrade
-      ?? (artifactVerified && verification.baselineId !== undefined ? 'proven' : 'no-baseline')
-    const problems = verification.problems.slice(0, 5)
+    // H-05: the artifact's TRUST ROOT. Every `verifyBundle` check so far is a
+    // self-consistency check — digests match the manifest, the chain walks,
+    // the anchor agrees with the chain the bundle itself carries — so a
+    // bundle built from scratch out of whole cloth verifies "clean", and a
+    // self-reported proven over it composed to a zero-blocker proven. The
+    // missing question is: does the bundle's evidence chain carry a SIGNED
+    // checkpoint naming the key the obligation's minter anchored? A signature
+    // is the one thing an empty-log forger cannot self-supply.
+    const walk = walkChain(bundleLogLines(bundle.files[EVIDENCE_FILE] ?? ''))
+    const malformed = new Set(walk.malformedCheckpoints)
+    const signedKeyIds = new Set(walk.checkpoints
+      .filter(cp => cp.sig !== null && cp.keyId !== null && !malformed.has(cp.index))
+      .map(cp => cp.keyId as string))
+    const anchorKey = await this.obligationAnchorKeyId()
+    const evidenceAnchored = anchorKey !== undefined
+      ? signedKeyIds.has(anchorKey)
+      : signedKeyIds.size > 0
+    // The grade the bundle's evidence can actually support: proven only when
+    // the artifact is self-consistent, carries a baseline AND is anchored to
+    // the minter's key; no-baseline for an anchored bundle without one; and
+    // capped at unproven — no matter how clean the self-consistency — when
+    // the evidence has no verifiable root.
+    const derivedGrade: ProofGrade = !evidenceAnchored
+      ? 'unproven'
+      : artifactVerified && verification.baselineId !== undefined ? 'proven' : 'no-baseline'
+    const problems: string[] = []
+    if (!evidenceAnchored) {
+      problems.push(anchorKey !== undefined
+        ? `bundle evidence not anchored: no signed checkpoint on the bundle's chain names the obligation anchor key ${anchorKey}`
+        : 'bundle evidence not anchored: the issuing chain carries no anchor key, and the bundle has no signed checkpoint at all')
+    }
+    // `claimedGrade` honesty boundary: a claim that exceeds what the evidence
+    // derives is capped and the discrepancy recorded — never believed, never
+    // silently dropped. (A claim over an artifact that FAILED verification is
+    // left exactly as declared: the composer's forgery charge is the harsher
+    // and more honest verdict there, and capping would only launder it.)
+    let claimedGrade: ProofGrade = input.claimedGrade ?? derivedGrade
+    if (artifactVerified && gradeRank(claimedGrade) > gradeRank(derivedGrade)) {
+      problems.push(`claimedGrade ${claimedGrade} exceeds the bundle evidence (${derivedGrade})`)
+      claimedGrade = derivedGrade
+    }
+    problems.push(...verification.problems)
+    const bounded = problems.slice(0, 5)
     const submission: DelegationSubmission = {
       childWorkspace: input.byWorkspace ?? bundle.manifest.workspaceKey,
       bundleRoot: bundleFingerprint(bundle.manifest.files),
       claimedGrade,
       artifactVerified,
-      ...(problems.length > 0 ? { problems } : {}),
+      ...(bounded.length > 0 ? { problems: bounded } : {}),
       submittedAt: new Date(this.clock.now()).toISOString(),
     }
     await this.store.mark('delegation/verdict', { taskId: input.taskId, submission })
@@ -2701,9 +3200,19 @@ export class ProofEngine {
   /**
    * v0.19: compose a task's verdict over the whole responsibility DAG
    * rebuilt from the chain (`delegation/created` + `delegation/verdict` +
-   * `delegation/waive`). `ownGrade`, when given, is THIS workspace's own
-   * locally-earned grade for the task — the one leg submission cannot
-   * supply, because the parent's own evidence never left the parent's chain.
+   * `delegation/waive`).
+   *
+   * H-11: `ownGrade` is a DECLARATION, never a measurement. The composed
+   * verdict's own-workspace leg derives from the chain — the latest
+   * `proof/verified` marker's grade, the freshest locally-earned verdict
+   * this engine itself wrote — and the caller's self-report can only say
+   * less than the evidence, never more: a report that exceeds the derived
+   * grade is recorded (returned as `discrepancies`, echoed into the composed
+   * blockers) and the derived grade stands. With no marker on the chain
+   * there is no own evidence at all: a self-reported 'proven' is a
+   * discrepancy and the composition proceeds pure-delegation, judged by the
+   * children's submissions alone.
+   *
    * `cycles` is the defense-in-depth report: empty on any chain this engine
    * alone wrote to, populated the moment a foreign edge closed a loop.
    */
@@ -2719,11 +3228,35 @@ export class ProofEngine {
       throw new Error(`taskVerdict: taskId ${input.taskId} does not exist on this chain — delegateTask first`)
     }
     const cycles = detectCycles(nodes.map(n => n.obligation))
-    const ownGrades = input.ownGrade !== undefined
-      ? new Map<string, ProofGrade>([[input.taskId, input.ownGrade]])
+    // H-11: the own-workspace leg, derived from the chain's own latest
+    // verdict — structurally read (the marker channel is untrusted input
+    // like every other log reader here).
+    const verdictMarkers = await this.markersWith('proof/verified')
+    const latest = verdictMarkers.length > 0 ? verdictMarkers[verdictMarkers.length - 1] : undefined
+    const derived: ProofGrade | undefined = typeof latest?.grade === 'string'
+      && DELEGATION_GRADES.has(latest.grade)
+      ? latest.grade as ProofGrade
+      : undefined
+    const discrepancies: string[] = []
+    if (input.ownGrade !== undefined) {
+      if (derived !== undefined && gradeRank(input.ownGrade) > gradeRank(derived)) {
+        discrepancies.push(`ownGrade self-report '${input.ownGrade}' exceeds the chain's evidence-derived grade '${derived}' — the derived grade stands`)
+      } else if (derived === undefined && gradeRank(input.ownGrade) > 1) {
+        discrepancies.push(`ownGrade self-report '${input.ownGrade}' has no proof/verified marker on this chain to stand on — no own evidence exists to lift`)
+      }
+    }
+    const ownGrades = derived !== undefined
+      ? new Map<string, ProofGrade>([[input.taskId, derived]])
       : new Map<string, ProofGrade>()
     const composed = composeTaskVerdict(input.taskId, nodes, ownGrades)
-    return { composed, nodes, cycles }
+    return {
+      composed: discrepancies.length > 0
+        ? { ...composed, blockers: [...composed.blockers, ...discrepancies.map(d => `${input.taskId}: ${d}`)] }
+        : composed,
+      nodes,
+      cycles,
+      ...(discrepancies.length > 0 ? { discrepancies } : {}),
+    }
   }
 
   /**
@@ -2734,6 +3267,14 @@ export class ProofEngine {
    * other — the composition layer is the one that refuses it. `by` and
    * `reason` are mandatory and non-empty: an anonymous or unexplained
    * acceptance of risk is not an acceptance, it is an erasure.
+   *
+   * H-10: the acceptance itself must be AUTHORIZED. `by` names the party
+   * accepting the risk, and the only parties who may are the OBLIGATION'S
+   * ISSUER (`issuedByWorkspace` — the workspace that opened the obligation
+   * owns the risk of leaving it unmet) or this host when it holds the
+   * anchor key (the operator of the chain the obligation was minted on).
+   * Anyone else's waiver is refused loudly AND recorded: a rejected
+   * risk-acceptance attempt is itself a fact the chain should keep.
    */
   async waiveDelegation(input: { taskId: string; by: string; reason: string }): Promise<void> {
     if (typeof input.taskId !== 'string' || input.taskId.length === 0) {
@@ -2745,13 +3286,26 @@ export class ProofEngine {
     if (typeof input.reason !== 'string' || input.reason.trim().length === 0) {
       throw new Error('waiveDelegation: reason must be a non-empty string')
     }
-    const exists = (await this.delegationObligations()).some(o => o.taskId === input.taskId)
-    if (!exists) {
+    const obligation = (await this.delegationObligations()).find(o => o.taskId === input.taskId)
+    if (obligation === undefined) {
       throw new Error(`waiveDelegation: no delegation/created marker for taskId ${input.taskId}`)
+    }
+    // H-10: authenticate the acceptor before the books are opened.
+    const by = input.by.trim()
+    if (by !== obligation.issuedByWorkspace && !(await this.holdsAnchorKey())) {
+      await this.store.mark('delegation/waive-refused', {
+        taskId: input.taskId,
+        by: by.slice(0, 200),
+        issuedByWorkspace: obligation.issuedByWorkspace,
+      })
+      throw new Error(
+        `waiveDelegation: "${by.slice(0, 200)}" may not waive ${input.taskId} — only the issuing workspace `
+        + `(${obligation.issuedByWorkspace}) or the holder of its anchor key may accept this risk`,
+      )
     }
     await this.store.mark('delegation/waive', {
       taskId: input.taskId,
-      by: input.by.trim().slice(0, 200),
+      by: by.slice(0, 200),
       reason: input.reason.trim().slice(0, 200),
       at: new Date(this.clock.now()).toISOString(),
     })
@@ -2805,6 +3359,49 @@ export class ProofEngine {
     return [...nodes.values()]
   }
 
+  /**
+   * H-05: the trust root a submitted bundle's evidence must answer to — the
+   * keyId of THIS workspace's anchor (the obligation minter's out-of-band
+   * root), falling back to the key our own chain's last signed checkpoint
+   * names (the anchor mirrors exactly that checkpoint, so the two agree on
+   * any honest deployment; the fallback keeps anchor-less-but-signed hosts
+   * demanding *some* signature instead of nothing). `undefined` = this
+   * deployment has no key at all, and the weaker "any signed checkpoint"
+   * rule applies — still strictly more than the nothing v0.21 demanded.
+   */
+  private async obligationAnchorKeyId(): Promise<string | undefined> {
+    if (this.anchorPath !== undefined) {
+      const raw = await this.fs.readFile(this.anchorPath)
+      if (raw !== undefined) {
+        const anchor = parseAnchor(raw)
+        if (anchor !== undefined && anchor.keyId !== '') return anchor.keyId
+      }
+    }
+    return (await this.store.latestSignedCheckpoint())?.keyId
+  }
+
+  /**
+   * H-10: does THIS host hold the anchor key? The one authorization besides
+   * the issuing workspace's name: an operator on the machine that holds the
+   * key the anchor names can accept the risk of the obligations that key's
+   * chain minted. No signer wired, no anchor deployed, an anchor that will
+   * not parse, or a different key — all answer false, the conservative
+   * direction for a risk-acceptance verb.
+   */
+  private async holdsAnchorKey(): Promise<boolean> {
+    if (this.signerProvider === undefined || this.anchorPath === undefined) return false
+    const raw = await this.fs.readFile(this.anchorPath)
+    if (raw === undefined) return false
+    const anchor = parseAnchor(raw)
+    if (anchor === undefined || anchor.keyId === '') return false
+    try {
+      const signer = await this.signerProvider()
+      return signer !== undefined && signer.keyId === anchor.keyId
+    } catch {
+      return false
+    }
+  }
+
   // -- training export (v0.20) ----------------------------------------------------
 
   /**
@@ -2813,13 +3410,19 @@ export class ProofEngine {
    * state translated into `DistillInput`; the distillation itself is
    * `core/training.ts`'s.
    *
-   * - **records** — the store's full log (`all()`), not just the slice before
-   *   the last checkpoint: the dataset anchors to the chain state at export
-   *   time, and the returned `anchor` names where the strongest commitment
-   *   stood ({count, head} of the last checkpoint, keyId when signed). A
-   *   consumer re-deriving the sample set from the same records reproduces
-   *   the manifest root or holds a different chain — that is the whole point
-   *   of anchoring.
+   * - **audit first (H-13)** — the export REFUSES a chain that fails its own
+   *   integrity audit (`store.audit()`), loudly, before any sample is
+   *   distilled: a dataset is "no annotator graded and no model
+   *   self-reported" only as long as the bytes it distils from are the bytes
+   *   the chain committed to. A tampered log would otherwise distil into a
+   *   perfectly self-consistent poisoned dataset.
+   * - **records** — the store's log SLICED to the current baseline's anchor
+   *   (H-13): only records produced AFTER the anchoring batch enter the
+   *   dataset. The anchoring batch itself is an observation of the OLD state
+   *   — self-comparing it against the baseline it built used to mint
+   *   reward-1.0 positive samples out of thin air (the self-proof loop), and
+   *   weeks-old records paired with today's changedPaths used to read as
+   *   "this change held" across a time window that never happened.
    * - **baselineVerdicts** — the loaded baseline's checks folded into the
    *   verdict vocabulary. `Baseline.checks` holds evidence RECORDS (not
    *   verdicts), so each is narrowed through `verdictOf(record, record)`: the
@@ -2835,17 +3438,64 @@ export class ProofEngine {
    *   `markerProvenance`). The manifest's `provenanceFilter` records the
    *   REQUESTED value either way.
    *
-   * `options.path`, when given, writes two files through the fs port's atomic
-   * `writeFile`: the JSONL samples (one `canonicalJson` line each) and the
-   * single manifest document. An empty chain is a legal export: zero counts,
-   * zero samples, anchor `{count: 0, head: ''}`.
+   * Idempotent re-runs (H-14): the full sliced record set is handed to
+   * distillation verbatim — same-content sample deduplication is the
+   * distiller's (core/training.ts), so a green workspace re-verified N times
+   * cannot water the reward table with N byte-identical "still-passing"
+   * positives.
+   *
+   * `options.path`, when given, is CONFINED to the workspace (H-16): the path
+   * must be workspace-relative — absolute paths and any `..` segment are
+   * refused loudly, and both files (the JSONL samples, one `canonicalJson`
+   * line each, and the single manifest document) land under the engine's
+   * root through the fs port's atomic `writeFile`. An empty chain is a legal
+   * export: zero counts, zero samples, anchor `{count: 0, head: ''}`.
    */
   async exportTrainingData(options: TrainingExportOptions = {}): Promise<TrainingExportResult> {
+    // H-13: the audit gate. Refuse — loudly, writing nothing — rather than
+    // distil a dataset whose integrity story cannot be told.
+    const audit = await this.store.audit()
+    if (!audit.ok || audit.chain.baselineTampered) {
+      const reasons: string[] = []
+      if (audit.corrupt.length > 0) reasons.push(`${audit.corrupt.length} corrupt record(s)`)
+      if (audit.chain.breaks.length > 0) reasons.push(`${audit.chain.breaks.length} chain break(s)`)
+      if (audit.chain.corruptLines?.length) reasons.push(`${audit.chain.corruptLines.length} corrupt line(s)`)
+      if (audit.chain.badCheckpoints.length > 0) reasons.push(`${audit.chain.badCheckpoints.length} forged checkpoint signature(s)`)
+      if (audit.chain.headMismatches.length > 0) reasons.push(`${audit.chain.headMismatches.length} head mismatch(es)`)
+      if (audit.chain.malformedCheckpoints?.length) reasons.push(`${audit.chain.malformedCheckpoints.length} malformed checkpoint(s)`)
+      if (audit.chain.unsignedCheckpoints.length > 0) reasons.push(`${audit.chain.unsignedCheckpoints.length} unsigned checkpoint(s) on a signed chain`)
+      if (audit.chain.rewind) reasons.push('the log ends before the anchored high-water mark (rewind)')
+      if (audit.chain.anchorMismatch) reasons.push('the anchor disagrees with the chain it anchors')
+      if (audit.chain.anchorForged) reasons.push('the anchor file failed its own signature check')
+      if (audit.chain.baselineTampered) reasons.push('the baseline file no longer matches its chain-recorded digest')
+      throw new Error(
+        `exportTrainingData: the evidence chain failed its integrity audit (${reasons.join('; ')}) `
+        + '— refusing to distil a dataset from untrusted bytes',
+      )
+    }
     const fidelity: SampleFidelity = options.fidelity ?? 'private'
     const provenanceFilter: 'agent-only' | 'all' = options.provenanceFilter ?? 'agent-only'
-    const records = await this.store.all()
+    const allRecords = await this.store.all()
+    const baseline = await this.store.loadBaseline()
+    // H-13: slice to the anchoring batch. The baseline's LAST check record
+    // marks the anchor position in the log; everything after it is post-
+    // anchor behaviour this baseline judged. No baseline (or an anchor record
+    // the log cannot find) keeps the honest subset: with no baseline there is
+    // nothing to time-order against, and a baseline whose records vanished
+    // from the log is the audit's problem, not a reason to guess an ordering.
+    const anchorRecord = baseline !== undefined && baseline.checks.length > 0
+      ? baseline.checks[baseline.checks.length - 1]
+      : undefined
+    const anchorIndex = anchorRecord === undefined
+      ? -1
+      : allRecords.findLastIndex(r => r.evidenceId === anchorRecord.evidenceId)
+    const records = anchorIndex >= 0
+      ? allRecords.slice(anchorIndex + 1)
+      : anchorRecord === undefined
+        ? allRecords
+        : []
     const baselineVerdicts = new Map<string, CheckVerdict>()
-    for (const record of (await this.store.loadBaseline())?.checks ?? []) {
+    for (const record of baseline?.checks ?? []) {
       baselineVerdicts.set(record.checkId, verdictOf(record, record))
     }
     const markers = await this.markersWith('proof/verified')
@@ -2875,13 +3525,62 @@ export class ProofEngine {
     const manifest: TrainingManifest = training.manifest
     const anchor = await this.trainingAnchor()
     if (options.path !== undefined) {
-      const dir = exportDirOf(options.path)
-      if (dir.length > 0) await this.fs.mkdirp(dir)
+      // H-16: the export path is workspace-relative, no exceptions. The
+      // checked-out workspace is the audited area; an export that could name
+      // `../../evidence.jsonl` or an absolute host path would hand the
+      // caller a write primitive the whole guard stack never sees.
+      const rel = this.exportRelPath(options.path)
+      const dir = dirnameRel(rel)
+      if (dir.length > 0) await this.fs.mkdirp(`${this.root}/${dir}`)
       const lines = training.samples.map(sample => canonicalJson(sample))
-      await this.fs.writeFile(options.path, lines.length > 0 ? `${lines.join('\n')}\n` : '')
-      await this.fs.writeFile(`${options.path}.manifest.json`, `${canonicalJson(manifest)}\n`)
+      await this.fs.writeFile(`${this.root}/${rel}`, lines.length > 0 ? `${lines.join('\n')}\n` : '')
+      await this.fs.writeFile(`${this.root}/${rel}.manifest.json`, `${canonicalJson(manifest)}\n`)
     }
     return { manifest, samples: training.samples, anchor }
+  }
+
+  /**
+   * H-16: validate and normalise one caller-supplied export path to a
+   * workspace-relative form. Refuses, loudly, on: empty paths, absolute
+   * paths (drive letters, `/`-roots and — M-35's lesson — `\\server` UNC
+   * roots), and ANY `..` segment (over-strict on purpose: a dotdot that
+   * happens to re-enter the workspace is indistinguishable, at this trust
+   * boundary, from one that escapes it, and the caller can always name the
+   * direct spelling).
+   */
+  private exportRelPath(path: string): string {
+    if (path.length === 0) {
+      throw new Error('exportTrainingData: path must be a non-empty workspace-relative path')
+    }
+    if (isAbsolutePath(path)) {
+      throw new Error(`exportTrainingData: path must be workspace-relative — absolute paths are refused (${JSON.stringify(path.slice(0, 80))})`)
+    }
+    if (path.replace(/\\/g, '/').split('/').includes('..')) {
+      throw new Error('exportTrainingData: path must stay inside the workspace — ".." segments are refused; name the workspace-relative path directly')
+    }
+    const normalized = normalizeRel(path)
+    if (normalized.length === 0) {
+      throw new Error('exportTrainingData: path must name a file, not a directory')
+    }
+    // N-2 (red team): case is not a boundary — on the case-insensitive
+    // filesystems most agents run on, `.PROOF/evidence.jsonl` IS the store,
+    // and an export that truncates the evidence log destroys the very chain
+    // that anchors the dataset. The comparison folds case, separators and
+    // Win32 trailing-dot/space deformation — the same folds the adapter
+    // guard's comparisons make.
+    const foldHost = (p: string): string => p.replace(/\\/g, '/')
+      .split('/')
+      .map(segment => segment.replace(/[. ]+$/, '').toLowerCase())
+      .filter(segment => segment.length > 0)
+      .join('/')
+    const foldedTarget = foldHost(`${this.root}/${normalized}`)
+    const foldedStore = foldHost(this.storeDir)
+    if (foldedStore.length > 0 && (foldedTarget === foldedStore || foldedTarget.startsWith(`${foldedStore}/`))) {
+      throw new Error(
+        `exportTrainingData: path resolves into the evidence store (${path}) — the dataset may not overwrite the chain that anchors it; export to a path outside the store`,
+      )
+    }
+    return normalized
   }
 
   /**
@@ -2917,26 +3616,42 @@ export class ProofEngine {
    * parsed here through the same fs port — the least invasive route that
    * leaves `EvidenceStore`'s public surface untouched. Any read or parse
    * failure degrades to "no witnesses" rather than failing verification.
+   *
+   * H-32: markers the evidence layer flags `suspect` (bound to a chain
+   * position the walk no longer corroborates) are EXCLUDED from the fusion
+   * and counted instead — the count rides the boundary markers so the
+   * withheld testimony stays visible in the narrative.
    */
-  private async activeAttestationsAll(): Promise<Attestation[]> {
+  private async activeAttestationsAll(): Promise<{ active: Attestation[]; suspect: number }> {
     try {
       const payloads: unknown[] = []
-      for (const line of await this.fs.readLines(this.logPath)) {
+      let suspect = 0
+      // H-32/N-4: the suspect test is the evidence layer's POSITION check
+      // (does this marker's headRef match its physical predecessor?), not a
+      // field anyone could echo back — an appended attest twin contradicts
+      // its position and never reaches the fusion.
+      const lines = await this.fs.readLines(this.logPath)
+      for (let i = 0; i < lines.length; i += 1) {
         let envelope: { kind?: unknown; payload?: unknown }
         try {
-          envelope = JSON.parse(line) as { kind?: unknown; payload?: unknown }
+          envelope = JSON.parse(lines[i]!) as { kind?: unknown; payload?: unknown }
         } catch {
           continue
         }
         if (envelope?.kind !== 'marker') continue
         const payload = envelope.payload as { label?: unknown } | undefined
-        if (payload?.label === 'attest/jury' || payload?.label === 'attest/human') payloads.push(payload)
+        if (payload?.label !== 'attest/jury' && payload?.label !== 'attest/human') continue
+        if (isSuspectMarker(lines, i)) {
+          suspect += 1
+          continue
+        }
+        payloads.push(payload)
       }
-      return activeAttestations(payloads)
+      return { active: activeAttestations(payloads), suspect }
     } catch {
       // An unreadable log cannot veto verification — it simply has no
       // witnesses to fuse. (The log's own integrity is `audit()`'s charge.)
-      return []
+      return { active: [], suspect: 0 }
     }
   }
 
@@ -3308,14 +4023,25 @@ export class ProofEngine {
    * log, priced with a quarter of the per-check timeout as the fallback cost
    * of a check that has never been observed.
    *
-   * H5: drifted checks are re-priced at the synthetic false-pass tier — the
-   * same β `PriorInput.syntheticFalsePass` charges a conjured test. A script
-   * body rewritten after the baseline carries at least the false-pass risk of
-   * a test authored by an interested party: whatever green it now reports, the
-   * body is new, unreviewed, and chosen by the same hand that owns the claim.
-   * The re-price is a map rewrite (core/bayes.ts is not this batch's to edit):
-   * every other parameter — learned failure tendency, flake rate, impact —
-   * keeps what history honestly said about the OLD body's sensor behaviour.
+   * H-03: a drifted check's OLD-BODY history is not evidence for the new
+   * body. The β discount used to be a one-shot rewrite while the learned
+   * prior (≈0.836 after five green runs) kept compounding — a tampered
+   * `"test": "node -e \"\""` borrowed the old body's green and one forged
+   * pass crossed the default 0.97 target. Two moves close it:
+   *
+   * - **time-sliced history** — for every drifted id, only records stamped
+   *   AFTER the chain first recorded that id's drift are summarised. First
+   *   detection: no such records exist, so the id prices at the cold prior
+   *   (ρ = 1/5, π = 1 − 0.2·impact ≤ 0.9 — and any factor ≤ 0.9 caps the
+   *   claim product below the 0.97 target, M-05's unanswered-drift shape
+   *   included). Later runs: the NEW body re-earns its prior honestly, pass
+   *   by pass, from its own records alone.
+   * - **the unreviewed-body β** (`driftedFalsePass`, default 0.5 — above the
+   *   synthetic tier: these bytes replaced a body the baseline had vouched
+   *   for, chosen by the hand that owns the claim, screened by no one) — so
+   *   a single new-body pass posterior lands ≈0.94, visibly short of 0.97;
+   *   re-certification takes multiple honest observations or a fresh
+   *   baseline.
    */
   private async priorsFor(
     affected: readonly CheckSpec[],
@@ -3323,7 +4049,21 @@ export class ProofEngine {
     graph: DependencyGraph | undefined,
     drifted?: ReadonlySet<string>,
   ): Promise<Map<string, CheckPrior>> {
-    const history = summarizeHistory(await this.store.all())
+    const all = await this.store.all()
+    // H-03: slice each drifted id's history to its post-drift records. An
+    // id the chain has never recorded as drifted-yet (first detection, this
+    // run) has no boundary and therefore no admissible history at all.
+    const driftSeenAt = drifted !== undefined && drifted.size > 0
+      ? await this.scriptDriftFirstSeen()
+      : undefined
+    const usable = driftSeenAt === undefined
+      ? all
+      : all.filter(record => {
+        if (!drifted?.has(record.checkId)) return true
+        const firstSeen = driftSeenAt.get(record.checkId)
+        return firstSeen !== undefined && record.recordedAt > firstSeen
+      })
+    const history = summarizeHistory(usable)
     const priors = computePriors({
       specs: affected,
       changed,
@@ -3341,10 +4081,41 @@ export class ProofEngine {
     const out = new Map<string, CheckPrior>()
     for (const [checkId, prior] of priors) {
       out.set(checkId, drifted.has(checkId)
-        ? { ...prior, falsePass: this.options.syntheticFalsePass }
+        ? { ...prior, falsePass: this.options.driftedFalsePass }
         : prior)
     }
     return out
+  }
+
+  /**
+   * H-03: the envelope `at` where each checkId's script drift FIRST became a
+   * chain fact (the first `proof/verified` marker carrying it in
+   * `scriptDrift`) — the time boundary between the old body's records and
+   * the new body's. Drift markers repeat on every verify while the body
+   * stays un-re-anchored; only the first sighting is the boundary.
+   */
+  private async scriptDriftFirstSeen(): Promise<Map<string, string>> {
+    const seen = new Map<string, string>()
+    try {
+      for (const line of await this.fs.readLines(this.logPath)) {
+        let envelope: { kind?: unknown; at?: unknown; payload?: unknown }
+        try {
+          envelope = JSON.parse(line) as { kind?: unknown; at?: unknown; payload?: unknown }
+        } catch {
+          continue
+        }
+        if (envelope?.kind !== 'marker') continue
+        const payload = envelope.payload as { label?: unknown; scriptDrift?: unknown } | undefined
+        if (payload?.label !== 'proof/verified' || !Array.isArray(payload.scriptDrift)) continue
+        if (typeof envelope.at !== 'string') continue
+        for (const id of payload.scriptDrift) {
+          if (typeof id === 'string' && !seen.has(id)) seen.set(id, envelope.at)
+        }
+      }
+    } catch {
+      /* unreadable log → no boundary is knowable → drifted ids price fully cold */
+    }
+    return seen
   }
 
   /**

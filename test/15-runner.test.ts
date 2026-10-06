@@ -13,7 +13,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { VerificationRunner } from '../src/core/runner.ts'
-import type { CommandPort, CommandResult, CommandRunOptions } from '../src/core/ports.ts'
+import type { Clock, CommandPort, CommandResult, CommandRunOptions } from '../src/core/ports.ts'
 import { sha256 } from '../src/core/hash.ts'
 import { FakeClock, FakeCommands, FakeWorkspace, spec } from './helpers.ts'
 
@@ -52,6 +52,16 @@ class ScriptedCommands extends FakeCommands implements CommandPort {
         exitCode: null, output: 'partial output before the kill', durationMs: 5, aborted: false,
         spawnError: 'timed out after 1000ms', timedOut: true,
       }
+    }
+    if (argv.includes('trap-timeout')) {
+      // H-18(d)/B7-M1, the POSIX shape a real port can now produce: the child
+      // TRAPPED the port's SIGTERM and exited with a code (graceful shutdown,
+      // jest worker pools). The port carries the first-class timedOut fact on
+      // the close(code !== null) shape too; the runner must rank it over the
+      // exit code or the timeout launders into a decisive 'fail' — a false
+      // regression on the session's ledger.
+      await super.run(argv, options)
+      return { exitCode: 1, output: 'graceful shutdown after SIGTERM', durationMs: 5, aborted: false, timedOut: true }
     }
     if (argv.includes('enoent')) {
       await super.run(argv, options)
@@ -247,4 +257,66 @@ test('RUNNER: timedOut=true maps to timeout even though the result carries a spa
 
   const enoent = byId.get('s')
   assert.equal(enoent?.status, 'error', 'a spawnError WITHOUT timedOut is still "never ran" — an error')
+})
+
+// 9. timedOut with a non-null exitCode stays a timeout (H-18d/B7-M1) --------------
+
+test('RUNNER: timedOut=true with a non-null exitCode is still a timeout, not a decisive fail (H-18d)', async () => {
+  // The POSIX SIGTERM-trap shape: the port killed the child for exceeding its
+  // budget, the child's handler ran process.exit(1) on the way down. Before
+  // the port carried `timedOut` through the close(code !== null) path, this
+  // landed as exitCode 1 → 'fail' — a DECISIVE outcome, recording a false
+  // regression for a check that was merely slow. The first-class fact wins.
+  const commands = new ScriptedCommands()
+  const result = await new VerificationRunner(commands, new FakeWorkspace(ROOT), new FakeClock())
+    .run([spec({ id: 'trapped', command: ['node', 'trap-timeout'] })])
+
+  const record = result.records[0]
+  assert.equal(record?.status, 'timeout', '"we killed it for exceeding the budget" outranks the corpse exit code')
+  assert.equal(record?.exitCode, 1, 'the exit code itself is preserved as a fact')
+  assert.match(record?.outputHead ?? '', /graceful shutdown/, 'captured pre-death output rides along')
+})
+
+// 10. In-flight budget overrun is recorded, not hidden (M-08) -----------------------
+
+/** Clock the test advances explicitly — no per-read ticking to hand-count. */
+class ManualClock implements Clock {
+  nowMs = 1_000
+  now(): number { return this.nowMs }
+}
+
+/** FakeCommands whose every run advances the manual clock by a fixed cost. */
+class AdvancingCommands extends FakeCommands implements CommandPort {
+  private readonly clock: ManualClock
+  constructor(clock: ManualClock) { super(); this.clock = clock }
+  async run(argv: readonly string[], options: CommandRunOptions): Promise<CommandResult> {
+    const result = await super.run(argv, options)
+    this.clock.nowMs += 50
+    return result
+  }
+}
+
+test('RUNNER: a check finishing past the budget flags budgetExceeded without being killed (M-08)', async () => {
+  // totalBudgetMs gates which checks START; the third check is admitted at
+  // t=100 (budget 120 still has room), runs its 50ms, and lands at t=150 —
+  // 30ms past the line. The old behaviour: nothing recorded the overrun, and
+  // the "wall-clock budget for the whole batch" claim quietly failed. The
+  // fix keeps the evidence real (no hard kill) and flags the batch.
+  const clock = new ManualClock()
+  const commands = new AdvancingCommands(clock)
+  const result = await new VerificationRunner(commands, new FakeWorkspace(ROOT), clock)
+    .run([spec({ id: 'a' }), spec({ id: 'b' }), spec({ id: 'c' })],
+      { concurrency: 1, totalBudgetMs: 120 })
+
+  assert.deepEqual(result.ranIds, ['a', 'b', 'c'], 'an in-flight check is never hard-killed — it finished')
+  assert.deepEqual(result.skippedIds, [], 'nothing was left unstarted: the budget never blocked a START')
+  assert.equal(result.budgetExceeded, true, 'the batch overran its wall-clock budget and says so')
+  assert.ok(result.records.every(r => r.status === 'pass'), 'the overrun check\'s evidence is a real pass, not a mangled skip')
+
+  // Control: the same batch inside the budget does not flag.
+  const fineClock = new ManualClock()
+  const fine = await new VerificationRunner(new AdvancingCommands(fineClock), new FakeWorkspace(ROOT), fineClock)
+    .run([spec({ id: 'a' }), spec({ id: 'b' }), spec({ id: 'c' })],
+      { concurrency: 1, totalBudgetMs: 10_000 })
+  assert.equal(fine.budgetExceeded, undefined, 'a batch that fits its budget carries no flag')
 })

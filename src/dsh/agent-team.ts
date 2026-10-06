@@ -146,7 +146,10 @@ export function normalizeTeamEvent(raw: unknown): TeamBridgeEvent | undefined {
  * What the bridge needs from its host. `delegate` is the engine's
  * `delegateTask` (or a test double); `instructionOf` renders the worker's
  * handoff text (index.ts's template, worded after the MCP `proof_delegate`
- * face); `stderr` receives the degradation lines, one at a time.
+ * face); `stderr` receives the degradation lines, one at a time. `mark`
+ * (wired by index.ts to the engine's store) lands the bridge's own
+ * observation markers on the tamper-evident chain — the parent-edge losses
+ * and id mappings below are chain facts, not stderr ephemera.
  */
 export interface TeamBridgeDeps {
   delegate: (input: { claim: string; parentTaskId?: string; acceptance?: string }) => Promise<{
@@ -156,6 +159,8 @@ export interface TeamBridgeDeps {
   }>
   instructionOf: (taskId: string, obligationId: string, claim: string) => string
   stderr?: (line: string) => void
+  /** Best-effort observation marker onto the chain; absent = no chain access. */
+  mark?: (label: string, payload: Record<string, unknown>) => Promise<void>
 }
 
 /**
@@ -190,6 +195,18 @@ function claimOf(event: TeamBridgeEvent): string | undefined {
  * Build the bridge: `onEvent` accepts a raw host event (unnormalized), and
  * `seams` carries the event names it expects to be fed from.
  *
+ * H-12 (v0.23): the host's task vocabulary and the engine's `task-N` ids are
+ * DIFFERENT namespaces, and the bridge no longer pretends otherwise. A host
+ * `parentTaskId` is translated through the hostId→engineId map the bridge
+ * maintains (every delegation it mints records the mapping, on-chain when a
+ * `mark` channel exists); an unmapped parent — including one that merely
+ * LOOKS like `task-N`, which could coincide with an engine id minted for an
+ * unrelated task — is never cast into the engine namespace. The obligation is
+ * still minted, as a root, and the lost parent edge is recorded loudly
+ * (stderr + observation marker) with the host's own id spelled out for
+ * manual re-linking. Silent wrong edges and silent lost obligations were the
+ * two failure modes; both are now visible.
+ *
  * `onEvent` never throws and never rejects: an unrecognizable event returns
  * silently, a delegation failure degrades to a stderr line, and a frozen or
  * absent payload channel degrades to a stderr handoff (taskId + obligationId)
@@ -202,6 +219,8 @@ export function createTeamBridge(deps: TeamBridgeDeps): {
   seams: string[]
 } {
   const seen = new WeakSet<object>()
+  /** Host task id → engine task id, for every obligation this bridge minted. */
+  const hostToEngine = new Map<string, string>()
   return {
     seams: [...TEAM_EVENT_SEAMS],
     onEvent: async (raw: unknown): Promise<void> => {
@@ -214,9 +233,49 @@ export function createTeamBridge(deps: TeamBridgeDeps): {
         if (event === undefined) return
         const claim = claimOf(event)
         if (claim === undefined) return
-        const parentTaskId = typeof event.parentTaskId === 'string' && event.parentTaskId.length > 0
+        const hostParentTaskId = typeof event.parentTaskId === 'string' && event.parentTaskId.length > 0
           ? event.parentTaskId
           : undefined
+        const hostTaskId = typeof event.taskId === 'string' && event.taskId.length > 0
+          ? event.taskId
+          : undefined
+        // H-12: translate the parent edge through the mapping — never trust
+        // shape coincidence between the two id namespaces.
+        let parentTaskId: string | undefined
+        let lostParent: { hostParentTaskId: string; reason: string } | undefined
+        if (hostParentTaskId !== undefined) {
+          const mapped = hostToEngine.get(hostParentTaskId)
+          if (mapped !== undefined) {
+            parentTaskId = mapped
+          } else {
+            // Unmapped. If it coincides with an engine id this bridge minted
+            // for a different host task, say so — that is the collision that
+            // used to mint a wrong signed parent edge.
+            let coincidence: string | undefined
+            for (const [host, engine] of hostToEngine) {
+              if (engine === hostParentTaskId && host !== hostParentTaskId) {
+                coincidence = `coincides with the engine id minted for host task ${JSON.stringify(host)}`
+                break
+              }
+            }
+            lostParent = {
+              hostParentTaskId,
+              reason: coincidence ?? 'no host task with this id was delegated through this bridge',
+            }
+          }
+        }
+        if (lostParent !== undefined) {
+          deps.stderr?.(
+            `dsh-proof: agent-team bridge could not translate parentTaskId `
+            + `${JSON.stringify(lostParent.hostParentTaskId)} (${lostParent.reason}) — the obligation below is `
+            + `minted as a ROOT; re-link it manually if the parent edge matters`,
+          )
+          await deps.mark?.('agent-team/parent-unmapped', {
+            hostParentTaskId: lostParent.hostParentTaskId,
+            reason: lostParent.reason,
+            claim: claim.slice(0, 200),
+          })
+        }
         let minted: { taskId: string; obligationId: string; obligation: unknown }
         try {
           minted = await deps.delegate({ claim, ...(parentTaskId !== undefined ? { parentTaskId } : {}) })
@@ -226,6 +285,17 @@ export function createTeamBridge(deps: TeamBridgeDeps): {
             + `${error instanceof Error ? error.message : String(error)}`,
           )
           return
+        }
+        // Record the namespace mapping so later host events (a grandchild, a
+        // verdict) can find this obligation — and so the mapping itself is a
+        // chain fact, not bridge-private memory.
+        if (hostTaskId !== undefined) {
+          hostToEngine.set(hostTaskId, minted.taskId)
+          await deps.mark?.('agent-team/delegated', {
+            hostTaskId,
+            engineTaskId: minted.taskId,
+            obligationId: minted.obligationId,
+          })
         }
         const instruction = deps.instructionOf(minted.taskId, minted.obligationId, claim)
         const payload = event.payload

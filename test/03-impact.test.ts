@@ -2,8 +2,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
-  attributeChange, buildDependencyGraph, extractImports, impactClosure,
-  isGlobalInvalidator, matches, matchesAny, selectAffectedChecks,
+  attributeChange, buildDependencyGraph, extractImportSites, extractImports,
+  impactClosure, isGlobalInvalidator, matches, matchesAny, selectAffectedChecks,
 } from '../src/core/impact.ts'
 import { MemoryFs, spec } from './helpers.ts'
 
@@ -76,6 +76,95 @@ test('python dotted imports resolve inside the scanned set only', async () => {
   // Edges are added only on proof: a dotted name with no scanned target
   // (the __init__ form here) adds nothing, so this stays exact, not guessed.
   assert.deepEqual([...impactClosure(graph, ['pkg/__init__.py'])], ['pkg/__init__.py'])
+})
+
+// ---------------------------------------------------------------------------
+// H-24 — the Python import forms that used to be edgeless. The absolute
+// `from pkg.mod import x` form was the only one with an edge; everything
+// below produced NO dependency edge at all, so a narrowly-pathed Python
+// check read "untouched" while its imports moved under it.
+// ---------------------------------------------------------------------------
+
+test('H-24: bare `import pkg.mod` carries the dependency edge', async () => {
+  const files = {
+    '/ws/pkg/__init__.py': '',
+    '/ws/pkg/mod.py': 'X = 1\n',
+    '/ws/bare.py': 'import pkg.mod\n',
+  }
+  const fs = MemoryFs.of(files)
+  const graph = await buildDependencyGraph(fs, '/ws', Object.keys(files).map(stripRoot))
+  const closure = impactClosure(graph, ['pkg/mod.py'])
+  assert.ok(closure.has('bare.py'), 'the bare statement binds to pkg/mod.py')
+  // The alias and comma-list spellings are dependency statements too.
+  const files2 = {
+    '/ws/pkg/mod.py': 'X = 1\n',
+    '/ws/other.py': 'Y = 1\n',
+    '/ws/bare2.py': 'import os, pkg.mod as m\n',
+  }
+  const graph2 = await buildDependencyGraph(MemoryFs.of(files2), '/ws', Object.keys(files2).map(stripRoot))
+  const closure2 = impactClosure(graph2, ['pkg/mod.py'])
+  assert.ok(closure2.has('bare2.py'), 'aliased comma-list bare import binds')
+  // os has no scanned target: proof-of-existence, no speculative edge.
+  assert.deepEqual([...impactClosure(graph2, ['other.py'])], ['other.py'])
+})
+
+test('H-24: relative python imports resolve by leading dots, not JS joins', async () => {
+  // `from .mod import x` / `from . import x` / `from ..x import z` /
+  // `from .sub.mod import w` — the old resolver joined `.mod` as a JS path
+  // segment (`pkg/.mod.py`), which never exists, so all four forms were
+  // edgeless. Python semantics: n leading dots = the source file's directory
+  // after climbing n−1 levels.
+  const files = {
+    '/ws/pkg/__init__.py': 'P = 1\n',
+    '/ws/pkg/mod.py': 'X = 1\n',
+    '/ws/pkg/sub/__init__.py': '',
+    '/ws/pkg/sub/mod.py': 'S = 1\n',
+    '/ws/pkg/main.py': 'from .mod import X\nfrom . import P\nfrom .sub.mod import S\n',
+    '/ws/other.py': 'Z = 1\n',
+    '/ws/pkg/deep.py': 'from ..other import Z\n',
+  }
+  const fs = MemoryFs.of(files)
+  const graph = await buildDependencyGraph(fs, '/ws', Object.keys(files).map(stripRoot))
+  const closure = (f: string) => impactClosure(graph, [f])
+  assert.ok(closure('pkg/mod.py').has('pkg/main.py'), 'from .mod import X -> pkg/mod.py')
+  assert.ok(closure('pkg/__init__.py').has('pkg/main.py'), 'from . import P -> pkg/__init__.py')
+  assert.ok(closure('pkg/sub/mod.py').has('pkg/main.py'), 'from .sub.mod import S -> pkg/sub/mod.py')
+  assert.ok(closure('other.py').has('pkg/deep.py'), 'from ..other import Z climbs out of the package')
+})
+
+test('H-24: `from pkg import mod` binds the submodule, not only the package', async () => {
+  const files = {
+    '/ws/pkg/__init__.py': '',
+    '/ws/pkg/mod.py': 'X = 1\n',
+    '/ws/app.py': 'from pkg import mod\n',
+  }
+  const fs = MemoryFs.of(files)
+  const graph = await buildDependencyGraph(fs, '/ws', Object.keys(files).map(stripRoot))
+  const closure = impactClosure(graph, ['pkg/mod.py'])
+  assert.ok(closure.has('app.py'), 'the imported NAME resolves to pkg/mod.py')
+  assert.ok(impactClosure(graph, ['pkg/__init__.py']).has('app.py'), 'the package itself still binds too')
+  // A plain function import adds no speculative submodule edge.
+  const files2 = { '/ws/pkg/__init__.py': 'def helper(): pass\n', '/ws/app.py': 'from pkg import helper\n' }
+  const graph2 = await buildDependencyGraph(MemoryFs.of(files2), '/ws', Object.keys(files2).map(stripRoot))
+  assert.ok(impactClosure(graph2, ['pkg/__init__.py']).has('app.py'), 'the package edge exists')
+})
+
+test('H-24/M-28: two imports on one line both carry edges — the second is not invisible', async () => {
+  const files = {
+    '/ws/a.ts': 'export const a = 1\n',
+    '/ws/b.ts': 'export const b = 1\n',
+    '/ws/multi.ts': "import { a } from './a'; import { b } from './b'\n",
+    '/ws/req.ts': "const x = require('./a'), y = require('./b')\n",
+  }
+  const fs = MemoryFs.of(files)
+  const graph = await buildDependencyGraph(fs, '/ws', Object.keys(files).map(stripRoot))
+  assert.ok(impactClosure(graph, ['a.ts']).has('multi.ts'), 'first in-line import binds')
+  assert.ok(impactClosure(graph, ['b.ts']).has('multi.ts'), 'SECOND in-line import binds too (used to be dropped)')
+  assert.ok(impactClosure(graph, ['a.ts']).has('req.ts'), 'first in-line require binds')
+  assert.ok(impactClosure(graph, ['b.ts']).has('req.ts'), 'SECOND in-line require binds too')
+  // And the sites exist for the LSP channel as well (positions verifiable).
+  const sites = extractImportSites(files['/ws/multi.ts'] as string)
+  assert.deepEqual(sites.map(s => s.specifier), ['./a', './b'])
 })
 
 test('impact closure walks reverse dependencies transitively', async () => {
@@ -175,6 +264,37 @@ test('M9: selection runs the previously-dead deep-glob check instead of burying 
   assert.equal(result.uncertain, false, 'the change is fully in-graph — only the glob shape decides')
   assert.deepEqual(result.affected.map(c => c.id), ['deep-glob'], 'the unsupported-glob check is selected, not skipped')
   assert.deepEqual(result.untouched.map(c => c.id), ['docs-check'], 'a supported narrow form still narrows honestly')
+})
+
+test('M-26: `./`- and `/`-prefixed patterns are normalised, not silently dead', () => {
+  // RelPaths never start with `./` or `/`, but users write both in config —
+  // the most natural spelling (`paths: ['./src/**']`) used to literal-compare
+  // `./src/` against `src/...` and match NOTHING, forever, without ever
+  // falling back to the conservative everything-match: a dead check wearing
+  // a live one's configuration (the M9 failure resurrected through a dot).
+  assert.ok(matches('src/a/b.ts', './src/**'), './-prefixed /** normalises to the supported form')
+  assert.ok(matches('src/a.ts', './src/*'), './-prefixed /* normalises')
+  assert.ok(matches('src/a.ts', './src/a.ts'), './-prefixed literal normalises')
+  assert.ok(!matches('docs/readme.md', './src/**'), 'a normalised narrow pattern still narrows honestly')
+  assert.ok(matches('anything/x.ts', '/src/**/*.ts'), 'a /-prefixed unsupported shape still falls back to everything')
+  assert.ok(matches('src/a.ts', '././src/**'), 'repeated ./ segments are all stripped')
+  assert.ok(matches('anything', './**'), './** normalises to the bare ** wildcard fallback')
+  assert.ok(matches('anything', './'), 'a pattern that normalises to nothing cannot mean a filter — match everything')
+  // The unprefixed canon is byte-identical to before.
+  assert.ok(matches('src/a/b.ts', 'src/**') && !matches('srcx/a.ts', 'src/**'))
+})
+
+test('M-26: selection honours a `./`-prefixed narrow path filter end to end', async () => {
+  const fs = MemoryFs.of(TREE)
+  const graph = await buildDependencyGraph(fs, '/ws', Object.keys(TREE).map(stripRoot))
+  const checks = [
+    spec({ id: 'src-check', paths: ['./src/**'] }),
+    spec({ id: 'docs-check', paths: ['docs/**'] }),
+  ]
+  const result = selectAffectedChecks(checks, ['src/c.ts'], graph)
+  assert.equal(result.uncertain, false)
+  assert.deepEqual(result.affected.map(c => c.id), ['src-check'], 'the ./-prefixed check is selectable, not dead')
+  assert.deepEqual(result.untouched.map(c => c.id), ['docs-check'])
 })
 
 test('graph reports truncation so callers can widen', async () => {

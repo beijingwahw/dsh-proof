@@ -96,6 +96,8 @@ export const SYNTHETIC_TEMPLATE: string = [
   '//   - any static or dynamic import of the process/network/worker modules',
   '//     named by FORBIDDEN_CAPABILITIES, in any of their node: spellings;',
   '//   - any require form of the same;',
+  '//   - any use of the zero-import outbound globals (fetch, WebSocket) —',
+  '//     reaching them needs no import at all, so none is accepted as cover;',
   '//   - any read of the environment-variable bag hanging off the process',
   '//     global — tests never need environment secrets.',
   '// fs IS allowed: read fixtures freely (writes are allowed but keep the',
@@ -178,10 +180,13 @@ export function sandboxEntryFor(claimId: string, seq: number): string {
  * process spawning (`child_process`), the environment bag (`process` /
  * `node:process` — an `import { env } from 'node:process'` would otherwise
  * bypass the whole `process.env` read check, and env reads are the classic
- * exfiltration channel), the network (`net`/`http`/`https`/`dgram`) and
+ * exfiltration channel), the network (`net`/`http`/`https`/`dgram`, and as
+ * of H-31 also `dns`/`tls` — a DNS lookup or a raw TLS socket is an outbound
+ * channel exactly like http, and dns tunnelling is the classic covert one),
  * parallel kernels that would escape the sandbox's cwd and timeout
- * (`worker_threads`). The list is a locked contract with the engine and tool
- * wiring — additions are a breaking change to what hosts must enforce at the
+ * (`worker_threads`, `cluster` — fork() is child_process with a friendlier
+ * name). The list is a locked contract with the engine and tool wiring —
+ * additions are a breaking change to what hosts must enforce at the
  * ptc-runtime tier, not a casual edit.
  *
  * `'node:process'` is listed for the contract's sake (the engine's conjure
@@ -191,9 +196,22 @@ export function sandboxEntryFor(claimId: string, seq: number): string {
  * answers for both.
  */
 export const FORBIDDEN_CAPABILITIES: readonly string[] = [
-  'child_process', 'net', 'http', 'https', 'dgram', 'worker_threads',
+  'child_process', 'net', 'http', 'https', 'dgram', 'worker_threads', 'cluster',
+  'dns', 'tls',
   'process', 'node:process',
 ]
+
+/**
+ * H-31: zero-import outbound GLOBALS a synthetic script may never touch.
+ * Node ≥ 18 ships `fetch` (and ≥ 22 `WebSocket`) on the global object — no
+ * `import` text for the module screen to see — so a script with a clean
+ * import section could still POST the workspace to any address. The screen
+ * flags the call forms (`fetch(…)`, `new WebSocket(…)`) of every name here;
+ * a local helper that happens to be called `fetch` is over-reported, the
+ * deny-list's documented safe direction (refuse the inert script, never run
+ * the live one).
+ */
+export const FORBIDDEN_GLOBALS: readonly string[] = ['fetch', 'WebSocket']
 
 /** One screened script: `ok` only when `findings` is empty (empty = cleared to run). */
 export interface ScreenResult {
@@ -232,6 +250,10 @@ const RE_REQUIRE = /\brequire\s*\(\s*(['"`])([^'"`\n]*)\1/g
 // static-screen limits. (The `process`/`node:process` deny-list entries close
 // the module-import route to the same bag.)
 const RE_PROCESS_ENV = [/\bprocess\s*\.\s*env\b/, /\bprocess\s*\[\s*(['"])env\1\s*\]/]
+// H-31: the zero-import outbound globals (see FORBIDDEN_GLOBALS) are screened
+// by their call forms, built from the names at screening time — no import
+// text is required to reach them (Node ships them on the global object), so
+// the import regexes above are structurally blind to this channel.
 
 /**
  * M11: decode the escape forms a specifier can hide behind before the
@@ -276,14 +298,15 @@ function forbiddenModuleOf(specifier: string): string | undefined {
  * `from`-clauses), bare side-effect imports, literal-specifier dynamic
  * imports and `require` calls of any `FORBIDDEN_CAPABILITIES` module — with
  * or without the `node:` prefix — plus `process.env` reads in member and
- * computed-member form. M11: all four import shapes accept backtick-quoted
- * specifiers (an uninterpolated template literal is statically decidable),
- * and specifiers are `\u`/`\x`-unescaped before the deny-list sees them, so
- * `'child_\u0070rocess'` screens as `child_process`. The scan runs over the
- * *raw text, comments included*: a commented-out forbidden import is flagged
- * rather than missed. That is deliberate over-reporting — this is a
- * deny-list, and for a screener the safe direction is refusing an inert
- * script, never running a live one.
+ * computed-member form, and (H-31) the call forms of the zero-import
+ * outbound globals named by `FORBIDDEN_GLOBALS`. M11: all four import shapes
+ * accept backtick-quoted specifiers (an uninterpolated template literal is
+ * statically decidable), and specifiers are `\u`/`\x`-unescaped before the
+ * deny-list sees them, so `'child_\u0070rocess'` screens as
+ * `'child_process'`. The scan runs over the *raw text, comments included*:
+ * a commented-out forbidden import is flagged rather than missed. That is
+ * deliberate over-reporting — this is a deny-list, and for a screener the
+ * safe direction is refusing an inert script, never running a live one.
  *
  * Admitted limits of static screening (this is a *screen*, not a sandbox):
  * computed specifiers (`import(buildName())`), aliases
@@ -324,6 +347,14 @@ export function screenScript(source: string): ScreenResult {
 
   for (const pattern of RE_PROCESS_ENV) {
     if (pattern.test(source)) findings.add('read of process.env (synthetic tests never need environment secrets)')
+  }
+  // H-31: the globals need no import, so this is the only line of defence the
+  // static screen can offer them — the easiest exfiltration channel used to
+  // be the one the screen could not even see.
+  for (const globalName of FORBIDDEN_GLOBALS) {
+    if (new RegExp(`\\b${globalName}\\s*\\(`).test(source)) {
+      findings.add(`use of global '${globalName}' (zero-import outbound capability — synthetic tests never need the network)`)
+    }
   }
 
   const sorted = [...findings].sort()

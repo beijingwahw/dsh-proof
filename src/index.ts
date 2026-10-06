@@ -22,7 +22,7 @@ import * as nodePath from 'node:path'
 import type { Config } from './config.ts'
 import { ProofEngine } from './engine.ts'
 import { createProofTools } from './dsh/tools.ts'
-import { WorkspaceWatch, driftNarrative, isMutationToolName, toWorkspaceRelative } from './dsh/observe.ts'
+import { WorkspaceWatch, driftNarrative, isMutationToolName, shellCommandMentionsPath, toWorkspaceRelative } from './dsh/observe.ts'
 import { buildPolicySection } from './dsh/prompt.ts'
 import { createLspResolver } from './dsh/lsp-impact.ts'
 import { attachTeamBridge, createTeamBridge } from './dsh/agent-team.ts'
@@ -205,8 +205,39 @@ export function apply(ctx: Context, config: Config): void {
       const target = collapseSegments(rel).toLowerCase()
       return target === evidenceSegment || target.startsWith(`${evidenceSegment}/`)
     }
+    // H-02: shell-class tools carry no structured path keys — their command
+    // string is the whole attack surface, so the guard sweeps it textually
+    // (conservatively; see observe.ts `shellCommandMentionsPath`). The
+    // targets: the store directory itself, every file inside it, and the
+    // trust-root file names — a deployment that misplaces the trust root
+    // inside the workspace gets the same protection for its keys and anchors.
+    const shellGuardTargets = [
+      evidenceSegment,
+      ...SHELL_GUARDED_FILE_NAMES.map(name => `${evidenceSegment}/${name}`),
+      ...SHELL_GUARDED_FILE_NAMES,
+    ]
     host.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
       if (!isMutationToolName(exec.name)) return next()
+      // H-02: a shell command string names no path key, so `pathsIn` is
+      // structurally blind to it — `bash {command: 'echo x >
+      // .proof/evidence.jsonl'}` used to pass this gate with nothing asked.
+      // A store-naming command is refused outright: a shell can rewrite
+      // anything (the reason says so), and "was that redirect really a
+      // write?" is not a question to resolve by parsing shell syntax.
+      // N-1: capability-gated, not name-gated — any mutation-class call
+      // carrying a command string is swept (hosts mint runner names faster
+      // than lists collect them; the read-only roster is the only exempt).
+      if (isMutationToolName(exec.name)) {
+        const command = shellCommandOf(exec.arguments)
+        if (command !== undefined && shellCommandMentionsPath(command, shellGuardTargets)) {
+          return {
+            kind: 'deny',
+            reason: 'dsh-proof: this shell command names the verification evidence store, which must not be '
+              + 'modified by the agent it is meant to audit — a shell can rewrite anything, so a '
+              + 'store-naming command is refused rather than parsed for intent.',
+          }
+        }
+      }
       // contentKeys: the guard prefers over-detection — a `move {source:
       // '.proof/evidence.jsonl', dest: …}` carries the log out through the
       // very key the watcher excludes as content-noise. A false positive here
@@ -264,9 +295,17 @@ export function apply(ctx: Context, config: Config): void {
   // means hosts (and tests) that index this pipeline keep their reading.
   host.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
     if (exec.name !== 'proof_endorse') return next()
-    const parsed = (exec.arguments ?? {}) as { claim?: unknown; approver?: unknown }
+    const parsed = (exec.arguments ?? {}) as { claim?: unknown; approver?: unknown; decision?: unknown }
     const claim = parsed.claim
     const head = typeof claim === 'string' ? claim.slice(0, 80) : '(no claim text)'
+    // M-70: the DIRECTION the record will carry is an agent parameter the
+    // approval must make visible — an endorse has unlock power a reject does
+    // not, so a human approving "recording" while the agent swapped the
+    // decision is approving the wrong act. Shown exactly like the approver:
+    // declared by the agent, seen by the human.
+    const decision = parsed.decision === 'endorse' || parsed.decision === 'reject'
+      ? parsed.decision
+      : '(no usable decision — the tool will refuse)'
     // M5: the approver is agent-declared free text that the chain will record
     // as the responsible human — the human at the approval seam must SEE the
     // name they are about to vouch for, or Class C's named accountability can
@@ -279,11 +318,14 @@ export function apply(ctx: Context, config: Config): void {
     return {
       kind: 'ask',
       reason: `dsh-proof: a human must consciously endorse/reject this claim — approve to record Class C evidence? `
-        + `claim: "${head}" approver (as declared by the agent): ${approver}`,
+        + `claim: "${head}" decision (as declared by the agent): ${decision} `
+        + `approver (as declared by the agent): ${approver}`,
       displayReason: {
         en: `dsh-proof: a human must consciously endorse/reject this claim — approve to record Class C evidence? `
+          + `decision (as declared by the agent): ${decision} `
           + `approver (as declared by the agent): ${approver}`,
         'zh-CN': `dsh-proof：需要人类有意识地背书/否决此主张——批准以记录 Class C 证据？`
+          + `方向（由 agent 自报）：${decision === 'endorse' ? 'endorse（背书）' : decision === 'reject' ? 'reject（否决）' : decision} `
           + `审批人（由 agent 自报）：${approver}`,
       },
     }
@@ -293,7 +335,11 @@ export function apply(ctx: Context, config: Config): void {
   // Each event is still fire-and-forget (a tool result must never be delayed
   // by bookkeeping), but the latest observation's promise is kept: the turn
   // can stop right behind the last tool result, and drift/enforcement computed
-  // from a half-written observation would read yesterday's state.
+  // from a half-written observation would read yesterday's state. The promise
+  // is also RETURNED from the listener: hosts are free to ignore it (the void
+  // contract is unchanged), while embedders and tests that need the
+  // observation settled before touching the workspace get a deterministic
+  // handle instead of racing the fingerprint read against their own writes.
   let pendingObserve: Promise<void> = Promise.resolve()
   host.on('tools/result', (exec, result) => {
     pendingObserve = (async () => {
@@ -305,6 +351,7 @@ export function apply(ctx: Context, config: Config): void {
         log('observe failed', error)
       }
     })()
+    return pendingObserve
   })
 
   // -- drift + unproven-claim enforcement ---------------------------------
@@ -324,7 +371,11 @@ export function apply(ctx: Context, config: Config): void {
 
         if (config.driftDetection) {
           const drift = await watch.detectDrift()
-          const narrative = driftNarrative(drift)
+          // M2 (H9② narrative half): once a shell ran this session, "changed
+          // outside your tool calls" is an accusation the watcher cannot back
+          // — the shell's edits are invisible to path extraction by
+          // construction. The narrative demotes to the honest wording.
+          const narrative = driftNarrative(drift, { shellUsed: watch.sessionShellUsed() })
           if (narrative !== undefined) notices.push(narrative)
           if (drift.drifted.length > 0) await watch.snapshot(drift.drifted)
         }
@@ -377,6 +428,10 @@ export function apply(ctx: Context, config: Config): void {
       delegate: input => engine.delegateTask(input),
       instructionOf: teamHandoffInstruction,
       stderr: stderrLine,
+      // H-12: the bridge's namespace facts (host id ↔ engine id, lost parent
+      // edges) land on the chain as observation markers — stderr is ephemeral,
+      // a re-linkable mapping is evidence.
+      mark: (label, payload) => engine.storeView.mark(label, payload),
     })
     const attached = attachTeamBridge(ctx, bridge, stderrLine)
     log(`agent-team bridge ${attached ? 'attached' : 'idle: no delegation seam'} (experimental)`)
@@ -451,8 +506,12 @@ export function teamHandoffInstruction(taskId: string, obligationId: string, cla
     '  3. proof_verify (or proof_claim carrying the claim text) — the affected checks must',
     '     re-run, and your session must grade "proven" with zero regressions before you',
     '     may submit.',
-    '  4. proof_bundle    — export the tamper-evident APP bundle of your evidence chain.',
-    `  5. Submit it back with proof_delegate_submit { taskId: ${JSON.stringify(taskId)}, bundle: <the bundle proof_bundle returned> }.`,
+    '  4. proof_bundle    — export the tamper-evident APP bundle of your evidence chain. This',
+    '     tool lives on the MCP tool face (dsh-proof-mcp), not the nine DSH proof_* tools; if',
+    '     your session cannot call it, ask the orchestrator to bundle your workspace.',
+    `  5. Submit it back with proof_delegate_submit { taskId: ${JSON.stringify(taskId)}, bundle: <the bundle proof_bundle returned> } —`,
+    '     also an MCP-face tool; hand the bundle to the orchestrator for it to submit when',
+    '     your own tool face cannot reach it.',
     '',
     'Your "proven" is the precondition of the parent task\'s "proven": until your bundle',
     'verifies, everything above you in the task graph stays stale — and a forged or',
@@ -504,10 +563,43 @@ function hostLogger(ctx: Context): (message: string) => void {
  * Windows drive letter or leading slash — engine.ts's private absolute-path
  * test, mirrored here so `evidenceLogPath` derives from exactly the same rule
  * the engine used for its own copy. If engine.ts's rule ever moves, this
- * mirror must move with it (the wiring test pins the derived path).
+ * mirror must move with it. Pinned by test/08 ('the evidenceLogPath mirror
+ * stays glued to the engine's own derivation'), which drives proof_jury →
+ * proof_jury_submit through the applied tools: the submit only succeeds by
+ * reading markers back through this exact path.
  */
 function isAbsoluteHostPath(p: string): boolean {
   return /^([A-Za-z]:[\\/]|\/)/.test(p)
+}
+
+/**
+ * H-02: file names whose mention in a shell command string means the command
+ * touches the proof trust fabric — the store's log and baseline, the anchor
+ * file, and the Ed25519 signing-key pair (node-ports names). Matched as
+ * substrings after separator/case folding by `shellCommandMentionsPath`.
+ */
+const SHELL_GUARDED_FILE_NAMES: readonly string[] = [
+  'evidence.jsonl', 'baseline.json', 'anchor.json',
+  'proof-signing-key.pem', 'proof-signing-key.pub.pem',
+]
+
+/**
+ * H-02: the command string a shell-class tool call carries, when it carries
+ * one — `command`/`cmd`/`script` as a string, or a string argv vector joined
+ * with spaces. Anything else is undefined (no guesswork: the guard then falls
+ * back to the structured-path check).
+ */
+function shellCommandOf(args: unknown): string | undefined {
+  if (args === null || typeof args !== 'object') return undefined
+  const record = args as Record<string, unknown>
+  for (const key of ['command', 'cmd', 'script']) {
+    const value = record[key]
+    if (typeof value === 'string') return value
+    if (Array.isArray(value) && value.length > 0 && value.every(item => typeof item === 'string')) {
+      return value.join(' ')
+    }
+  }
+  return undefined
 }
 
 /**

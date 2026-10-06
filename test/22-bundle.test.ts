@@ -14,9 +14,13 @@ import assert from 'node:assert/strict'
 import { Buffer } from 'node:buffer'
 
 import { buildBundle, verifyBundle, type ManifestTransparency, type ProofBundle } from '../src/app/bundle.ts'
-import { appFingerprint, PROTOCOL_VERSION } from '../src/app/protocol.ts'
+import {
+  CHAIN_MODES, CHECK_STATUSES, CLAIM_KINDS, GRADE_VALUES, PROTOCOL_VERSION, VERDICT_VALUES,
+  appFingerprint, knownDialects,
+} from '../src/app/protocol.ts'
 import { EvidenceStore, buildBaseline, makeEvidence, snapshotWorkspace } from '../src/core/evidence.ts'
-import { sha256 } from '../src/core/hash.ts'
+import { canonicalJson, sha256 } from '../src/core/hash.ts'
+import { GENESIS_PREV, walkChain } from '../src/core/trust.ts'
 import type { SignerPort } from '../src/core/ports.ts'
 import { FakeClock, MemoryFs, spec } from './helpers.ts'
 
@@ -120,15 +124,26 @@ test('buildBundle is deterministic: same input, same bytes, manifest digests mat
   assert.deepEqual(Object.keys(buildBundle({ evidenceLog: 'x' }, 'ws', AT).files), ['evidence.jsonl'], 'optional files are simply absent')
 })
 
-test('minimal evidence-only bundles verify clean: empty log, and a real unsigned chain', async () => {
+test('an empty evidence log is a problem, not a clean verdict; a real unsigned chain stays clean (v0.22 flip)', async () => {
+  // The empty-log bless is FLIPPED (H-05 app-layer pillar): a bundle whose
+  // log carries zero lines has nothing to verify, and "problems: []" let a
+  // zero-evidence artifact ride `verifyBundle`'s clean verdict into
+  // delegation submissions. The structural fields stay true — the bundle IS
+  // well-formed — but the aggregate verdict must refuse to read as proof.
   const empty = buildBundle({ evidenceLog: '' }, 'ws', AT)
   const emptyVerdict = await verifyBundle(empty)
   assert.equal(emptyVerdict.protocolOk, true)
   assert.equal(emptyVerdict.manifestOk, true)
-  assert.deepEqual(emptyVerdict.problems, [])
   assert.equal(emptyVerdict.chainMode, 'unsigned')
   assert.equal(emptyVerdict.tailRecords, 0)
+  assert.deepEqual(emptyVerdict.malformedCheckpoints, [])
+  assert.ok(
+    emptyVerdict.problems.some(p => p.startsWith('evidence log is empty')),
+    `the empty log must be named, got ${JSON.stringify(emptyVerdict.problems)}`,
+  )
 
+  // A real unsigned chain (records, no checkpoints) verifies exactly as
+  // before: emptiness was the problem, not unsignedness.
   const fs = MemoryFs.of({})
   const store = new EvidenceStore(fs, LOG, BASE, new FakeClock())
   await store.append(evidence('c1'))
@@ -141,6 +156,7 @@ test('minimal evidence-only bundles verify clean: empty log, and a real unsigned
   assert.deepEqual(unsigned.problems, [])
   assert.equal(unsigned.chainMode, 'unsigned')
   assert.equal(unsigned.tailRecords, 2, 'no checkpoint: every record is tail')
+  assert.equal(unsigned.checkpointSignature, undefined, 'no signatures on the chain: no adjudication to report')
 })
 
 test('full chain from a trusted store: signed mode, honest tail count, anchor head matches', async () => {
@@ -202,18 +218,39 @@ test('tamper matrix: an unknown protocol version in the manifest is rejected', a
   assert.ok(verdict.problems.some(p => p.includes('unsupported bundle protocol')))
 })
 
-test('without an anchorSigner the signature is skipped, never charged: only headMatchesChain is judged', async () => {
+test('without an anchorSigner the signature is skipped, never charged — but the keyless cross-checks fire (v0.22 flip)', async () => {
   const { bundle } = await honestFullChain()
   const honest = await verifyBundle(bundle)
-  assert.deepEqual(honest.problems, [])
+  assert.deepEqual(honest.problems, [], 'an honest anchor still verifies clean without any key')
   assert.equal(honest.anchor?.headMatchesChain, true)
+  assert.equal(honest.chainMode, 'signed-unverified', 'no key at hand: signatures exist but were not verified')
+  assert.equal(honest.checkpointSignature, 'unverified')
 
+  // The no-signer bless is FLIPPED (M-57): inflating the anchor count used
+  // to be invisible without a key — a "missing capability is not an
+  // accusation" that somehow also suppressed every contradiction the bundle
+  // CAN prove on its own. The count the anchor claims and the count the
+  // chain's own last checkpoint says are both in the bundle: they disagree,
+  // and that disagreement is a problem now.
   const anchor = JSON.parse(bundle.files['anchor.json'] as string) as Record<string, unknown>
   const doctored = JSON.stringify({ ...anchor, count: 99 }, null, 2)
   const unverifiable = await verifyBundle(withFile(bundle, 'anchor.json', doctored))
-  assert.equal(unverifiable.problems.some(p => p.includes('signature')), false, 'no key in hand, no adjudication — a missing capability is not an accusation')
-  assert.deepEqual(unverifiable.problems, [])
-  assert.equal(unverifiable.anchor?.headMatchesChain, true)
+  assert.equal(unverifiable.problems.some(p => p.includes('signature')), false, 'no key in hand, no signature adjudication — a missing capability is not an accusation')
+  assert.ok(
+    unverifiable.problems.some(p => p.includes('anchor count (99) does not match the last checkpoint')),
+    `the keyless count cross-check must fire, got ${JSON.stringify(unverifiable.problems)}`,
+  )
+  assert.equal(unverifiable.anchor?.headMatchesChain, true, 'the head was not touched')
+
+  // The same keyless floor catches a workspaceKey swap and a foreign keyId
+  // on the anchor — contradictions no signature was ever needed to see.
+  const swappedKey = JSON.stringify({ ...anchor, workspaceKey: 'DIFFERENT-WORKSPACE' }, null, 2)
+  const swapped = await verifyBundle(withFile(bundle, 'anchor.json', swappedKey))
+  assert.ok(swapped.problems.some(p => p.includes('anchor workspaceKey') && p.includes('DIFFERENT-WORKSPACE')))
+
+  const foreignAnchor = JSON.stringify({ ...anchor, keyId: 'foreign-key' }, null, 2)
+  const foreign = await verifyBundle(withFile(bundle, 'anchor.json', foreignAnchor))
+  assert.ok(foreign.problems.some(p => p.includes('anchor keyId') && p.includes('foreign-key')))
 })
 
 test('exchange round-trip: JSON.stringify -> JSON.parse preserves the verification exactly', async () => {
@@ -277,7 +314,7 @@ function withTransparency(value: unknown): ProofBundle {
   return { manifest: { ...sound.manifest, transparency: value as ManifestTransparency }, files: sound.files }
 }
 
-test('transparency: a sound record stamps through deterministically and verifies as recorded', async () => {
+test('transparency: a sound record stamps through deterministically; a record over a chain with no signed checkpoint is refused (v0.22 flip)', async () => {
   const fs = MemoryFs.of({})
   const { store } = trustedStore(fs)
   await store.append(evidence('c1'))
@@ -293,9 +330,17 @@ test('transparency: a sound record stamps through deterministically and verifies
     'transparency appends at a fixed position, after the header and files',
   )
   assert.deepEqual(first.manifest.transparency, record)
+  // The fabricated-record bless is FLIPPED (M-59/H-05 territory): this
+  // chain carries NO signed checkpoint — the store had no signer, nothing
+  // was ever publishable — so a transparency record claiming a publication
+  // is a contradiction the bundle itself proves. Structure alone still
+  // stamps 'recorded'; the aggregate verdict refuses.
   const verdict = await verifyBundle(first)
-  assert.equal(verdict.transparency, 'recorded')
-  assert.deepEqual(verdict.problems, [], 'a sound record adds no problem — structure was all there was to judge')
+  assert.equal(verdict.transparency, 'recorded', 'the record is structurally sound — that judgment stays structural')
+  assert.ok(
+    verdict.problems.some(p => p.includes('transparency record but the bundled chain has no signed checkpoint')),
+    `a record without a publishable chain must be named, got ${JSON.stringify(verdict.problems)}`,
+  )
 })
 
 test('transparency: every malformed shape is refused with a named reason', async () => {
@@ -353,4 +398,170 @@ test('transparency: no record means no field and byte-identical behaviour', asyn
   // exact bytes every pre-0.18.0 producer emitted.
   const withEmptyExtras = buildBundle({ evidenceLog: log }, 'ws', AT, {})
   assert.equal(JSON.stringify(withEmptyExtras), JSON.stringify(plain))
+})
+
+// ---------------------------------------------------------------------------
+// v0.22 adversarial additions — forged checkpoints, closed manifest layout,
+// transparency bounds, dialect negotiation.
+// ---------------------------------------------------------------------------
+
+/** Re-chain a log's lines so every `prev` links again (the forger holds the pen). */
+function rechain(lines: string[]): string[] {
+  let prev = GENESIS_PREV
+  return lines.map(line => {
+    const envelope = JSON.parse(line) as Record<string, unknown>
+    envelope.prev = prev
+    const rewritten = JSON.stringify(envelope)
+    prev = sha256(rewritten)
+    return rewritten
+  })
+}
+
+test('v0.22: a fully re-chained log with a lying-count checkpoint is refused, not laundered', async () => {
+  const { bundle } = await honestFullChain()
+  const original = (bundle.files['evidence.jsonl'] as string).split('\n').filter(l => l.length > 0)
+  // Rewrite the whole log with this package's own hashing, then stamp a
+  // checkpoint whose count (`1e999` parses to Infinity) the walk refutes —
+  // the exact laundering shape core/trust built malformedCheckpoints for.
+  const walk0 = walkChain(original)
+  const forgedCheckpoint = {
+    v: 2, kind: 'checkpoint', at: AT,
+    payload: { count: 999, head: sha256('forged-head'), workspaceKey: 'ws', at: AT },
+    sig: 'FORGED', keyId: 'fake-key',
+  }
+  const lines = [...original.slice(0, walk0.checkpoints[0]?.index ?? original.length), JSON.stringify(forgedCheckpoint)]
+  const doctored = `${rechain(lines).join('\n')}\n`
+  const verdict = await verifyBundle(withFile(bundle, 'evidence.jsonl', doctored), anchorVerifier(new FakeSigner()))
+  assert.deepEqual(verdict.malformedCheckpoints.length, 1, 'the lying count is surfaced, not swallowed')
+  assert.ok(
+    verdict.problems.some(p => p.startsWith('malformed checkpoint at line')),
+    `the malformed checkpoint must be a problem, got ${JSON.stringify(verdict.problems)}`,
+  )
+  assert.ok(verdict.problems.some(p => p.includes('checkpoint signature invalid') || p.includes('malformed checkpoint')))
+})
+
+test('v0.22: a garbage checkpoint signature under the held key is refuted; without the key it is honestly unverified', async () => {
+  const { bundle, signer } = await honestFullChain()
+  const original = (bundle.files['evidence.jsonl'] as string).split('\n').filter(l => l.length > 0)
+  // Keep the honest keyId, replace only the sig bytes, then re-chain the
+  // remainder (the forger holds the pen): signature present, signature
+  // false, chain intact.
+  const lines = original.map(line => line.replace(/"sig":"sig:[0-9a-f]+"/, '"sig":"sig:forged"'))
+  assert.notEqual(lines[1], original[1], 'the edit must change the checkpoint sig')
+  const doctored = `${rechain(lines).join('\n')}\n`
+  const refuted = await verifyBundle(withFile(bundle, 'evidence.jsonl', doctored), anchorVerifier(signer))
+  assert.equal(refuted.checkpointSignature, 'invalid')
+  assert.ok(refuted.problems.some(p => p.includes('checkpoint signature invalid at line')), JSON.stringify(refuted.problems))
+  assert.deepEqual(refuted.chainBreaks, [], 'the forgery is re-chained: only the signature check catches it')
+
+  // Same forged bytes, no key at hand: a missing capability is not an
+  // accusation — but the mode must never claim the signatures were checked.
+  const unverified = await verifyBundle(withFile(bundle, 'evidence.jsonl', doctored))
+  assert.equal(unverified.checkpointSignature, 'unverified')
+  assert.equal(unverified.chainMode, 'signed-unverified', 'presence of sig fields is not proof of them')
+  assert.deepEqual(unverified.problems, [], 'no key in hand: nothing else is provably wrong with the re-manifested file')
+})
+
+test('v0.22: an honest signed chain with the key at hand reports verified signatures and mode signed', async () => {
+  const { bundle, signer } = await honestFullChain()
+  const verdict = await verifyBundle(bundle, anchorVerifier(signer))
+  assert.equal(verdict.checkpointSignature, 'verified')
+  assert.equal(verdict.chainMode, 'signed')
+  assert.deepEqual(verdict.problems, [])
+  assert.deepEqual(verdict.malformedCheckpoints, [])
+})
+
+test('v0.22: the manifest layout is closed — traversal, absolute, UNC and duplicate paths are refused', async () => {
+  const { bundle } = await honestFullChain()
+  const base = buildBundle({ evidenceLog: bundle.files['evidence.jsonl'] ?? '' }, 'ws', AT)
+  const rogueEntry = (path: string): ProofBundle => ({
+    manifest: {
+      ...base.manifest,
+      files: [...base.manifest.files, { path, sha256: sha256('x'), bytes: 1 }],
+    },
+    files: { ...base.files, [path]: 'x' },
+  })
+  for (const path of ['../../etc/cron.d/evil', '/etc/passwd', 'C:/Windows/evil', '\\\\server\\share\\evil', 'sub/dir/evil.txt', 'evil.txt']) {
+    const verdict = await verifyBundle(rogueEntry(path))
+    assert.equal(verdict.manifestOk, false, path)
+    assert.ok(
+      verdict.problems.some(p => p.includes('outside the bundle layout') && p.includes(path)),
+      `${path} must be named as out-of-layout, got ${JSON.stringify(verdict.problems)}`,
+    )
+  }
+  // A duplicate of a legal name is just as refused: two entries for one file
+  // is a layout violation no unpacker should have to arbitrate.
+  const duplicated = await verifyBundle({
+    manifest: {
+      ...base.manifest,
+      files: [...base.manifest.files, { ...base.manifest.files[0]! }],
+    },
+    files: base.files,
+  })
+  assert.equal(duplicated.manifestOk, false)
+  assert.ok(duplicated.problems.some(p => p.includes('more than once')))
+})
+
+test('v0.22: transparency records with an out-of-tree sequence or disagreeing logIds are malformed', async () => {
+  const beyond = withTransparency({ ...soundTransparency(), sequence: 999999 })
+  const beyondVerdict = await verifyBundle(beyond)
+  assert.equal(beyondVerdict.transparency, 'malformed')
+  assert.ok(beyondVerdict.problems.some(p => p.includes('sequence 999999 is not below the published tree size 1')))
+
+  const split = withTransparency({ ...soundTransparency(), logId: 'log-B' })
+  const splitVerdict = await verifyBundle(split)
+  assert.equal(splitVerdict.transparency, 'malformed')
+  assert.ok(splitVerdict.problems.some(p => p.includes('record logId') && p.includes('publishedHead.logId')))
+
+  const nonHex = withTransparency({ ...soundTransparency(), inclusionProof: ['zz'.repeat(32)] })
+  const nonHexVerdict = await verifyBundle(nonHex)
+  assert.equal(nonHexVerdict.transparency, 'malformed')
+  assert.ok(nonHexVerdict.problems.some(p => p.includes('inclusionProof must be an array of 64-hex digest strings')))
+})
+
+test('v0.22: a real APP/1.3 bundle verifies under fingerprint-match acceptance, flagged as legacy', async () => {
+  const { bundle, signer } = await honestFullChain()
+  // The exact v0.20-era dialect pair: APP/1.3 with the fingerprint that
+  // era's constants digested to (recomputed from the pinned material — the
+  // same derivation protocol.ts's knownDialects uses).
+  const app13Fingerprint = sha256(canonicalJson({
+    name: 'agent-proof-protocol',
+    version: 'APP/1.3',
+    verdict: VERDICT_VALUES,
+    grade: GRADE_VALUES,
+    chainModes: CHAIN_MODES,
+    claimKinds: CLAIM_KINDS,
+    checkStatuses: CHECK_STATUSES,
+    addressing: 'sha256(canonicalJson(v))',
+    chain: 'prev=sha256(prevLine)',
+    signature: 'ed25519(canonicalJson(checkpointPayload))',
+  }))
+  const legacy: ProofBundle = {
+    manifest: { ...bundle.manifest, protocol: 'APP/1.3' as typeof bundle.manifest.protocol, appFingerprint: app13Fingerprint },
+    files: bundle.files,
+  }
+  const verdict = await verifyBundle(legacy, anchorVerifier(signer))
+  assert.equal(verdict.protocolOk, true, 'a known ancestor dialect is accepted by fingerprint')
+  assert.equal(verdict.legacyProtocol, true, 'and flagged, so readers see which dialect they verified under')
+  assert.deepEqual(verdict.problems, [], 'the bundle format never changed across the genealogy: full verification applies')
+  assert.equal(verdict.chainMode, 'signed')
+  assert.equal(verdict.checkpointSignature, 'verified')
+  const known = knownDialects().find(d => d.version === 'APP/1.3')
+  assert.equal(known?.fingerprint, app13Fingerprint, 'protocol.ts recomputes the same table this test derives')
+
+  // A CURRENT version string wearing a fingerprint that version never had
+  // is incoherent, not legacy: refused with the bundle's fingerprint and
+  // the current one both on the record (C3-H2's named-refusal demand).
+  const incoherent: ProofBundle = {
+    manifest: { ...bundle.manifest, appFingerprint: app13Fingerprint },
+    files: bundle.files,
+  }
+  const refused = await verifyBundle(incoherent)
+  assert.equal(refused.protocolOk, false)
+  assert.equal(refused.legacyProtocol, undefined)
+  const refusal = refused.problems.find(p => p.includes('unsupported bundle protocol'))
+  assert.ok(refusal !== undefined, JSON.stringify(refused.problems))
+  assert.ok(refusal.includes(app13Fingerprint), 'the refusal names the bundle fingerprint')
+  assert.ok(refusal.includes('APP/1.4'), 'the refusal names the current dialect')
+  assert.ok(refusal.includes('re-publish'), 'the refusal gives the migration path')
 })

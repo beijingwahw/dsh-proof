@@ -34,7 +34,7 @@ import {
   SLA_EXCLUSIONS, priceSla, summarizeRunLedger,
   type RateCard,
 } from '../src/core/economics.ts'
-import type { CheckStatus, Evidence } from '../src/core/evidence.ts'
+import type { CheckStatus, Evidence, ProofGrade } from '../src/core/evidence.ts'
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -237,10 +237,13 @@ test('skippedCount keeps the sunk cost visible — non-decisive time is spent mo
   assert.equal(ledger.assertions, 0) // …and none of them bought an answer
   assert.equal(ledger.decisiveCount, 0)
   assert.equal(ledger.skippedCount, 4)
-  // With zero assertions the divisor floors at 1: the whole cost is stated
-  // as the price of the first assertion nobody got.
+  assert.equal(ledger.rejectedDurationRecords, 0)
+  // M24: with zero assertions there is no per-assertion price to state — the
+  // whole cost IS stated (as `cost`, above), and `costPerAssertion` is null,
+  // the same three-state law as the per-dollar ratios: a "per X" with no X is
+  // not the total wearing a divisor's clothes.
   assert.equal(ledger.cost, 4)
-  assert.equal(ledger.costPerAssertion, 4)
+  assert.equal(ledger.costPerAssertion, null)
 })
 
 test('money carries at most six decimals — float dust never reaches a statement', () => {
@@ -490,4 +493,106 @@ test('the ledger defends its rate card too — a corrupt card corrupts every sta
   assert.throws(() => summarizeRunLedger({
     records, humanReviewItems: -2, rate: USD,
   }), TypeError)
+})
+
+// ---------------------------------------------------------------------------
+// H-15 adversarial: overflow, vocabulary, sick durations, factor domains,
+// integer counting, and the roundMoney exit guard
+// ---------------------------------------------------------------------------
+
+test('H-15: overflow coverage is refused at the gate — the quoteId collision PoC is dead', () => {
+  const base = { grade: 'proven' as const, confidence: 0, rate: USD }
+  // The audit's exact trio: three finite coverages that all rounded to
+  // Infinity in roundMoney (×10^6 over DBL_MAX) and — through canonical
+  // JSON's non-finite fold — minted ONE identical quoteId (6041b75f829dcb33).
+  // Now none of them mints anything: what the money spec cannot round, the
+  // pricer never prices.
+  for (const coverageAmount of [1.5e308, 1.7e308, 1.7976931348623157e308, 2e15]) {
+    assert.throws(() => priceSla({ ...base, coverageAmount }), TypeError, `coverageAmount ${coverageAmount}`)
+  }
+  // The ceiling itself is a legal value and prices without overflow…
+  const atCeiling = priceSla({ ...base, coverageAmount: 1e15 })
+  assert.equal(atCeiling.decision.class, 'offer')
+  assert.equal((atCeiling.decision as { premium: number }).premium, 1e15,
+    'P=0 at the ceiling prices full coverage, exactly')
+  // …and the far legal region stays injective: different amounts, different
+  // addresses — the content-addressing promise holds everywhere it is asked.
+  const farA = priceSla({ ...base, coverageAmount: 9e14 })
+  const farB = priceSla({ ...base, coverageAmount: 8e14 })
+  assert.notEqual(farA.quoteId, farB.quoteId)
+
+  // The ceiling guards the optional money fields and the rate card the same
+  // way — no field can carry a magnitude the spec cannot round.
+  assert.throws(() => priceSla({ ...base, coverageAmount: 10_000, deductible: 1e16 }), TypeError)
+  assert.throws(() => priceSla({ ...base, coverageAmount: 10_000, minPremium: 1e16 }), TypeError)
+  assert.throws(() => priceSla({
+    grade: 'proven', confidence: 0.97, coverageAmount: 10_000,
+    rate: { currency: 'USD', computePerMs: 1e16 },
+  }), TypeError)
+})
+
+test('H-15: a foreign grade is refused — manual underwriting, never the proven branch', () => {
+  for (const grade of ['Proven', 'nonsense', ''] as unknown as ProofGrade[]) {
+    const quote = priceSla({ grade, confidence: 0.999, coverageAmount: 10_000, rate: USD })
+    assert.deepEqual(quote.decision, {
+      class: 'manual-underwriting',
+      reason: 'the grade is not one of the five proof grades this policy prices — a word the formula cannot read never reaches the proven branch, a human underwriter reads it instead',
+    }, `grade ${JSON.stringify(grade)}`)
+    assert.equal(quote.grade, grade, 'the quote echoes what was asked, verbatim')
+  }
+})
+
+test('M22: a record with a negative or non-finite durationMs books as unknown — never a number on the statement', () => {
+  for (const bad of [-100, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+    const ledger = summarizeRunLedger({
+      records: [evidence('unit/sick', 'pass', bad), evidence('unit/fine', 'pass', 1000)],
+      rate: USD,
+    })
+    assert.equal(ledger.rejectedDurationRecords, 1, `durationMs ${bad} is rejected and counted`)
+    assert.equal(ledger.computeMs, 1000, 'the sick time contributed nothing')
+    assert.equal(ledger.cost, 0.1, 'only the measured millisecond is priced')
+    assert.equal(ledger.decisiveCount, 2, 'decisiveness reads status — a bad duration poisons nothing')
+  }
+  // An all-sick ledger still refuses to state a number for what it rejected.
+  const sick = summarizeRunLedger({ records: [evidence('unit/x', 'pass', Number.NaN)], rate: USD })
+  assert.equal(sick.rejectedDurationRecords, 1)
+  assert.equal(sick.computeMs, 0)
+  assert.equal(sick.cost, 0)
+  assert.equal(sick.confidencePerDollar, null)
+  // Clean ledgers state zero rejections — the counter is exhaustive law.
+  assert.equal(summarizeRunLedger({ records: [evidence('unit/y', 'pass', 5)], rate: USD }).rejectedDurationRecords, 0)
+})
+
+test('M23: factors outside [0,1] are refused — never entropy-folded into plausible information', () => {
+  const base = { records: [] as Evidence[], rate: USD }
+  for (const factors of [
+    [{ prior: 2, posterior: 0.5 }],                       // prior beyond certainty — was folded to H(1)=0, minting a fake negative gain
+    [{ prior: 0.5, posterior: -0.1 }],
+    [{ prior: Number.NaN, posterior: 0.5 }],              // was NaN straight onto infoNats
+    [{ prior: 0.5, posterior: Number.POSITIVE_INFINITY }],
+  ] as { prior: number; posterior: number }[][]) {
+    assert.throws(() => summarizeRunLedger({ ...base, factors }), TypeError, `factors ${JSON.stringify(factors)}`)
+  }
+  // The endpoints themselves stay legal — 0 and 1 are probabilities.
+  assert.equal(summarizeRunLedger({ ...base, factors: [{ prior: 0, posterior: 1 }] }).infoNats, 0)
+})
+
+test('L4: review items are counted, not weighed — a fractional count is refused', () => {
+  assert.throws(() => summarizeRunLedger({
+    records: [evidence('unit/test', 'pass', 1000)], humanReviewItems: 2.5, rate: USD,
+  }), TypeError)
+  assert.equal(summarizeRunLedger({
+    records: [evidence('unit/test', 'pass', 1000)], humanReviewItems: 2, rate: USD,
+  }).cost, 30.1, '0.1 compute + 2 × $15 — whole items only')
+})
+
+test('H-15 backstop: a sum that overflows the money spec refuses the whole statement — never Infinity on it', () => {
+  // Every input here is individually legal (finite durations, a legal card);
+  // the SUM overflows the double range. roundMoney's exit guard turns the
+  // would-be Infinity into a refusal — "never Infinity" enforced at the last
+  // arithmetic exit as well as at every input gate.
+  assert.throws(() => summarizeRunLedger({
+    records: [evidence('unit/a', 'pass', 1e308), evidence('unit/b', 'pass', 1e308)],
+    rate: USD,
+  }), TypeError, 'Σ durationMs = Infinity must refuse the ledger, not report it')
 })

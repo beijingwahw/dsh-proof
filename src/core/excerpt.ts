@@ -122,6 +122,14 @@ function marker(omitted: number): string {
  *   holds by construction instead of by a post-hoc slice.
  */
 export function excerptOutput(normalized: string, options: ExcerptOptions): Excerpt {
+  // H-33: a non-finite budget is a configuration error, not a request. The
+  // old clamp (`Math.max(16, NaN)` is NaN) silently returned an EMPTY text
+  // with NaN accounting while outputDigest still addressed "something" — the
+  // hardest bad-evidence shape to notice after the fact. Pure-function domain
+  // discipline: refuse loudly at the boundary instead of laundering the NaN.
+  if (!Number.isFinite(options.budget)) {
+    throw new TypeError(`excerpt budget must be a finite number, got ${options.budget}`)
+  }
   const budget = Math.max(16, Math.floor(options.budget))
   if (normalized.length <= budget) {
     return { text: normalized, truncated: false, omittedChars: 0, keptOriginalChars: normalized.length }
@@ -207,14 +215,20 @@ export function excerptOutput(normalized: string, options: ExcerptOptions): Exce
     const kept2 = picked.filter(p => p.start < tailStart)
     const salientPart = kept2.map(p => p.line).join('\n')
     // Exact books (contract #2): the kept content is a chain of verbatim
-    // segments of `normalized`. Where two kept segments are adjacent in the
-    // original (a salient line directly followed by the next kept salient
-    // line or by the tail window), the newline joining them in the text IS
-    // that original newline, so it counts as kept — only the newlines around
-    // the marker are synthetic joins. Without this, a salient line moving
-    // between the tail and the salient block would silently lose one kept
-    // char (and a budget increase could then keep fewer characters).
-    let keptOriginal = headPart.length + salientPart.length + tailPart.length
+    // segments of `normalized`. The kept char count is the SUM OF THE SEGMENT
+    // LENGTHS — the newlines `salientPart`'s join manufactures between
+    // non-adjacent picks are synthetic, not original (M-25: they used to be
+    // booked as kept, over-reporting by one per surviving salient line minus
+    // one, a wrong number written into signed evidence records). Where two
+    // kept segments ARE adjacent in the original (a salient line directly
+    // followed by the next kept salient line or by the tail window), the
+    // newline joining them in the text IS that original newline, so the loop
+    // below adds it back — only the newlines around the marker are synthetic
+    // joins. Without that compensation, a salient line moving between the
+    // tail and the salient block would silently lose one kept char (and a
+    // budget increase could then keep fewer characters).
+    let keptOriginal = headPart.length + tailPart.length
+    for (const p of kept2) keptOriginal += p.line.length
     for (let k = 0; k < kept2.length; k += 1) {
       const cur = kept2[k]
       if (cur === undefined) break

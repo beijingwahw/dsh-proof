@@ -32,24 +32,30 @@
  * Tool surface: settings matchers do the coarse filtering (see
  * examples/claude-code.settings.json), but every handler here stays total for
  * ANY tool name — a hook configured with a broader matcher must never crash.
- * Write/Edit/MultiEdit/NotebookEdit mutate via `tool_input.file_path`; Read
- * reads via `file_path`; Bash executes `tool_input.command`, a shell command
- * that names no path — a deliberate path blind spot (documented in the example
- * settings and the SessionStart context): a Bash-written file contributes no
- * fingerprint, so only its gate classification (mutation-capable) applies.
+ * Write/Edit/MultiEdit/NotebookEdit mutate via `tool_input.file_path`
+ * (NotebookEdit via `notebook_path`); Read reads via `file_path`; Bash
+ * executes `tool_input.command`. Since H-02 the Bash command string is swept
+ * for evidence/trust paths at the gate; what it still cannot do is attribute
+ * the files a command changed (a Bash-written file contributes no
+ * fingerprint — the documented observation blind spot, stated in the example
+ * settings and the SessionStart context).
  *
  * State is per Claude Code session (session_id), persisted under the shared
  * adapter paths (src/adapters/shared/paths.ts) so independent hook processes —
- * one process per event — read and write the same observation window.
+ * one process per event — read and write the same observation window. The
+ * ledger is workspace-keyed and self-checking (H-19): a snapshot that does not
+ * address itself resets loudly instead of being trusted.
  *
- * Environment (mirrors the DSH plugin's config defaults; see src/config.ts):
+ * Environment (mirrors the DSH plugin's config defaults; parsed ONCE in
+ * paths.ts `resolveAdapterEnv`, the contract app/mcp-entry.ts shares):
  *   DSH_PROOF_ROOT             workspace root (default: the hook's cwd)
  *   DSH_PROOF_TRUST_DIR        trust root (default: deriveProofPaths' own)
  *   DSH_PROOF_EVIDENCE_STORE   'host' (default) | 'workspace'
  *   DSH_PROOF_EVIDENCE_DIR     workspace-relative evidence dir (default '.proof')
  *   DSH_PROOF_REQUIRE_BASELINE 'off' | 'warn' (default) | 'ask'
- *   DSH_PROOF_DRIFT            '0' disables drift detection (default: on)
- *   DSH_PROOF_ENFORCE_TURN_END '0' disables the turn-end reminder (default: on)
+ *   DSH_PROOF_DRIFT            '0'|'false'|'no'|'off' disables drift (default: on)
+ *   DSH_PROOF_ENFORCE_TURN_END '0'|'false'|'no'|'off' disables the turn-end
+ *                              reminder (default: on)
  *
  * @module dsh-proof/adapters/claude-code/hooks
  */
@@ -57,7 +63,7 @@
 import { promises as fsp } from 'node:fs'
 
 import type { ProofPaths } from '../shared/paths.ts'
-import { deriveProofPaths } from '../shared/paths.ts'
+import { deriveProofPaths, resolveAdapterEnv } from '../shared/paths.ts'
 import type { AdapterSession } from '../shared/session.ts'
 import { applyObservation, computeDrift, emptySession, loadSession, saveSession, windowStart } from '../shared/session.ts'
 import type { DriftResult, GateOptions, StopFacts } from '../shared/gates.ts'
@@ -84,21 +90,17 @@ export interface CcAdapterEnv {
   enforceOnTurnEnd: boolean
   now: () => string
   readFile: (abs: string) => Promise<string | undefined>
+  /** Diagnostics sink, one line per call (persistence failures are said, not swallowed). */
+  stderr: (line: string) => void
 }
 
-function envString(env: NodeJS.ProcessEnv, name: string): string | undefined {
-  const value = env[name]
-  return typeof value === 'string' && value.length > 0 ? value : undefined
-}
-
-/** DSH_PROOF_REQUIRE_BASELINE parsing — anything invalid falls back to config.ts's 'warn'. */
-function parseRequireBaseline(value: string | undefined): 'off' | 'warn' | 'ask' {
-  return value === 'off' || value === 'ask' ? value : 'warn'
-}
-
-/** DSH_PROOF_DRIFT / DSH_PROOF_ENFORCE_TURN_END parsing — only '0' turns a default-on flag off. */
-function parseFlag(value: string | undefined): boolean {
-  return value !== '0'
+/** Best-effort stderr default; a closed stream must never break a handler. */
+function defaultStderr(line: string): void {
+  try {
+    process.stderr.write(`${line}\n`)
+  } catch {
+    /* nothing further to do */
+  }
 }
 
 async function nodeReadFile(abs: string): Promise<string | undefined> {
@@ -112,35 +114,40 @@ async function nodeReadFile(abs: string): Promise<string | undefined> {
 /**
  * Assemble the adapter environment. `cwd` is the hook process's working
  * directory (Claude Code sets it to the project dir); DSH_PROOF_ROOT wins.
+ * The env contract itself is parsed by the shared `resolveAdapterEnv` — one
+ * parser for every face (H-21: a variable only this file reads is a forked
+ * deployment, not a configuration).
  */
 export function ccAdapterEnv(env: NodeJS.ProcessEnv, cwd: string): CcAdapterEnv {
-  const root = envString(env, 'DSH_PROOF_ROOT') ?? cwd
-  const trustRoot = envString(env, 'DSH_PROOF_TRUST_DIR')
-  const evidenceStore = envString(env, 'DSH_PROOF_EVIDENCE_STORE')
-  const evidenceDir = envString(env, 'DSH_PROOF_EVIDENCE_DIR')
+  const values = resolveAdapterEnv(env)
+  const root = values.root ?? cwd
   // The trust-root default is left to deriveProofPaths (the DSH_HOME rule the
   // plugin and the MCP entry both apply), so all three faces derive the same one.
   const paths = deriveProofPaths({
     root,
-    ...(trustRoot !== undefined ? { trustRoot } : {}),
-    ...(evidenceStore !== undefined ? { evidenceStore } : {}),
-    ...(evidenceDir !== undefined ? { evidenceDir } : {}),
+    ...(values.trustRoot !== undefined ? { trustRoot: values.trustRoot } : {}),
+    ...(values.evidenceStore !== undefined ? { evidenceStore: values.evidenceStore } : {}),
+    ...(values.evidenceDir !== undefined ? { evidenceDir: values.evidenceDir } : {}),
   })
   // GateOptions mirrors the plugin config's semantics: `evidenceDir` is the
   // workspace-relative dir ('.proof' by default), only meaningful in
-  // workspace mode — host mode keeps the store outside the sandbox.
+  // workspace mode — host mode keeps the store outside the sandbox. The
+  // trust root rides along so the shell-command sweep can guard the
+  // trust-side artifacts too (H-02).
   const gate: GateOptions = {
     evidenceStore: paths.evidenceStore,
-    evidenceDir: evidenceDir ?? '.proof',
-    requireBaseline: parseRequireBaseline(env.DSH_PROOF_REQUIRE_BASELINE),
+    evidenceDir: values.evidenceDir ?? '.proof',
+    requireBaseline: values.requireBaseline ?? 'warn',
+    trustRoot: paths.trustRoot,
   }
   return {
     paths,
     gate,
-    driftDetection: parseFlag(env.DSH_PROOF_DRIFT),
-    enforceOnTurnEnd: parseFlag(env.DSH_PROOF_ENFORCE_TURN_END),
+    driftDetection: values.driftDetection ?? true,
+    enforceOnTurnEnd: values.enforceTurnEnd ?? true,
     now: () => new Date().toISOString(),
     readFile: nodeReadFile,
+    stderr: defaultStderr,
   }
 }
 
@@ -179,7 +186,8 @@ export async function handlePreToolUse(payload: CcHookPayload, env: CcAdapterEnv
  * PostToolUse — provenance observation. Loads the session (seeding an empty
  * one on first sight), folds the observation in, persists. A tool result must
  * never be delayed by bookkeeping failures, so an observation error is
- * swallowed: the handler answers undefined and the turn continues.
+ * swallowed — but SAID on stderr since v0.23 (M-43: a silent observation
+ * loss reads to the operator like working drift detection).
  * A payload without session_id is a no-op — there is nowhere to persist.
  */
 export async function handlePostToolUse(payload: CcHookPayload, env: CcAdapterEnv): Promise<undefined> {
@@ -191,9 +199,11 @@ export async function handlePostToolUse(payload: CcHookPayload, env: CcAdapterEn
       session = await applyObservation(session, payload.tool_name, payload.tool_input, env.paths.root, env.readFile)
     }
     await saveSession(env.paths.sessionDir, sessionId, session)
-  } catch {
+  } catch (error) {
     // Observation is best-effort by design; drift detection at Stop re-reads
     // the filesystem anyway, so a lost observation degrades, never breaks.
+    env.stderr(`dsh-proof: post-tool observation failed (${error instanceof Error ? error.message : String(error)}); `
+      + 'drift attribution may lag one turn')
   }
 }
 
@@ -204,13 +214,21 @@ export async function handlePostToolUse(payload: CcHookPayload, env: CcAdapterEn
  * windowStart seam: whatever this handler decides, the observation window
  * advances and the session persists. A block hands the reason back to the
  * model instead of letting the turn end; the baseline reminder (`fire`) is
- * one-shot per session through `firedNotices`, while a drift block re-arms
- * every stop until the drift is resolved.
+ * one-shot per session through `firedNotices`, a drift block re-arms every
+ * stop, and the verify reminder re-arms every TURN (v0.23: one blockable
+ * fact per mutating turn — a notice that can be burned once is not
+ * enforcement).
+ *
+ * Ordering (M-43, v0.23): the DECISION is computed first and returned even
+ * when persistence fails; the save runs last in its own best-effort try. A
+ * chmod'd read-only session directory used to swallow every drift block this
+ * handler had already computed — the exact failure the block exists for.
  * A payload without session_id is a no-op — there is nothing to observe.
  */
 export async function handleStop(payload: CcHookPayload, env: CcAdapterEnv): Promise<Record<string, unknown> | undefined> {
   const sessionId = sessionIdOf(payload)
   if (sessionId === undefined) return undefined
+  let outcome: { reason: string | undefined; next: AdapterSession }
   try {
     const session = await loadSession(env.paths.sessionDir, sessionId) ?? emptySession(env.now())
     const drift: DriftResult | undefined = env.driftDetection
@@ -225,26 +243,45 @@ export async function handleStop(payload: CcHookPayload, env: CcAdapterEnv): Pro
       driftDetection: env.driftDetection,
     }
     const decision = evaluateStop(facts, session)
-    if (decision.fire !== undefined && !session.firedNotices.includes(decision.fire)) {
-      session.firedNotices.push(decision.fire)
-    }
     // Drift is the louder signal: when both a block and a one-shot notice are
     // due, the drift reason is what the model needs to act on first.
     const reason = decision.block !== undefined ? decision.block : decision.fire
-    await saveSession(env.paths.sessionDir, sessionId, windowStart(session, env.now()))
-    if (reason === undefined) return undefined
-    return { decision: 'block', reason }
-  } catch {
-    // A failing Stop hook must never wedge the turn's wind-down.
+    const fired = decision.fire !== undefined && !session.firedNotices.includes(decision.fire)
+      ? [...session.firedNotices, decision.fire]
+      : session.firedNotices
+    outcome = { reason, next: windowStart({ ...session, firedNotices: fired }, env.now()) }
+  } catch (error) {
+    // A failing Stop evaluation must never wedge the turn's wind-down — but
+    // it is said, not silenced.
+    env.stderr(`dsh-proof: stop evaluation failed (${error instanceof Error ? error.message : String(error)}); the turn proceeds unblocked`)
     return undefined
   }
+  try {
+    await saveSession(env.paths.sessionDir, sessionId, outcome.next)
+  } catch (error) {
+    env.stderr(`dsh-proof: session persistence failed (${error instanceof Error ? error.message : String(error)}); `
+      + `the observation window did not advance — one-time notices may repeat`)
+  }
+  if (outcome.reason === undefined) return undefined
+  return { decision: 'block', reason: outcome.reason }
 }
 
-/** The MCP line appended to the SessionStart context: the tool names on THIS host. */
+/**
+ * The MCP line appended to the SessionStart context: the tool names on THIS
+ * host, plus the wiring self-check (H-22): the policy section describes what
+ * the hooks DO when they are wired, and this adapter cannot verify its own
+ * wiring — a project-scope settings file can silently drop the PreToolUse
+ * hook. The context therefore states the detection, not a guarantee, and
+ * hands the model the one check that falsifies it.
+ */
 function mcpToolsLine(): string {
   return 'On this host the proof verbs are MCP tools: proof_status, proof_baseline, proof_verify, proof_claim, proof_bundle '
     + '(registered with `claude mcp add proof -- dsh-proof-mcp`). Call proof_verify after any significant change, before claiming the work done. '
-    + 'Note: files changed only through Bash are not path-attributed — prefer Write/Edit so drift attribution can see them.'
+    + 'Note: files changed only through Bash are not path-attributed — prefer Write/Edit so drift attribution can see them.\n\n'
+    + 'Enforcement wiring: the gates above run through host hooks (.claude/settings.json). This context cannot '
+    + 'verify they are wired — a project-level settings file can omit or remove them, and hook wiring supplied by '
+    + 'the repository travels with the repository. Treat enforcement as DETECTED, not guaranteed: if a write into '
+    + 'the evidence store (.proof/evidence.jsonl) is not denied, report that the guard is absent instead of assuming oversight.'
 }
 
 /**

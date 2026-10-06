@@ -41,6 +41,18 @@ function preAsk(reason: string): string {
   })}\n`
 }
 
+/**
+ * Read stdin with a size cap and a deadline (B3-L2). Claude Code writes one
+ * JSON object and closes the pipe; a host that never ends (or an upstream
+ * pipe fault that floods) must not hang the hook until the host's own
+ * timeout or grow the buffer without bound. On either limit we take what
+ * arrived: a truncated payload fails JSON.parse downstream, and for
+ * pre-tool-use that honestly answers `ask` — a gate that cannot read its
+ * input must not wave the mutation through.
+ */
+const STDIN_LIMIT_BYTES = 4 * 1024 * 1024
+const STDIN_DEADLINE_MS = 10_000
+
 function readStdin(): Promise<string> {
   return new Promise((resolve) => {
     const stdin = process.stdin
@@ -50,9 +62,26 @@ function readStdin(): Promise<string> {
     }
     stdin.setEncoding('utf8')
     let buffer = ''
-    stdin.on('data', (chunk: string) => { buffer += chunk })
-    stdin.on('end', () => { resolve(buffer) })
-    stdin.on('error', () => { resolve(buffer) })
+    let settled = false
+    const settle = (): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try {
+        stdin.destroy()
+      } catch {
+        /* already gone */
+      }
+      resolve(buffer)
+    }
+    const timer = setTimeout(settle, STDIN_DEADLINE_MS)
+    stdin.on('data', (chunk: string) => {
+      if (settled) return
+      buffer += chunk
+      if (buffer.length > STDIN_LIMIT_BYTES) settle()
+    })
+    stdin.on('end', settle)
+    stdin.on('error', settle)
   })
 }
 
@@ -69,7 +98,7 @@ async function main(): Promise<void> {
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('payload is not a JSON object')
     payload = parsed as CcHookPayload
   } catch {
-    if (arg === 'pre-tool-use') process.stdout.write(preAsk('dsh-proof: gate could not parse the hook payload'))
+    if (arg === 'pre-tool-use') writeOut(preAsk('dsh-proof: gate could not parse the hook payload'))
     return
   }
 
@@ -94,14 +123,28 @@ async function main(): Promise<void> {
       result = await handleSessionStart(payload, env)
       break
   }
-  if (result !== undefined) process.stdout.write(`${JSON.stringify(result)}\n`)
+  if (result !== undefined) writeOut(`${JSON.stringify(result)}\n`)
+}
+
+// A closed stdout (EPIPE when the host has already gone away) turns
+// process.stdout.write into an 'error' event that, unhandled, exits non-zero
+// — breaking the "exit 0 always" contract for nothing the host can use.
+// The answer is best-effort; silence is already the protocol's no-action.
+process.stdout.on('error', () => { /* the pipe is gone; nothing left to say */ })
+
+function writeOut(line: string): void {
+  try {
+    process.stdout.write(line)
+  } catch {
+    /* EPIPE after the host left — exit 0 regardless */
+  }
 }
 
 main().catch((error: unknown) => {
   // Exit 0 regardless: the protocol speaks through stdout, and a dead hook
   // must not look like a denied tool call. Only the gate answers, with `ask`.
   if (process.argv[2] === 'pre-tool-use') {
-    process.stdout.write(preAsk('dsh-proof: gate internal error'))
+    writeOut(preAsk('dsh-proof: gate internal error'))
     return
   }
   console.error(`[dsh-proof-cc] ${error instanceof Error ? error.stack ?? error.message : String(error)}`)

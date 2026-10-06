@@ -335,6 +335,41 @@ test('H6: a healthy query set stays un-degraded (failures alone trigger the mark
   assert.deepEqual(resolution.changed, ['src/a.ts'])
 })
 
+// ---------------------------------------------------------------------------
+// M-27 — an optional capability the host NEVER IMPLEMENTED is not a query
+// that answered "nothing": a missing `changedSince` (with a baseline head to
+// diff against) blinds the committed-change dimension, a missing `untracked`
+// blinds the new-file dimension, and both used to pass WITHOUT the degraded
+// marker — a third-party minimal WorkspacePort got its narrowed change set
+// trusted (H6's "an empty answer is not evidence of cleanliness", applied to
+// capability absence).
+// ---------------------------------------------------------------------------
+
+test('M-27: a host without changedSince/untracked capabilities is degraded, not silently narrowed', async () => {
+  const fs = MemoryFs.of(project())
+  // A minimal port: only the required gitHead/gitDirty — exactly what a
+  // third-party host implementing the mandatory surface looks like.
+  const root = '/ws'
+  const minimal = {
+    root,
+    gitHead: async () => 'abc123' as string | null,
+    gitDirty: async () => ['src/a.ts'] as string[],
+  }
+  const baseline = { head: 'abc123', dirty: [], dirtyDigests: {} }
+  const resolution = await resolveChangeSet({ fs, workspace: minimal as unknown as FakeWorkspace, baseline })
+  assert.equal(resolution.degraded, true, 'the missing dimensions must carry the same weight as failed queries')
+  assert.deepEqual(resolution.changed, ['src/a.ts'], 'the required dirty dimension still contributes')
+
+  // Control: a host WITHOUT a baseline head has no committed-diff dimension
+  // to lose — `changedSince` absence is not blindness there (there is no ref
+  // to diff against), and the resolution stays honest about what it knew.
+  const unborn = await resolveChangeSet({
+    fs, workspace: minimal as unknown as FakeWorkspace,
+    baseline: { head: null, dirty: [], dirtyDigests: {} },
+  })
+  assert.equal(unborn.degraded, true, 'untracked is still a missing dimension with a baseline present')
+})
+
 test('ENGINE (H6): a committed change hidden by a failed diff still forces the full check set', async () => {
   // The headline scenario: the agent commits its work, `git diff` then fails
   // (index.lock contention), and the dirty/untracked dimensions see nothing.

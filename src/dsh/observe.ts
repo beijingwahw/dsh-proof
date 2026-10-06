@@ -32,22 +32,131 @@ import { sha256 } from '../core/hash.ts'
  * the false charge. Callers that must not miss (the evidence guard) pass
  * `{contentKeys: true}` to re-admit the key.
  */
-const PATH_KEYS = ['path', 'file', 'file_path', 'filePath', 'target', 'filename', 'dest', 'destination']
+const PATH_KEYS = ['path', 'file', 'file_path', 'filePath', 'target', 'filename', 'dest', 'destination', 'notebook_path']
 const PATH_ARRAY_KEYS = ['paths', 'files', 'targets', 'globs', 'patterns']
 
 /**
  * Tool-name classification — the single source both adapter layers consult
- * (the pre-execute gates in index.ts and the read/write split below). It lives
- * here so the watcher cannot drift from the gates again.
+ * (the pre-execute gates in index.ts / gates.ts and the read/write split
+ * below). It lives here so the watcher cannot drift from the gates again.
+ *
+ * H-01 (v0.23): the classification is an ANCHORED NAME LIST, not a word
+ * pattern. The pre-v0.23 regex required a mutation verb to be delimited by
+ * `^|[_-]`, so the camelCase names real hosts ship (`MultiEdit`,
+ * `NotebookEdit` — both documented Claude Code mutators) matched nothing,
+ * and because the gates are allowlist-shaped ("not a mutation → pass
+ * through") those names walked every pre-execute gate while carrying a
+ * `file_path` straight into the evidence store. Names are now enumerated;
+ * anything the lists do not recognize is classified as a MUTATION — the
+ * conservative charge — so an unrecognized write tool can only cost the
+ * agent an over-recorded touch, never an unguarded write. Only a name on
+ * the read-only list may classify as a read.
  */
+
+/**
+ * Explicitly recognized mutation tool names (matched case-insensitively,
+ * whole-name anchored). The list is documentation plus override: unknown
+ * names default to mutation anyway, but an explicit entry wins even if a
+ * future read-only addition ever collided with it.
+ */
+export const MUTATION_TOOL_NAMES: readonly string[] = [
+  // Claude Code's documented mutators (adapters/claude-code/hooks.ts) — the
+  // camelCase names the old delimited-verb pattern could not see.
+  'edit', 'write', 'multiedit', 'notebookedit',
+  // Common host spellings seen across tool surfaces.
+  'writefile', 'applypatch', 'createfile', 'deletefile', 'removefile',
+  'movefile', 'renamefile', 'strreplace', 'replacetext',
+  // Legacy bare verbs the pre-v0.23 pattern matched as whole names.
+  'create', 'patch', 'delete', 'remove', 'move', 'rename', 'mkdir', 'touch',
+  'apply', 'install', 'update', 'upsert',
+]
+
+/**
+ * Shell-class tool names (matched case-insensitively, whole-name anchored):
+ * calls that execute an arbitrary host command — which can mutate anything,
+ * through a `command` string this observer deliberately does not parse.
+ */
+export const SHELL_TOOL_NAMES: readonly string[] = [
+  'bash', 'shell', 'exec', 'run_code', 'run_command', 'terminal', 'process',
+  'task', 'npm', 'pnpm', 'yarn', 'pip', 'cargo', 'go', 'make',
+  // Host spellings the pre-v0.23 enum missed (Gemini et al.) — their calls
+  // never flipped the session's shellUsed fact, silently keeping the H9b
+  // "changed outside your tool calls" accusation alive.
+  'execute_command', 'run_shell_command', 'shell_exec',
+]
+
+/**
+ * Read-only tool names (matched case-insensitively). The ONLY names that
+ * classify as reads — camelCase host spellings (`Read`, `Grep`, `View`,
+ * `Glob`, `LS`, `WebFetch`) fold onto their lowercase forms.
+ */
+export const READ_ONLY_TOOL_NAMES: readonly string[] = [
+  'read', 'read_file', 'view', 'cat', 'grep', 'glob', 'ls', 'list',
+  'search', 'search_files', 'find', 'show', 'head', 'tail', 'webfetch',
+]
+
+const MUTATION_SET = new Set(MUTATION_TOOL_NAMES)
+const SHELL_SET = new Set(SHELL_TOOL_NAMES)
+const READ_ONLY_SET = new Set(READ_ONLY_TOOL_NAMES)
+
+const foldName = (toolName: string): string => toolName.toLowerCase()
+
 /** Tools whose calls constitute a workspace mutation. */
-export const MUTATION_TOOL_RE = /(^|[_-])(write|edit|create|patch|delete|remove|move|rename|mkdir|touch|apply|install|update|upsert)([_-]|$)/i
+export const MUTATION_TOOL_RE = anchoredPatternOf(MUTATION_TOOL_NAMES)
 /** Tools that execute arbitrary host commands (which can mutate anything). */
-export const SHELL_TOOL_RE = /^(bash|shell|exec|run_code|run_command|terminal|process|task|npm|pnpm|yarn|pip|cargo|go|make)$/i
+export const SHELL_TOOL_RE = anchoredPatternOf(SHELL_TOOL_NAMES)
+
+/** An anchored, case-insensitive full-name pattern over an explicit list. */
+function anchoredPatternOf(names: readonly string[]): RegExp {
+  return new RegExp(`^(?:${names.map(escapeRegExp).join('|')})$`, 'i')
+}
+
+/** Quote regex metacharacters so a listed name anchors a literal. */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
 
 /** True when a tool call of this name can move workspace state. */
 export function isMutationToolName(toolName: string): boolean {
-  return MUTATION_TOOL_RE.test(toolName) || SHELL_TOOL_RE.test(toolName)
+  const folded = foldName(toolName)
+  if (MUTATION_SET.has(folded) || SHELL_SET.has(folded)) return true
+  if (READ_ONLY_SET.has(folded)) return false
+  // Unknown names default to *mutation* (H-01): the gates only ever hold a
+  // call back when this says yes, so an unrecognized write tool must land on
+  // the guarded side, never the pass-through side.
+  return true
+}
+
+/** True when a tool call of this name runs an arbitrary host command. */
+export function isShellToolName(toolName: string): boolean {
+  return SHELL_SET.has(foldName(toolName))
+}
+
+/**
+ * H-02: does a shell command string mention any of the guarded targets?
+ *
+ * The command string is the one argument shape `pathsIn` structurally cannot
+ * see (a `bash {command: 'echo x > .proof/evidence.jsonl'}` names no path
+ * key), so the evidence-store guard needs a conservative textual sweep: path
+ * separators are normalized (`\` → `/`, both spell a redirect target on
+ * Windows), everything is case-folded the way the guard's path comparison
+ * already folds (H10), and any target appearing as a substring — the bare
+ * store directory, a file inside it, or a trusted file name such as
+ * `evidence.jsonl` / `baseline.json` / `anchor.json` / the signing-key files —
+ * is a hit. Substring, not word-boundary, on purpose: `cd .proof && rm *`
+ * and `>.PROOF/EVIDENCE.jsonl` must both land. False positives cost one
+ * denied shell call with a reason saying why; a false negative costs the
+ * chain.
+ */
+export function shellCommandMentionsPath(command: string, targets: readonly string[]): boolean {
+  if (typeof command !== 'string' || command.length === 0) return false
+  const haystack = command.replace(/\\/g, '/').toLowerCase()
+  for (const target of targets) {
+    if (typeof target !== 'string' || target.length === 0) continue
+    const needle = target.replace(/\\/g, '/').toLowerCase()
+    if (haystack.includes(needle)) return true
+  }
+  return false
 }
 
 export interface DriftReport {
@@ -74,9 +183,13 @@ export class WorkspaceWatch {
   private readonly read = new Set<string>()
   /**
    * Tool names that only read, so their paths are "read" not "touched".
-   * Consulted only after `isMutationToolName` says no (see `observe`).
+   * Consulted only after `isMutationToolName` says no (see `observe`) — the
+   * shared, case-insensitive {@link READ_ONLY_TOOL_NAMES} list (H-01: a
+   * camelCase `Read` from a real host used to miss the case-sensitive set,
+   * fall to the default mutation charge, and permanently silence drift
+   * detection for the files it read).
    */
-  private readonly readOnlyTools = new Set(['read', 'read_file', 'view', 'cat', 'grep', 'glob', 'ls', 'list', 'search', 'search_files', 'find', 'show', 'head', 'tail'])
+  private readonly readOnlyTools = READ_ONLY_SET
 
   constructor(fs: FsPort, root: string) {
     this.fs = fs
@@ -156,7 +269,7 @@ export class WorkspaceWatch {
 
   /** Record one completed tool call. */
   async observe(exec: Readonly<ToolExecution>, _result: Readonly<ToolExecutionResult>): Promise<void> {
-    if (SHELL_TOOL_RE.test(exec.name)) this.shellUsed = true
+    if (isShellToolName(exec.name)) this.shellUsed = true
     const paths = WorkspaceWatch.pathsIn(exec.arguments)
     // Classification precedence, one source of truth (`isMutationToolName`):
     //   1. the name matches a mutation/shell pattern -> mutation
@@ -166,7 +279,7 @@ export class WorkspaceWatch {
     //      detection can walk back, but an unknown write classified as a read
     //      would let a real edit escape attribution entirely. Better to
     //      over-charge the agent than let it escape responsibility.
-    const isRead = !isMutationToolName(exec.name) && this.readOnlyTools.has(exec.name)
+    const isRead = !isMutationToolName(exec.name) && this.readOnlyTools.has(exec.name.toLowerCase())
     for (const raw of paths) {
       const rel = toWorkspaceRelative(raw, this.root)
       if (rel === undefined) continue
@@ -305,16 +418,31 @@ function looksLikePath(value: string): boolean {
   return /[/.\\]/.test(value) || /^[A-Za-z0-9_-]+$/.test(value) === false
 }
 
-/** Render drift as corrective context for the model. Short on purpose. */
-export function driftNarrative(report: DriftReport): string | undefined {
+/**
+ * Render drift as corrective context for the model. Short on purpose.
+ *
+ * H9②/M2 (v0.23): `shellUsed` says a shell-class tool ran this session. A
+ * shell's edits are invisible to path extraction by construction, so with it
+ * set, "changed outside your tool calls" would be a false accusation in the
+ * plugin's authoritative voice — exactly the statement the session-level
+ * shell fact exists to prevent. The headings demote to what is actually
+ * known ("outside your file tools; a shell ran — yours or an external
+ * editor's, indistinguishable here") while the remedy line stays.
+ */
+export function driftNarrative(report: DriftReport, options: { shellUsed?: boolean } = {}): string | undefined {
   if (report.drifted.length === 0 && report.staleReads.length === 0) return undefined
+  const shell = options.shellUsed === true
   const lines: string[] = []
   if (report.staleReads.length > 0) {
-    lines.push('⚠️ Files you already read have changed outside your tool calls. Your in-context copies are stale:')
+    lines.push(shell
+      ? '⚠️ Files you already read have changed outside your file tools — a shell ran this session, so these may be your own shell edits or an external editor\'s (indistinguishable here). Your in-context copies are stale:'
+      : '⚠️ Files you already read have changed outside your tool calls. Your in-context copies are stale:')
     for (const f of report.staleReads.slice(0, 10)) lines.push(`  · ${f}`)
   }
   if (report.drifted.length > 0 && report.staleReads.length !== report.drifted.length) {
-    lines.push('⚠️ Workspace changes not made through your tools:')
+    lines.push(shell
+      ? '⚠️ Workspace changes not made through your file tools (a shell ran this session — shell edits and external edits cannot be told apart here):'
+      : '⚠️ Workspace changes not made through your tools:')
     for (const f of report.drifted.filter(f => !report.staleReads.includes(f)).slice(0, 10)) lines.push(`  · ${f}`)
   }
   lines.push('Re-read these before relying on them, then re-run proof_verify.')

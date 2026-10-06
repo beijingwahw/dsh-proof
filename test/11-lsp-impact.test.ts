@@ -187,3 +187,92 @@ test('ENGINE: precision surfaces end to end through verify', async () => {
   assert.ok(outcome.selection.affected.length > 0, 'the alias-reachable check is selected')
   assert.equal(outcome.report.grade, 'proven')
 })
+
+// -- H-34/M-30: the resolver's own reliability (hang, poison, budget order) --------
+
+test('H-34: a never-settling language server degrades to null within the deadline — and is not cached as fact', async () => {
+  // The hang shape this pins: `query()` returns a promise that never settles
+  // (init deadlock, a zombie language-server process). Before H-34 the
+  // resolver awaited it bare — no engine budget covers graph building — so
+  // one hung position hung the WHOLE verify. Now every round-trip races a
+  // deadline (injectable: 60ms here, 5s in production).
+  let queries = 0
+  const signals: (AbortSignal | undefined)[] = []
+  const hung: LspLike = {
+    query(operation, args, signal): Promise<LspQueryResult> {
+      void operation; void args
+      queries += 1
+      signals.push(signal)
+      return new Promise<LspQueryResult>(() => { /* never settles */ })
+    },
+  }
+  const fs = MemoryFs.of({ '/ws/src/a.ts': "import { t } from '@lib/t'\n" })
+  const resolver = createLspResolver(hung, '/ws', fs, { budget: 10, queryTimeoutMs: 60 })
+  assert.ok(resolver, 'resolver built when the seam is present')
+
+  const startedAt = Date.now()
+  const first = await resolver.resolveDefinition('src/a.ts', 0, 10)
+  const wallMs = Date.now() - startedAt
+  assert.equal(first, null, 'a hung server costs its position precision, never the whole verify')
+  assert.ok(wallMs < 2_000, `resolveDefinition took ${wallMs}ms — the deadline must bound it`)
+  assert.equal(signals[0] instanceof AbortSignal, true, 'the vendor seam receives the signal parameter')
+  assert.equal(signals[0]?.aborted, true, 'the deadline aborts it — servers that honour signals stop early')
+
+  // Cache-poisoning guard: a timeout is a fact about the SERVER, not the
+  // code. The same position must be QUERIED again (and time out again),
+  // never served from a cached null.
+  const second = await resolver.resolveDefinition('src/a.ts', 0, 10)
+  assert.equal(second, null)
+  assert.equal(queries, 2, 'a timed-out answer must not be frozen as "no definition"')
+})
+
+test('M-30: a transient server rejection is retried; a deterministic answer still caches', async () => {
+  // Cold-start reject (server not ready) used to be cached as null until the
+  // file changed on disk — the graph silently pinned to approximate
+  // precision for the whole session exactly when the server was warming up.
+  let queries = 0
+  const flaky: LspLike = {
+    async query(): Promise<LspQueryResult> {
+      queries += 1
+      if (queries === 1) throw new Error('server not ready (cold start)')
+      return { kind: 'locations', locations: [{ uri: 'file:///ws/lib/t.ts', range: {} }] }
+    },
+  }
+  const fs = MemoryFs.of({ '/ws/src/a.ts': "import { t } from '@lib/t'\n" })
+  const resolver = createLspResolver(flaky, '/ws', fs, { budget: 10 })
+  assert.ok(resolver)
+
+  assert.equal(await resolver.resolveDefinition('src/a.ts', 0, 10), null,
+    'the rejection answers null now — soundness never narrows')
+  assert.equal(await resolver.resolveDefinition('src/a.ts', 0, 10), 'lib/t.ts',
+    'the retry reaches the now-ready server')
+  assert.equal(queries, 2, 'the failed first attempt was not cached as an answer')
+  assert.equal(await resolver.resolveDefinition('src/a.ts', 0, 10), 'lib/t.ts',
+    'deterministic answers cache exactly as before')
+  assert.equal(queries, 2)
+})
+
+test('M-30: the budget gates NEW round-trips only — cache hits stay free after it runs dry', async () => {
+  // The resolver is a plugin-lifetime singleton and the budget a whole-
+  // session allowance; the old budget-before-cache order blinded the graph to
+  // answers already paid for the moment the counter flipped.
+  let queries = 0
+  const lsp: LspLike = {
+    async query(): Promise<LspQueryResult> {
+      queries += 1
+      return { kind: 'locations', locations: [{ uri: 'file:///ws/lib/t.ts', range: {} }] }
+    },
+  }
+  const fs = MemoryFs.of({ '/ws/src/a.ts': "import { t } from '@lib/t'\n" })
+  const resolver = createLspResolver(lsp, '/ws', fs, { budget: 1 })
+  assert.ok(resolver)
+
+  assert.equal(await resolver.resolveDefinition('src/a.ts', 0, 10), 'lib/t.ts',
+    'the one round-trip the budget allows')
+  assert.equal(await resolver.resolveDefinition('src/a.ts', 0, 10), 'lib/t.ts',
+    'a cache hit answers without consulting the budget')
+  assert.equal(queries, 1, 'no new round-trip for a cached position')
+  assert.equal(await resolver.resolveDefinition('src/a.ts', 0, 11), null,
+    'a NEW position past the budget degrades to null (approximate graph)')
+  assert.equal(queries, 1)
+})

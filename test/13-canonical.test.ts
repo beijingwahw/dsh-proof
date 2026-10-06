@@ -56,6 +56,18 @@ test('root substitution fires at separators, quotes, whitespace and line end —
   assert.equal(normalized, 'cd "$WORKSPACE"\nsee $WORKSPACE\\src ok in $WORKSPACE and /appdata')
 })
 
+test('root substitution fires at glued punctuation (paren, colon, comma, semicolon) — B6-L2', () => {
+  // Linters and stack frames render paths as `(/app/x.ts)`, `at /app:3:1`,
+  // `/app/a.ts,/app/b.ts` — none of those used to substitute at the bare
+  // root, minting cross-machine false DIFFERENCES (same file, different
+  // digest per spelling). The boundary now includes the punctuation a path
+  // is routinely glued to; the mid-word guard is untouched.
+  const out = normalizeOutput('at (/app) and /app:1:1 then /app/a.ts,/app/b.ts; done', { root: '/app' })
+  assert.equal(out, 'at ($WORKSPACE) and $WORKSPACE:1:1 then $WORKSPACE/a.ts,$WORKSPACE/b.ts; done')
+  // The anchor still refuses to chew into a longer name sharing the prefix.
+  assert.equal(normalizeOutput('see /application', { root: '/app' }), 'see /application')
+})
+
 test('without canonical roots, legacy behaviour is byte-for-byte unchanged', () => {
   assert.equal(normalizeOutput('plain output\n', {}), 'plain output', 'trailing-empty-line pop is legacy behaviour, unchanged')
   assert.equal(normalizeOutput('fail at /nowhere/here/a.ts\n'), 'fail at /nowhere/here/a.ts', 'no roots given — no substitution, digests stay legacy-stable')

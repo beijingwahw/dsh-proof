@@ -691,11 +691,27 @@ function withinBudgetObligation(input: ContractInput): ObligationResult {
       detail: 'perf-budget claim requires contract.budgetMs — state the number of milliseconds the benchmark must stay under',
     }
   }
+  // H-29: a non-finite budget is not a budget. `1e999` parses to Infinity and
+  // used to sail through (`durationMs > Infinity` is always false — the
+  // obligation was vacuously met for any benchmark, so a performance claim's
+  // budget component was decorative). Non-positive budgets are refused for
+  // the same reason: a bound that cannot bind is a misdelivery of the
+  // contract, and the honest answer is not-met with the fix stated.
+  if (!Number.isFinite(budget) || budget <= 0) {
+    return {
+      id: 'within-budget',
+      met: false,
+      detail: `contract.budgetMs must be a finite positive number of milliseconds, got ${budget} — restate the budget the benchmark must actually stay under`,
+    }
+  }
   const found = benchmarkRecords(input)
   if (found.length === 0) {
     return { id: 'within-budget', met: false, detail: 'no benchmark evidence to compare against the budget — see benchmark-evidence' }
   }
-  const offenders = found.filter(r => r.durationMs > budget)
+  // NaN-safe comparison: a record whose durationMs is not a finite number
+  // fails `<= budget` and lands in offenders (a NaN duration cannot be
+  // "within" anything), instead of slipping past a `>` that is false for NaN.
+  const offenders = found.filter(r => !(r.durationMs <= budget))
   if (offenders.length > 0) {
     return {
       id: 'within-budget',
@@ -794,6 +810,10 @@ function juryUpholdsObligation(input: ContractInput): ObligationResult {
     return { id: 'jury-upholds', met: false, detail: 'no jury verdict to uphold the claim — see jury-delivered' }
   }
   if (att.verdict === 'uphold') {
+    // H-30 note: a coherent uphold carries p ≥ 0.5 by construction —
+    // `parseJury` refuses the contradictory records at the chain-read
+    // boundary — so this threshold branch is defense for records arriving
+    // through other doors (pre-parsed inputs), not the chain path.
     if (att.probability >= UPHOLD_PROBABILITY_MIN) {
       return {
         id: 'jury-upholds',
