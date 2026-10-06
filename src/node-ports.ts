@@ -15,7 +15,7 @@ import { StringDecoder } from 'node:string_decoder'
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign as edSign, verify as edVerify } from 'node:crypto'
 import type {
   Clock, CommandPort, CommandResult, CommandRunOptions, FileStat, FsPort,
-  SignerPort, WalkOptions, WorkspacePort,
+  SignerPort, WalkOptions, WalkResult, WorkspacePort,
 } from './core/ports.ts'
 
 export class SystemClock implements Clock {
@@ -376,7 +376,7 @@ export class NodeFsPort implements FsPort {
     }
   }
 
-  async walk(root: string, options: WalkOptions = {}): Promise<string[]> {
+  async walk(root: string, options: WalkOptions = {}): Promise<WalkResult> {
     const ignore = new Set(options.ignoreDirs ?? [])
     const limit = options.limit ?? 20_000
     const out: string[] = []
@@ -401,7 +401,14 @@ export class NodeFsPort implements FsPort {
       }
     }
     await visit(root, '')
-    return out.sort()
+    // M8: the walk stops the moment it holds `limit` files, so reaching the
+    // cap means the listing is a prefix, never a census — even a workspace of
+    // exactly `limit` files cannot be distinguished from a bigger one without
+    // walking past the cap, so the honest answer at the cap is `truncated`.
+    // Consumers must treat the file list as incomplete (judge the graph
+    // uncertain), not as "the whole workspace".
+    const truncated = out.length >= limit
+    return { files: out.sort(), truncated }
   }
 
   async appendLine(filePath: string, line: string): Promise<void> {

@@ -175,14 +175,24 @@ export function sandboxEntryFor(claimId: string, seq: number): string {
 
 /**
  * Modules a synthetic script may never reach, under any of their spellings:
- * process spawning (`child_process`), the network (`net`/`http`/`https`/
- * `dgram`) and parallel kernels that would escape the sandbox's cwd and
- * timeout (`worker_threads`). The list is a locked contract with the engine
- * and tool wiring — additions are a breaking change to what hosts must
- * enforce at the ptc-runtime tier, not a casual edit.
+ * process spawning (`child_process`), the environment bag (`process` /
+ * `node:process` — an `import { env } from 'node:process'` would otherwise
+ * bypass the whole `process.env` read check, and env reads are the classic
+ * exfiltration channel), the network (`net`/`http`/`https`/`dgram`) and
+ * parallel kernels that would escape the sandbox's cwd and timeout
+ * (`worker_threads`). The list is a locked contract with the engine and tool
+ * wiring — additions are a breaking change to what hosts must enforce at the
+ * ptc-runtime tier, not a casual edit.
+ *
+ * `'node:process'` is listed for the contract's sake (the engine's conjure
+ * instruction and the tool prose render this list verbatim, and both
+ * spellings must be named to the model); matching itself reduces through the
+ * `node:` strip in `forbiddenModuleOf`, where the single `'process'` entry
+ * answers for both.
  */
 export const FORBIDDEN_CAPABILITIES: readonly string[] = [
   'child_process', 'net', 'http', 'https', 'dgram', 'worker_threads',
+  'process', 'node:process',
 ]
 
 /** One screened script: `ok` only when `findings` is empty (empty = cleared to run). */
@@ -193,21 +203,52 @@ export interface ScreenResult {
 
 // Static `… from '<specifier>'` — covers `import … from`, multi-line import
 // lists (the from-clause closes the statement) and `export … from` re-exports
-// (a re-export pulls the module in exactly like an import).
-const RE_FROM_CLAUSE = /(?:^|[^\w$])from\s*(['"])([^'"\n]*)\1/g
+// (a re-export pulls the module in exactly like an import). M11: the quote
+// class includes the backtick — a template literal WITHOUT interpolation is
+// a statically decidable specifier (`import(\`node:child_process\`)` used to
+// sail past the screen), and interpolated templates remain in the
+// computed-specifier limit below.
+const RE_FROM_CLAUSE = /(?:^|[^\w$])from\s*(['"`])([^'"`\n]*)\1/g
 // Bare side-effect import: `import '<specifier>'`.
-const RE_BARE_IMPORT = /\bimport\s*(['"])([^'"\n]*)\1/g
+const RE_BARE_IMPORT = /\bimport\s*(['"`])([^'"`\n]*)\1/g
 // Dynamic import with a *literal* specifier: `await import('<specifier>')`.
 // Computed specifiers (`import(name + suffix)`) are beyond static screening —
 // see the limits note on `screenScript`.
-const RE_DYNAMIC_IMPORT = /\bimport\s*\(\s*(['"])([^'"\n]*)\1/g
+const RE_DYNAMIC_IMPORT = /\bimport\s*\(\s*(['"`])([^'"`\n]*)\1/g
 // `require('<specifier>')`, the CommonJS spelling an .mjs could still reach
 // through a transitive dependency.
-const RE_REQUIRE = /\brequire\s*\(\s*(['"])([^'"\n]*)\1/g
+const RE_REQUIRE = /\brequire\s*\(\s*(['"`])([^'"`\n]*)\1/g
 // `process.env` in its member and computed-member spellings. A synthetic test
 // reads fixtures from the sandbox, never secrets from the environment — and
 // an environment read is the classic covert channel for exfiltration prompts.
+//
+// Known residual (M11, deliberately left uncaught): `process?.env` and
+// destructuring forms (`const { env } = process`) do not match either pattern.
+// Extending the regexes toward them (optional chains, any binding shape)
+// risks flagging innocent member/computed access that merely resembles an env
+// read — false positives teach authors to route around the screen — so the
+// optional-chain and deconstruction spellings stay documented residuals,
+// bounded by the same sandbox cwd/timeout/output-cap regime as the other
+// static-screen limits. (The `process`/`node:process` deny-list entries close
+// the module-import route to the same bag.)
 const RE_PROCESS_ENV = [/\bprocess\s*\.\s*env\b/, /\bprocess\s*\[\s*(['"])env\1\s*\]/]
+
+/**
+ * M11: decode the escape forms a specifier can hide behind before the
+ * deny-list sees it — `\u0070`, `\x70` and `\u{70}` all write `p`, so
+ * `'child_\u0070rocess'` is `'child_process'` and must screen as one. Only
+ * the *identifier-relevant* escapes are decoded (hex/unicode); everything
+ * else passes through verbatim, and a trailing lone backslash is kept — the
+ * goal is matching what the runtime would resolve, not validating syntax.
+ */
+function unescapeSpecifier(specifier: string): string {
+  return specifier.replace(/\\(?:u\{([0-9a-fA-F]{1,6})\}|u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2}))/g, (_, braced, u4, x2) => {
+    const code = braced !== undefined ? Number.parseInt(braced, 16)
+      : u4 !== undefined ? Number.parseInt(u4, 16)
+        : Number.parseInt(x2 ?? '0', 16)
+    return code > 0 && code <= 0x10_FFFF ? String.fromCodePoint(code) : _
+  })
+}
 
 /**
  * Normalize a module specifier to the name the deny-list speaks: strip the
@@ -235,10 +276,14 @@ function forbiddenModuleOf(specifier: string): string | undefined {
  * `from`-clauses), bare side-effect imports, literal-specifier dynamic
  * imports and `require` calls of any `FORBIDDEN_CAPABILITIES` module — with
  * or without the `node:` prefix — plus `process.env` reads in member and
- * computed-member form. The scan runs over the *raw text, comments included*:
- * a commented-out forbidden import is flagged rather than missed. That is
- * deliberate over-reporting — this is a deny-list, and for a screener the
- * safe direction is refusing an inert script, never running a live one.
+ * computed-member form. M11: all four import shapes accept backtick-quoted
+ * specifiers (an uninterpolated template literal is statically decidable),
+ * and specifiers are `\u`/`\x`-unescaped before the deny-list sees them, so
+ * `'child_\u0070rocess'` screens as `child_process`. The scan runs over the
+ * *raw text, comments included*: a commented-out forbidden import is flagged
+ * rather than missed. That is deliberate over-reporting — this is a
+ * deny-list, and for a screener the safe direction is refusing an inert
+ * script, never running a live one.
  *
  * Admitted limits of static screening (this is a *screen*, not a sandbox):
  * computed specifiers (`import(buildName())`), aliases
@@ -258,10 +303,13 @@ export function screenScript(source: string): ScreenResult {
 
   const checkImports = (regex: RegExp, how: string) => {
     for (const match of source.matchAll(regex)) {
-      const specifier = match[2] ?? ''
-      const forbidden = forbiddenModuleOf(specifier)
+      // M11: the deny-list judges the specifier the runtime would resolve —
+      // escapes decoded — while the finding quotes the raw text as written,
+      // so the evidence shows exactly what the author typed.
+      const raw = match[2] ?? ''
+      const forbidden = forbiddenModuleOf(unescapeSpecifier(raw))
       if (forbidden !== undefined) {
-        findings.add(`${how} of forbidden module '${forbidden}' (from '${specifier}')`)
+        findings.add(`${how} of forbidden module '${forbidden}' (from '${raw}')`)
       }
     }
   }

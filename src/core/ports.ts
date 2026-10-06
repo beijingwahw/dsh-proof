@@ -70,8 +70,8 @@ export interface FsPort {
   readDir(path: string): Promise<string[] | undefined>
   /** POSIX-ish `lstat`: file kind + mtime + size, or `undefined`. */
   stat(path: string): Promise<FileStat | undefined>
-  /** Recursively list regular files under `root`, relative to it. */
-  walk(root: string, options?: WalkOptions): Promise<string[]>
+  /** Recursively list regular files under `root`, relative to it. See `WalkResult`. */
+  walk(root: string, options?: WalkOptions): Promise<WalkResult>
   /** Append one line to a JSONL log, creating parent directories. */
   appendLine(path: string, line: string): Promise<void>
   /** Read every line of a JSONL log, or `[]` when absent. */
@@ -101,6 +101,25 @@ export interface WalkOptions {
   readonly ignoreDirs?: readonly string[]
   /** Maximum number of files returned before the walk stops. */
   readonly limit?: number
+}
+
+/**
+ * M8: what a workspace walk saw — and, crucially, whether it stopped early.
+ * `truncated` is `true` the moment the walk stopped at its `limit`: the file
+ * list is then a PREFIX of the workspace, not a census, and every consumer
+ * (the dependency graph, check selection, anything reasoning about "files
+ * that do not exist") must treat the result as incomplete — a silently
+ * truncated walk presented as complete is how a workspace bigger than the
+ * limit produced a graph that never said it was partial, and a "proven"
+ * grade over files the walk never saw. Callers that cannot widen the limit
+ * must propagate `truncated` so the impact decision degrades to *uncertain*
+ * (over-selection), never to a falsely narrow selection.
+ */
+export interface WalkResult {
+  /** Regular files under `root`, relative to it, sorted. */
+  readonly files: readonly string[]
+  /** True when the walk stopped at `limit` — more files may exist unseen. */
+  readonly truncated: boolean
 }
 
 /** Deterministic time source, so evidence ids are reproducible in tests. */

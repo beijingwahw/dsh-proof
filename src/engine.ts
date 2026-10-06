@@ -185,6 +185,13 @@ export interface VerifyOptions {
   /** Force the full check set regardless of impact analysis. */
   readonly all?: boolean
   readonly onProgress?: (label: string, index: number, total: number) => void
+  /**
+   * M19b: the claim text this verification answers — what the tool-side
+   * `claim` parameter was for. Bounded to 200 characters and recorded on the
+   * `proof/verified` boundary marker when non-empty, so the chain says WHAT
+   * was proven, not only that something was.
+   */
+  readonly claim?: string
 }
 
 export interface VerifyOutcome {
@@ -350,6 +357,26 @@ function syntheticRequestOf(payload: Record<string, unknown>): SyntheticRequest 
   return { claimId, claim, paths, entry, requestedAt }
 }
 
+/**
+ * M12: the note prepended to a record whose exit code claimed success without
+ * the scaffold's protocol line — the honest first line of an output that lied
+ * by omission.
+ */
+const SYNTHETIC_PROTOCOL_NOTE = 'protocol line missing: scaffolded scripts must end with SYNTHETIC: PASS/FAIL'
+
+/**
+ * M12: does the run's normalised output carry the scaffold's own verdict
+ * line? The judgement of a conjured script is the *protocol*, not the exit
+ * code alone: the scaffold's contract says a passing script ends with a
+ * `SYNTHETIC: PASS` line, and an empty script (or one that merely
+ * `process.exit(0)`s) satisfies the exit code while proving nothing. The
+ * check reads the record's excerpt of the normalised output line by line, so
+ * a protocol line buried mid-noise does not count — the line IS the verdict.
+ */
+function hasSyntheticProtocolPassLine(outputHead: string): boolean {
+  return outputHead.split(/\r?\n/).some(line => line.trim() === 'SYNTHETIC: PASS')
+}
+
 function isAbsolutePath(p: string): boolean {
   return /^([A-Za-z]:[\\/]|\/)/.test(p)
 }
@@ -428,6 +455,16 @@ function attachEvidenceCoverage(record: Evidence, coverage: NonNullable<Evidence
 function failureText(reason: unknown): string {
   const text = reason instanceof Error ? reason.message : String(reason)
   return text.slice(0, 200)
+}
+
+/**
+ * M19b: bounded, non-empty text for a boundary marker (≤200 characters), or
+ * `undefined` when the caller said nothing — absent stays absent on the
+ * chain; no empty fields are minted for parameters that were not passed.
+ */
+function markerText(value: string | undefined): string | undefined {
+  const trimmed = value?.trim()
+  return trimmed !== undefined && trimmed.length > 0 ? trimmed.slice(0, 200) : undefined
 }
 
 /**
@@ -608,9 +645,16 @@ export class ProofEngine {
    * it is a fact about the signer, not about the checkpoint's position.
    */
   private watchSigner(load: () => Promise<SignerPort | undefined>): Promise<SignerPort | undefined> {
+    // Only a *successful* resolution is memoized. A transient load failure
+    // (AV lock, a key dir that appears a moment later) must not poison the
+    // whole engine instance: the store retries its provider on the next
+    // checkpoint (v0.17 M15), and caching the undefined here would defeat
+    // that retry — every later checkpoint would reuse the cached failure.
     this.signerPromise ??= (async () => {
       try {
-        return await load()
+        const signer = await load()
+        if (signer === undefined) this.signerPromise = undefined
+        return signer
       } catch (reason) {
         const error = failureText(reason)
         if (this.verbose && this.logger !== undefined) {
@@ -618,6 +662,7 @@ export class ProofEngine {
         }
         void this.store.mark('trust/signer-unavailable', { error })
           .catch(() => { /* the log itself is unwritable; nothing more to record */ })
+        this.signerPromise = undefined
         return undefined
       }
     })()
@@ -654,7 +699,13 @@ export class ProofEngine {
   async loadGraph(force = false): Promise<DependencyGraph | undefined> {
     if (!this.options.impactGraph) return undefined
     if (this.graph !== undefined && !force) return this.graph
-    const files = await this.fs.walk(this.root, {
+    // M8: the walk result is consumed whole — `files` feeds the builder, and
+    // the walk's own `truncated` travels in through `walkTruncated`, where it
+    // ORs into `graph.truncated`. The builder cannot detect this truncation
+    // itself (its `limit` may never fire while the file list is still a
+    // prefix of the workspace), and a graph that silently reasons over a
+    // partial node set is the false-proven shape the flag exists to kill.
+    const walked = await this.fs.walk(this.root, {
       limit: this.options.impactGraphLimit,
       // E4: one ignore list, owned by discovery (checks.ts) — a second
       // hand-maintained copy here had already drifted. The only local
@@ -663,8 +714,9 @@ export class ProofEngine {
       // would make every build a whole-graph invalidator.
       ignoreDirs: [...DEFAULT_IGNORE_DIRS, 'lib'],
     })
-    this.graph = await buildDependencyGraph(this.fs, this.root, files, {
+    this.graph = await buildDependencyGraph(this.fs, this.root, walked.files, {
       limit: this.options.impactGraphLimit,
+      ...(walked.truncated ? { walkTruncated: true } : {}),
       ...(this.resolver !== undefined ? { resolver: this.resolver, lspQueryBudget: this.options.lspQueryBudget } : {}),
     })
     return this.graph
@@ -715,7 +767,12 @@ export class ProofEngine {
    * but no baseline file is written: the next verify then honestly reports
    * `no-baseline` instead of silently anchoring on an accident.
    */
-  async establishBaseline(options: { signal?: AbortSignal; onProgress?: VerifyOptions['onProgress'] } = {}): Promise<{ baseline: EngineBaseline; records: readonly Evidence[] }> {
+  async establishBaseline(options: {
+    signal?: AbortSignal
+    onProgress?: VerifyOptions['onProgress']
+    /** M19b: why this anchor was taken (≤200 characters), recorded on the `baseline/established` marker when non-empty. */
+    reason?: string
+  } = {}): Promise<{ baseline: EngineBaseline; records: readonly Evidence[] }> {
     // M7: an anchoring run re-discovers — the baseline must reflect the
     // checks the workspace declares NOW, not whatever an earlier verb cached.
     const specs = await this.loadChecks(true)
@@ -791,10 +848,13 @@ export class ProofEngine {
     }
     // saveBaseline records the file digest into the chain and checkpoints.
     await this.store.saveBaseline(anchored)
+    // M19b: the caller's reason for anchoring (bounded, only when said).
+    const reason = markerText(options.reason)
     await this.store.mark('baseline/established', {
       baselineId: baseline.baselineId,
       root: baseline.root,
       checks: batch.records.length,
+      ...(reason !== undefined ? { reason } : {}),
       // ζ: whether this baseline carries an API surface is a chain fact —
       // a later `api-surface-unchanged` judgment rests on it.
       apiSurface: apiSurface !== undefined ? apiSurface.length : null,
@@ -948,11 +1008,14 @@ export class ProofEngine {
     // a proof deserves to see.
     const report = this.gateByCoverage(machineReport, collected.summary)
 
+    // M19b: what the caller claims this run proves, when they said so.
+    const claimText = markerText(options.claim)
     await this.store.mark('proof/verified', {
       grade: report.grade, root: report.root, changed: changed.length,
       attribution: attribution.method,
       preExistingExcluded: attribution.preExistingExcluded.length,
       regressions: report.summary.regressions,
+      ...(claimText !== undefined ? { claim: claimText } : {}),
       // β: the wave plan's footprint rides the marker — what stopped it and
       // how much of the plan never ran are chain facts, like everything else.
       ...(schedule !== undefined
@@ -1120,7 +1183,10 @@ export class ProofEngine {
     // machine factor is the neutral 1 (nothing ran), so the number is exactly
     // Π attestationFactor: a strong jury upholding at p=0.99 still pays
     // 0.99^0.7 ≈ 0.993, and certification needs that product to clear
-    // `certifyTarget` on top of every obligation holding.
+    // `certifyTarget` on top of every obligation holding. M10: a human
+    // *endorsement* is excluded from that product (risk acceptance, not
+    // probability transfer — see `attestationProduct`); a reject keeps its
+    // veto weight.
     if (contract.kind === 'llm-jury') {
       const claimId = claimIdOf(contract.claim)
       const active = attestationsFor(await this.activeAttestationsAll(), claimId)
@@ -1412,6 +1478,9 @@ export class ProofEngine {
       }
     }
 
+    // M19b: the caller's claim text for this verdict, when supplied — the
+    // contract's own claim already lives in the attest/jury markers.
+    const claimText = markerText(rest.claim)
     await this.store.mark('proof/verified', {
       grade: graded.grade,
       root: graded.root,
@@ -1419,6 +1488,7 @@ export class ProofEngine {
       attribution: attribution.method,
       preExistingExcluded: attribution.preExistingExcluded.length,
       regressions: graded.summary.regressions,
+      ...(claimText !== undefined ? { claim: claimText } : {}),
       // ζ: the contract summary rides the boundary marker — kind, the
       // unmet obligation ids, and whether the verdict was jury-capped.
       contract: {
@@ -1508,7 +1578,7 @@ export class ProofEngine {
     const instruction = [
       `Conjured-test sandbox ready for the claim "${input.claim}" (covers: ${request.paths.join(', ') || 'no paths'}).`,
       `1. Copy ${this.options.syntheticDir}/${entry}.template.mjs to ${this.options.syntheticDir}/${entry}.`,
-      '2. Replace the placeholder assertion with a real executable test of the claim: exit code 0 proves it, anything else fails it.',
+      '2. Replace the placeholder assertion with a real executable test of the claim: exit code 0 AND a final SYNTHETIC: PASS line prove it — a passing exit code without the protocol line is recorded as an error.',
       `3. Read and write files only inside ${this.options.syntheticDir}/ — a script importing ${FORBIDDEN_CAPABILITIES.join(', ')} is refused at screening and never runs.`,
       `4. Call proof_conjure_run with this exact claim text and entry ${entry}: the verifier screens and executes the script itself and records the evidence.`,
     ].join('\n')
@@ -1544,7 +1614,9 @@ export class ProofEngine {
       .find(p => p.claimId === claimId && p.entry === input.entry)
     const request = payload === undefined ? undefined : syntheticRequestOf(payload)
     if (request === undefined) {
-      throw new Error(`conjureRun: no synthetic/requested marker for claimId ${claimId} with entry ${input.entry} — call proof_conjure_request first`)
+      // M19a: the model-facing tool is `proof_conjure` (the request opener);
+      // the old text named a tool that does not exist.
+      throw new Error(`conjureRun: no synthetic/requested marker for claimId ${claimId} with entry ${input.entry} — call proof_conjure first`)
     }
     const spec = syntheticSpec(request, this.options.syntheticDir, this.options.syntheticTimeoutMs)
     const source = await this.fs.readFile(`${this.syntheticRoot()}/${input.entry}`)
@@ -1570,8 +1642,23 @@ export class ProofEngine {
     // spec (syntheticTimeoutMs) is the only budget.
     const snapshot = await this.workspaceSnapshot()
     const batch = await this.runner.run([spec], { workspace: snapshot })
-    const record = batch.records[0]
+    let record = batch.records[0]
     if (record === undefined) throw new Error('conjureRun: the verification runner produced no record')
+    // M12: exit code 0 is only half of the scaffold contract — the other half
+    // is the protocol line. A script that exits clean without saying
+    // `SYNTHETIC: PASS` proved nothing (an empty script, a bare
+    // `process.exit(0)`), so the record is rewritten to `error` with the
+    // breach named on the output's first line, and the re-addressing below
+    // folds the honest verdict into the evidence's own address. Non-pass
+    // records (fail/timeout/…) keep their status: their protocol story is
+    // already told by their outcome.
+    if (record.status === 'pass' && !hasSyntheticProtocolPassLine(record.outputHead)) {
+      record = {
+        ...record,
+        status: 'error',
+        outputHead: `${SYNTHETIC_PROTOCOL_NOTE}\n${record.outputHead}`,
+      }
+    }
     const meta: SyntheticEvidenceMeta = {
       scriptDigest,
       // The host's ptc-runtime seam (executing inside a sandboxed PTC
@@ -1825,10 +1912,26 @@ export class ProofEngine {
     }
   }
 
-  /** κ: Π attestationFactor over the active witnesses — the neutral 1 when empty. */
+  /**
+   * κ: Π attestationFactor over the active witnesses — the neutral 1 when
+   * empty.
+   *
+   * M10: a human *endorsement* never enters the product. Endorsement is risk
+   * acceptance, not a probability transfer — the machine path's
+   * `fuseConfidence` keeps the number untouched for exactly that reason, and
+   * the product used to contradict it: a B uphold at 0.99 certifies alone
+   * (0.99^0.7 ≈ 0.993 ≥ 0.97), yet adding a human endorsement multiplied in
+   * 0.95^0.9 ≈ 0.955 and *demoted* the claim to stale — backing a claim made
+   * it worse, the exact inversion of what a Class C witness is for. Rejects
+   * still multiply: the veto is a probability statement (the human asserts
+   * the claim is false at their error rate) and keeps its full weight.
+   */
   private attestationProduct(active: readonly Attestation[]): number {
     let product = 1
-    for (const att of active) product *= attestationFactor(att, this.trustWeights)
+    for (const att of active) {
+      if (att.kind === 'attest/human' && att.decision === 'endorse') continue
+      product *= attestationFactor(att, this.trustWeights)
+    }
     return product
   }
 
@@ -2305,6 +2408,32 @@ export class ProofEngine {
   }
 
   /**
+   * M18: canonicalise one host-supplied change path to the '/'-separated
+   * workspace-relative form every downstream consumer speaks — impact
+   * closure, path filters, the coverage executed-set match. Hosts hand over
+   * whatever their platform produced (`src\a.ts`, `./src/a.ts`, a
+   * root-anchored `C:\repo\src\a.ts`), and an unnormalised entry silently
+   * matches nothing: the change reads uncovered, the selection reads empty.
+   * `normalizeRel` folds separators and `.`/`..` segments; root-anchored
+   * spellings fold against the engine's own root first (the
+   * `toWorkspaceRelative` discipline), and a path anchoring outside the root
+   * keeps its normalised form rather than being dropped — over-attribution
+   * costs a re-run, under-attribution hides a break.
+   */
+  private canonicalChanged(paths: readonly RelPath[]): RelPath[] {
+    const root = this.root.replace(/\\/g, '/').replace(/\/+$/, '')
+    const fold = (path: string): string => {
+      const slashed = path.replace(/\\/g, '/')
+      if ((/^[A-Za-z]:\//.test(slashed) || slashed.startsWith('/'))
+        && slashed.toLowerCase().startsWith(`${root.toLowerCase()}/`)) {
+        return normalizeRel(slashed.slice(root.length + 1))
+      }
+      return normalizeRel(slashed)
+    }
+    return [...new Set(paths.map(fold).filter(p => p.length > 0))].sort()
+  }
+
+  /**
    * Which files moved since the baseline, and who moved them. Explicit sets
    * are honoured as-is; otherwise the resolution is content-anchored to the
    * baseline's working-tree snapshot, with the plain dirty set as the
@@ -2315,7 +2444,10 @@ export class ProofEngine {
     return resolveChangeSet({
       fs: this.fs,
       workspace: this.workspace,
-      ...(options.changed !== undefined ? { explicit: options.changed } : {}),
+      // M18: "honoured as-is" means the SET is the caller's, not the
+      // spellings — each path is canonicalised first (see canonicalChanged),
+      // so backslash/`./`/root-anchored forms stop silently never matching.
+      ...(options.changed !== undefined ? { explicit: this.canonicalChanged(options.changed) } : {}),
       ...(baseline !== undefined
         ? {
             baseline: {

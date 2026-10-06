@@ -401,12 +401,26 @@ function isFiniteNumber(v: unknown): v is number {
   return typeof v === 'number' && Number.isFinite(v)
 }
 
+/**
+ * A juror's probability, as read off the chain: a finite number in [0, 1].
+ * Anything else makes the record malformed — deliberately harsher than the
+ * abstain-degradation `attestationFactor` applies downstream: a `probability`
+ * outside [0,1] is not weak evidence, it is a broken delivery, and admitting
+ * it would let one payload satisfy `jury-upholds` (which only thresholds the
+ * number, so 5 counts as "≥ 0.5") while its factor reads it as an abstain —
+ * the two layers ruling opposite ways on one record. Skipping the record
+ * keeps every reader on the same page: there is no verdict on record.
+ */
+function isJuryProbability(v: unknown): v is number {
+  return isFiniteNumber(v) && v >= 0 && v <= 1
+}
+
 function parseJury(p: Record<string, unknown>): JuryAttestation | undefined {
   if (
     !isString(p.claimId) || !isGen(p.gen) || !isString(p.prompt) || !isString(p.rubricVersion)
     || !isString(p.model) || typeof p.independence !== 'string' || !INDEPENDENCE.has(p.independence)
     || typeof p.verdict !== 'string' || !VERDICTS.has(p.verdict)
-    || !isFiniteNumber(p.probability) || !isString(p.output) || !isFiniteNumber(p.at)
+    || !isJuryProbability(p.probability) || !isString(p.output) || !isFiniteNumber(p.at)
   ) return undefined
   return {
     kind: 'attest/jury',

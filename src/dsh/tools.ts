@@ -56,6 +56,14 @@ export interface StatusValue {
   unverifiableCheckpoints?: number
   /** Present only when true (v0.7): the anchor failed its own signature check. */
   anchorForged?: boolean
+  /**
+   * Present only when true (v0.17, M19d): the log's content at the anchor's
+   * remembered checkpoint disagrees with what was anchored — records behind
+   * the anchor were rewritten. The audit already fails on it (unlike a mere
+   * unverifiable checkpoint); this field carries that verdict into the
+   * structured output so `chainIntact` and the render agree.
+   */
+  anchorMismatch?: true
   dirtyFiles: number
   summary: string
 }
@@ -144,6 +152,14 @@ export interface ClaimValue {
    * claim card can speak in probabilities. Absent on the legacy binary path.
    */
   confidence?: number
+  /**
+   * M4: how the claim's `confidence` was earned — the full six-value union,
+   * because a plain verify over a conjured-test-only run reaches this card
+   * with basis 'synthetic', and a probability without its regime would dress
+   * testimony up as a machine measurement. Rides with `confidence`, never
+   * alone.
+   */
+  confidenceBasis?: ConfidenceBasis
   /**
    * ζ: the contract kind this claim was typed against. Present exactly when the
    * call carried a `kind` (the typed path); the legacy path omits every field
@@ -417,6 +433,23 @@ function isClaimKind(value: unknown): value is ClaimKind {
 }
 
 /**
+ * M4: the full six-value basis union the report layer can mint. A plain
+ * verify over a conjured-test-only run reaches 'synthetic'; the engine's κ
+ * fusion mints 'attested'; the ζ jury assembler mints 'jury-only'. A tool
+ * surface that recognises only the three machine bases would strip the basis
+ * while passing the number through — a canonical value carrying a probability
+ * with no regime, exactly what report.ts promises never to emit.
+ */
+const CONFIDENCE_BASES: readonly string[] = [
+  'full-coverage', 'certified-subset', 'degraded', 'jury-only', 'attested', 'synthetic',
+]
+
+/** M4: narrow an untrusted `confidenceBasis` to the six-value union, or nothing. */
+function isConfidenceBasis(value: unknown): value is ConfidenceBasis {
+  return typeof value === 'string' && CONFIDENCE_BASES.includes(value)
+}
+
+/**
  * λ: `evidenceLogPath` is the physical evidence-log location, derived by the
  * plugin entry with the same rule ProofEngine applies to its own private copy
  * (the store exposes no marker read-back, and the engine exports neither the
@@ -489,6 +522,7 @@ function createStatusTool(engine: ProofEngine): ToolDefinition {
           // schema stays truthful about what a degraded host may emit.
           unverifiableCheckpoints: { type: 'integer' },
           anchorForged: { type: 'boolean' },
+          anchorMismatch: { type: 'boolean' },
           dirtyFiles: { type: 'integer' },
           summary: { type: 'string' },
         },
@@ -562,13 +596,18 @@ function createBaselineTool(engine: ProofEngine): ToolDefinition {
     },
     async execute(args, exec: ToolRunContext) {
       assertActive(exec)
+      const parsed = (args ?? {}) as { reason?: string }
       const { records, baseline } = await engine.establishBaseline({
         signal: exec.signal,
         onProgress: (label, index, total) => {
           void label; void index; void total
         },
+        // D3 (tools side): forward the declared `reason` so the anchor's
+        // justification is recorded with it instead of silently dropped.
+        // Type-safe spread: absent/blank forwards nothing, keeping the
+        // no-reason options shape byte-identical.
+        ...(typeof parsed.reason === 'string' && parsed.reason.trim() !== '' ? { reason: parsed.reason } : {}),
       })
-      void args
       return toBaselineValue(baseline, records) as unknown as JsonValue
     },
   }
@@ -598,7 +637,7 @@ function createVerifyTool(engine: ProofEngine, touched?: () => readonly string[]
           // Present only when the run carries graded trust (γ) — declared so
           // the schema stays truthful about what a bayesian run may emit.
           confidence: { type: 'number' },
-          confidenceBasis: { type: 'string', enum: ['full-coverage', 'certified-subset', 'degraded'] },
+          confidenceBasis: { type: 'string', enum: ['full-coverage', 'certified-subset', 'degraded', 'jury-only', 'attested', 'synthetic'] },
           certifiedSkips: { type: 'integer' },
           stoppedEarly: { type: 'string', enum: ['certified', 'failed', 'budget'] },
           waves: { type: 'integer' },
@@ -648,6 +687,12 @@ function createVerifyTool(engine: ProofEngine, touched?: () => readonly string[]
       const outcome = await engine.verify({
         ...(Array.isArray(parsed.changed) ? { changed: parsed.changed } : {}),
         ...(parsed.all === true ? { all: true } : {}),
+        // D3 (tools side): the `claim` parameter's description says "for the
+        // record" — forward it to the engine so the record actually happens
+        // (the engine side attaches it to the verification's chain evidence).
+        // Type-safe spread: absent/blank forwards nothing, keeping the
+        // no-claim options shape byte-identical.
+        ...(typeof parsed.claim === 'string' && parsed.claim.trim() !== '' ? { claim: parsed.claim } : {}),
         ...(touched !== undefined ? { touched: touched() } : {}),
         // H9b: once a shell ran, "not in the touched set" no longer proves
         // "changed outside the agent" — the engine demotes those to 'unknown'.
@@ -680,6 +725,9 @@ function createClaimTool(engine: ProofEngine, touched?: () => readonly string[],
           proven: { type: 'boolean' }, root: { type: 'string' },
           // Present only when the verification carried a posterior (γ).
           confidence: { type: 'number' },
+          // M4: how the posterior was earned — declared so the schema stays
+          // truthful about what a testimony-regime run may emit.
+          confidenceBasis: { type: 'string', enum: ['full-coverage', 'certified-subset', 'degraded', 'jury-only', 'attested', 'synthetic'] },
           // Present only when the claim carried a `kind` (ζ) — declared so the
           // schema stays truthful about what a typed contract may emit.
           kind: { type: 'string', enum: ['behavior-preserving', 'behavior-adding', 'perf-budget', 'docs-only', 'llm-jury'] },
@@ -741,6 +789,23 @@ function createClaimTool(engine: ProofEngine, touched?: () => readonly string[],
         budgetMs?: number
         review?: string
         entryPoints?: string[]
+      }
+      // M6: the schema is a promise to the model, not a boundary — the one
+      // required parameter of the nine tools gets the same defensive check the
+      // testimony tools give theirs. A missing/non-string/blank claim used to
+      // flow into the engine and land as a `claim: undefined` record (legacy
+      // path) or a low-level sha256 throw (typed path); a clean parameter
+      // error names the fix instead.
+      if (typeof parsed.claim !== 'string' || parsed.claim.trim().length === 0) {
+        throw new Error('proof_claim: claim is required — the exact completion claim this call must prove')
+      }
+      // M6: an unrecognized `kind` (e.g. the `behavior_preserving` typo) used
+      // to fall through to the legacy verify() silently — the model believed a
+      // contract was binding while none of its obligations ran. That is a
+      // double deception; refuse loudly and list the legal values.
+      if (parsed.kind !== undefined && !isClaimKind(parsed.kind)) {
+        throw new Error(`proof_claim: kind must be one of ${CLAIM_KINDS.join(' | ')} — or omit it to verify without a contract `
+          + `(got ${typeof parsed.kind === 'string' ? JSON.stringify(parsed.kind) : 'nothing usable'})`)
       }
       // ζ typed-contract path: a `kind` binds the claim to its obligations via
       // engine.verifyContract. Everything else (no kind) keeps the legacy
@@ -1427,7 +1492,10 @@ export function toStatusValue(input: StatusProjectInput): StatusValue {
     chainIntact: audit.chain.breaks.length === 0
       && audit.chain.badCheckpoints.length === 0
       && audit.chain.unsignedCheckpoints.length === 0
-      && audit.chain.headMismatches.length === 0,
+      && audit.chain.headMismatches.length === 0
+      // M19d: the audit fails on an anchor/log disagreement, so the headline
+      // boolean must too — three green booleans must never paper over it.
+      && audit.chain.anchorMismatch !== true,
     tailRecords: audit.chain.tailRecords,
     rewindDetected: audit.chain.rewind,
     baselineTampered: audit.chain.baselineTampered,
@@ -1441,6 +1509,9 @@ export function toStatusValue(input: StatusProjectInput): StatusValue {
       ? { unverifiableCheckpoints: audit.chain.unverifiableCheckpoints.length }
       : {}),
     ...(audit.chain.anchorForged ? { anchorForged: true } : {}),
+    // M19d: same visibility rule for the anchor/log disagreement — present
+    // only in the abnormal state, `true` and nothing else.
+    ...(audit.chain.anchorMismatch ? { anchorMismatch: true as const } : {}),
     summary: baseline === undefined
       ? `No baseline. ${specs.length} objective check(s) discovered. Establish one with proof_baseline before editing. ${trustLine}.`
       : `Baseline from ${baseline.createdAt} (${baseline.checks.length} checks, root ${baseline.root.slice(0, 12)}). `
@@ -1526,9 +1597,12 @@ export function toVerifyValue(
   const confidence = typeof report.confidence === 'number'
     ? Math.round(report.confidence * 100) / 100
     : undefined
-  const confidenceBasis = report.confidenceBasis === 'full-coverage'
-    || report.confidenceBasis === 'certified-subset'
-    || report.confidenceBasis === 'degraded'
+  // M4: the full six-value union — 'synthetic' (plain verify, conjured tests
+  // only), 'attested' (κ fusion) and 'jury-only' (ζ jury) are real regimes a
+  // plain run reaches; recognising only the machine bases would emit a
+  // probability with no regime, the exact invariant the report layer vows
+  // never to break.
+  const confidenceBasis = isConfidenceBasis(report.confidenceBasis)
     ? report.confidenceBasis
     : undefined
   const skippedByPlan = Array.isArray(schedule?.skippedByPlan) ? schedule.skippedByPlan : []
@@ -1610,7 +1684,21 @@ export function toClaimValue(
   if (report.grade === 'no-baseline') blockers.push('No baseline exists. Run proof_baseline first.')
   if (report.grade === 'stale') blockers.push(`Stale evidence: ${report.unverified.join(', ') || 'affected checks not re-run'}.`)
   for (const reg of verified.regressions) blockers.push(`Regression: ${reg.label} — ${reg.detail}`)
-  if (report.grade === 'unproven') blockers.push('Verification was incomplete (skipped, aborted or timed out).')
+  if (report.grade === 'unproven') {
+    // M19c: two diseases share this grade. A τ demotion (coverage measured at
+    // basis 'v8' and the change left uncovered) is an EVIDENCE verdict — the
+    // process completed, everything that ran was green, and no green check
+    // ever executed the change; the cure is a check that runs it (or a
+    // conjured one), never a re-run. Every other unproven is a PROCESS
+    // verdict — the verification itself did not finish — and keeps the
+    // original corrective text.
+    const tauDemoted = report.coverage?.basis === 'v8'
+      && Array.isArray(report.coverage.uncovered)
+      && report.coverage.uncovered.length > 0
+    blockers.push(tauDemoted
+      ? 'The change never executed under any green check — point a check at it (or see proof_conjure).'
+      : 'Verification was incomplete (skipped, aborted or timed out).')
+  }
   // υ: an unexecuted change is blame on the claim itself — every check that
   // ran came back green without ever executing a line of the change, so each
   // uncovered file is a blocker in its own right (the model's action item:
@@ -1627,6 +1715,19 @@ export function toClaimValue(
   // verification had one — same two-decimal number, never a bare probability.
   // The no-posterior branches keep their exact legacy text.
   const p = typeof verified.confidence === 'number' ? verified.confidence : undefined
+  // M4: the basis rides with the posterior, and the three testimony regimes
+  // say so in the head — proofNarrative's own words, so the claim card cannot
+  // dress self-authored tests, blended witnesses or self-attestation up as a
+  // purely measured number. Machine bases and the ungraded path keep their
+  // exact legacy heads.
+  const basis = isConfidenceBasis(report.confidenceBasis) ? report.confidenceBasis : undefined
+  const regimeTail = basis === 'synthetic'
+    ? ', synthetic evidence — conjured tests, discounted'
+    : basis === 'attested'
+      ? ', machine + B/C attested'
+      : basis === 'jury-only'
+        ? ', jury evidence — self-attestation is capped'
+        : ''
 
   // ζ typed-contract half: rides only when the engine judged a contract. The
   // obligation list is defensively copied into plain records (the canonical
@@ -1658,15 +1759,16 @@ export function toClaimValue(
     proven: report.grade === 'proven',
     root: report.root,
     ...(p !== undefined ? { confidence: p } : {}),
+    ...(p !== undefined && basis !== undefined ? { confidenceBasis: basis } : {}),
     ...(kind !== undefined && obligations !== undefined ? { kind, obligations } : {}),
     ...(jury ? { jury: true as const } : {}),
     regressions: verified.regressions,
     blockers,
     summary: report.grade === 'proven'
-      ? `PROVEN${p !== undefined ? ` (p≈${p.toFixed(2)})` : ''} — "${claim}" is backed by evidence root ${report.root.slice(0, 12)}: `
+      ? `PROVEN${p !== undefined ? ` (p≈${p.toFixed(2)}${regimeTail})` : ''} — "${claim}" is backed by evidence root ${report.root.slice(0, 12)}: `
         + `${report.summary.passing} check(s) passing, ${report.summary.regressions} regression(s), `
         + `${report.summary.preExisting} pre-existing failure(s) left untouched.`
-      : `NOT PROVEN (${report.grade}${p !== undefined ? `, p≈${p.toFixed(2)}` : ''}) — "${claim}". ${blockers.join(' ')}`,
+      : `NOT PROVEN (${report.grade}${p !== undefined ? `, p≈${p.toFixed(2)}${regimeTail}` : ''}) — "${claim}". ${blockers.join(' ')}`,
   }
 }
 
@@ -1679,7 +1781,10 @@ function renderStatus(value: StatusValue): string {
   const checks = Array.isArray(v.checks) ? v.checks : []
   const summary = typeof v.summary === 'string' ? v.summary : 'no status available'
   const lines = [summary, '']
-  if (v.rewindDetected === true || v.baselineTampered === true || v.chainIntact === false) {
+  if (v.rewindDetected === true || v.baselineTampered === true || v.chainIntact === false
+    // M19d: the anchor/log disagreement lights the same banner even when a
+    // partial or older meta carries no `chainIntact` to flip.
+    || v.anchorMismatch === true) {
     lines.push('⚠️ Evidence log trust: TAMPER-EVIDENCE TRIPPED — do not trust grades until restored from a known-good copy.')
     lines.push('')
   }
@@ -1733,16 +1838,18 @@ function renderBaseline(value: BaselineValue): string {
  * what earned it — full-coverage: every affected check ran; certified-subset:
  * the posterior crossed the target and the unrun checks rest on their priors;
  * degraded: the run ended below target (with the stop reason when there was
- * one). Total on replay: every field is individually guarded, and a value
- * without a posterior produces no line at all.
+ * one); and the three testimony regimes (M4) borrow proofNarrative's own
+ * words — synthetic: conjured tests, discounted; attested: machine + B/C
+ * attested; jury-only: self-attestation is capped. Total on replay: every
+ * field is individually guarded, and a value without a posterior produces no
+ * line at all.
  */
 function confidenceLine(v: VerifyValue): string | null {
   if (typeof v.confidence !== 'number') return null
   const p = v.confidence.toFixed(2)
-  const basis = v.confidenceBasis === 'full-coverage' || v.confidenceBasis === 'certified-subset'
-    || v.confidenceBasis === 'degraded'
-    ? v.confidenceBasis
-    : null
+  // M4: all six regimes, so a replayed testimony-run value keeps its label
+  // instead of degrading to a bare probability.
+  const basis = isConfidenceBasis(v.confidenceBasis) ? v.confidenceBasis : null
   const waves = typeof v.waves === 'number' ? v.waves : null
   const skips = typeof v.certifiedSkips === 'number' ? v.certifiedSkips : 0
   const stopped = v.stoppedEarly === 'certified' || v.stoppedEarly === 'failed' || v.stoppedEarly === 'budget'
@@ -1757,6 +1864,12 @@ function confidenceLine(v: VerifyValue): string | null {
     parts.push('all checks run')
   } else if (basis === 'degraded') {
     parts.push(stopped !== null ? `stopped early: ${stopped}` : 'below target')
+  } else if (basis === 'synthetic') {
+    parts.push('conjured tests, discounted')
+  } else if (basis === 'attested') {
+    parts.push('machine + B/C attested')
+  } else if (basis === 'jury-only') {
+    parts.push('self-attestation is capped')
   } else if (skips > 0) {
     // Unknown or missing basis (partial replay): keep whatever schedule facts
     // survive instead of throwing.

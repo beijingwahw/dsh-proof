@@ -5,7 +5,7 @@
 
 import type {
   CheckSpec, Clock, CommandPort, CommandResult, CommandRunOptions,
-  FileStat, FsPort, WalkOptions, WorkspacePort,
+  FileStat, FsPort, WalkOptions, WalkResult, WorkspacePort,
 } from '../src/core/ports.ts'
 
 export class FakeClock implements Clock {
@@ -18,6 +18,17 @@ export class FakeClock implements Clock {
 export class MemoryFs implements FsPort {
   files = new Map<string, string>()
   log: string[] = []
+  /**
+   * Per-path mtime clock (instance-level counter). `stat` used to report a
+   * constant `mtimeMs: 0`, which made cache-invalidation-by-mtime untestable:
+   * the LSP resolver versions documents as `mtimeMs:size`, so a file rewritten
+   * to the same length looked unchanged forever. `mutate` (the test hook for
+   * "the file changed behind the engine's back") bumps the counter; every
+   * never-mutated path keeps `mtimeMs: 0`, exactly the pre-existing value, so
+   * no existing assertion on fresh files can observe the counter.
+   */
+  private mtimeCounter = 0
+  private readonly mtimes = new Map<string, number>()
 
   static of(entries: Record<string, string>): MemoryFs {
     const fs = new MemoryFs()
@@ -41,10 +52,10 @@ export class MemoryFs implements FsPort {
   async stat(path: string): Promise<FileStat | undefined> {
     const content = this.files.get(normalize(path))
     if (content === undefined) return undefined
-    return { kind: 'file', size: content.length, mtimeMs: 0 }
+    return { kind: 'file', size: content.length, mtimeMs: this.mtimes.get(normalize(path)) ?? 0 }
   }
 
-  async walk(root: string, options: WalkOptions = {}): Promise<string[]> {
+  async walk(root: string, options: WalkOptions = {}): Promise<WalkResult> {
     const prefix = `${normalize(root).replace(/\/+$/, '')}/`
     const ignore = new Set(options.ignoreDirs ?? [])
     const out: string[] = []
@@ -54,7 +65,14 @@ export class MemoryFs implements FsPort {
       if (rel.split('/').some(s => ignore.has(s))) continue
       out.push(rel)
     }
-    return out.sort().slice(0, options.limit ?? 1e9)
+    const limit = options.limit ?? 1e9
+    const files = out.sort().slice(0, limit)
+    // Mirrors NodeFsPort semantics exactly: hitting the cap is truncation —
+    // the fake knows the full list, but fidelity with the real port beats
+    // cleverness, and tests that pin the real port's conservative answer
+    // (`limit` reached ⇒ `truncated`, even when nothing more remained) must
+    // see the same answer here.
+    return { files, truncated: files.length >= limit }
   }
 
   async appendLine(path: string, line: string): Promise<void> {
@@ -77,7 +95,9 @@ export class MemoryFs implements FsPort {
 
   /** Test helper: mutate a file behind the engine's back. */
   mutate(path: string, contents: string): void {
-    this.files.set(normalize(path), contents)
+    const key = normalize(path)
+    this.files.set(key, contents)
+    this.mtimes.set(key, ++this.mtimeCounter)
   }
 }
 

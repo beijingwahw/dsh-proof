@@ -302,6 +302,18 @@ export interface AuditReport {
   readonly total: number
   /** checkIds whose payload no longer addresses itself. */
   readonly corrupt: readonly string[]
+  /**
+   * M15: the anchor file EXISTS but could not be parsed as an anchor
+   * (malformed JSON, wrong shape, wrong version). Pure visibility signal —
+   * it deliberately does NOT fail `ok`, because an unreadable anchor is a
+   * missing capability on the auditor's side, not a provable forgery in the
+   * log; but a reader MUST be able to see that the out-of-band defence line
+   * (rewind/monotonicity) was not checked. An absent anchor (no file) stays
+   * silent as before: "never anchored" is a deployment fact, not a defect.
+   * Optional so hand-built reports from older surfaces keep satisfying the
+   * type; `audit()` always emits it.
+   */
+  readonly anchorUnreadable?: boolean
   readonly chain: {
     readonly mode: 'signed' | 'unsigned' | 'legacy'
     readonly breaks: readonly number[]
@@ -326,6 +338,15 @@ export interface AuditReport {
      * always emits it (empty when clean).
      */
     readonly malformedCheckpoints?: readonly number[]
+    /**
+     * Line indexes that are not valid v1/v2 envelopes at all (unparseable
+     * JSON, wrong envelope shape) — the raw `walkChain` channel the `ok`
+     * formula has always consumed but the report never surfaced, so callers
+     * could see breaks and bad signatures but not WHICH lines were garbage.
+     * Optional for the same hand-built-report compatibility reason;
+     * `audit()` always emits it (empty when clean).
+     */
+    readonly corruptLines?: readonly number[]
     /** Records after the last checkpoint — chain-covered, not checkpoint-covered. */
     readonly tailRecords: number
     /** The log ends before the best checkpoint the anchor remembers. */
@@ -444,7 +465,30 @@ export class EvidenceStore {
 
   private async resolveSigner(): Promise<SignerPort | undefined> {
     if (this.trust.signer === undefined) return undefined
-    this.signerPromise ??= this.trust.signer().catch(() => undefined)
+    // M15: only a SUCCESSFUL resolution is memoized. The old
+    // `this.signerPromise ??= this.trust.signer().catch(() => undefined)`
+    // cached the FIRST outcome, failure included — a transient provider error
+    // (key directory locked by an AV scan, a network blip) then poisoned every
+    // later checkpoint in this process: all of them landed unsigned, and since
+    // `unsignedCheckpoints` never empties while a signer is active again, the
+    // audit's `ok` could never recover either, even after the provider healed.
+    // Recovery semantics now: a rejected (or empty) resolution is NOT
+    // remembered — the next checkpoint retries the provider, so a healed
+    // signer resumes signing (and re-verifies) on the next boundary; a
+    // resolved signer is cached for the process lifetime, as before.
+    if (this.signerPromise === undefined) {
+      const attempt = this.trust.signer().then(
+        signer => {
+          if (signer === undefined) this.signerPromise = undefined // no signer yet — ask again next time
+          return signer
+        },
+        () => {
+          this.signerPromise = undefined // transient failure — retry on the next checkpoint
+          return undefined
+        },
+      )
+      this.signerPromise = attempt
+    }
     return this.signerPromise
   }
 
@@ -629,7 +673,17 @@ export class EvidenceStore {
     const corrupt: string[] = []
     for (const ev of all) {
       const { evidenceId, ...rest } = ev
-      if (addressOf(rest) !== evidenceId) corrupt.push(ev.checkId)
+      // The audit answers hostile bytes with a report, never a throw: a
+      // payload carrying values the canonical form refuses (a `1e999`
+      // duration, say) cannot have its address recomputed at all, which is
+      // the strongest possible form of "does not address itself".
+      let addressed: string
+      try {
+        addressed = addressOf(rest)
+      } catch {
+        addressed = '<uncanonicalisable payload>'
+      }
+      if (addressed !== evidenceId) corrupt.push(ev.checkId)
     }
 
     const signer = await this.resolveSigner()
@@ -654,13 +708,39 @@ export class EvidenceStore {
         unverifiableCheckpoints.push(cp.index)
         continue
       }
-      if (!(await signer.verify(checkpointSignedData(cp.payload), cp.sig))) badCheckpoints.push(cp.index)
+      // A payload the canonical form refuses to serialise (the `1e999`
+      // count-laundering trick) cannot be the bytes ANY honest signature
+      // covers — signatures are made over canonical bytes, and these bytes
+      // have none. Refuted; and the audit keeps reporting instead of
+      // throwing, because a hostile log must never be able to crash its
+      // auditor — that would be a denial-of-service bypass of the whole
+      // verdict.
+      let refuted: boolean
+      try {
+        refuted = !(await signer.verify(checkpointSignedData(cp.payload), cp.sig))
+      } catch {
+        refuted = true
+      }
+      if (refuted) badCheckpoints.push(cp.index)
     }
 
     let rewind = false
     let anchorMismatch = false
     let anchorForged = false
-    const anchor = parseAnchor(this.trust.anchorPath === undefined ? undefined : await this.fs.readFile(this.trust.anchorPath))
+    let anchorUnreadable = false
+    const anchorRaw = this.trust.anchorPath === undefined ? undefined : await this.fs.readFile(this.trust.anchorPath)
+    const anchor = parseAnchor(anchorRaw)
+    // M15: `parseAnchor` returns `undefined` both for "no anchor file" and for
+    // "a file exists but is not a valid anchor" — indistinguishable at its
+    // boundary, yet opposite situations. No file is a deployment fact (never
+    // anchored, or audited without an anchor path) and stays silent. A file
+    // that EXISTS but does not parse (malformed JSON, wrong shape) means the
+    // out-of-band high-water mark this audit was configured to consult cannot
+    // be consulted: the rewind/monotonicity defence below is skipped. That is
+    // an auditor-side capability gap, not a provable forgery, so it is a
+    // visibility flag (`anchorUnreadable`) and deliberately NOT an `ok`
+    // failure — but the reader must see that the band-off line went unchecked.
+    if (anchorRaw !== undefined && anchor === undefined) anchorUnreadable = true
     if (anchor !== undefined) {
       // The anchor speaks for the key that wrote it, so the log's answer to
       // the anchor is the last *well-formed* checkpoint that same key
@@ -689,13 +769,23 @@ export class EvidenceStore {
         && anchor.keyId === signer.keyId
         && anchor.workspaceKey !== undefined
       ) {
-        const signed = checkpointSignedData({
-          count: anchor.count,
-          head: anchor.head,
-          workspaceKey: anchor.workspaceKey,
-          at: anchor.at,
-        })
-        if (!(await signer.verify(signed, anchor.sig))) anchorForged = true
+        // Same refusal discipline as the checkpoint loop above: anchor fields
+        // the canonical form will not serialise cannot be the bytes the
+        // honest writer signed over, and the audit reports rather than
+        // throwing on hostile input.
+        let forged: boolean
+        try {
+          const signed = checkpointSignedData({
+            count: anchor.count,
+            head: anchor.head,
+            workspaceKey: anchor.workspaceKey,
+            at: anchor.at,
+          })
+          forged = !(await signer.verify(signed, anchor.sig))
+        } catch {
+          forged = true
+        }
+        if (forged) anchorForged = true
       }
     }
 
@@ -713,6 +803,7 @@ export class EvidenceStore {
       unsignedCheckpoints,
       headMismatches,
       malformedCheckpoints: walk.malformedCheckpoints,
+      corruptLines: walk.corruptLines,
       tailRecords: walk.tailRecords,
       rewind,
       anchorMismatch,
@@ -735,7 +826,11 @@ export class EvidenceStore {
       && !anchorMismatch
       && !anchorForged
       && !baselineTampered
-    return { ok, total: all.length, corrupt, chain }
+    // `anchorUnreadable` deliberately does NOT enter the `ok` formula (see
+    // the field): an anchor this host cannot parse is not evidence of
+    // tampering in the log, and failing `ok` on it would conflate "cannot
+    // check" with "checked and refuted". Readers consult the flag itself.
+    return { ok, total: all.length, corrupt, anchorUnreadable, chain }
   }
 
   async saveBaseline(baseline: Baseline): Promise<void> {

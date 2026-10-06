@@ -1970,3 +1970,202 @@ test('H5②: a deleted check definition surfaces as vanished — the report cann
   assert.equal(outcome.report.grade, 'stale', 'a vanished definition blocks proven')
   assert.ok((outcome.report.vanished?.[0] ?? "").startsWith("package.json:"), "identified by source id")
 })
+
+// -- M10: llm-jury never punishes a human endorsement ---------------------------
+
+test('M10: llm-jury — an endorsement leaves the fused product untouched; a rejection still collapses it', async () => {
+  const claim = 'b internals refactored; the jury and a human both reviewed it'
+  const setup = async (): Promise<{ fs: MemoryFs; engine: ProofEngine }> => {
+    const fs = MemoryFs.of(surfaceProject())
+    const engine = contractEngine(fs, new FakeCommands())
+    await engine.establishBaseline()
+    return { fs, engine }
+  }
+  const verify = (engine: ProofEngine) => engine.verifyContract({
+    changed: ['src/b.ts'],
+    contract: { kind: 'llm-jury', claim },
+  })
+
+  // Control: the B uphold alone — 0.99^0.7 ≈ 0.993 clears the 0.97 target.
+  const control = await setup()
+  await seedJuryAttestation(control.engine, claim, { gen: 0, verdict: 'uphold', probability: 0.99 })
+  const alone = await verify(control.engine)
+  assert.equal(alone.report.grade, 'proven')
+  assert.ok(alone.report.confidence !== undefined)
+  assert.ok(Math.abs(alone.report.confidence - 0.99 ** 0.7) < 1e-12)
+
+  // B uphold + human endorse. The product used to multiply in the human's
+  // 0.95^0.9 ≈ 0.955 factor and DEMOTE this exact claim to stale — backing
+  // it made it worse, the inversion of what a Class C witness is for. The
+  // endorsement is risk acceptance (the machine path's fuseConfidence keeps
+  // the number untouched for the same reason), so the product must not move.
+  const endorsed = await setup()
+  await seedJuryAttestation(endorsed.engine, claim, { gen: 0, verdict: 'uphold', probability: 0.99 })
+  await seedHumanAttestation(endorsed.engine, claim, { gen: 0, decision: 'endorse' })
+  const withEndorse = await verify(endorsed.engine)
+  assert.equal(withEndorse.report.grade, 'proven', 'an endorsement must never demote an llm-jury claim')
+  assert.ok(withEndorse.report.confidence !== undefined)
+  assert.ok(Math.abs(withEndorse.report.confidence - (alone.report.confidence ?? 0)) < 1e-12,
+    `endorse leaves the product untouched (got ${withEndorse.report.confidence}, B alone ${alone.report.confidence})`)
+  // Both witnesses stay visible in the summary — the grade rode on both.
+  assert.deepEqual(withEndorse.contract.attestations?.map(a => a.class).sort(), ['B', 'C'])
+
+  // B uphold + human reject: the veto keeps its full weight — the product
+  // collapses to 0.99^0.7 · 0.05^0.9 and the claim is stale.
+  const rejected = await setup()
+  await seedJuryAttestation(rejected.engine, claim, { gen: 0, verdict: 'uphold', probability: 0.99 })
+  await seedHumanAttestation(rejected.engine, claim, { gen: 0, decision: 'reject' })
+  const withReject = await verify(rejected.engine)
+  assert.equal(withReject.report.grade, 'stale', 'a human rejection still vetoes an llm-jury claim')
+  assert.ok(Math.abs((withReject.report.confidence ?? 0) - (0.99 ** 0.7) * (0.05 ** 0.9)) < 1e-12,
+    `reject keeps its product weight (got ${withReject.report.confidence})`)
+})
+
+// -- M12: the scaffold's protocol line is judged, not just the exit code --------
+
+test('M12: conjureRun — exit 0 without a SYNTHETIC: PASS line is an error, not a pass', async () => {
+  const fs = MemoryFs.of(project())
+  const commands = new FakeCommands()
+  const engine = makeEngine(fs, commands)
+  const claim = 'the silent script'
+  const { request } = await engine.conjureRequest({ claim, paths: ['src/a.ts'] })
+  // Screens clean, exits 0, prints everything EXCEPT the protocol line — the
+  // empty-script hole: the exit code alone proved nothing, and the protocol
+  // used to be judged by nobody.
+  fs.mutate(`${ROOT}/.proof-synthetic/${request.entry}`, 'const one = 1\n')
+  commands.on(() => true, { exitCode: 0, output: 'all good, trust me' })
+
+  const run = await engine.conjureRun({ claim, entry: request.entry })
+  assert.equal(run.status, 'error', 'no protocol line: the exit code does not get to say PASS')
+  assert.match(run.outputHead, /^protocol line missing: scaffolded scripts must end with SYNTHETIC: PASS\/FAIL/)
+  assert.match(run.outputHead, /all good, trust me/, 'the original output rides below the note')
+
+  // The evidence and the run marker record the honest verdict, and the
+  // re-addressed record still addresses itself.
+  const evidence = (await engine.latestEvidence()).get(run.checkId)
+  assert.ok(evidence, 'the breached run is still evidence — recorded, not discarded')
+  assert.equal(evidence.status, 'error')
+  assert.match(evidence.outputHead ?? '', /^protocol line missing/)
+  assert.ok(evidence.synthetic !== undefined, 'the synthetic metadata still self-certifies the script')
+  assert.ok(fs.log.some(l => l.includes('"synthetic/run"') && l.includes('"status":"error"')),
+    'the run marker carries the breach')
+  assert.equal((await engine.audit()).ok, true)
+
+  // Control: the same exit 0 WITH the line is a pass — the screen and the
+  // scaffold's own contract are untouched.
+  const speaking = 'the speaking script'
+  const { request: speakingRequest } = await engine.conjureRequest({ claim: speaking, paths: ['src/a.ts'] })
+  fs.mutate(`${ROOT}/.proof-synthetic/${speakingRequest.entry}`, "console.log('SYNTHETIC: PASS')\n")
+  commands.on(argv => argv.includes(speakingRequest.entry), { exitCode: 0, output: 'SYNTHETIC: PASS' })
+  const spoken = await engine.conjureRun({ claim: speaking, entry: speakingRequest.entry })
+  assert.equal(spoken.status, 'pass')
+})
+
+// -- M18: explicit change sets are canonicalised before they are used -----------
+
+test('M18: backslash and ./ change spellings select and grade like canonical ones', async () => {
+  const fs = MemoryFs.of({
+    [`${ROOT}/package.json`]: JSON.stringify({ name: 'demo' }),
+    [`${ROOT}/src/a.ts`]: 'export const a = 1\n',
+    [`${ROOT}/docs/guide.md`]: '# guide\n',
+  })
+  const engine = preciseEngine(fs, new FakeCommands(), [
+    { label: 'src tests', command: ['npm', 'test'], kind: 'test', paths: ['src/**'] },
+  ])
+  await engine.establishBaseline()
+
+  // Pre-M18 both spellings silently matched nothing: the selection came back
+  // empty and the change read "covered by no check" — unproven by spelling.
+  const outcome = await engine.verify({ changed: ['src\\a.ts', './src/a.ts'] })
+  assert.deepEqual(outcome.changed, ['src/a.ts'], 'the spellings collapse onto one canonical path')
+  assert.deepEqual(outcome.selection.affected.map(c => c.label), ['src tests'],
+    'the normalised path selects the check the change actually touches')
+  assert.equal(outcome.report.grade, 'proven', 'not unproven by spelling alone')
+
+  // Root-anchored spellings fold against the engine's own root (the
+  // toWorkspaceRelative discipline).
+  const anchored = await engine.verify({ changed: [`${ROOT}/src/a.ts`] })
+  assert.deepEqual(anchored.changed, ['src/a.ts'])
+  assert.equal(anchored.report.grade, 'proven')
+})
+
+test('M18: coverage matching survives host path spellings — a backslash change no longer reads uncovered', async () => {
+  const root = join(COVER_ROOT, 'm18-canonical')
+  await makeCoverageWorkspace(root, {
+    'src/feature.mjs': 'export const feature = (n) => n * 2\n',
+    'check.mjs': [
+      "import { feature } from './src/feature.mjs'",
+      'if (feature(2) !== 4) process.exit(1)',
+      "console.log('executed feature')",
+      '',
+    ].join('\n'),
+  })
+  try {
+    const engine = coverageEngine(root, [
+      { label: 'feature tests', command: ['node', 'check.mjs'], kind: 'test', paths: ['src/**'] },
+    ])
+    await engine.establishBaseline()
+    // The executed set is canonical ('/'-separated, from the V8 profile);
+    // the change set arrives in host spellings. Matching the two is exactly
+    // what canonicalisation is for — pre-M18 this run read uncovered.
+    const outcome = await engine.verify({ changed: ['src\\feature.mjs', './src/feature.mjs'] })
+    assert.equal(outcome.report.coverage?.basis, 'v8')
+    assert.deepEqual(outcome.coverage?.uncovered, [],
+      'the canonical executed set matched the normalised change')
+    assert.equal(outcome.coverage?.executedCount, 1)
+    assert.equal(outcome.report.grade, 'proven', 'observe mode + executed change: no unproven demotion')
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true })
+  }
+})
+
+// -- M19b: the claim / reason parameters land on the boundary markers -----------
+
+test('M19b: verify claim and baseline reason ride their markers, bounded to 200 characters', async () => {
+  const long = 'x'.repeat(350)
+  const fs = MemoryFs.of(project())
+  const engine = makeEngine(fs, new FakeCommands())
+  await engine.establishBaseline({ reason: `anchoring: ${long}` })
+  const anchored = fs.log.find(l => l.includes('"baseline/established"'))
+  assert.ok(anchored, 'the established marker is on the chain')
+  assert.ok(anchored.includes(`"reason":"anchoring: ${'x'.repeat(189)}"`),
+    'the reason is recorded, truncated at 200 characters total')
+  assert.ok(!anchored.includes('x'.repeat(190)), 'and not a character longer')
+
+  const outcome = await engine.verify({ changed: ['src/a.ts'], claim: `claim: ${long}` })
+  assert.equal(outcome.report.grade, 'proven')
+  const verified = [...fs.log].reverse().find(l => l.includes('"proof/verified"'))
+  assert.ok(verified, 'the verified marker is on the chain')
+  assert.ok(verified.includes(`"claim":"claim: ${'x'.repeat(193)}"`),
+    'the claim rides the marker, truncated at 200 characters total')
+
+  // Absent stays absent: no empty fields are minted for unsaid parameters.
+  const quietFs = MemoryFs.of(project())
+  const quiet = makeEngine(quietFs, new FakeCommands())
+  await quiet.establishBaseline()
+  await quiet.verify({ changed: ['src/a.ts'] })
+  assert.ok(quietFs.log.filter(l => l.includes('"baseline/established"')).every(l => !l.includes('"reason"')),
+    'no reason field when none was given')
+  assert.ok(quietFs.log.filter(l => l.includes('"proof/verified"')).every(l => !l.includes('"claim"')),
+    'no claim field when none was given')
+})
+
+// -- M8: the walk's own truncation reaches the graph -----------------------------
+
+test('M8: loadGraph folds the walk\'s truncation into graph.truncated', async () => {
+  // limit 2 over project()'s four files: the WALK stops at two (truncated),
+  // while the builder's own eligible count (one .ts among the two walked)
+  // never exceeds its limit — so graph.truncated is true exactly through the
+  // walkTruncated wiring, not through the builder's own cap.
+  const engine = new ProofEngine({
+    root: ROOT,
+    fs: MemoryFs.of(project()),
+    commands: new FakeCommands(),
+    workspace: new FakeWorkspace(ROOT),
+    clock: new FakeClock(),
+    impactGraphLimit: 2,
+  })
+  const graph = await engine.loadGraph()
+  assert.ok(graph !== undefined)
+  assert.equal(graph.truncated, true, 'the walk stopped at its limit; the graph must say so')
+})

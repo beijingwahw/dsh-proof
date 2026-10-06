@@ -1,6 +1,6 @@
 /**
  * ATTEST (ι) — Classes B and C re-enter the proof system as first-class,
- * replayable evidence. These tests pin four layers:
+ * replayable evidence. These tests pin five layers:
  *
  * 1. the rubric: it exists, it orders structured output, and its version
  *    constant is wired (a prompt without a versioned rubric is not evidence);
@@ -9,9 +9,15 @@
  * 3. the trust arithmetic of `attestationFactor`: p^w semantics, the
  *    abstain/zero-weight neutralities, and the [p,1] property that makes
  *    testimony a discount, never an amplifier;
- * 4. the chain-reading discipline of `activeAttestations` (defensive parse,
- *    appeal resolution by gen, deterministic (claimId, kind) order) and the
- *    llm-jury obligation matrix of `evaluateContract`.
+ * 4. the reliability mixture of `fuseConfidence`: (1−w)·current + w·p for a
+ *    decisive jury verdict, the neutralities (abstain, unusable probability,
+ *    unusable current), and the Class C seam — endorse is risk acceptance
+ *    (the number stands), reject multiplies through `attestationFactor`,
+ *    never the mixture;
+ * 5. the chain-reading discipline of `activeAttestations` (defensive parse —
+ *    including the jury probability's closed [0,1] domain — appeal resolution
+ *    by gen, deterministic (claimId, kind) order) and the llm-jury obligation
+ *    matrix of `evaluateContract`.
  */
 
 import { test } from 'node:test'
@@ -19,7 +25,7 @@ import assert from 'node:assert/strict'
 
 import {
   DEFAULT_TRUST_WEIGHTS, JURY_RUBRIC, RUBRIC_V1, activeAttestations,
-  attestationFactor, attestationsFor, claimIdOf, juryPrompt,
+  attestationFactor, attestationsFor, claimIdOf, fuseConfidence, juryPrompt,
   type Attestation, type HumanAttestation, type JuryAttestation, type TrustWeights,
 } from '../src/core/attest.ts'
 import { evaluateContract, type ContractInput } from '../src/core/contract.ts'
@@ -226,6 +232,87 @@ test('Class C reject is a heavy discount: (1-0.95)^0.9', () => {
 })
 
 // ---------------------------------------------------------------------------
+// fuseConfidence — the reliability mixture (and the Class C seam)
+// ---------------------------------------------------------------------------
+
+test('fuseConfidence: a decisive jury verdict pulls the number toward its probability — (1-w)*current + w*p in closed form', () => {
+  // current 0.94, jury asserting 0.99 at the default classB weight 0.7:
+  // fused = 0.3*0.94 + 0.7*0.99 = 0.975 — the mixture form, exactly.
+  const fused = fuseConfidence(0.94, jury({ verdict: 'uphold', probability: 0.99 }), DEFAULT_TRUST_WEIGHTS)
+  assert.ok(Math.abs(fused - ((1 - 0.7) * 0.94 + 0.7 * 0.99)) < 1e-12, `expected 0.3*0.94+0.7*0.99, got ${fused}`)
+  assert.ok(Math.abs(fused - 0.975) < 1e-12, 'and that value is 0.975')
+
+  // Both mixture endpoints are p and current: the fused value can never
+  // overshoot the witness's own assertion, in either direction.
+  assert.ok(fused > 0.94 && fused < 0.99, 'strictly between the machine number and the assertion')
+  // Direction lives in p: the same weights at p=0.1 crash the number.
+  const crashed = fuseConfidence(0.94, jury({ verdict: 'reject', probability: 0.1 }), DEFAULT_TRUST_WEIGHTS)
+  assert.ok(Math.abs(crashed - (0.3 * 0.94 + 0.7 * 0.1)) < 1e-12, `expected 0.3*0.94+0.7*0.1 = 0.352, got ${crashed}`)
+  assert.ok(crashed < 0.36, 'a rejecting jury pulls the number most of the way down to its assertion')
+
+  // Pull strength is exactly w: at w=0 the number stands, at w=1 it is replaced.
+  assert.equal(fuseConfidence(0.94, jury({ probability: 0.99 }), weights({ classB: 0 })), 0.94)
+  assert.equal(fuseConfidence(0.94, jury({ probability: 0.99 }), weights({ classB: 1 })), 0.99)
+})
+
+test('fuseConfidence: an abstaining jury leaves the machine number untouched', () => {
+  // "I cannot tell" carries no asserted probability to pull toward.
+  assert.equal(fuseConfidence(0.94, jury({ verdict: 'abstain', probability: 0.5 }), DEFAULT_TRUST_WEIGHTS), 0.94)
+  assert.equal(fuseConfidence(0.12, jury({ verdict: 'abstain', probability: 0.9 }), weights({ classB: 1 })), 0.12)
+})
+
+test('fuseConfidence: a jury probability unreadable as a probability leaves the number untouched', () => {
+  // Broken delivery is not evidence: the mixture would amplify (>1) or
+  // NaN-poison — the guard returns current instead.
+  for (const bad of [Number.NaN, 1.5, -0.2, Number.POSITIVE_INFINITY]) {
+    assert.equal(fuseConfidence(0.94, jury({ verdict: 'uphold', probability: bad }), DEFAULT_TRUST_WEIGHTS), 0.94)
+  }
+})
+
+test('fuseConfidence: an unusable current is returned verbatim, whatever the witness says', () => {
+  // The first guard fires before any witness arithmetic: a NaN current
+  // must not be "rescued" into a number by an upholding jury, and an
+  // out-of-range current is passed through as the caller's problem.
+  assert.ok(Number.isNaN(fuseConfidence(Number.NaN, jury({ verdict: 'uphold', probability: 0.99 }), DEFAULT_TRUST_WEIGHTS)))
+  assert.equal(fuseConfidence(5, jury({ verdict: 'uphold', probability: 0.99 }), DEFAULT_TRUST_WEIGHTS), 5)
+  assert.equal(fuseConfidence(-0.2, jury({ verdict: 'reject', probability: 0.1 }), DEFAULT_TRUST_WEIGHTS), -0.2)
+  assert.ok(Number.isNaN(fuseConfidence(Number.NaN, human({ decision: 'reject' }), DEFAULT_TRUST_WEIGHTS)))
+})
+
+test('fuseConfidence: a human endorsement is risk acceptance — the number stands, at every classC weight', () => {
+  // The approval seam carries no probability, so there is nothing to
+  // mixture: the human accepted the residual risk and the machine
+  // certification stays exactly what machines measured. The unlock happens
+  // at the grade level, not in this number.
+  for (const w of [0, 0.5, 0.9, 1]) {
+    assert.equal(fuseConfidence(0.94, human({ decision: 'endorse' }), weights({ classC: w })), 0.94)
+  }
+  // The semantic boundary, pinned from both sides: the SAME endorsement is a
+  // discount in the claim product (attestationFactor: hp^w < 1) and a no-op
+  // in the confidence mixture — by design, not by oversight.
+  assert.ok(attestationFactor(human({ decision: 'endorse' }), DEFAULT_TRUST_WEIGHTS) < 1)
+  assert.equal(fuseConfidence(0.94, human({ decision: 'endorse' }), DEFAULT_TRUST_WEIGHTS), 0.94)
+})
+
+test('fuseConfidence: a human rejection multiplies through attestationFactor — the collapse is multiplicative, never a mixture', () => {
+  // Class C has no asserted p to pull toward, so reject does NOT take the
+  // (1-w)*current + w*p form: it books the heavy discount of a trusted
+  // human contradicting the claim, multiplicatively.
+  const fused = fuseConfidence(0.9, human({ decision: 'reject' }), DEFAULT_TRUST_WEIGHTS)
+  assert.ok(Math.abs(fused - 0.9 * 0.05 ** 0.9) < 1e-12, `expected 0.9 * (1-0.95)^0.9, got ${fused}`)
+  assert.ok(fused < 0.11, 'a rejection collapses the number hard')
+
+  // The composition is pinned across the weight grid: fuseConfidence(reject)
+  // is exactly current * attestationFactor(reject), the same factor the
+  // claim product would apply.
+  for (const classC of [0, 0.3, 0.6, 0.9, 1]) {
+    const w = weights({ classC })
+    const factor = attestationFactor(human({ decision: 'reject' }), w)
+    assert.equal(fuseConfidence(0.77, human({ decision: 'reject' }), w), 0.77 * factor, `classC=${classC}`)
+  }
+})
+
+// ---------------------------------------------------------------------------
 // activeAttestations / attestationsFor
 // ---------------------------------------------------------------------------
 
@@ -249,6 +336,36 @@ test('activeAttestations skips garbage payloads without throwing', () => {
   const only = active[0] as JuryAttestation
   assert.equal(only.kind, 'attest/jury')
   assert.equal(only.verdict, 'reject')
+})
+
+test('parseJury: a probability outside [0,1] makes the whole record unusable — not an abstain, not evidence', () => {
+  // The read path used to accept any finite number, so `uphold @ 5` entered
+  // the active set and the two layers read it opposite ways: jury-upholds
+  // thresholds the number (5 ≥ 0.5 → met) while attestationFactor treated it
+  // as an abstain. Out-of-domain means broken delivery; the record is
+  // skipped like any other malformed payload.
+  const outOfRange: Attestation[] = [
+    jury({ verdict: 'uphold', probability: 5 }),
+    jury({ verdict: 'uphold', probability: -0.2 }),
+    jury({ verdict: 'uphold', probability: Number.NaN }),
+    jury({ verdict: 'uphold', probability: Number.POSITIVE_INFINITY }),
+  ]
+  assert.equal(activeAttestations(outOfRange).length, 0, 'no out-of-domain probability may enter the active set')
+
+  // With the record unusable, the obligation layer reads the same absence —
+  // the two verdicts can no longer disagree about one payload.
+  const v = evaluateContract(cInput({ attestations: outOfRange }))
+  assert.equal(byId(v.obligations, 'jury-delivered').met, false, 'an uphold at probability 5 is not a delivered verdict')
+  assert.equal(byId(v.obligations, 'jury-upholds').met, false)
+
+  // The closed interval [0,1] is the legal domain and parses exactly as
+  // before, boundaries included.
+  const zero = jury({ claimId: claimIdOf('claim at zero'), verdict: 'reject', probability: 0 })
+  const one = jury({ claimId: claimIdOf('claim at one'), verdict: 'uphold', probability: 1 })
+  const active = activeAttestations([zero, one, ...outOfRange])
+  assert.equal(active.length, 2, 'the legal records survive alongside the skipped ones')
+  assert.equal((active[0] as JuryAttestation).probability, 0)
+  assert.equal((active[1] as JuryAttestation).probability, 1)
 })
 
 test('an appeal at higher gen supersedes the original deliberation', () => {

@@ -76,3 +76,81 @@ test('normalizeOutput folds drive-letter case drift (c:\\ws vs root C:/ws)', () 
   // is a different location, never this workspace.
   assert.equal(normalizeOutput('built c:/wsx/out.js', { root: 'C:/ws' }), 'built c:/wsx/out.js')
 })
+
+test('canonicalJson rejects values with no injective JSON rendering: bigint, symbol, function', () => {
+  // Each of these used to fold onto some other value's rendering — 1n onto
+  // the string "1", functions/symbols onto null — so distinct payloads
+  // minted the SAME address (silent false dedupe). Now they refuse, naming
+  // the culprit.
+  for (const [label, value] of [
+    ['bigint', 1n],
+    ['symbol', Symbol('x')],
+    ['function', () => 1],
+  ] as const) {
+    assert.throws(() => canonicalJson(value), TypeError, `${label} must throw`)
+    assert.throws(() => canonicalJson(value), new RegExp(`${label} cannot be canonicalised`))
+  }
+  // Nested inside a legal structure, the exotic leaf still refuses — the
+  // address of a container must not silently drop the odd field.
+  assert.throws(() => canonicalJson([0, 1n]), /bigint cannot be canonicalised/)
+  assert.throws(() => canonicalJson({ list: [/re/] }), /RegExp cannot be canonicalised/)
+  // The public addressing API reports the same refusal, not a stack trace.
+  assert.throws(() => addressOf({ v: 1n }), /bigint cannot be canonicalised/)
+})
+
+test('canonicalJson non-finite numbers fold to null — the documented M17 residual, not a throw', () => {
+  // NaN/±Infinity alias null exactly like the rejected kinds, but the
+  // checkpoint adjudication paths feed JSON.parse-derived numbers where a
+  // forged "count":1e999 parses to Infinity: the fold's signature-verify
+  // failure is the correct verdict there, and a throw would crash the audit
+  // mid-walk (see the canonicalJson doc comment). This pins the interim
+  // behavior so the future flip to a TypeError is a visible change here.
+  assert.equal(canonicalJson(Number.NaN), 'null')
+  assert.equal(canonicalJson(Number.POSITIVE_INFINITY), 'null')
+  assert.equal(canonicalJson(Number.NEGATIVE_INFINITY), 'null')
+  assert.equal(canonicalJson({ evidenceId: 'x', n: Number.NaN }), '{"evidenceId":"x","n":null}')
+  assert.equal(addressOf({ n: Number.NaN }), addressOf({ n: null }), 'the known collision, pinned open pending the call-site fix')
+})
+
+test('canonicalJson rejects non-plain objects — Date, RegExp, Error, boxed, Map, class instances — instead of collapsing them to {}', () => {
+  // All of these used to canonicalise as '{}' (or a lossy key subset),
+  // aliasing each other AND the genuinely-empty object: new Date() and /re/
+  // minted the same evidenceId as {}. Now the constructor is named.
+  class Point { x: number; tag: string; constructor(x: number, tag: string) { this.x = x; this.tag = tag } }
+  for (const [label, value] of [
+    ['Date', new Date(0)],
+    ['RegExp', /re/],
+    ['Error', new Error('boom')],
+    ['Number', new Number(1)],
+    ['String', new String('s')],
+    ['Boolean', new Boolean(false)],
+    ['Map', new Map()],
+    ['Set', new Set()],
+    ['Point', new Point(1, 'a')],
+  ] as const) {
+    assert.throws(() => canonicalJson(value), TypeError, `${label} must throw`)
+    assert.throws(() => canonicalJson(value), new RegExp(`${label} cannot be canonicalised`))
+  }
+  // Even an enumerable-keyed class instance refuses: addressing `{x:1}` for a
+  // Point whose `tag` the format would drop is a false address — better
+  // strict than silently deduplicated against a different value.
+  assert.throws(() => addressOf(new Point(1, 'a')), /Point cannot be canonicalised/)
+  // And the old collision is truly gone: a Date can never share an address
+  // with anything the format does accept.
+  assert.throws(() => canonicalJson(new Date(0)), TypeError)
+  assert.equal(canonicalJson({}), '{}')
+})
+
+test('plain values canonicalise exactly as before — undefined fields, legal numbers, null-prototype objects stay legal', () => {
+  assert.equal(canonicalJson({ a: undefined, b: 1 }), '{"b":1}', 'undefined object fields are still dropped')
+  assert.equal(canonicalJson([1, undefined, 2]), '[1,null,2]', 'undefined array slots still render as null')
+  assert.equal(canonicalJson(undefined), 'null')
+  assert.equal(canonicalJson({ n: -0 }), canonicalJson({ n: 0 }), '-0 still folds onto 0')
+  assert.equal(canonicalJson({ a: 0.5, b: 1e-7, c: 123456789 }), '{"a":0.5,"b":1e-7,"c":123456789}')
+  // Object.create(null) is a plain object by prototype: legal, addressed as usual.
+  const nullProto = Object.assign(Object.create(null), { k: 'v', nested: { z: [true, null] } })
+  assert.equal(canonicalJson(nullProto), '{"k":"v","nested":{"z":[true,null]}}')
+  assert.equal(addressOf(nullProto), addressOf({ nested: { z: [true, null] }, k: 'v' }), 'key order still irrelevant')
+  // The full legal shapes still round-trip through the public address.
+  assert.equal(addressOf({ s: 'text', n: 3, t: true, x: null, arr: [1, 'two', false] }), addressOf({ arr: [1, 'two', false], x: null, t: true, n: 3, s: 'text' }))
+})

@@ -144,8 +144,14 @@ test('screenScript: a clean fs-reading script passes with empty findings', () =>
 })
 
 test('screenScript: the deny list is exactly the locked capability set', () => {
+  // M11: 'process' joined the lock (with 'node:process' named for the
+  // contract text the engine and tool prose render verbatim; matching itself
+  // reduces through the `node:` strip, where 'process' answers for both) —
+  // `import { env } from 'node:process'` used to bypass the entire
+  // process.env read check.
   assert.deepEqual(FORBIDDEN_CAPABILITIES, [
     'child_process', 'net', 'http', 'https', 'dgram', 'worker_threads',
+    'process', 'node:process',
   ])
 })
 
@@ -505,4 +511,79 @@ test('determinism: every entry point is a pure function of its inputs', () => {
     history: new Map(), fallbackCostMs: 1_000, syntheticFalsePass: 0.2,
   }
   assert.deepEqual(computePriors(pi), computePriors(pi))
+})
+
+// ---------------------------------------------------------------------------
+// 7. M11: screen hardening — backtick specifiers, escaped names, process
+// ---------------------------------------------------------------------------
+
+test('M11: backtick template-literal specifiers are screened like quoted ones', () => {
+  // An uninterpolated template literal is a statically decidable specifier —
+  // it never belonged in the computed-specifier limit, and `import(`…`)` used
+  // to sail past all four regexes.
+  for (const source of [
+    'const cp = await import(`node:child_process`)',
+    'const cp = import(`child_process`)',
+    'const { spawn } = require(`node:child_process`)',
+    'import { exec } from `node:child_process`',
+    'import `node:child_process`',
+    'export { spawn } from `node:child_process`',
+  ]) {
+    const { ok, findings } = screenScript(source)
+    assert.equal(ok, false, source)
+    assert.ok(findings.some(f => f.includes('child_process')), `${source}: ${findings.join('; ')}`)
+  }
+})
+
+test('M11: interpolated templates stay in the computed-specifier limit — silently, without false findings', () => {
+  // `${…}` is a runtime value; text cannot see it. The screen neither flags
+  // the partial text (a wrong finding teaches distrust) nor the classic
+  // computed form — the admitted limit, bounded by the sandbox regime.
+  assert.equal(screenScript('const mod = await import(`child_${name}`)').ok, true)
+  assert.equal(screenScript('const mod = await import(name + suffix)').ok, true)
+})
+
+test('M11: unicode- and hex-escaped specifiers are unescaped before the deny list sees them', () => {
+  for (const source of [
+    "import { exec } from 'child_\\u0070rocess'",
+    'import { exec } from "child_\\u0070rocess"',
+    "const cp = await import('child_\\x70rocess')",
+    "require('child_\\u0070rocess')",
+    "require(`child_\\u{70}rocess`)",
+  ]) {
+    const { ok, findings } = screenScript(source)
+    assert.equal(ok, false, source)
+    assert.ok(findings.some(f => f.includes('child_process')), `${source}: ${findings.join('; ')}`)
+  }
+  // The finding quotes the raw text as written — the evidence shows the
+  // escape the author typed, the verdict names the decoded module.
+  const one = screenScript("import { exec } from 'child_\\u0070rocess'")
+  assert.ok(one.findings.some(f => f.includes("from 'child_\\u0070rocess'")))
+})
+
+test('M11: process / node:process imports are denied — the env bag has no module-import bypass', () => {
+  for (const source of [
+    "import { env } from 'node:process'",
+    "import process from 'process'",
+    "const { env } = await import('node:process')",
+    "const p = require('process')",
+    "import { env } from `proc\\u0065ss`",
+  ]) {
+    const { ok, findings } = screenScript(source)
+    assert.equal(ok, false, source)
+    assert.ok(findings.some(f => f.includes("'process'")), `${source}: ${findings.join('; ')}`)
+  }
+  // Boundary precision both ways: local fixtures merely named like the
+  // module reduce to root '.' and stay allowed.
+  assert.equal(screenScript("import { helper } from './process.util.mjs'").ok, true)
+  assert.equal(screenScript("import { helper } from './process'").ok, true)
+})
+
+test('M11 (documented residual): process?.env and deconstruction stay unflagged', () => {
+  // Known residual recorded beside RE_PROCESS_ENV: chasing optional chains
+  // and binding shapes risks false positives on innocent member access, so
+  // these spellings stay uncaught — bounded by the sandbox cwd, run timeout
+  // and output cap, same as every other static-screen limit.
+  assert.equal(screenScript('const v = process?.env?.HOME').ok, true)
+  assert.equal(screenScript('const { env } = process').ok, true)
 })

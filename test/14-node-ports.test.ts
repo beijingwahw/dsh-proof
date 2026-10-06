@@ -556,3 +556,39 @@ test('GIT: one failing fact query does not take the others down (H6)', async () 
   assert.deepEqual(await ws.changedSince('HEAD'), ['keep.ts'])
   assert.deepEqual(await ws.untracked(), ['untracked.ts'])
 })
+
+// -- walk truncation is a first-class fact (M8) -----------------------------------
+//
+// The fidelity bug this pins: `FsPort.walk` used to return a bare file list,
+// so a workspace with more files than the limit produced a complete-LOOKING
+// prefix and the impact graph built on it never said it was partial. The
+// walk must now carry `truncated` — verified here against a real directory.
+
+test('FS: walk reports truncated=true when a real directory exceeds the limit (M8)', async () => {
+  const dir = join(SCRATCH, `node-ports-walk-${process.pid}`)
+  await fsp.rm(dir, { recursive: true, force: true })
+  await fsp.mkdir(join(dir, 'src'), { recursive: true })
+  await fsp.writeFile(join(dir, 'a.ts'), 'a', 'utf8')
+  await fsp.writeFile(join(dir, 'b.ts'), 'b', 'utf8')
+  await fsp.writeFile(join(dir, 'src', 'c.ts'), 'c', 'utf8')
+  try {
+    const fs = new NodeFsPort()
+
+    const capped = await fs.walk(dir, { limit: 2 })
+    assert.equal(capped.files.length, 2, 'the walk stops at the limit')
+    assert.equal(capped.truncated, true, 'stopping at the cap means the listing is a prefix, never a census')
+
+    const full = await fs.walk(dir, {})
+    assert.deepEqual([...full.files], ['a.ts', 'b.ts', 'src/c.ts'])
+    assert.equal(full.truncated, false, 'a walk that never hits the cap is complete')
+
+    // Hitting the cap EXACTLY is also truncation: without walking past N the
+    // port cannot distinguish "exactly N files" from "N and more" — the
+    // conservative, honest answer at the cap is truncated.
+    const exact = await fs.walk(dir, { limit: 3 })
+    assert.deepEqual([...exact.files], [...full.files])
+    assert.equal(exact.truncated, true, 'the cap itself stops the walk — conservatively truncated')
+  } finally {
+    await fsp.rm(dir, { recursive: true, force: true })
+  }
+})

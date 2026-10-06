@@ -420,6 +420,125 @@ test('BAYES: VOI is finite and never negative across a wide prior grid (informat
 })
 
 // ---------------------------------------------------------------------------
+// 5b. rankByInformationGain over folded factors — the re-run domain
+// ---------------------------------------------------------------------------
+
+test('BAYES: the martingale is exact over the folded-factor domain — E[p1] = claim0 measured from the current factor', () => {
+  // π = 0.8, α = 0.3; one pass folds the factor to that observation's
+  // posterior ≈ 0.9929. Marginalising the next observation over the FOLDED
+  // factor and updating from the same folded factor must return the claim
+  // probability unchanged — the total-probability identity that makes
+  // VOI ≥ 0 a theorem over the folded domain too. (Marginalising over the
+  // fold but updating from the session-start prior — the pre-fix math —
+  // measured the two branches of the expectation against different
+  // baselines: E[p1] landed 13.5pp below claim0.)
+  const pr = prior({ checkId: 'c:fold', priorHealthy: 0.8, falseFail: 0.3 })
+  const factor = posteriorHealthy(pr, 'pass')
+  assert.ok(Math.abs(factor - 0.56 / 0.564) < 1e-15, `one pass folds π=0.8,α=0.3 to ≈0.9929, got ${factor}`)
+
+  const standing: CheckPrior = { ...pr, priorHealthy: factor }
+  const pPass = factor * (1 - pr.falseFail) + (1 - factor) * pr.falsePass
+  const afterPass = claimProbability(model({ 'c:fold': posteriorHealthy(standing, 'pass') }))
+  const afterFail = claimProbability(model({ 'c:fold': posteriorHealthy(standing, 'fail') }))
+  const claim0 = claimProbability(model({ 'c:fold': factor }))
+  const expectation = pPass * afterPass + (1 - pPass) * afterFail
+  assert.ok(
+    Math.abs(expectation - claim0) < 1e-12,
+    `E[p1] must equal claim0 exactly when both terms start from the fold, got ${expectation} vs ${claim0}`,
+  )
+
+  // The scheduler prices the re-run from the same fold: a folded pass leaves
+  // only the fail branch's residual entropy (≈0.0077 nats — small but real),
+  // where the stale-baseline math produced a raw −0.197 that the clamp
+  // silently ate as exactly 0.
+  const schedule = rankByInformationGain(priorsOf(pr), model({ 'c:fold': factor }))
+  const voi = schedule[0]?.voi ?? Number.NaN
+  assert.ok(voi > 0.005 && voi < 0.01, `a folded pass posterior still prices its fail branch, got ${voi}`)
+  const closedForm = entropy(claim0) - (pPass * entropy(afterPass) + (1 - pPass) * entropy(afterFail))
+  assert.ok(Math.abs(voi - closedForm) < 1e-12, `implementation matches the formula: ${voi} vs ${closedForm}`)
+})
+
+test('BAYES: a failed check keeps real re-run value — VOI measured from the folded factor', () => {
+  // π = 0.6, α = 0.3; one fail folds the factor to 0.18/0.572 ≈ 0.3147. The
+  // re-run's information is priced from THAT factor: the fold still sits far
+  // from both 0 and 1, so its next observation can move the claim a lot, and
+  // the scheduler must report that (measured ≈ 0.2846 nats). The pre-fix
+  // code priced this state against the raw prior instead — understating the
+  // re-run at ≈ 0.124, and clamping the mirrored pass-fold case's raw −0.197
+  // to a silent 0: re-run value was systematically mispriced in BOTH
+  // directions.
+  const pr = prior({ checkId: 'c:retry', priorHealthy: 0.6, falseFail: 0.3 })
+  const factor = posteriorHealthy(pr, 'fail')
+  assert.ok(Math.abs(factor - 0.18 / 0.572) < 1e-15, `one fail folds π=0.6,α=0.3 to ≈0.3147, got ${factor}`)
+
+  const schedule = rankByInformationGain(priorsOf(pr), model({ 'c:retry': factor }))
+  const voi = schedule[0]?.voi ?? 0
+  assert.ok(voi > 0.1, `a folded fail posterior still buys >0.1 nats of certainty, got ${voi}`)
+  assert.ok(voi > 0.25 && voi < 0.32, `and the measured value is ≈0.2846 nats, got ${voi}`)
+
+  // The value is the new math's closed form, transcribed independently:
+  // marginalise over the fold, update from the fold.
+  const standing: CheckPrior = { ...pr, priorHealthy: factor }
+  const pPass = factor * (1 - pr.falseFail) + (1 - factor) * pr.falsePass
+  const fPass = posteriorHealthy(standing, 'pass')
+  const fFail = posteriorHealthy(standing, 'fail')
+  const expected = entropy(factor) - (pPass * entropy(fPass) + (1 - pPass) * entropy(fFail))
+  assert.ok(Math.abs(voi - expected) < 1e-9, `implementation matches the formula: ${voi} vs ${expected}`)
+})
+
+test('BAYES: VOI stays ≥ 0 across the folded-factor grid — the clamp only absorbs float dust', () => {
+  // Every factor is a posterior of its prior (the folded state of a check
+  // that already answered) — the domain over which the martingale, and hence
+  // VOI ≥ 0, must hold once re-runs are priced from the current factor. Each
+  // grid point is a single-check claim so the entropy is macroscopic and the
+  // sign is not a matter of underflow.
+  let points = 0
+  for (const pi of [0.05, 0.15, 0.3, 0.5, 0.7, 0.85, 0.95, 0.999]) {
+    for (const alpha of [0.01, 0.05, 0.1, 0.2, 0.3]) {
+      const pr = prior({ checkId: 'c:grid', priorHealthy: pi, falseFail: alpha })
+      for (const obs of ['pass', 'fail'] as const) {
+        const factor = posteriorHealthy(pr, obs)
+        points += 1
+        const schedule = rankByInformationGain(priorsOf(pr), model({ 'c:grid': factor }))
+        const voi = schedule[0]?.voi ?? Number.NaN
+        assert.ok(Number.isFinite(voi) && voi >= 0, `π=${pi} α=${alpha} folded ${obs}: VOI must be ≥ 0, got ${voi}`)
+        // And it is the true Jensen gap, not the clamp masking a negative:
+        // the closed form (marginalise over the fold, update from the fold)
+        // is itself non-negative and matches to float dust.
+        const standing: CheckPrior = { ...pr, priorHealthy: factor }
+        const pPass = factor * (1 - pr.falseFail) + (1 - factor) * pr.falsePass
+        const fPass = posteriorHealthy(standing, 'pass')
+        const fFail = posteriorHealthy(standing, 'fail')
+        const raw = entropy(factor) - (pPass * entropy(fPass) + (1 - pPass) * entropy(fFail))
+        assert.ok(raw > -1e-12, `π=${pi} α=${alpha} folded ${obs}: the unclamped value is mathematically ≥ 0, got ${raw}`)
+        assert.ok(Math.abs(voi - Math.max(0, raw)) < 1e-9, `π=${pi} α=${alpha} folded ${obs}: ${voi} vs ${raw}`)
+      }
+    }
+  }
+  assert.ok(points >= 80, `the sweep actually swept (${points} folded points)`)
+
+  // The same theorem over a shared multi-check model, folded factors and all:
+  // the whole-schedule product claim stays clamp-clean too.
+  const items: CheckPrior[] = []
+  const factors: Record<string, number> = {}
+  let i = 0
+  for (const pi of [0.05, 0.15, 0.3, 0.5, 0.7, 0.85, 0.95, 0.999]) {
+    for (const alpha of [0.01, 0.05, 0.1, 0.2, 0.3]) {
+      const pr = prior({ checkId: `c:${String(i).padStart(3, '0')}`, priorHealthy: pi, falseFail: alpha, expectedCostMs: 50 * ((i % 7) + 1) })
+      i += 1
+      items.push(pr)
+      factors[pr.checkId] = posteriorHealthy(pr, i % 2 === 0 ? 'pass' : 'fail')
+    }
+  }
+  const schedule = rankByInformationGain(priorsOf(...items), model(factors))
+  assert.equal(schedule.length, items.length)
+  for (const step of schedule) {
+    assert.ok(Number.isFinite(step.voi) && step.voi >= 0, `${step.checkId}: folded-domain VOI must be finite and ≥ 0, got ${step.voi}`)
+    assert.ok(Number.isFinite(step.voiPerCost) && step.voiPerCost >= 0)
+  }
+})
+
+// ---------------------------------------------------------------------------
 // 6. Determinism
 // ---------------------------------------------------------------------------
 

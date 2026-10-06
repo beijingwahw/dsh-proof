@@ -16,10 +16,39 @@ import { createHash } from 'node:crypto'
  * Deterministic JSON: object keys sorted recursively, `undefined` dropped,
  * numbers normalised through `String()` so `-0` and `0` agree.
  *
- * A circular structure is rejected with a `TypeError` naming the problem —
- * this is a public addressing primitive (`addressOf` promises to address
- * "any canonicalisable value"), and "Maximum call stack size exceeded" from
- * an exhausted recursion is not an answer a caller can act on.
+ * A value whose JSON rendering is not *injective* — where two distinct values
+ * would canonicalise to the same bytes and thus mint the same address,
+ * silently deduplicating things that are not the same — is rejected with a
+ * `TypeError` naming the problem, the same discipline as the circular check
+ * below. Rejected kinds:
+ *
+ * - `bigint` — would alias the equal-looking string (`1n` ≡ `"1"`);
+ * - `symbol`, `function` — would alias each other and `null`;
+ * - non-plain objects — anything whose prototype is neither
+ *   `Object.prototype` nor `null`: `Date`, `RegExp`, `Error`, boxed
+ *   primitives, `Map`/`Set`, and class instances (even with enumerable
+ *   keys — better to refuse than to address a lossy subset of the value).
+ *   Most canonicalise as `'{}'`, aliasing every other such object.
+ *
+ * One deliberate residual: non-finite numbers (`NaN`, `±Infinity`) still
+ * fold to `'null'` instead of throwing. They collide with `null` exactly as
+ * the rejected kinds do, but the adjudication read paths
+ * (`checkpointSignedData` under `EvidenceStore.audit` and the bundle trust
+ * check) feed `JSON.parse`-derived numbers where a forged `"count":1e999`
+ * parses to `Infinity` — throwing there would crash the audit mid-walk
+ * instead of adjudicating the checkpoint as malformed (the fold makes its
+ * signature verify fail, which is the correct verdict, and the walk's own
+ * safe-integer gate already flags the lie). Flipping this to a `TypeError`
+ * is blocked on those call sites catching (or pre-gating) it first.
+ *
+ * Plain objects (both prototypes), arrays, and the JSON primitives
+ * canonicalise exactly as before; `undefined` is still dropped from objects
+ * and rendered as `null` inside arrays.
+ *
+ * This is a public addressing primitive (`addressOf` promises to address
+ * "any canonicalisable value"), and a silent collision is strictly worse
+ * than a loud refusal: "Maximum call stack size exceeded" or `{}` for a
+ * `Date` is not an answer a caller can act on.
  */
 export function canonicalJson(value: unknown): string {
   return stringify(value, new WeakSet())
@@ -28,10 +57,20 @@ export function canonicalJson(value: unknown): string {
 function stringify(value: unknown, seen: WeakSet<object>): string {
   if (value === null) return 'null'
   const t = typeof value
-  if (t === 'number') return Number.isFinite(value as number) ? JSON.stringify(Object.is(value, -0) ? 0 : value) : 'null'
+  if (t === 'number') {
+    // The M17 residual named in the doc comment above: fold, don't throw —
+    // `Infinity` reaches here from forged chain bytes (`1e999`) via the
+    // checkpoint signature checks, where the fold's verify-false is the
+    // correct adjudication and a throw would kill the audit mid-walk.
+    return Number.isFinite(value as number) ? JSON.stringify(Object.is(value, -0) ? 0 : value) : 'null'
+  }
   if (t === 'boolean' || t === 'string') return JSON.stringify(value)
-  if (t === 'bigint') return JSON.stringify(String(value))
-  if (t === 'undefined' || t === 'function' || t === 'symbol') return 'null'
+  if (t === 'bigint') throw uncanonicalisable('bigint')
+  // `undefined` is JSON's absence, not an exotic value: object fields holding
+  // it are dropped by the key filter below, array slots render it as null.
+  if (t === 'undefined') return 'null'
+  if (t === 'function') throw uncanonicalisable('function')
+  if (t === 'symbol') throw uncanonicalisable('symbol')
   if (Array.isArray(value)) {
     if (seen.has(value)) throw circularError()
     seen.add(value)
@@ -42,6 +81,15 @@ function stringify(value: unknown, seen: WeakSet<object>): string {
     }
   }
   const obj = value as Record<string, unknown>
+  // Only plain objects (Object.prototype or null prototype) canonicalise:
+  // everything else — Date, RegExp, Error, boxed primitives, Map, Set, class
+  // instances — has state this format cannot render injectively, and two
+  // distinct such values collapsing onto one address is the exact failure
+  // (silent false dedupe) the address exists to prevent.
+  const proto: unknown = Object.getPrototypeOf(obj)
+  if (proto !== Object.prototype && proto !== null) {
+    throw uncanonicalisable(constructorName(obj) ?? 'non-plain object')
+  }
   if (seen.has(obj)) throw circularError()
   seen.add(obj)
   try {
@@ -50,6 +98,16 @@ function stringify(value: unknown, seen: WeakSet<object>): string {
   } finally {
     seen.delete(obj)
   }
+}
+
+/** The value's constructor name when it carries a usable one (e.g. 'Date'). */
+function constructorName(obj: object): string | undefined {
+  const name = (obj as { constructor?: { name?: unknown } }).constructor?.name
+  return typeof name === 'string' && name.length > 0 ? name : undefined
+}
+
+function uncanonicalisable(what: string): TypeError {
+  return new TypeError(`${what} cannot be canonicalised`)
 }
 
 function circularError(): TypeError {

@@ -573,6 +573,14 @@ v0.16 是一个**诚实性收口版**：对核心发出的每一个判定做一�
 
 其余清剿同一纪律：API 面提取不再漏掉 `export const x: number = 1`、解构类型注解不再产出幻影名（H4——behavior-preserving 对惯用 TS 重新成立）；观察器的 `pathsIn` 数组分支不再绕过键白名单（patch 行 / argv 数组不再被误当路径），本会话用过 shell 后，touched 集之外的变更归因从 `external` 降为 `unknown`——宁可归因不了，也不误指外部（H9）；`.PROOF` 大小写变体与反斜杠配置不再穿透工作区证据守卫（H10）；签名私钥读失败仅 ENOENT 才生成新钥，杀软瞬时锁不再触发静默轮换（H11）；预算耗尽或超时的基线拒绝锚定、落 `aborted` 标志（H12）——半真基线不再上链；`proof_endorse` 审批提示显示 agent 自报的 approver 名，冒名至少可见（M5）；verify 与 baseline 强制重发现，中途加脚本无法静默逃逸（M7）；config→engine 透传补上最后三个缺口——`lspQueryBudget`、`logger`、`verbose`（M14）。测试 493 → 543（+50），零新增配置键：scriptDigest、vanished、timedOut 都是内部观测字段，不是旋钮。
 
+## 五·二十二、剩余缝隙全部收口（v0.17.0）：数学实际说了什么，测试实际没测什么
+
+v0.17 接续 v0.16 收尾：对核心发出的每一个判定做同一场深读，这一轮把深读报告的中优先批次全部清零，连同审计顺带暴露的测试基建缺口一并补上。最大的一处在调度器本身（M3）：贝叶斯更新曾从各因子的**原始先验**而非**当前值**出发，折叠因子域因此漂移（E[p₁] ≠ p₀，差 13.5pp），一条已经失败过的检查，重跑价值被低估 61%——你最想重跑的那条恰好被排成最不值得跑；排序数学如今在全因子域上精确。置信度词表不再小处说谎（M4/M10/M13）：工具层不再丢弃 `synthetic`/`attested`/`jury-only` 基数，canonical 值不再携带「没有基数的概率」（ClaimValue 带 basis 与 regime 短语）；llm-jury 断言不再因为接受了人类背书而被惩罚——endorse 是风险接受不是证据，它只能让乘积不变、绝不变差，reject 的否决权原样保留；越界的陪审概率如今在两层裁夺上都让整条证词不可用。
+
+工具面的静默一律改为保守或可见（M5/M6/M8/M9/M15/M18/M19）：`proof_claim` 缺 claim、非法 kind 干净报错，不再静默降级到无契约路径；`FsPort.walk` 返回 `{files, truncated}`，>2000 文件的工作区图不完整时 `graph.truncated=true`，选择判 uncertain 全跑——此前静默漏掉的导入方会造出假 `proven`；`src/**/*.ts` 这类不支持形状过包含全跑，不再静默永不匹配（死检查是披着绿字的谎话）；锚文件存在但不可解析浮出 `anchorUnreadable` 信号；signer 瞬时失败在引擎与存储两层重试、只缓存成功，恢复后签名自动回来，不再永久 unsigned 毒化；显式 `changed` 路径归一，反斜杠与 `./` 前缀不再误判 uncovered；`proof_verify.claim` / `proof_baseline.reason` 两个死参数接线进 marker，τ 门降级文案区分病因、`anchorMismatch` 进结构化输出与横幅同批落地（M19）。`canonicalJson` 按构造单射（M17）：bigint/symbol/function/`Date`/`Map` 等奇异值抛 `TypeError`，不再折叠成与别的值相同的字节——两个不同的 payload 不再可能铸出同一个 evidenceId；非有限数维持 legacy 折叠，并显式 pin 为决策而非事故（见 §十）。合成筛检堵上三类绕过（M11——反引号模板、Unicode 转义、`node:` 前缀拼写的 `process`），`SYNTHETIC: PASS` 末行协议强制校验（M12）：空脚本 exit 0 不再计为 pass。
+
+审计还抓住了测试在装样子：audit 五通道（`badCheckpoints`、`headMismatches`、`unsignedCheckpoints`、`anchorMismatch`、`corruptLines`）如今真实触发覆盖——`08` 的 fakeAudit 是伪装成覆盖的格式化器测试；`fuseConfidence` 首次获得直接单测；`MemoryFs` 计数 `mtimeMs`，LSP 缓存失效从此可测。测试 543 → 584（+41），配置维持 32 项（零新增）：以上没有一样是旋钮。
+
 ---
 
 ## 六、架构：领域核心 + 薄适配层
@@ -627,7 +635,7 @@ dsh-proof/
 │   │       ├── plugin.ts     # 运行时鸭子类型探测 tool.execute.before/after + chat.params，优雅降级
 │   │       └── vendor.ts     # 宿主 API 形状收窄器（探测不到 = 留空不炸宿主）
 │   └── vendor/dsh-tools.ts   # 契约快照（pinned to dsh v0.2.1-alpha.1）
-├── test/                     # 26 个测试文件（543 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心、类型化断言合约、证据分级 B/C、PTC 证据合成、覆盖感知证明、协议词表钉死、bundle 篡改矩阵、MCP 真子进程集成、适配器共享层字节对齐、Claude Code 真子进程协议、OpenCode 鸭子类型降级
+├── test/                     # 26 个测试文件（584 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心、类型化断言合约、证据分级 B/C、PTC 证据合成、覆盖感知证明、协议词表钉死、bundle 篡改矩阵、MCP 真子进程集成、适配器共享层字节对齐、Claude Code 真子进程协议、OpenCode 鸭子类型降级
 ├── PROTOCOL.md               # Agent Proof Protocol (APP/1.0) 开放标准（英文规范，八节）
 ├── cordis.patch.yml          # bundle 层
 └── examples/
@@ -639,7 +647,7 @@ dsh-proof/
 **为什么领域核心不碰 `@deepseek-ai/*`：**
 
 1. DSH 是开发者预览版，破坏性变更频繁。核心逻辑与 harness 版本解耦 → 升级不重写。
-2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，543 个测试全绿。
+2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，584 个测试全绿。
 3. 同一个核心可以被别的宿主（CLI、CI、其他 harness）复用。
 
 **为什么 `vendor/dsh-tools.ts` 是契约快照而不是活依赖：**
@@ -738,7 +746,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit，离线可跑
-npm test              # 543 个测试（node:test）
+npm test              # 584 个测试（node:test）
 npm run build         # 产出 lib/
 npm run bundle:check  # 打包契约自检
 ```
@@ -811,6 +819,8 @@ pnpm dsh web --patch /absolute/path/to/dsh-proof/examples/cordis.yml
 - **超时如今是被观察的状态，不是推断（v0.16）。** 命令端口上报 `timedOut` 标志，真实超时的检查在两个平台上都记 `'timeout'`——此前生产端口报告不了这个死因，真实超时全被记成普通 `error`。边界仍在原处：信号死亡在能报告的平台上仍记 `error` 并注明信号（见 v0.8 条），Windows 上以普通退出码到达的击杀仍读作 `error`——插件只报告端口观察到的，绝不多说。
 - **本会话用过 shell 后，`external` 降级为 `unknown`（v0.16）。** 「不在 touched 集」曾被读作外部改动的肯定证据——可会话一旦用过 shell（其路径任何宿主都提取不了，见 v0.15 条），这个缺失可能只是 agent 自己的 shell 工作没有被归因。归因如今对此说 `unknown`，不说自信但可能错指的 `external`，漂移叙事与外部嫌疑记账都读这个降级；`external` 只在本会话确实没有能产出该改动的手段时保留。
 - **MCP `serverInfo.version` 就是包版本（v0.16）。** `initialize` 应答 `MCP_DEFAULT_VERSION`，随发布纪律与 `package.json` 保持同步，并被 `test/23-mcp` 的握手断言钉死——它是**实现版本**，不是协议能力声明；协议兼容性另行协商（`2025-06-18` 等）。
+- **合成 deny-list 增补 process 系（v0.17）。** `process` / `node:process` 进入禁用清单，文本层能看见的拼写——反引号模板、`\u`/`\x` 转义、`node:` 前缀——先解转义归一再匹配，`import { env } from 'node:process'` 不再绕过 env 读取检查。增补对诚实脚本**按构造非破坏**：脚手架协议经全局取 process 状态（`process.exitCode`，无需 import），正当的合成测试分毫无损。清单看不见的仍是它从来看不见的——运行时计算的 specifier 与别名通道（见 v0.12 条）：文本不是沙箱；且清单是与引擎钉死的契约，增补是对宿主强制面的破坏性变更，不是随手编辑。
+- **canonicalJson 对普通 JSON 单射，对非有限数刻意不单射（v0.17）。** bigint/symbol/function 与非普通对象（`Date`、`Map`、类实例……）抛 `TypeError`，不再静默折叠成别的值已占有的字节——两个 payload 不再可能铸出同一个 evidenceId。`NaN`/`±Infinity` 维持折叠为 `'null'` 的 legacy 行为，如今显式 pin 为决策而非事故：裁定读路径吃的是 `JSON.parse` 出来的数，伪造的 `"count": 1e999` 会 parse 成 `Infinity`——在那里 throw 会把审计当场崩掉，而不是把检查点裁定为 malformed；折叠已经产出正确裁定（验签失败，且走链的安全整数门点名这个谎）。改成 throw 被这些调用点的前置门挡着，是待办不是疏忽。
 - **`proven` 允许存在预置红灯。** 一个本来就红的仓库不该让 Agent 无法工作。预置失败会在报告里显著列出，但不计入本次会话的责任。这是刻意设计，不是漏洞。
 - **它不替代测试本身。** `dsh-proof` 编排并归因你已有的客观检查。v0.12 的证据合成也不改变这条边界：断言由 agent 起草，插件只冻结脚手架、筛检、执行，并把结果折价记账为弱于任何独立检查的证据。
 - **DSH 是 v0.1/0.2 开发者预览版。** 插件契约会变。本插件已把依赖面最小化并钉死契约快照（`src/vendor/dsh-tools.ts`），但上游变更时仍需重新对齐。

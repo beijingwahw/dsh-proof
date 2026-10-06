@@ -131,7 +131,7 @@ export interface Config {
   classCTrust: number
   /**
    * π: where conjured-test sandboxes live, relative to the workspace root.
-   * `proof_conjure_request` scaffolds templates here, the model writes its
+   * `proof_conjure` scaffolds templates here, the model writes its
    * test next to them, and `proof_conjure_run` executes it inside this
    * directory. Discovery ignores it (it rides `DEFAULT_IGNORE_DIRS`), so a
    * sandbox never becomes an objective check by accident.

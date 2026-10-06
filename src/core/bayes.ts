@@ -509,23 +509,38 @@ function withFactor(model: ClaimModel, checkId: string, value: number): ClaimMod
 /**
  * Rank every check in `priors` by expected information gain about the claim.
  *
- * For one check: with p₀ = current claim probability,
+ * For one check: with p₀ = current claim probability and f the check's
+ * current factor (its prior, or the posterior folded in by an earlier run —
+ * `model.factors`, else the prior),
  *
  *     VOI = H(p₀) − [P(pass)·H(p₁|pass) + P(fail)·H(p₁|fail)]
  *
- * where p₁|obs is the claim probability with this check's factor replaced by
- * `posteriorHealthy(prior, obs)` and P(obs) marginalizes the observation over
- * the factor's current value (the prior, for a not-yet-run check). Because the
- * factor update is a genuine Bayesian step, E[p₁] = p₀ exactly (a martingale),
- * so Jensen's inequality on the concave H gives VOI ≥ 0 — running a check
- * never *increases* expected uncertainty. The returned value is clamped at 0
- * to absorb floating-point dust (the mathematical value is provably
- * non-negative; the clamp makes the float answer agree with the theorem).
+ * where P(obs) marginalises the observation over f, and p₁|obs replaces the
+ * factor with `posteriorHealthy` computed FROM f — the factor is treated as
+ * this check's standing prior, so both terms of the expectation are measured
+ * against the same baseline. That is what makes the martingale exact over the
+ * whole factor domain, folded factors included, not just fresh priors:
+ * writing the single-check claim as p₀ = f·Πothers,
+ *
+ *     E[p₁] = P(pass)·(p₀/f)·P(h|pass) + P(fail)·(p₀/f)·P(h|fail)
+ *           = (p₀/f)·[P(h|pass)·P(pass) + P(h|fail)·P(fail)]
+ *           = (p₀/f)·f = p₀
+ *
+ * by total probability over f — whatever f's history. Jensen's inequality on
+ * the concave H then gives VOI ≥ 0 over the entire legal factor domain:
+ * running a check never *increases* expected uncertainty, and a re-run of an
+ * already-folded check is priced by the uncertainty its factor still carries
+ * (a fail posterior at 0.31 has most of its entropy left to resolve; the
+ * observation that produced it is already spent, but the factor is not
+ * settled). The returned value is clamped at 0 to absorb floating-point dust
+ * (the mathematical value is provably non-negative; the clamp makes the float
+ * answer agree with the theorem).
  *
  * This function does not judge "already run": it scores everything it is
- * given. A check already folded into `model` as a posterior scores ≈ 0
- * naturally (its observation is spent), so callers may simply pass the live
- * model. Factors absent from the model default to the prior.
+ * given, so callers may simply pass the live model — a folded factor is a
+ * legal starting point, and re-running it buys exactly the Jensen gap its
+ * residual uncertainty admits. Factors absent from the model default to the
+ * prior.
  *
  * Order: voiPerCost descending, ties broken by checkId ascending (byte
  * order) — fully deterministic whatever order the maps were built in.
@@ -539,10 +554,18 @@ export function rankByInformationGain(
   for (const checkId of [...priors.keys()].sort()) {
     const prior = priors.get(checkId) as CheckPrior
     const factor = model.factors.get(checkId) ?? prior.priorHealthy
+    // The Bayesian step must start from the same value P(obs) marginalises
+    // over: the check's standing prior is its CURRENT factor (a posterior,
+    // for a check this session already heard from), not the session-start
+    // prior. Updating from the raw prior while marginalising over the folded
+    // factor would price the re-run against a stale baseline — E[p₁] ≠ p₀,
+    // and a genuinely informative re-run could score below zero and be
+    // clamped away.
+    const standing: CheckPrior = { ...prior, priorHealthy: factor }
     const pPass = factor * (1 - prior.falseFail) + (1 - factor) * prior.falsePass
     const pFail = 1 - pPass
-    const afterPass = claimProbability(withFactor(model, checkId, posteriorHealthy(prior, 'pass')))
-    const afterFail = claimProbability(withFactor(model, checkId, posteriorHealthy(prior, 'fail')))
+    const afterPass = claimProbability(withFactor(model, checkId, posteriorHealthy(standing, 'pass')))
+    const afterFail = claimProbability(withFactor(model, checkId, posteriorHealthy(standing, 'fail')))
     const voi = Math.max(0, h0 - (pPass * binaryEntropy(afterPass) + pFail * binaryEntropy(afterFail)))
     steps.push({ checkId, voi, voiPerCost: voi / Math.max(1, prior.expectedCostMs) })
   }

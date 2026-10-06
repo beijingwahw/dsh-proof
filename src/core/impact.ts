@@ -38,6 +38,17 @@ export interface BuildGraphOptions {
   readonly resolver?: DefinitionResolverPort
   /** Maximum resolver round-trips for one graph build (degrades beyond). */
   readonly lspQueryBudget?: number
+  /**
+   * M8: the caller's workspace walk (`FsPort.walk`) reported truncation — the
+   * `files` list handed to this builder is a prefix of the workspace, so the
+   * graph is incomplete for reasons THIS function cannot detect (its own
+   * `limit` may never have fired). Propagated into `DependencyGraph.truncated`
+   * so `selectAffectedChecks` degrades the selection to uncertain (all checks
+   * run) instead of silently reasoning over a partial node set — a workspace
+   * bigger than the walk limit used to produce a complete-looking graph that
+   * never said it was partial.
+   */
+  readonly walkTruncated?: boolean
 }
 
 const SOURCE_EXT = /\.(m|c)?(j|t)sx?$|\.py$|\.go$|\.rs$|\.java$|\.kt$|\.rb$|\.php$|\.cs$/
@@ -98,8 +109,12 @@ export async function buildDependencyGraph(
 ): Promise<DependencyGraph> {
   const limit = options.limit ?? 20_000
   const ignore = new Set(options.ignoreDirs ?? [])
-  const scannedFiles = files.filter(f => SOURCE_EXT.test(f) && !isIgnored(f, ignore)).slice(0, limit)
-  const truncated = files.filter(f => SOURCE_EXT.test(f) && !isIgnored(f, ignore)).length > limit
+  const eligible = files.filter(f => SOURCE_EXT.test(f) && !isIgnored(f, ignore))
+  const scannedFiles = eligible.slice(0, limit)
+  // Truncation is the disjunction of BOTH causes: this builder's own scan
+  // cap firing, or the caller's walk having stopped at its limit upstream
+  // (M8 — the walk knows, the builder does not, so the caller must tell it).
+  const truncated = eligible.length > limit || options.walkTruncated === true
 
   const known = new Set(scannedFiles)
   const dependents = new Map<RelPath, Set<RelPath>>()
@@ -294,9 +309,52 @@ export function matchesAny(file: RelPath, patterns: readonly string[]): boolean 
   return patterns.some(pattern => matches(file, pattern))
 }
 
+// Whether a pattern uses glob metacharacters in a position the five-form
+// matcher below does not interpret. The supported canon, exhaustively:
+//
+//   pattern shape            | matched how
+//   -------------------------+----------------------------------------------
+//   `*`                      | everything (wildcard-all)
+//   `<literal>/**`           | `<literal>` itself and everything under it
+//   `<literal>/*`            | direct children of `<literal>` only
+//   `<literal>`              | exactly `<literal>` or anything under it
+//
+// `<literal>` must itself be metacharacter-free. EVERY other metacharacter-
+// bearing shape is unsupported — the decision table, spelled per feature:
+//
+//   `?` anywhere                      e.g. `a?b.ts`            → unsupported
+//   `[` or `]` (character class)      e.g. `[abc].ts`          → unsupported
+//   `{` or `}` (brace group)          e.g. `{a,b}`             → unsupported
+//   `**` NOT as the terminal          e.g. `src/` + `**` + `/*.ts`,
+//                                      or a leading `**` prefix          → unsupported
+//   `*` glued to other text           e.g. `src/*.ts`, `a*`               → unsupported
+//   `*` in a supported terminal form  e.g. `src/**`, `src/*`, `*`         → supported
+//   no metacharacter at all           e.g. `src/a.ts` (plain literal)     → supported
+function isUnsupportedGlobShape(pattern: string): boolean {
+  if (!/[*?[\]{}]/.test(pattern)) return false // plain literal — always supported
+  if (pattern === '*') return false // wildcard-all — supported
+  const doubleStar = /^(.*)\/\*\*$/.exec(pattern)
+  if (doubleStar !== null) return hasGlobMeta(doubleStar[1] ?? '')
+  const singleStar = /^(.*)\/\*$/.exec(pattern)
+  if (singleStar !== null) return hasGlobMeta(singleStar[1] ?? '')
+  return true
+}
+
+function hasGlobMeta(literal: string): boolean {
+  return /[*?[\]{}]/.test(literal)
+}
+
 export function matches(file: RelPath, pattern: string): boolean {
   if (pattern === '*') return true
   const normalized = pattern.replace(/\/+$/, '')
+  // M9 conservative fallback: a pattern that LOOKS like a glob but is not one
+  // of the five supported shapes matches EVERYTHING. The old matcher silently
+  // treated `src/**/*.ts` (or `a?b.ts`, or `{a,b}`) as a literal prefix — a
+  // shape that matches no real file, so a check configured that way never ran:
+  // a dead check wearing a live one's configuration. For a filter we cannot
+  // interpret, over-inclusion (run the check) is the only sound direction;
+  // under-inclusion manufactures false "untouched" verdicts.
+  if (isUnsupportedGlobShape(normalized)) return true
   if (normalized.endsWith('/**')) {
     const prefix = normalized.slice(0, -3)
     return file === prefix || file.startsWith(`${prefix}/`)

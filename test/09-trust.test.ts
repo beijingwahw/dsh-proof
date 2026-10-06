@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 
 import { EvidenceStore, buildBaseline, makeEvidence, snapshotWorkspace } from '../src/core/evidence.ts'
-import { GENESIS_PREV, lineDigest } from '../src/core/trust.ts'
+import { GENESIS_PREV, checkpointSignedData, lineDigest } from '../src/core/trust.ts'
 import { addressOf, sha256 } from '../src/core/hash.ts'
 import type { SignerPort } from '../src/core/ports.ts'
 import { ProofEngine } from '../src/engine.ts'
@@ -287,6 +287,7 @@ test('a corrupt line mid-log is never "recovered" — tampering stays visible', 
   const audit = await revived.audit()
   assert.equal(audit.ok, false, 'mid-log corruption must keep failing audit')
   assert.ok(audit.chain.breaks.length > 0, 'the line after the garbage no longer chains')
+  assert.deepEqual(audit.chain.corruptLines, [1], 'the garbage line itself is named by index — the channel says WHICH line is not an envelope')
 })
 
 test('signed chain audited without the key is UNVERIFIABLE, not forged', async () => {
@@ -570,4 +571,159 @@ test('the anchor answers to its own key: a later well-formed foreign checkpoint 
   assert.equal(audit.chain.anchorMismatch, false)
   assert.equal(audit.chain.unverifiableCheckpoints.length, 1, 'the foreign checkpoint stays unverifiable — a missing capability, not a charge')
   assert.equal(audit.ok, true, 'a well-formed foreign checkpoint must not fail the audit')
+})
+
+// -- M15 + real audit-channel triggers (v0.17) -----------------------------------
+//
+// The deep-read finding: badCheckpoints / headMismatches / unsignedCheckpoints
+// / anchorMismatch / corruptLines had ZERO real-coverage — the only "audit"
+// tests for them fed hand-built reports into formatters (test/08's fakeAudit),
+// which tests the formatter, not the channel. These trigger each channel for
+// real against an honestly-built chain, with the host key in hand.
+
+test('M15: an anchor file that exists but cannot parse is surfaced as anchorUnreadable, not silence', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1'))
+  await store.checkpoint()
+  // Healthy anchor: readable, flag stays down.
+  assert.equal((await store.audit()).anchorUnreadable, false)
+
+  // Malformed JSON at the anchor path: the out-of-band high-water mark cannot
+  // be consulted, so the rewind/monotonicity line of defence is SKIPPED — the
+  // reader must see that, even though it does not fail ok (a capability gap,
+  // not a refuted claim).
+  fs.mutate(ANCHOR, '{not json at all')
+  let audit = await store.audit()
+  assert.equal(audit.anchorUnreadable, true)
+  assert.equal(audit.ok, true, 'ok semantics unchanged: the LOG is intact — the flag is the visibility signal')
+
+  // Well-formed JSON that is not an anchor (wrong shape/version): same hole.
+  fs.mutate(ANCHOR, JSON.stringify({ v: 2, note: 'not an anchor' }))
+  audit = await store.audit()
+  assert.equal(audit.anchorUnreadable, true)
+
+  // An anchor that simply does not exist stays silent, as before: "never
+  // anchored" is a deployment fact, not a defect of this audit.
+  const neverAnchored = new EvidenceStore(fs, LOG, BASE, new FakeClock(), { signer: async () => new FakeSigner() })
+  assert.equal((await neverAnchored.audit()).anchorUnreadable, false)
+})
+
+test('M15 + unsignedCheckpoints: a transient signer failure is not memoized — the next checkpoint signs again', async () => {
+  const fs = MemoryFs.of({})
+  const signer = new FakeSigner()
+  let broken = true
+  const store = new EvidenceStore(fs, LOG, BASE, new FakeClock(), {
+    signer: async () => {
+      if (broken) throw new Error('key directory locked by a scanner')
+      return signer
+    },
+    anchorPath: ANCHOR,
+    workspaceKey: 'ws',
+  })
+  await store.append(evidence('c1'))
+  await store.checkpoint() // provider rejects: an unsigned checkpoint lands
+
+  // Recovery: the provider heals. The store must RETRY it — the old code
+  // cached the first failure forever, so every later checkpoint stayed
+  // unsigned and the audit's ok could never recover either.
+  broken = false
+  await store.append(evidence('c2'))
+  await store.checkpoint()
+
+  const audit = await store.audit()
+  // The real channel trigger: a sig-less checkpoint while a signer is (again)
+  // active is exactly what unsignedCheckpoints exists to name.
+  assert.deepEqual(audit.chain.unsignedCheckpoints, [1], 'the first checkpoint is unsigned and the host key is back — charged')
+  assert.equal(audit.ok, false)
+  // Proof the SECOND checkpoint was signed (the retry worked): the anchor is
+  // only ever written by a successful sign(), and it covers count 2.
+  const anchorRaw = await fs.readFile(ANCHOR)
+  assert.notEqual(anchorRaw, undefined, 'no anchor could ever be written while the failure was memoized')
+  const anchor = JSON.parse(anchorRaw as string) as { count: number; keyId: string }
+  assert.equal(anchor.count, 2)
+  assert.equal(anchor.keyId, 'fake-key')
+  assert.equal(audit.chain.checkpoints, 2)
+  assert.equal(audit.chain.mode, 'signed')
+})
+
+test('badCheckpoints: a tampered checkpoint payload is refuted by the host key (the forgery channel)', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1'))
+  await store.append(evidence('c2'))
+  await store.checkpoint()
+
+  // Honest chain, then the adversary edits the checkpoint's payload.count,
+  // KEEPING the signature. The line is last, so no `prev` links into it — the
+  // chain stays intact — but the signature now covers bytes that no longer
+  // exist: canonicalJson(payload) changed, and the key-holding host refutes.
+  const lines = await fs.readLines(LOG)
+  lines[lines.length - 1] = (lines[lines.length - 1] as string).replace('"count":2', '"count":3')
+  fs.mutate(LOG, `${lines.join('\n')}\n`)
+
+  const audit = await auditor(fs).audit()
+  assert.deepEqual(audit.chain.badCheckpoints, [2], 'the key this checkpoint names actively refutes its signature')
+  // v0.14 semantics ride along: count 3 where the walk counted 2 is ALSO
+  // malformed — the channel split is real, both fire on this input.
+  assert.deepEqual(audit.chain.malformedCheckpoints, [2])
+  // And with the only checkpoint of the anchored key malformed, no well-formed
+  // checkpoint can answer the anchor any more — the rewrite reads as a rewind.
+  assert.equal(audit.chain.rewind, true)
+  assert.equal(audit.ok, false)
+})
+
+test('headMismatches: a legitimately-signed checkpoint replayed at another position fails its head', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1'))
+  await store.append(evidence('c2'))
+  await store.checkpoint()
+
+  // Copy the (honestly signed) checkpoint to the tail, re-chaining `prev` so
+  // the chain links. The payload still swears head = H(ev2) — the head at its
+  // ORIGINAL position — but the walk expects digest(checkpoint-line) there.
+  // The signature verifies (the payload bytes are untouched): only the
+  // position is a lie, and only headMismatches can say so.
+  const lines = await fs.readLines(LOG)
+  const cp = JSON.parse(lines[2] as string) as Record<string, unknown>
+  const copy = JSON.stringify({ ...cp, prev: lineDigest(lines[2] as string) })
+  fs.mutate(LOG, `${[...lines, copy].join('\n')}\n`)
+
+  const audit = await auditor(fs).audit()
+  assert.deepEqual(audit.chain.headMismatches, [3], 'the replayed checkpoint swears a head it did not see at that position')
+  assert.deepEqual(audit.chain.badCheckpoints, [], 'the signature itself stays honest — this is not a forgery charge')
+  assert.deepEqual(audit.chain.malformedCheckpoints, [], 'count 2 matches the two records walked: structurally sound')
+  assert.equal(audit.ok, false)
+})
+
+test('anchorMismatch: a hand-minted anchor whose head disagrees with the log is caught', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1'))
+  await store.append(evidence('c2'))
+  await store.checkpoint()
+
+  // Forge the out-of-band artifact the one way that survives its own
+  // signature: mint a NEW anchor honestly signed by the real key, same count
+  // as the log's last checkpoint but a different head. Signature checks pass
+  // (it is genuinely signed); only the count/head comparison can catch it.
+  const otherHead = 'ff'.repeat(32)
+  const at = '2026-10-06T00:00:00.000Z'
+  const minted = {
+    v: 1 as const,
+    keyId: 'fake-key',
+    count: 2,
+    head: otherHead,
+    sig: await new FakeSigner().sign(checkpointSignedData({ count: 2, head: otherHead, workspaceKey: 'ws', at })),
+    at,
+    workspaceKey: 'ws',
+  }
+  fs.mutate(ANCHOR, JSON.stringify(minted, null, 2))
+
+  const audit = await store.audit()
+  assert.equal(audit.chain.anchorMismatch, true, 'same count, different head — the anchor and the log disagree')
+  assert.equal(audit.chain.anchorForged, false, 'the anchor is honestly signed; it simply says something else')
+  assert.equal(audit.chain.rewind, false, 'count 2 is not below the anchored 2 — this is a mismatch, not a rewind')
+  assert.equal(audit.ok, false)
 })

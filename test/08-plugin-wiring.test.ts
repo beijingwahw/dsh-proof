@@ -1447,7 +1447,10 @@ test('υ: a claim over an unexecuted change carries an unexecuted-change blocker
   )
   assert.ok(claim.blockers.includes('unexecuted change: src/x.ts was never run by any green check'))
   assert.ok(claim.blockers.includes('unexecuted change: src/y.ts was never run by any green check'))
-  assert.ok(claim.blockers.includes('Verification was incomplete (skipped, aborted or timed out).'))
+  // M19c: this τ-demoted claim names its evidence cause — the process-completion
+  // canned text would point the wrong cure (a re-run cannot execute the change).
+  assert.ok(claim.blockers.includes('The change never executed under any green check — point a check at it (or see proof_conjure).'))
+  assert.ok(!claim.blockers.includes('Verification was incomplete (skipped, aborted or timed out).'))
   assert.match(claim.summary, /unexecuted change: src\/x\.ts was never run by any green check/)
   assert.match(renderedText(claimTool, claim), /unexecuted change: src\/x\.ts was never run by any green check/)
 
@@ -1645,4 +1648,299 @@ test('M5: an endorsement without an approver shows the default in the ask', asyn
   assert.match(String(asked.reason), /host-approver \(default\)/)
   assert.match(asked.displayReason?.en ?? '', /host-approver \(default\)/)
   assert.match(asked.displayReason?.['zh-CN'] ?? '', /host-approver \(default\)/)
+})
+
+// ---------------------------------------------------------------------------
+// M4: the confidence basis is six-valued on the report layer, and a plain
+// proof_verify reaches three of the testimony regimes without ever touching
+// the λ tools — 'synthetic' when every decisive check was conjured by the
+// claim's author, 'attested' after the engine's κ fusion, 'jury-only' from
+// the ζ jury assembler. The tool surface must carry the basis (a probability
+// with no regime dresses testimony up as measurement) and say so in the claim
+// head, in proofNarrative's own words.
+// ---------------------------------------------------------------------------
+
+test('M4: synthetic/attested/jury-only bases ride the verify value, the confidence line and the claim head', () => {
+  const verify = appliedTools().find(t => t.name === 'proof_verify')!
+  const claimTool = appliedTools().find(t => t.name === 'proof_claim')!
+
+  // synthetic: plain verify over a conjured-test-only run.
+  const synthetic = toVerifyValue(
+    gradedReport(0.9321, 'synthetic', { grade: 'proven' }),
+    ['src/a.ts'], [], { untouched: [], precision: 'approximate' },
+  )
+  assert.equal(synthetic.confidence, 0.93)
+  assert.equal(synthetic.confidenceBasis, 'synthetic', 'the regime survives the projection instead of being stripped')
+  assert.match(synthetic.summary, /synthetic evidence — conjured tests, discounted/)
+  assert.match(renderedText(verify, synthetic), /confidence p≈0\.93 \(synthetic · conjured tests, discounted\)/)
+
+  // attested: machine evidence fused with B/C witnesses.
+  const attested = toVerifyValue(
+    gradedReport(0.97, 'attested', { grade: 'proven' }),
+    [], [], { untouched: [], precision: 'approximate' },
+  )
+  assert.equal(attested.confidenceBasis, 'attested')
+  assert.match(attested.summary, /machine \+ B\/C attested/)
+  assert.match(renderedText(verify, attested), /confidence p≈0\.97 \(attested · machine \+ B\/C attested\)/)
+
+  // jury-only: the capped self-attestation.
+  const jury = toVerifyValue(
+    gradedReport(0.8, 'jury-only', { grade: 'proven' }),
+    [], [], { untouched: [], precision: 'approximate' },
+  )
+  assert.equal(jury.confidenceBasis, 'jury-only')
+  assert.match(renderedText(verify, jury), /confidence p≈0\.80 \(jury-only · self-attestation is capped\)/)
+
+  // The claim card: the basis rides with the posterior and the head states
+  // the regime — never a bare probability over testimony.
+  const claim = toClaimValue(
+    'added a conjured regression test',
+    gradedReport(0.9321, 'synthetic', { grade: 'proven' }),
+    synthetic,
+  )
+  assert.equal(claim.confidenceBasis, 'synthetic')
+  assert.match(claim.summary, /PROVEN \(p≈0\.93, synthetic evidence — conjured tests, discounted\) — /)
+  const attestedClaim = toClaimValue(
+    'shipped with jury and human backing',
+    gradedReport(0.97, 'attested', { grade: 'proven' }),
+    attested,
+  )
+  assert.equal(attestedClaim.confidenceBasis, 'attested')
+  assert.match(attestedClaim.summary, /PROVEN \(p≈0\.97, machine \+ B\/C attested\) — /)
+  const juryClaim = toClaimValue(
+    'documented the retry options',
+    gradedReport(0.8, 'jury-only', { grade: 'proven' }),
+    jury,
+  )
+  assert.equal(juryClaim.confidenceBasis, 'jury-only')
+  assert.match(juryClaim.summary, /PROVEN \(p≈0\.80, jury evidence — self-attestation is capped\) — /)
+  // The not-proven head carries the same regime honesty.
+  const notProven = toClaimValue(
+    'claimed too much',
+    gradedReport(0.61, 'attested', { grade: 'stale', unverified: ['e2e'] }),
+    toVerifyValue(gradedReport(0.61, 'attested', { grade: 'stale' }), [], [], { untouched: [], precision: 'approximate' }),
+  )
+  assert.match(notProven.summary, /NOT PROVEN \(stale, p≈0\.61, machine \+ B\/C attested\)/)
+
+  // Machine bases and the ungraded path keep their exact legacy heads — no
+  // regime tail where none was earned.
+  const machine = toClaimValue(
+    'plain machine proof',
+    gradedReport(0.97, 'full-coverage', { grade: 'proven' }),
+    toVerifyValue(gradedReport(0.97, 'full-coverage', { grade: 'proven' }), [], [], { untouched: [], precision: 'approximate' }),
+  )
+  assert.match(machine.summary, /PROVEN \(p≈0\.97\) — /)
+  const ungraded = toClaimValue(
+    'no posterior anywhere',
+    fakeReport({ grade: 'proven' }),
+    toVerifyValue(fakeReport({ grade: 'proven' }), [], [], { untouched: [], precision: 'approximate' }),
+  )
+  assert.ok(!('confidence' in ungraded) && !('confidenceBasis' in ungraded),
+    'no posterior, no basis — the ungraded claim stays byte-identical')
+
+  // Both tool schemas declare the full six-value union.
+  const six = ['full-coverage', 'certified-subset', 'degraded', 'jury-only', 'attested', 'synthetic']
+  const verifyProps = (verify.output!.schema.properties ?? {}) as Record<string, { enum?: string[] }>
+  assert.deepEqual(verifyProps.confidenceBasis?.enum, six, 'the verify schema declares the six-value union')
+  const claimProps = (claimTool.output!.schema.properties ?? {}) as Record<string, { enum?: string[] }>
+  assert.deepEqual(claimProps.confidenceBasis?.enum, six, 'the claim schema declares the six-value union')
+})
+
+// ---------------------------------------------------------------------------
+// M6: proof_claim's two silent degradations — a missing claim and a typo'd
+// kind — must fail loudly at the parameter boundary instead of producing a
+// claim-less record (legacy path) or running the legacy verify while the
+// model believes a contract is binding (typed path).
+// ---------------------------------------------------------------------------
+
+test('M6: proof_claim refuses a missing/blank claim and an unknown kind; legal inputs route unchanged', async () => {
+  const routed: string[] = []
+  const outcome = {
+    report: fakeReport({ grade: 'proven' }),
+    changed: [],
+    checks: [],
+    selection: { untouched: [], precision: 'approximate' },
+  }
+  const engine = {
+    verify: async () => { routed.push('verify'); return outcome },
+    verifyContract: async () => {
+      routed.push('verifyContract')
+      return { ...outcome, contract: { kind: 'behavior-preserving' as const, obligations: [] } }
+    },
+  } as unknown as ProofEngine
+  const claimTool = createProofTools(engine).find(t => t.name === 'proof_claim')!
+
+  // claim missing / non-string / blank → a clean parameter error, jury-style.
+  await assert.rejects(claimTool.execute({}, execution('proof_claim', {})), /proof_claim: claim is required/)
+  await assert.rejects(claimTool.execute({ claim: 42 }, execution('proof_claim', {})), /proof_claim: claim is required/)
+  await assert.rejects(claimTool.execute({ claim: '   ' }, execution('proof_claim', {})), /proof_claim: claim is required/)
+
+  // A typo'd kind throws WITH the legal values listed — the model believed a
+  // contract was binding; the honest answer names what would have been.
+  await assert.rejects(
+    claimTool.execute({ claim: 'safe refactor', kind: 'behavior_preserving' }, execution('proof_claim', {})),
+    /kind must be one of behavior-preserving \| behavior-adding \| perf-budget \| docs-only \| llm-jury/,
+  )
+  await assert.rejects(
+    claimTool.execute({ claim: 'safe refactor', kind: 7 }, execution('proof_claim', {})),
+    /kind must be one of .*\(got nothing usable\)/,
+  )
+  assert.deepEqual(routed, [], 'nothing reached the engine on any refused call')
+
+  // Legal inputs keep their exact routing: a valid kind → verifyContract…
+  const typed = valueOf(await claimTool.execute(
+    { claim: 'safe refactor', kind: 'behavior-preserving' },
+    execution('proof_claim', {}),
+  ))
+  assert.equal(routed[0], 'verifyContract')
+  assert.equal(typed.kind, 'behavior-preserving')
+
+  // …and no kind → the legacy verify path, byte-for-byte.
+  const plain = valueOf(await claimTool.execute({ claim: 'plain claim' }, execution('proof_claim', {})))
+  assert.equal(routed[1], 'verify')
+  assert.equal(plain.claim, 'plain claim')
+  assert.ok(!('kind' in plain))
+})
+
+// ---------------------------------------------------------------------------
+// M19c: the two diseases behind an `unproven` grade must name their own cure.
+// A τ demotion (coverage measured, change never executed by any green check)
+// is an evidence verdict — the fix is a check that runs the change, not a
+// re-run; a genuinely incomplete process keeps the original canned text.
+// ---------------------------------------------------------------------------
+
+test('M19c: τ-demoted unproven names the coverage cause; process-incomplete keeps the process text', () => {
+  // τ: the process completed green, the change never executed under it.
+  const tauReport = coveredReport('v8', ['src/x.ts'], { grade: 'unproven' })
+  const tau = toClaimValue(
+    'rewired the parser',
+    tauReport,
+    toVerifyValue(
+      tauReport, ['src/x.ts'], [], { untouched: [], precision: 'approximate' },
+      undefined, undefined, undefined,
+      { basis: 'v8', uncovered: ['src/x.ts'], executedCount: 0 },
+    ),
+  )
+  assert.ok(tau.blockers.includes('The change never executed under any green check — point a check at it (or see proof_conjure).'))
+  assert.ok(
+    !tau.blockers.includes('Verification was incomplete (skipped, aborted or timed out).'),
+    'the τ demotion completed its process — the re-run guidance would point the wrong cure',
+  )
+  assert.match(tau.summary, /The change never executed under any green check/)
+
+  // Process: no coverage data at all → the original text stands.
+  const processReport = fakeReport({ grade: 'unproven' })
+  const process = toClaimValue(
+    'same claim', processReport,
+    toVerifyValue(processReport, [], [], { untouched: [], precision: 'approximate' }),
+  )
+  assert.ok(process.blockers.includes('Verification was incomplete (skipped, aborted or timed out).'))
+  assert.ok(!process.blockers.some(b => b.includes('never executed under any green check')))
+
+  // Basis 'none' measured nothing — no coverage verdict may be implied either.
+  const blindReport = coveredReport('none', ['src/x.ts'], { grade: 'unproven' })
+  const blind = toClaimValue(
+    'same claim', blindReport,
+    toVerifyValue(
+      blindReport, [], [], { untouched: [], precision: 'approximate' },
+      undefined, undefined, undefined,
+      { basis: 'none', uncovered: ['src/x.ts'], executedCount: 0 },
+    ),
+  )
+  assert.ok(
+    blind.blockers.includes('Verification was incomplete (skipped, aborted or timed out).'),
+    'basis none has no measurement — the process text is the honest cause',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// M19d: the audit fails on an anchor/log disagreement (anchorMismatch), so the
+// structured status output must carry it, `chainIntact` must agree with the
+// audit, and the render's tamper banner must light — three green booleans must
+// never paper over a rewritten history.
+// ---------------------------------------------------------------------------
+
+test('M19d: anchorMismatch reaches StatusValue, flips chainIntact and lights the TAMPER banner', () => {
+  const status = appliedTools().find(t => t.name === 'proof_status')!
+
+  const clean = toStatusValue({
+    specs: [],
+    latest: new Map<string, { status: string; recordedAt: string }>(),
+    audit: fakeAudit(),
+    snapshot: { dirty: [] },
+  })
+  assert.ok(!('anchorMismatch' in clean), 'clean path canonical value stays byte-identical — no anchorMismatch field')
+  assert.equal(clean.chainIntact, true)
+
+  const mismatched = toStatusValue({
+    specs: [],
+    latest: new Map<string, { status: string; recordedAt: string }>(),
+    audit: fakeAudit({ anchorMismatch: true }),
+    snapshot: { dirty: [] },
+  })
+  assert.equal(mismatched.anchorMismatch, true, 'the audit verdict reaches the structured output')
+  assert.equal(mismatched.chainIntact, false, 'audit.ok fails on an anchor mismatch — chainIntact must not disagree')
+  assert.match(mismatched.summary, /ANCHOR MISMATCH/, 'the trust line has carried the flag since it was introduced')
+
+  // The render's banner lights from the structured value…
+  assert.match(renderedText(status, mismatched), /TAMPER-EVIDENCE TRIPPED/)
+  // …and from a partial replay value that carries only the new field.
+  assert.match(renderedText(status, { summary: 's', checks: [], anchorMismatch: true }), /TAMPER-EVIDENCE TRIPPED/)
+  // A legacy value with no field and a clean chain renders no banner.
+  const quiet = renderedText(status, {
+    summary: 's', checks: [], chainIntact: true, rewindDetected: false, baselineTampered: false,
+  })
+  assert.ok(!quiet.includes('TAMPER-EVIDENCE TRIPPED'))
+
+  // The schema declares the field so it stays truthful about degraded hosts.
+  const props = (status.output!.schema.properties ?? {}) as Record<string, unknown>
+  assert.ok('anchorMismatch' in props, 'the status schema declares anchorMismatch')
+})
+
+// ---------------------------------------------------------------------------
+// D3 (tools side): proof_verify.claim and proof_baseline.reason used to be
+// dead parameters — described as "for the record" and then dropped. The tool
+// bodies now forward them into the engine calls; these tests pin the wiring
+// with a capturing engine so the contract holds the moment the engine side
+// lands its recording.
+// ---------------------------------------------------------------------------
+
+test('D3 wiring: proof_verify forwards a usable claim and proof_baseline forwards a usable reason', async () => {
+  const verifyCalls: Record<string, unknown>[] = []
+  const baselineCalls: Record<string, unknown>[] = []
+  const outcome = {
+    report: fakeReport({ grade: 'proven' }),
+    changed: [],
+    checks: [],
+    selection: { untouched: [], precision: 'approximate' },
+  }
+  const engine = {
+    verify: async (options: Record<string, unknown>) => { verifyCalls.push(options); return outcome },
+    establishBaseline: async (options: Record<string, unknown>) => {
+      baselineCalls.push(options)
+      return { baseline: { baselineId: 'b'.repeat(32), root: 'r'.repeat(64) }, records: [] }
+    },
+  } as unknown as ProofEngine
+  const tools = createProofTools(engine)
+
+  await tools.find(t => t.name === 'proof_verify')!.execute(
+    { changed: ['src/a.ts'], claim: 'fixed the redirect' },
+    execution('proof_verify', {}),
+  )
+  assert.equal(verifyCalls[0]!.claim, 'fixed the redirect')
+  assert.deepEqual(verifyCalls[0]!.changed, ['src/a.ts'])
+  // A blank or missing claim forwards nothing — the engine's options stay
+  // shape-identical to the pre-D3 call.
+  await tools.find(t => t.name === 'proof_verify')!.execute({ claim: '   ' }, execution('proof_verify', {}))
+  assert.ok(!('claim' in verifyCalls[1]!), 'a whitespace-only claim is no claim')
+  await tools.find(t => t.name === 'proof_verify')!.execute({}, execution('proof_verify', {}))
+  assert.ok(!('claim' in verifyCalls[2]!))
+
+  await tools.find(t => t.name === 'proof_baseline')!.execute(
+    { reason: 'fresh session after the flaky baseline' },
+    execution('proof_baseline', {}),
+  )
+  assert.equal(baselineCalls[0]!.reason, 'fresh session after the flaky baseline')
+  await tools.find(t => t.name === 'proof_baseline')!.execute({}, execution('proof_baseline', {}))
+  assert.ok(!('reason' in baselineCalls[1]!))
 })

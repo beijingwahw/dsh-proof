@@ -141,6 +141,42 @@ test('glob matching covers prefix, /**, /* and exact forms', () => {
   assert.ok(matchesAny('x/y.ts', ['nope', 'x/**']))
 })
 
+test('M9: unsupported glob shapes match everything — a check scoped like src/**/*.ts is never silently dead', () => {
+  // The five supported forms keep their exact semantics:
+  assert.ok(matches('src/a/b.ts', 'src/**'), 'terminal dir/** form unchanged')
+  assert.ok(!matches('srcx/a.ts', 'src/**'), 'terminal dir/** form unchanged (no prefix bleed)')
+  assert.ok(matches('src/a.ts', 'src/*'), 'terminal dir/* form unchanged')
+  assert.ok(!matches('src/a/b.ts', 'src/*'), 'terminal dir/* form unchanged (direct children only)')
+  assert.ok(matches('anything', '*'), 'bare * still matches everything')
+  assert.ok(matches('src/a.ts', 'src/a.ts'), 'pure literal: exact match')
+  assert.ok(!matches('src/other.ts', 'src/a.ts'), 'pure literal: no accidental sibling match')
+
+  // Everything else that LOOKS like a glob is over-inclusive: the old matcher
+  // compared these as literal prefixes, a shape no real file ever has — so a
+  // check configured with src/**/*.ts simply never ran. A dead check wearing
+  // a live one's configuration. The conservative direction is to run it.
+  assert.ok(matches('src/a/b.ts', 'src/**/*.ts'), 'mid-pattern ** used to silently match nothing')
+  assert.ok(matches('docs/readme.md', 'src/**/*.ts'), 'the fallback is TOTAL: a filter we cannot interpret selects everything')
+  assert.ok(matches('anything/x.ts', 'a?b.ts'), '? is not interpretable — match')
+  assert.ok(matches('anything/x.ts', '{a,b}'), 'brace groups are not interpretable — match')
+  assert.ok(matches('anything/x.ts', '[abc].ts'), 'character classes are not interpretable — match')
+  assert.ok(matches('anything/x.ts', '**'), 'a bare ** is not the terminal dir/** form — match')
+  assert.ok(matches('src/x.ts', 'src/*.ts'), 'a star glued to text is not the dir/* form — match')
+})
+
+test('M9: selection runs the previously-dead deep-glob check instead of burying it', async () => {
+  const fs = MemoryFs.of(TREE)
+  const graph = await buildDependencyGraph(fs, '/ws', Object.keys(TREE).map(stripRoot))
+  const checks = [
+    spec({ id: 'deep-glob', paths: ['src/**/*.ts'] }),
+    spec({ id: 'docs-check', paths: ['docs/**'] }),
+  ]
+  const result = selectAffectedChecks(checks, ['src/c.ts'], graph)
+  assert.equal(result.uncertain, false, 'the change is fully in-graph — only the glob shape decides')
+  assert.deepEqual(result.affected.map(c => c.id), ['deep-glob'], 'the unsupported-glob check is selected, not skipped')
+  assert.deepEqual(result.untouched.map(c => c.id), ['docs-check'], 'a supported narrow form still narrows honestly')
+})
+
 test('graph reports truncation so callers can widen', async () => {
   const files = {
     '/ws/a.ts': "import './b'",
@@ -150,6 +186,56 @@ test('graph reports truncation so callers can widen', async () => {
   const graph = await buildDependencyGraph(fs, '/ws', Object.keys(files).map(stripRoot), { limit: 1 })
   assert.equal(graph.truncated, true)
   assert.equal(graph.scanned, 1)
+})
+
+test('M8: walkTruncated ORs into graph.truncated and the selection degrades to uncertain (all checks run)', async () => {
+  const fs = MemoryFs.of(TREE)
+  const files = Object.keys(TREE).map(stripRoot)
+  // Contrast first: same files, no walk truncation — the graph is complete.
+  const honest = await buildDependencyGraph(fs, '/ws', files)
+  assert.equal(honest.truncated, false, 'no local cap fired and the walk said nothing — complete graph')
+  // The builder cannot see the walk's limit itself; the caller must tell it.
+  const fromTruncatedWalk = await buildDependencyGraph(fs, '/ws', files, { walkTruncated: true })
+  assert.equal(fromTruncatedWalk.truncated, true, 'the walk\'s truncation ORs into the graph flag')
+  assert.equal(fromTruncatedWalk.scanned, honest.scanned, 'the builder scanned its whole input — the flag is purely propagated')
+
+  // Pin the widening behaviour: an in-graph change with a narrowly-scoped
+  // check still selects EVERYTHING, because the node set is a prefix of the
+  // workspace, not a census — a missing node could hide any dependency.
+  const checks = [
+    spec({ id: 'src-check', paths: ['src/**'] }),
+    spec({ id: 'docs-check', paths: ['docs/**'] }),
+  ]
+  const result = selectAffectedChecks(checks, ['src/c.ts'], fromTruncatedWalk)
+  assert.equal(result.uncertain, true, 'a truncated graph makes every selection uncertain')
+  assert.deepEqual(result.affected.map(c => c.id).sort(), ['docs-check', 'src-check'], 'uncertainty widens to ALL checks')
+  assert.deepEqual(result.untouched, [], 'nothing may be declared untouched over a partial node set')
+})
+
+test('M8: MemoryFs walk returns the truncation shape (files + truncated round-trip)', async () => {
+  const fs = MemoryFs.of({ '/ws/src/a.ts': 'a', '/ws/src/b.ts': 'b', '/ws/src/sub/c.ts': 'c' })
+  const full = await fs.walk('/ws', { ignoreDirs: ['node_modules'] })
+  assert.deepEqual([...full.files], ['src/a.ts', 'src/b.ts', 'src/sub/c.ts'])
+  assert.equal(full.truncated, false, 'below the limit: complete listing, no truncation')
+
+  const capped = await fs.walk('/ws', { limit: 2 })
+  assert.equal(capped.files.length, 2)
+  assert.equal(capped.truncated, true, 'the limit was hit — the fake mirrors the real port\'s conservative answer')
+
+  const exact = await fs.walk('/ws', { limit: 3 })
+  assert.deepEqual([...exact.files], [...full.files])
+  assert.equal(exact.truncated, true, 'hitting the cap exactly is still truncation, as in NodeFsPort')
+})
+
+test('MemoryFs.stat mtimeMs: fresh files are 0, mutations bump an instance counter', async () => {
+  const fs = MemoryFs.of({ '/ws/src/a.ts': 'export const a = 1\n' })
+  assert.equal((await fs.stat('/ws/src/a.ts'))?.mtimeMs, 0, 'never-mutated paths keep the historical 0')
+  fs.mutate('/ws/src/a.ts', 'export const a = 2\n')
+  const first = (await fs.stat('/ws/src/a.ts'))?.mtimeMs
+  assert.ok(first !== undefined && first > 0, 'a mutation is visible in the version clock')
+  fs.mutate('/ws/src/a.ts', 'export const a = 3 // same length?\n')
+  const second = (await fs.stat('/ws/src/a.ts'))?.mtimeMs
+  assert.ok(second !== undefined && second > first, 'mtime advances even when the size could stay equal — the LSP version cache must invalidate')
 })
 
 function stripRoot(path: string): string {
