@@ -1,0 +1,27 @@
+/**
+ * Public surface of the `dsh-proof` domain core.
+ *
+ * Nothing in here imports `@deepseek-ai/*`. The DSH adapter lives in
+ * `../dsh/`, and the test suite in `../../test/` proves the same core runs
+ * without a harness.
+ *
+ * @module dsh-proof/core
+ */
+export type { CheckKind, CheckSource, CheckSpec, Clock, CommandPort, CommandResult, CommandRunOptions, DefinitionResolverPort, FileStat, FsPort, JuryPort, SignerPort, WalkOptions, WorkspacePort, } from './ports.ts';
+export { addressOf, canonicalJson, merkleRoot, normalizeOutput, sha256, } from './hash.ts';
+export { DEFAULT_TRUST_WEIGHTS, JURY_RUBRIC, RUBRIC_V1, activeAttestations, attestationFactor, attestationsFor, claimIdOf, juryPrompt, type Attestation, type AttestationMarkerPayloads, type EvidenceClass, type HumanAttestation, type JuryAttestation, type TrustWeights, } from './attest.ts';
+export type { NormalizeOptions } from './hash.ts';
+export { GENESIS_PREV, checkpointSignedData, lineDigest, parseAnchor, walkChain, type AnchorFile, type ChainMode, type ChainWalk, type CheckpointPayload, type WalkedCheckpoint, } from './trust.ts';
+export { DEFAULT_IGNORE_DIRS, DEFAULT_SCRIPT_KINDS, checkId, discoverChecks, type CheckConfigEntry, type DiscoverOptions, } from './checks.ts';
+export { diffApiSurface, evaluateContract, extractApiSurface, isDocsPath, type ClaimContract, type ClaimKind, type ContractInput, type ContractVerdict, type ObligationResult, type SurfaceEntry, } from './contract.ts';
+export { DEFAULT_BASELINE_RELPATH, DEFAULT_LOG_RELPATH, EvidenceStore, buildBaseline, isDecisiveStatus, makeEvidence, snapshotWorkspace, verdictOf, type AuditReport, type Baseline, type CheckReport, type CheckStatus, type CheckVerdict, type Evidence, type ProofGrade, type ProofReport, type RunOutcome, type StoreTrust, type WorkspaceSnapshot, } from './evidence.ts';
+export { GLOBAL_INVALIDATORS, attributeChange, buildDependencyGraph, extractImports, extractImportSites, impactClosure, isGlobalInvalidator, matches, matchesAny, selectAffectedChecks, type DependencyGraph, type ImportSite, type RelPath, type SelectionPrecision, type SelectionResult, } from './impact.ts';
+export { attributeChecks, proofNarrative, regressionNarrative, type AttributedCheck, type AttributionInput, } from './regression.ts';
+export { resolveChangeSet, type ChangeProvenance, type ChangeRecord, type ChangeSetInput, type ChangeSetMethod, type ChangeSetResolution, } from './changeset.ts';
+export { excerptOutput, firstInformativeLine, isSalientLine, type Excerpt, type ExcerptOptions, type ExcerptStrategy, } from './excerpt.ts';
+export { coverageGate, parseV8CoverageReport, summarizeCoverage, type CoverageGateResult, type CoverageSummary, type ParsedCoverage, } from './coverage.ts';
+export { applyCoverageGate, assembleBaseline, assembleProof, type AssembleInput, type AssembleResult, type ConfidenceBasis, type ConfidenceInput, type GradedProofReport, } from './report.ts';
+export { VerificationRunner, type BatchResult, type RunnerOptions, } from './runner.ts';
+export { BAYES_CONSTANTS, claimProbability, computePriors, posteriorHealthy, rankByInformationGain, summarizeHistory, type CheckPrior, type CheckStats, type ClaimModel, type PriorInput, type ScheduleStep, } from './bayes.ts';
+export { FORBIDDEN_CAPABILITIES, SYNTHETIC_DIR_DEFAULT, SYNTHETIC_TEMPLATE, sandboxEntryFor, screenScript, syntheticSpec, type ScreenResult, type SyntheticEvidenceMeta, type SyntheticRequest, } from './synthetic.ts';
+//# sourceMappingURL=index.d.ts.map
