@@ -25,8 +25,14 @@
  *
  * The composition lattice, in strict priority order:
  *
- * 1. Any forged or regressed child → parent `regressed`. Broken work outranks
- *    everything; a waiver excuses missing work, never broken or forged work.
+ * 1. Any forged or regressed child, OR the queried task's own evidence being
+ *    `regressed` → `regressed` (X-H-18). Broken work outranks everything —
+ *    including missing work — and a waiver excuses missing work, never
+ *    broken or forged work, in whomever's hands it sits: a task whose OWN
+ *    workspace evidence regressed cannot launder that fact into a waivable
+ *    `stale` by also having a child that never submitted. Monotonicity is
+ *    the law being enforced: one MORE piece of bad news (a missing child)
+ *    must never make the composed verdict easier to waive.
  * 2. Else any unwaived child that is MISSING work — never submitted, or
  *    submitted `stale` / `unproven` / `no-baseline` — → parent `stale`.
  *    Missing work is a process gap, not a defect: it blocks `proven` without
@@ -35,8 +41,11 @@
  *    evidence (`ownGrade`), reported as-is even when it degrades.
  *    `ownGrade === undefined` means pure delegation — the parent did none of
  *    the work itself, so there is nothing of its own to fail → `proven`.
- * 4. No children at all → `ownGrade ?? 'proven'`: a leaf task speaks through
- *    its own evidence.
+ * 4. No children at all → the leaf speaks through its own evidence:
+ *    submission claim, engine measurement, or — with neither (X-H-07) —
+ *    `unproven`. A leaf nobody proved is NOT `proven`; the old
+ *    `ownGrade ?? 'proven'` fallback minted a zero-blocker `proven` out of
+ *    pure absence, and absence is not discharge.
  *
  * A child that itself has children (an interior node) is composed from below:
  * its effective grade is the lattice over its own subtree, with its own
@@ -140,6 +149,19 @@ export interface DelegationSubmission {
   transparencyVerified?: boolean
   /** Verification problems, passed through to the composed blockers verbatim. */
   problems?: readonly string[]
+  /**
+   * W7-8: sticky forgery memory. Set when an EARLIER submission for this
+   * obligation claimed `proven` on an artifact that did not verify and a
+   * re-submission arrived afterwards: the re-submission may update every
+   * verdict field (last-wins, as ever), but it cannot erase the forgery from
+   * the record — once `isForged` was true for this obligation it stays true,
+   * the grade stays waiver-immune `regressed`, and only an explicit appeal
+   * discipline (none is minted here) could ever lift it. The engine's
+   * `delegationGraph` sets this while folding `delegation/verdict`
+   * re-submissions via `mergeSubmission`; a first submission never carries
+   * it, so every historical record composes exactly as before.
+   */
+  priorForgery?: true
   submittedAt: string
 }
 
@@ -212,9 +234,49 @@ interface EffectiveState {
   readonly effective: ChildEffective
 }
 
-/** The forgery test: a proven claim whose artifact did not verify. */
+/**
+ * The forgery test: a proven claim whose artifact did not verify — or a
+ * submission folded onto an earlier one that did (W7-8, `priorForgery`):
+ * forgery is a fact about the obligation's history, not about whichever
+ * submission happens to be the latest on record.
+ */
 function isForged(sub: DelegationSubmission | undefined): boolean {
-  return sub !== undefined && sub.claimedGrade === 'proven' && !sub.artifactVerified
+  return sub !== undefined
+    && (sub.priorForgery === true || (sub.claimedGrade === 'proven' && !sub.artifactVerified))
+}
+
+/**
+ * W7-8: fold a re-submission onto its predecessor — the merge the engine's
+ * `delegationGraph` applies when a task's `delegation/verdict` marker
+ * appears more than once. The verdict fields are last-wins (a re-submission
+ * is a fresh, honest or otherwise, statement of the child's claim), but the
+ * forgery flag is STICKY: once a submission for this obligation was forged,
+ * every later submission composes as forged too, so submitting a clean
+ * bundle over a caught forgery cannot launder the `regressed` it booked.
+ * Nothing but this function mints `priorForgery`.
+ */
+export function mergeSubmission(
+  previous: DelegationSubmission | undefined,
+  next: DelegationSubmission,
+): DelegationSubmission {
+  if (previous === undefined || !isForged(previous)) return next
+  return { ...next, priorForgery: true }
+}
+
+/**
+ * W7-7 (read-side re-derivation): when a caller holds an obligation id that
+ * was RECORDED alongside the obligation (the `delegation/created` /
+ * `agent-team/delegated` markers can carry `obligationIdOf`'s answer), a
+ * re-derived id that disagrees with it is a detectable rewrite of the
+ * contract. Returns the problem line to book, or `undefined` when the
+ * recorded id matches (or none was recorded).
+ */
+export function obligationRewriteProblem(
+  recordedId: string | undefined,
+  obligation: TaskObligation,
+): string | undefined {
+  if (recordedId === undefined || recordedId === obligationIdOf(obligation)) return undefined
+  return `recorded obligation id ${recordedId} does not match the re-derived ${obligationIdOf(obligation)} — the obligation was rewritten`
 }
 
 /** A submission's effective grade for the flat (non-recursive) composition. */
@@ -270,8 +332,13 @@ function composeFromFacts(facts: readonly ChildFacts[], ownGrade: ProofGrade | u
     for (const problem of f.problems) problemLines.push(`${f.taskId}: ${problem}`)
   }
 
+  // X-H-18: own degradation participates in the priority, it is not the
+  // fallback. `ownGrade === 'regressed'` must compose to `regressed` even
+  // over missing children — the reverse ordering let a waiver on the missing
+  // child buy out the own regression one level up ("waiver excuses missing
+  // work, never broken work" — the own leg is nobody's missing work).
   const grade: ProofGrade =
-    forgedChildren.length > 0 || regressedChildren.length > 0
+    forgedChildren.length > 0 || regressedChildren.length > 0 || ownGrade === 'regressed'
       ? 'regressed'
       : unprovenChildren.length > 0
         ? 'stale'
@@ -349,36 +416,53 @@ export function childrenByParent(obligations: readonly TaskObligation[]): Map<st
  * parent pointing at a task that does not exist ends the walk (no cycle) —
  * dangling references are a minting problem, not a topology lie. Returns []
  * for any acyclic forest.
+ *
+ * W7-5: every RECORD contributes its parent edge, not just the first record
+ * per taskId. A duplicated taskId is a minting error, but the edge its later
+ * copy carries (worst case `parentTaskId` naming itself) is still a fact in
+ * the input, and a cycle visible only through that copy must not slip past
+ * detection — the fold downstream (`composeTaskVerdict`) groups children by
+ * every record too, so an undetected duplicate-edge cycle is an unbounded
+ * recursive fold, not a cosmetic miss. With unique ids the edge set is
+ * exactly the old first-wins set and every historical output is unchanged;
+ * a task genuinely shared by two parents (the diamond) contributes two
+ * parent edges and is, as ever, no cycle.
  */
 export function detectCycles(obligations: readonly TaskObligation[]): string[] {
-  // First occurrence wins: parent lookups need ONE record per task, and a
-  // duplicate taskId is a minting error, not something to average over.
-  const byId = new Map<string, TaskObligation>()
-  for (const o of obligations) if (!byId.has(o.taskId)) byId.set(o.taskId, o)
-
-  const settled = new Set<string>() // tasks proven cycle-free through an earlier walk
-  const found = new Map<string, string>() // canonical key -> formatted path
-
-  for (const root of obligations) {
-    if (settled.has(root.taskId)) continue
-    const stack: string[] = []
-    const indexOf = new Map<string, number>()
-    let cur: TaskObligation | undefined = root
-    while (cur !== undefined) {
-      if (indexOf.has(cur.taskId)) {
-        // Closed a loop: the stack slice from the earlier visitation is the
-        // cycle, in parent-pointer order.
-        recordCycle(stack.slice(indexOf.get(cur.taskId) as number), found)
-        break
-      }
-      if (settled.has(cur.taskId)) break // joins already-adjudicated territory
-      indexOf.set(cur.taskId, stack.length)
-      stack.push(cur.taskId)
-      const parentId: string | undefined = cur.parentTaskId
-      cur = parentId === undefined ? undefined : byId.get(parentId)
-    }
-    for (const id of stack) settled.add(id)
+  // All recorded parent edges, per child, in first-seen order.
+  const parentEdges = new Map<string, string[]>()
+  for (const o of obligations) {
+    if (o.parentTaskId === undefined) continue
+    const edges = parentEdges.get(o.taskId)
+    if (edges === undefined) parentEdges.set(o.taskId, [o.parentTaskId])
+    else if (!edges.includes(o.parentTaskId)) edges.push(o.parentTaskId)
   }
+  const known = new Set(obligations.map(o => o.taskId))
+
+  const found = new Map<string, string>() // canonical key -> formatted path
+  const settled = new Set<string>() // tasks proven cycle-free through an earlier walk
+  const visiting = new Set<string>() // tasks on the current walk's stack
+  const stack: string[] = []
+
+  const walkFrom = (id: string): void => {
+    if (settled.has(id)) return
+    if (visiting.has(id)) {
+      // Closed a loop: the stack slice from the earlier visitation is the
+      // cycle, in parent-pointer order.
+      recordCycle(stack.slice(stack.indexOf(id)), found)
+      return
+    }
+    visiting.add(id)
+    stack.push(id)
+    for (const parent of parentEdges.get(id) ?? []) {
+      if (known.has(parent)) walkFrom(parent) // dangling parents end the walk
+    }
+    stack.pop()
+    visiting.delete(id)
+    settled.add(id)
+  }
+
+  for (const o of obligations) walkFrom(o.taskId)
   return [...found.keys()].sort().map(k => found.get(k) as string)
 }
 
@@ -404,12 +488,22 @@ function recordCycle(parentOrder: readonly string[], found: Map<string, string>)
  * one (`ownGrades` — authoritative, it is the only party that can measure
  * its own workspace), else the task's own submission claim (a child's
  * verified claim about itself, with forgery already folded down to
- * `regressed`), else undefined (pure delegation).
+ * `regressed`), else — for a task with children — undefined (pure
+ * delegation). For a LEAF with neither submission nor measurement the answer
+ * is `'unproven'` (X-H-07): an obligation with no children, no bundle and no
+ * engine measurement was discharged by nobody, and the old `undefined` used
+ * to let the lattice's pure-delegation fallback mint `proven` out of pure
+ * absence. `undefined` stays reserved for delegation that actually
+ * delegated.
  */
-function ownLevelOf(node: DagNode, ownGrades: ReadonlyMap<string, ProofGrade>): ProofGrade | undefined {
+function ownLevelOf(
+  node: DagNode,
+  ownGrades: ReadonlyMap<string, ProofGrade>,
+  leaf: boolean,
+): ProofGrade | undefined {
   if (ownGrades.has(node.obligation.taskId)) return ownGrades.get(node.obligation.taskId)
   const sub = node.submission
-  if (sub === undefined) return undefined
+  if (sub === undefined) return leaf ? 'unproven' : undefined
   return isForged(sub) ? 'regressed' : sub.claimedGrade
 }
 
@@ -444,7 +538,10 @@ function ownLevelOf(node: DagNode, ownGrades: ReadonlyMap<string, ProofGrade>): 
  * Duplicate taskIds in `all` are a minting error; the FIRST node wins for
  * submission/waiver lookups, while every obligation record still groups
  * under its own parent (so one task can genuinely be shared by two parents,
- * the diamond the memo exists for).
+ * the diamond the memo exists for). A duplicate whose later copy closes a
+ * cycle the first copy hides (a self-parenting re-registration, say) is now
+ * caught by `detectCycles`' all-edges walk (W7-5) and refused with the
+ * cycle verdict — it used to escape detection and recurse the fold unboundedly.
  */
 export function composeTaskVerdict(
   taskId: string,
@@ -558,8 +655,11 @@ export function composeTaskVerdict(
   }
 
   // Non-forged own submissions still pass their verification problems
-  // through, exactly like a child's would.
-  const verdict = composeFromFacts(kidFacts, ownLevelOf(target, ownGrades))
+  // through, exactly like a child's would. The own-grade input is leaf-aware
+  // (X-H-07): a queried task with no children, no submission and no
+  // measurement composes from 'unproven', never from the 'proven' the
+  // undefined fallback used to imply.
+  const verdict = composeFromFacts(kidFacts, ownLevelOf(target, ownGrades, kidFacts.length === 0))
   const ownProblems = target.submission?.problems ?? []
   if (ownProblems.length === 0) return verdict
   return { ...verdict, blockers: [...verdict.blockers, ...ownProblems.map(p => `${taskId}: ${p}`)] }

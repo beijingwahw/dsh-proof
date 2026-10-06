@@ -24,9 +24,9 @@ export {
 
 export {
   ANCHOR_FILE, BASELINE_FILE, EVIDENCE_FILE, buildBundle, verifyBundle,
-  type BundleAnchor, type BundleChainMode, type BundleExtras, type BundleInput,
-  type BundleVerification, type ManifestFileEntry, type ManifestTransparency,
-  type ProofBundle, type TransparentBundleManifest,
+  type BundleAnchor, type BundleAnchorSigner, type BundleChainMode, type BundleExtras,
+  type BundleInput, type BundleVerification, type ManifestFileEntry, type ManifestTransparency,
+  type ProofBundle, type TransparentBundleManifest, type VerifyBundleOptions,
 } from './bundle.ts'
 
 // The MCP face: the frozen five-tool contract, the pure per-message

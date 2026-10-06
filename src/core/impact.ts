@@ -142,16 +142,21 @@ export async function buildDependencyGraph(
       //   instead of joining the dots as JS path segments — `pkg/.mod.py`
       //   never existed on any disk. JS relative specifiers resolve through
       //   the same dot arithmetic (their `.`/`..` semantics agree), plus the
-      //   Python `__init__.py` candidates for mixed trees.
+      //   Python `__init__.py` candidates for mixed trees. X-H-17(b): a dot
+      //   INSIDE the remainder is ambiguous across languages, so both
+      //   readings are probed (see resolveSpecifier) and every hit adds its
+      //   own edge — over-inclusion is the direction the constitution allows.
       // - bare: only Python dotted modules (`from pkg.mod import x`, bare
       //   `import pkg.mod`, and the name-list sites those mint) get a
       //   filesystem attempt. A dotted name that happens to collide with a
       //   scanned file can only add a spurious edge — over-selection, which
       //   the soundness constitution allows; a missed edge is what it forbids.
-      const resolved = site.kind === 'relative'
-        ? resolveSpecifier(file, site.specifier, known)
-        : resolveBarePythonModule(site.specifier, known)
-      if (resolved !== undefined) ensure(resolved).add(file)
+      if (site.kind === 'relative') {
+        for (const target of resolveSpecifier(file, site.specifier, known)) ensure(target).add(file)
+      } else {
+        const target = resolveBarePythonModule(site.specifier, known)
+        if (target !== undefined) ensure(target).add(file)
+      }
       // Verified edge: ask the language server where this import actually
       // binds. `node:` builtins are external by contract; everything else
       // (bare aliases included) may resolve inside the workspace.
@@ -366,7 +371,12 @@ export function matches(file: RelPath, pattern: string): boolean {
     .replace(/^(?:\.\/)+/, '')
     .replace(/^\/+/, '')
     .replace(/\/+$/, '')
-  if (normalized.length === 0) return true
+  // W14-L9: wildcard-all is judged AFTER normalisation. `./*`, `/*` and `*/`
+  // all normalise to `*` but used to fall through to the literal comparison
+  // below (`file === '*'`) — dead for every file that exists, while their
+  // empty-residue sibling `./` matched everything. Same-family spellings must
+  // not be split between a live and a dead reading of the same intent.
+  if (normalized.length === 0 || normalized === '*') return true
   // M9 conservative fallback: a pattern that LOOKS like a glob but is not one
   // of the five supported shapes matches EVERYTHING. The old matcher silently
   // treated `src/**/*.ts` (or `a?b.ts`, or `{a,b}`) as a literal prefix — a
@@ -434,8 +444,50 @@ const SITE_PYTHON_BARE = /^import\s+((?:[.\w][\w.]*(?:\s+as\s+[\w.]+)?\s*,\s*)*[
 export function extractImportSites(content: string): ImportSite[] {
   const out: ImportSite[] = []
   const lines = content.split('\n')
+  // W14-M5: a `from pkg import (` whose paren the line cannot close — the
+  // black/isort formatting of any long name list. Until the paren closes,
+  // every identifier on the continuation lines mints the same pkg/<name>.py
+  // name edge the single-line form would have; before this state existed the
+  // opening line yielded the package edge only and every listed name was
+  // silently edgeless (the exact under-inclusion the constitution forbids).
+  let pending: { readonly module: string; depth: number } | null = null
+  // A continuation segment that is a plain (optionally aliased) name, plus
+  // optional trailing comma/closer — anything else cannot mend the list.
+  const NAME_TAIL = /^([\w.]+)(?:\s+as\s+[\w.]+)?\s*,?\s*\)*\s*$/
+  const CLOSER_TAIL = /^[),\s]*$/
+  const parenDepth = (text: string): number => {
+    const opens = text.match(/\(/g)?.length ?? 0
+    const closes = text.match(/\)/g)?.length ?? 0
+    return opens - closes
+  }
+
   lines.forEach((rawLine, index) => {
     const trimmed = rawLine.trim()
+    const indent = rawLine.length - rawLine.trimStart().length
+    if (pending !== null) {
+      const state = pending
+      // Comments are legal inside a parenthesised list; the `#` cut mirrors
+      // SITE_PYTHON's name-list capture (`[^#\n]*`), which stops there too.
+      const body = trimmed.split('#', 1)[0] ?? ''
+      let cursor = 0
+      for (const raw of body.split(',')) {
+        const segment = raw.trim()
+        if (segment.length > 0 && !CLOSER_TAIL.test(segment)) {
+          const head = NAME_TAIL.exec(segment)
+          if (head?.[1] !== undefined) {
+            out.push({
+              specifier: `${state.module}.${head[1]}`,
+              line: index,
+              character: indent + cursor + (raw.length - raw.trimStart().length),
+              kind: kindOf(`${state.module}.${head[1]}`),
+            })
+          }
+        }
+        cursor += raw.length + 1
+      }
+      state.depth += parenDepth(body)
+      if (state.depth <= 0) pending = null
+    }
     if (trimmed.length === 0 || trimmed.startsWith('//') || trimmed.startsWith('#') || trimmed.startsWith('*')) return
     for (const pattern of [SITE_ESM_FROM, SITE_SIDE_EFFECT, SITE_DYNAMIC_IMPORT, SITE_MULTILINE_FROM, SITE_REQUIRE]) {
       // Global patterns report every in-line site; the anchored multi-line
@@ -449,48 +501,70 @@ export function extractImportSites(content: string): ImportSite[] {
         }
       }
     }
-    const py = SITE_PYTHON.exec(trimmed)
-    const pyStart = py?.indices?.[1]?.[0]
-    if (pyStart !== undefined && py?.[1] !== undefined) {
-      const indent = rawLine.length - rawLine.trimStart().length
-      out.push({ specifier: py[1], line: index, character: pyStart + indent, kind: kindOf(py[1]) })
-      // H-24(c): `from pkg import mod` binds the SUBMODULE pkg/mod.py, and
-      // `from . import x` binds pkg/x.py — the name list carries those edges.
-      // Only plain identifier names are followed (an `as` alias renames the
-      // binding, `(` opens a multi-line list the line cannot close); the
-      // resolution itself stays proof-of-existence, so a plain function import
-      // (`from pkg import helper` with no pkg/helper.py) adds nothing.
-      const listStart = py.indices?.[2]?.[0]
-      if (listStart !== undefined) {
-        let cursor = listStart
-        for (const rawName of (py[2] ?? '').split(',')) {
-          const head = /^[\s(]*([\w.]+)/.exec(rawName)
-          if (head?.[1] !== undefined) {
-            const name = head[1]
-            out.push({
-              specifier: `${py[1]}.${name}`,
-              line: index,
-              character: cursor + (head.index ?? 0) + (head[0].length - head[1].length) + indent,
-              kind: kindOf(`${py[1]}.${name}`),
-            })
+    // W14-M4: Python allows `;`-separated simple statements on one line. The
+    // anchored forms must judge each statement alone: the whole-line match
+    // either rejected `import os; import sys` outright (the `$` anchor fails
+    // on the `;` — BOTH module edges lost) or parsed `from x import y;
+    // from z import w` as the name list `y; from z import w` (the second
+    // statement invisible). Split first, match each segment independently.
+    let offset = 0
+    for (const rawSegment of trimmed.split(';')) {
+      const segment = rawSegment.trimStart()
+      const base = offset + (rawSegment.length - segment.length)
+      const py = SITE_PYTHON.exec(segment)
+      const pyStart = py?.indices?.[1]?.[0]
+      if (pyStart !== undefined && py?.[1] !== undefined) {
+        const module = py[1]
+        out.push({ specifier: module, line: index, character: base + pyStart + indent, kind: kindOf(module) })
+        // H-24(c): `from pkg import mod` binds the SUBMODULE pkg/mod.py, and
+        // `from . import x` binds pkg/x.py — the name list carries those edges.
+        // Only plain identifier names are followed (an `as` alias renames the
+        // binding); the resolution itself stays proof-of-existence, so a plain
+        // function import (`from pkg import helper` with no pkg/helper.py)
+        // adds nothing.
+        const listStart = py.indices?.[2]?.[0]
+        if (listStart !== undefined) {
+          let cursor = listStart
+          for (const rawName of (py[2] ?? '').split(',')) {
+            const head = /^[\s(]*([\w.]+)/.exec(rawName)
+            if (head?.[1] !== undefined) {
+              const name = head[1]
+              // X-H-17(a): the concatenation must respect a dot the module
+              // prefix already ends with. `${'.'}.${'x'}` minted '..x' — one
+              // dot too many, which resolveSpecifier walked to the PARENT
+              // package: `from . import x` (the highest-frequency Python
+              // import form) resolved to the parent's x, never the sibling
+              // pkg/x.py the statement actually binds.
+              const specifier = module.endsWith('.') ? `${module}${name}` : `${module}.${name}`
+              out.push({
+                specifier,
+                line: index,
+                character: base + cursor + (head.index ?? 0) + (head[0].length - head[1].length) + indent,
+                kind: kindOf(specifier),
+              })
+            }
+            cursor += rawName.length + 1
+          }
+          // W14-M5: an unclosed paren — the name list continues on the next
+          // lines; hand the module to the continuation reader above.
+          const depth = parenDepth(py[2] ?? '')
+          if (depth > 0 && pending === null) pending = { module, depth }
+        }
+      }
+      const bare = SITE_PYTHON_BARE.exec(segment)
+      const bareSpan = bare?.indices?.[1]
+      if (bare?.[1] !== undefined && bareSpan?.[0] !== undefined) {
+        let cursor = bareSpan[0]
+        for (const rawName of bare[1].split(',')) {
+          const lead = rawName.length - rawName.trimStart().length
+          const name = /^([\w.]+)/.exec(rawName.trim())?.[1]
+          if (name !== undefined) {
+            out.push({ specifier: name, line: index, character: base + cursor + lead + indent, kind: kindOf(name) })
           }
           cursor += rawName.length + 1
         }
       }
-    }
-    const bare = SITE_PYTHON_BARE.exec(trimmed)
-    const bareSpan = bare?.indices?.[1]
-    if (bare?.[1] !== undefined && bareSpan?.[0] !== undefined) {
-      const indent = rawLine.length - rawLine.trimStart().length
-      let cursor = bareSpan[0]
-      for (const rawName of bare[1].split(',')) {
-        const lead = rawName.length - rawName.trimStart().length
-        const name = /^([\w.]+)/.exec(rawName.trim())?.[1]
-        if (name !== undefined) {
-          out.push({ specifier: name, line: index, character: cursor + lead + indent, kind: kindOf(name) })
-        }
-        cursor += rawName.length + 1
-      }
+      offset += rawSegment.length + 1
     }
   })
   return out
@@ -528,7 +602,8 @@ function add(into: Set<string>, specifier: string): void {
 }
 
 /**
- * Resolve a `.`-prefixed specifier against the scanned file set.
+ * Resolve a `.`-prefixed specifier against the scanned file set, returning
+ * EVERY candidate that exists (usually zero or one).
  *
  * H-24: the leading-dot run is walked Python-style — `.` keeps the source
  * file's directory, each extra dot climbs one level, the remainder's dots
@@ -536,14 +611,41 @@ function add(into: Set<string>, specifier: string): void {
  * semantics agree at one and two dots), and it replaces the old JS join,
  * which turned Python's `.mod` into the never-existing `pkg/.mod.py` — the
  * reason every relative Python form used to be edgeless.
+ *
+ * X-H-17(b): H-24's dot-to-slash rewrite of the remainder was applied to
+ * every relative specifier, but a dot inside the remainder means different
+ * things in the two languages — `pkg.mod` is `pkg/mod` in Python, while
+ * `./x.component` / `./mod.js` are FILE NAMES in JS (Angular's component
+ * convention; TS NodeNext's mandatory `.js` spelling of a `.ts` source).
+ * Both readings are therefore probed and every existing candidate adds its
+ * own edge: a spurious edge over-selects a check (the allowed direction), a
+ * dropped edge manufactured a false "untouched". The NodeNext `.js`-strip
+ * retry below covers the emitted-extension spelling against `.ts` sources.
  */
-function resolveSpecifier(from: RelPath, specifier: string, known: ReadonlySet<RelPath>): RelPath | undefined {
-  if (!specifier.startsWith('.')) return undefined
+function resolveSpecifier(from: RelPath, specifier: string, known: ReadonlySet<RelPath>): readonly RelPath[] {
+  if (!specifier.startsWith('.')) return []
   const dots = /^\.+/.exec(specifier)?.[0]?.length ?? 0
   const rest = specifier.slice(dots)
   let base = dirname(from)
   for (let i = 1; i < dots; i += 1) base = dirname(base)
-  const joined = normalizePath(rest === '' ? base : `${base}/${rest.replace(/\./g, '/')}`)
+  if (rest === '') {
+    // A bare dot-run (`from . import x`'s module site) names the enclosing
+    // package directory itself — its `__init__.py` (or index) candidates.
+    return firstKnown(candidatePaths(normalizePath(base)), known)
+  }
+  const dotted = normalizePath(`${base}/${rest}`)
+  const slashed = normalizePath(`${base}/${rest.replace(/\./g, '/')}`)
+  const out: RelPath[] = []
+  for (const form of dotted === slashed ? [dotted] : [dotted, slashed]) {
+    for (const candidate of candidatePaths(form)) {
+      if (known.has(candidate) && !out.includes(candidate)) out.push(candidate)
+    }
+  }
+  return out
+}
+
+/** The filesystem spellings one resolved specifier could denote, in probe order. */
+function candidatePaths(joined: string): readonly string[] {
   const candidates = [
     joined,
     `${joined}.ts`, `${joined}.tsx`, `${joined}.js`, `${joined}.jsx`, `${joined}.mjs`, `${joined}.cjs`,
@@ -553,8 +655,19 @@ function resolveSpecifier(from: RelPath, specifier: string, known: ReadonlySet<R
     // package's `__init__.py` (specifier `.`, rest empty, joined = the dir).
     `${joined}.py`, `${joined}/__init__.py`, `${joined}.go`, `${joined}.rs`,
   ]
-  for (const candidate of candidates) if (known.has(candidate)) return candidate
-  return undefined
+  // NodeNext: TS sources import their own compilation output as `./mod.js`
+  // while the file on disk is `mod.ts` — strip the emitted extension and
+  // retry. Proof of existence only; nothing is invented.
+  const stripped = joined.replace(/\.(js|jsx|mjs|cjs)$/, '')
+  if (stripped !== joined) {
+    candidates.push(`${stripped}.ts`, `${stripped}.tsx`, `${stripped}.js`, `${stripped}.jsx`, `${stripped}.mjs`, `${stripped}.cjs`)
+  }
+  return candidates
+}
+
+function firstKnown(candidates: readonly string[], known: ReadonlySet<RelPath>): readonly RelPath[] {
+  for (const candidate of candidates) if (known.has(candidate)) return [candidate]
+  return []
 }
 
 /**

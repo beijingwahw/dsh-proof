@@ -188,13 +188,18 @@ export function assembleProof(input: AssembleInput): AssembleResult {
   const vanished = [...(input.vanished ?? [])].sort()
 
   // H2: how many decisive observations THIS run actually produced — counted
-  // over `runCheckIds`, the checks this verification dispatched, so a
-  // decisive record from anywhere else (another run's log, a caller's stray
-  // input) cannot stand in for this run's own work. Zero means every factor
-  // is a prior: nothing was measured, so nothing was certified.
+  // over the intersection of `runCheckIds` (the checks this verification
+  // dispatched) and the AFFECTED set (W6-F5: the checks the claim is about),
+  // so a decisive record from anywhere else — another run's log, a caller's
+  // stray input, or a green check the change set never touched — cannot
+  // stand in for this run's own work on the claim. Zero means every affected
+  // factor is a prior: nothing the claim rests on was measured, so nothing
+  // was certified.
   const runIds = input.confidence?.runCheckIds
   const observedDecisive = input.records
-    .filter(r => isDecisiveStatus(r.status) && (runIds === undefined || runIds.has(r.checkId)))
+    .filter(r => isDecisiveStatus(r.status)
+      && affectedIds.has(r.checkId)
+      && (runIds === undefined || runIds.has(r.checkId)))
     .length
 
   const grade = decideGrade({
@@ -240,7 +245,7 @@ export function assembleProof(input: AssembleInput): AssembleResult {
   // this function (they come from the jury assembler and the engine's κ
   // fusion, which run after and overwrite), the pinned priority order
   // jury-only > attested > synthetic > machine bases holds by construction.
-  if (confidenceBasis !== undefined && onlySyntheticDecisive(input.records, input.specs)) {
+  if (confidenceBasis !== undefined && onlySyntheticDecisive(input.records, input.specs, runIds)) {
     confidenceBasis = 'synthetic'
   }
 
@@ -382,23 +387,112 @@ interface GradeInput {
   confidence?: { value: number; target: number }
   /**
    * H2: decisive observations this run produced (decisive records over the
-   * dispatched set — see `assembleProof`). The bayesian grade gate refuses to
-   * certify without at least one: priors are what checks brought to the
-   * table, not what this run measured.
+   * dispatched ∩ affected set — see `assembleProof`). The bayesian grade gate
+   * refuses to certify without at least one: priors are what checks brought
+   * to the table, not what this run measured.
    */
   observedDecisive: number
   /** H5②: baseline checks whose definitions vanished from discovery. */
   vanishedCount: number
 }
 
+/**
+ * W6-F9 (H-04 family): one completeness door between a green run and
+ * `proven`. `decideGrade` closes these doors in a pinned priority to pick
+ * the grade; the engine's endorsement unlock (`endorsementUnlock`) must ask
+ * the SAME questions or the two lists drift — H-04 fixed the last drift by
+ * hand, this type is the structural fix: one enumeration, two consumers.
+ */
+export type EndorsementDoor =
+  /** No baseline to compare against — nothing can be proven, only re-anchored. */
+  | 'no-baseline'
+  /** A check that passed at baseline now fails — broken work, never residual risk. */
+  | 'regressed'
+  /** A check with no baseline failed — indistinguishable from new breakage. */
+  | 'new-failure'
+  /** The workspace declares no checks, or the change set touches none of them. */
+  | 'nothing-to-verify'
+  /** H2: zero decisive observations this run — every factor is a prior. */
+  | 'unobserved'
+  /** Checks were selected but produced no decisive outcome (full-coverage regime). */
+  | 'unfinished'
+  /** H5②: a baseline check's definition vanished from discovery — a hole in the pool. */
+  | 'vanished'
+  /** β: the claim posterior sits below the certify target. */
+  | 'below-target'
+
+/** The facts every door is read from — primitive counts, so both consumers (report and engine) can state them. */
+export interface EndorsementDoorInput {
+  readonly hasBaseline: boolean
+  readonly discoveredCount: number
+  readonly affectedCount: number
+  readonly regressions: number
+  readonly newFailures: number
+  readonly unverifiedCount: number
+  readonly vanishedCount: number
+  readonly observedDecisive: number
+  /**
+   * Present exactly when the caller wired a `ConfidenceInput`; the
+   * `below-target` door only exists in the bayesian regime
+   * (`requireFullCoverage: false`), and `unfinished` only in the
+   * full-coverage regime — the two gates replace each other, they never
+   * stack.
+   */
+  readonly confidence?: { value: number; target: number }
+  readonly requireFullCoverage: boolean
+}
+
+/**
+ * W6-F9: every OPEN door, in the canonical order above — the single
+ * enumeration `decideGrade` reads and the engine's endorsement unlock
+ * should read instead of re-deriving the list by hand. Empty means nothing
+ * stands between this run and `proven` (the machine side; the engine adds
+ * its own doors — unmet obligations, script drift, coverage blocks, a
+ * tampered baseline — around this call).
+ *
+ * For the endorsement contract specifically: `'below-target'` is the ONE
+ * door a human endorsement is allowed to accept (residual risk is what an
+ * endorser signs for), so an unlock is "every door closed except
+ * below-target" — plus the engine's own extras. Every other open door is
+ * missing or broken work, which endorsement never pays for (H3).
+ */
+export function endorsementBlockers(input: EndorsementDoorInput): EndorsementDoor[] {
+  const doors: EndorsementDoor[] = []
+  if (!input.hasBaseline) doors.push('no-baseline')
+  if (input.regressions > 0) doors.push('regressed')
+  if (input.newFailures > 0) doors.push('new-failure')
+  if (input.discoveredCount === 0 || input.affectedCount === 0) doors.push('nothing-to-verify')
+  if (input.observedDecisive === 0) doors.push('unobserved')
+  if (input.vanishedCount > 0) doors.push('vanished')
+  if (input.unverifiedCount > 0 && input.requireFullCoverage) doors.push('unfinished')
+  if (input.confidence !== undefined && input.confidence.value < input.confidence.target) {
+    doors.push('below-target')
+  }
+  return doors
+}
+
 /** Statuses that actually answer the question — single source: `evidence.ts`. */
 
 function decideGrade(input: GradeInput): ProofGrade {
-  const regressions = input.attributed.filter(c => c.verdict === 'regression').length
-  const newFailures = input.attributed.filter(c => c.verdict === 'new-failure').length
+  // W6-F9: the doors are enumerated ONCE (endorsementBlockers) and consumed
+  // here with the pinned per-regime priority; the engine's endorsement
+  // unlock reads the same enumeration, so a new door can never again exist
+  // in one list and not the other.
+  const doors = endorsementBlockers({
+    hasBaseline: input.hasBaseline,
+    discoveredCount: input.discoveredCount,
+    affectedCount: input.affectedCount,
+    regressions: input.attributed.filter(c => c.verdict === 'regression').length,
+    newFailures: input.attributed.filter(c => c.verdict === 'new-failure').length,
+    unverifiedCount: input.unverifiedCount,
+    vanishedCount: input.vanishedCount,
+    observedDecisive: input.observedDecisive,
+    ...(input.confidence !== undefined ? { confidence: input.confidence } : {}),
+    requireFullCoverage: input.requireFullCoverage,
+  })
 
-  if (!input.hasBaseline) return 'no-baseline'
-  if (regressions > 0 || newFailures > 0) return 'regressed'
+  if (doors.includes('no-baseline')) return 'no-baseline'
+  if (doors.includes('regressed') || doors.includes('new-failure')) return 'regressed'
   // β graded trust: under the bayesian scheduler coverage stops being binary.
   // The stale gate ("something ran without a verdict") is replaced by the
   // certify target — a claim is proven when its posterior crosses the target,
@@ -410,25 +504,28 @@ function decideGrade(input: GradeInput): ProofGrade {
   if (input.confidence !== undefined && !input.requireFullCoverage) {
     // Nothing objective speaks for the claim: the workspace declares no
     // checks, or the change set touches none of them. Honest answer stays
-    // "unproven" — an empty product is vacuous certainty, not proof.
-    if (input.discoveredCount === 0 || input.affectedCount === 0) return 'unproven'
+    // "unproven" — an empty product is vacuous certainty, not proof. This
+    // outranks the unfinished doors on this branch: an empty claim is not an
+    // unfinished verification.
+    if (doors.includes('nothing-to-verify')) return 'unproven'
     // H2: prior-only certification guard. Zero decisive observations means
     // the verification never finished — every factor is a prior, and however
     // high the prior product sits, it is history's number, not this run's
     // measurement. An unobserved run lands in the same bucket as any other
-    // unfinished verification: stale.
-    if (input.observedDecisive === 0) return 'stale'
-    // H5②: a vanished definition is a hole in the pool — however high the
-    // posterior, the baseline's own checks did not all answer. Rebuild.
-    if (input.vanishedCount > 0) return 'stale'
-    return input.confidence.value >= input.confidence.target ? 'proven' : 'stale'
+    // unfinished verification: stale. H5② joins it: a vanished definition is
+    // a hole in the pool, and a sub-target posterior is simply not
+    // certified.
+    if (doors.includes('unobserved') || doors.includes('vanished') || doors.includes('below-target')) {
+      return 'stale'
+    }
+    return 'proven'
   }
-  if (input.unverifiedCount > 0 && input.requireFullCoverage) return 'stale'
-  // H5②: same rule on the full-coverage path — missing work is missing work.
-  if (input.vanishedCount > 0) return 'stale'
-  // Nothing objective speaks for the claim: the workspace declares no checks,
-  // or the change set touches none of them. Honest answer is "unproven".
-  if (input.discoveredCount === 0 || input.affectedCount === 0) return 'unproven'
+  // Legacy full-coverage path: unfinished work and vanished definitions are
+  // 'stale' (missing work), and only THEN does the nothing-to-verify honesty
+  // apply — the reverse of the bayesian branch's priority, pinned by the
+  // pre-β grades.
+  if (doors.includes('unfinished') || doors.includes('vanished')) return 'stale'
+  if (doors.includes('nothing-to-verify')) return 'unproven'
   return 'proven'
 }
 
@@ -451,12 +548,21 @@ function productOf(factors: ReadonlyMap<string, number>): number {
 
 /**
  * π: whether every decisive record this run addressed a synthetic-source
- * spec (with at least one decisive record at all). Records whose checkId no
- * spec claims count as non-synthetic — an unknown speaker is never evidence
- * FOR the interested-party discount.
+ * spec (with at least one decisive record at all). Scoped exactly like
+ * `observedDecisive` (W6-F7): when the caller wired `runCheckIds`, only the
+ * checks THIS run dispatched decide the basis — a log carrying an old
+ * synthetic-green history next to this run's organic observations must not
+ * have its basis renamed by records the run never produced. Records whose
+ * checkId no spec claims count as non-synthetic — an unknown speaker is
+ * never evidence FOR the interested-party discount.
  */
-function onlySyntheticDecisive(records: readonly Evidence[], specs: readonly CheckSpec[]): boolean {
-  const decisive = records.filter(r => isDecisiveStatus(r.status))
+function onlySyntheticDecisive(
+  records: readonly Evidence[],
+  specs: readonly CheckSpec[],
+  runIds: ReadonlySet<string> | undefined,
+): boolean {
+  const decisive = records.filter(r =>
+    isDecisiveStatus(r.status) && (runIds === undefined || runIds.has(r.checkId)))
   if (decisive.length === 0) return false
   const synthetic = new Set(specs.filter(s => s.source === 'synthetic').map(s => s.id))
   return decisive.every(r => synthetic.has(r.checkId))

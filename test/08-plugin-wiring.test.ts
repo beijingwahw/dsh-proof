@@ -147,11 +147,14 @@ test('workspace mode gates writes into the evidence store', async () => {
     exec: unknown, next: () => Promise<unknown>,
   ) => Promise<{ kind: string; reason?: string }>
 
+  // X-H-13: the write's path VALUE names the store, so the value sweep denies
+  // it before the structured ask layer is even consulted — a string that
+  // names the store is refused whatever key carried it.
   const denied = await gate(
     { name: 'write', arguments: { path: '.proof/evidence.jsonl', content: 'forged' }, signal: new AbortController().signal },
     async () => ({ kind: 'allow' }),
   )
-  assert.equal(denied.kind, 'ask')
+  assert.equal(denied.kind, 'deny')
   assert.match(denied.reason ?? '', /evidence/i)
 
   // Ordinary writes are never gated by the evidence-store guard.
@@ -186,7 +189,7 @@ test('workspace mode cannot be bypassed with absolute paths or dotted detours', 
       { name: 'write', arguments: { path: forged, content: 'forged' }, signal: new AbortController().signal },
       async () => ({ kind: 'allow' }),
     )
-    assert.equal(denied.kind, 'ask', `a write naming the evidence store must ask, whatever path shape it uses: ${forged}`)
+    assert.equal(denied.kind, 'deny', `a write naming the evidence store must be denied, whatever path shape it uses: ${forged}`)
     assert.match(denied.reason ?? '', /evidence/i)
   }
 })
@@ -207,12 +210,13 @@ test('workspace mode gates moves whose source key carries the evidence log out',
   // `source` is excluded from the watcher's path keys (it usually carries
   // content, not paths) — but the guard must still see it: moving the log OUT
   // of the store through the source leg is exactly the exfiltration the gate
-  // exists for, and a false positive only costs one approval prompt.
+  // exists for. X-H-13: the value sweep no longer reads keys at all, so the
+  // source string denies this before the structured layer runs.
   const denied = await gate(
     { name: 'move', arguments: { source: '.proof/evidence.jsonl', dest: 'exfil.jsonl' }, signal: new AbortController().signal },
     async () => ({ kind: 'allow' }),
   )
-  assert.equal(denied.kind, 'ask', 'a move sourcing the evidence log must ask even though the watcher ignores content keys')
+  assert.equal(denied.kind, 'deny', 'a move sourcing the evidence log must be denied even though the watcher ignores content keys')
   assert.match(denied.reason ?? '', /evidence/i)
 
   // The precise view is unchanged: a source holding plain content still
@@ -333,7 +337,10 @@ test('a mutation is gated while no baseline exists', async () => {
     delete process.env.DSH_PROOF_ROOT
   }
 
-  const gate = harness.listeners.get('tools/pre-execute')![0] as (
+  // X-H-16: the evidence-store guard now registers FIRST in both store
+  // modes, so the baseline ladder (registered second, only when its mode is
+  // not 'off') sits at index 1.
+  const gate = harness.listeners.get('tools/pre-execute')![1] as (
     exec: unknown, next: () => Promise<unknown>,
   ) => Promise<{ kind: string; reason?: string }>
 
@@ -363,7 +370,9 @@ test('warn mode passes the mutation and injects a corrective baseline notice at 
     delete process.env.DSH_PROOF_ROOT
   }
 
-  const gate = harness.listeners.get('tools/pre-execute')![0] as (
+  // X-H-16: index 1 = the baseline ladder (the evidence guard is index 0 in
+  // every mode now).
+  const gate = harness.listeners.get('tools/pre-execute')![1] as (
     exec: unknown, next: () => Promise<unknown>,
   ) => Promise<{ kind: string }>
   const allowed = await gate(
@@ -1127,8 +1136,9 @@ test('λ: proof_jury_submit records at gen+1, refuses mismatches and broken prob
 })
 
 test('λ: proof_endorse asks the host for conscious approval, then records Class C on approval', async () => {
-  // The seam: with the workflow gates off, the endorsement ask is the one
-  // pre-execute decision the plugin registers.
+  // The seam: with the workflow gates off, the endorsement ask is the last
+  // pre-execute decision the plugin registers (X-H-16 moved the
+  // evidence-store guard to index 0 in every mode).
   const harness = makeHarness()
   process.env.DSH_PROOF_ROOT = ROOT
   try {
@@ -1136,7 +1146,7 @@ test('λ: proof_endorse asks the host for conscious approval, then records Class
   } finally {
     delete process.env.DSH_PROOF_ROOT
   }
-  const gate = harness.listeners.get('tools/pre-execute')![0]! as (
+  const gate = harness.listeners.get('tools/pre-execute')![1]! as (
     exec: unknown, next: () => Promise<unknown>,
   ) => Promise<{ kind: string; reason?: string; displayReason?: Record<string, string> }>
 
@@ -1528,7 +1538,7 @@ test('H10: workspace mode gates case variants of the evidence store path', async
       { name: 'write', arguments: { path: forged, content: 'forged' }, signal: new AbortController().signal },
       async () => ({ kind: 'allow' }),
     )
-    assert.equal(denied.kind, 'ask', `a case variant of the evidence path must ask: ${forged}`)
+    assert.equal(denied.kind, 'deny', `a case variant of the evidence path must be denied: ${forged}`)
     assert.match(denied.reason ?? '', /evidence/i)
   }
 
@@ -1559,7 +1569,7 @@ test('H10: a differently-named evidence dir keeps its case-folded guard', async 
       { name: 'write', arguments: { path: forged, content: 'forged' }, signal: new AbortController().signal },
       async () => ({ kind: 'allow' }),
     )
-    assert.equal(denied.kind, 'ask', `case variant of configured dir 'proof' must ask: ${forged}`)
+    assert.equal(denied.kind, 'deny', `case variant of configured dir 'proof' must be denied: ${forged}`)
   }
 })
 
@@ -1583,7 +1593,7 @@ test('H10: a backslash-flavoured evidenceDir config still guards the real path',
       { name: 'write', arguments: { path: forged, content: 'forged' }, signal: new AbortController().signal },
       async () => ({ kind: 'allow' }),
     )
-    assert.equal(denied.kind, 'ask', `a write into the configured store must ask: ${forged}`)
+    assert.equal(denied.kind, 'deny', `a write into the configured store must be denied: ${forged}`)
     assert.match(denied.reason ?? '', /evidence/i)
   }
 
@@ -1611,7 +1621,9 @@ test('M5: the endorsement ask names the agent-declared approver', async () => {
   } finally {
     delete process.env.DSH_PROOF_ROOT
   }
-  const gate = harness.listeners.get('tools/pre-execute')![0] as (
+  // Index 1 = the endorsement seam (the evidence guard is index 0 in every
+  // mode since X-H-16).
+  const gate = harness.listeners.get('tools/pre-execute')![1] as (
     exec: unknown, next: () => Promise<unknown>,
   ) => Promise<{ kind: string; reason?: string; displayReason?: Record<string, string> }>
 
@@ -1651,7 +1663,8 @@ test('M5: an endorsement without an approver shows the default in the ask', asyn
   } finally {
     delete process.env.DSH_PROOF_ROOT
   }
-  const gate = harness.listeners.get('tools/pre-execute')![0] as (
+  // Index 1 = the endorsement seam (X-H-16 put the evidence guard at 0).
+  const gate = harness.listeners.get('tools/pre-execute')![1] as (
     exec: unknown, next: () => Promise<unknown>,
   ) => Promise<{ kind: string; reason?: string; displayReason?: Record<string, string> }>
 
@@ -2270,7 +2283,8 @@ test('H-01/H-02: camelCase mutators and store-naming shell commands cannot reach
   ) => Promise<{ kind: string; reason?: string }>
 
   // H-01: the Claude Code camel mutators (documented in the CC adapter's own
-  // header) must hit the structured-path guard exactly like `write` does.
+  // header) must hit the value sweep exactly like `write` does — X-H-13 made
+  // the sweep read VALUES, so the camelCase NAME no longer matters at all.
   const camelMutators: [string, Record<string, unknown>][] = [
     ['MultiEdit', { file_path: '.proof/evidence.jsonl', edits: [] }],
     ['NotebookEdit', { notebook_path: '.proof/evidence.jsonl' }],
@@ -2280,16 +2294,16 @@ test('H-01/H-02: camelCase mutators and store-naming shell commands cannot reach
       { name, arguments: args, signal: new AbortController().signal },
       async () => ({ kind: 'allow' }),
     )
-    assert.equal(denied.kind, 'ask', `${name} naming the evidence store must be routed through approval`)
+    assert.equal(denied.kind, 'deny', `${name} naming the evidence store must be refused`)
     assert.match(denied.reason ?? '', /evidence/i)
   }
 
-  // H-02: the shell command string names no path key — the guard sweeps it
-  // conservatively and REFUSES (a shell can rewrite anything; "was that
-  // redirect really a write?" is not for a parser to guess).
+  // H-02: the shell command string names no path key — the value sweep
+  // catches it conservatively and REFUSES (a command can rewrite anything;
+  // "was that redirect really a write?" is not for a parser to guess).
   const shellForges = [
     'echo x > .proof/evidence.jsonl',
-    'echo x >> .PROOF\evidence.jsonl', // backslash + case variant
+    'echo x >> .PROOF\\evidence.jsonl', // backslash + case variant
     'rm -rf .proof',
     'cat .proof/baseline.json | sha256sum',
   ]
@@ -2299,7 +2313,7 @@ test('H-01/H-02: camelCase mutators and store-naming shell commands cannot reach
       async () => ({ kind: 'allow' }),
     )
     assert.equal(denied.kind, 'deny', `a store-naming shell command must be refused: ${command}`)
-    assert.match(denied.reason ?? '', /shell can rewrite anything/)
+    assert.match(denied.reason ?? '', /must not be modified by the agent/)
   }
   // The CC camel spelling of the shell tool is caught by the same sweep.
   const camelShell = await gate(
@@ -2315,13 +2329,25 @@ test('H-01/H-02: camelCase mutators and store-naming shell commands cannot reach
     async () => ({ kind: 'allow' }),
   )
   assert.equal(ordinary.kind, 'allow')
-  // Reading the log back through a read-class tool stays legitimate (the
-  // proof tools themselves do exactly that).
+  // X-H-13: the read-only roster is NO LONGER exempt — a NAME is not a
+  // capability, and the audited PoC's fourth form was exactly a
+  // read-only-named call carrying a store-writing command. The price is
+  // deliberate and documented: even a genuinely read-only call that names
+  // the store (reading the log back with a host file tool) is denied with a
+  // reason — the plugin's own proof_* tools read the log through the
+  // engine's fs port, never through host tool calls, so verification itself
+  // is not in this blast radius.
   const read = await gate(
     { name: 'Read', arguments: { file_path: '.proof/evidence.jsonl' }, signal: new AbortController().signal },
     async () => ({ kind: 'allow' }),
   )
-  assert.equal(read.kind, 'allow')
+  assert.equal(read.kind, 'deny')
+  // But an ordinary read of an ordinary file still sails through.
+  const plainRead = await gate(
+    { name: 'Read', arguments: { file_path: 'src/a.ts' }, signal: new AbortController().signal },
+    async () => ({ kind: 'allow' }),
+  )
+  assert.equal(plainRead.kind, 'allow')
 })
 
 // ---------------------------------------------------------------------------
@@ -2440,7 +2466,8 @@ test('M-70: the endorsement ask names the decision the record will carry', async
   } finally {
     delete process.env.DSH_PROOF_ROOT
   }
-  const gate = harness.listeners.get('tools/pre-execute')![0] as (
+  // Index 1 = the endorsement seam (X-H-16 put the evidence guard at 0).
+  const gate = harness.listeners.get('tools/pre-execute')![1] as (
     exec: unknown, next: () => Promise<unknown>,
   ) => Promise<{ kind: string; reason?: string; displayReason?: Record<string, string> }>
 

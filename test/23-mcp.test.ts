@@ -24,6 +24,8 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { promises as fsp } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
+import { PassThrough } from 'node:stream'
+import { Buffer } from 'node:buffer'
 
 import { sha256 } from '../src/core/hash.ts'
 import { deriveProofPaths } from '../src/adapters/shared/paths.ts'
@@ -31,6 +33,14 @@ import { deriveProofPaths } from '../src/adapters/shared/paths.ts'
 // by minting a real APP bundle from the fixture's evidence artifacts — the
 // same builder the proof_bundle tool itself calls.
 import { buildBundle } from '../src/app/bundle.ts'
+// v0.23 (W8): the transport layer and the suspect-filtering marker reader are
+// pinned at the unit level too — a chunk boundary inside a code point and an
+// out-of-band marker twin are both invisible through the happy-path RPCs.
+import { markerPayloads, readCappedLines } from '../src/app/mcp-server.ts'
+import type { McpEngineDeps } from '../src/app/mcp-server.ts'
+import type { ProofEngine } from '../src/engine.ts'
+import { lineDigest } from '../src/core/trust.ts'
+import { MemoryFs } from './helpers.ts'
 
 // The repo (for the entry script) and the scratch workspace per the task's
 // designated temp area: C:\mimoclaw_workspace\.openclaw\tmp\mcp-it-<pid>.
@@ -1300,6 +1310,253 @@ test('proof_training_export confines `path` to the workspace — absolute, UNC a
     false,
     'the refused absolute destination must not exist',
   )
+})
+
+// ---------------------------------------------------------------------------
+// v0.23 fix batch (W8 + entry hardening) — loud argument discipline for
+// all/changed/entryPoints, the 200-char claim bound made visible, the
+// byte-level transport line splitter, the suspect-filtering marker reader,
+// proof_economics fail-closed on a failing chain audit, the anchored SLA
+// quote description, and the relative-trust-path startup refusals.
+// ---------------------------------------------------------------------------
+
+/** Spawn the entry and resolve on exit with the collected stderr. */
+function spawnEntry(env: Record<string, string>): Promise<{ code: number | null; stderr: string }> {
+  const ephemeral = spawn(process.execPath, ['--experimental-strip-types', ENTRY], {
+    cwd: WORKSPACE,
+    env: {
+      ...process.env,
+      DSH_PROOF_ROOT: WORKSPACE,
+      DSH_HOME: join(WORKSPACE, 'dsh-home'),
+      ...env,
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  return new Promise((resolve) => {
+    let text = ''
+    ephemeral.stderr!.setEncoding('utf8')
+    ephemeral.stderr!.on('data', (chunk: string) => { text += chunk })
+    ephemeral.on('exit', exitCode => resolve({ code: exitCode, stderr: text }))
+  })
+}
+
+test('W8-M2: a truthy non-boolean all is a tool error, never a silently narrower run', async () => {
+  const result = await callTool('proof_verify', { all: 'true', changed: ['check.mjs'] }, 60_000)
+  assert.equal(result.isError, true, 'all: "true" is refused — it once meant "run the impact analysis anyway"')
+  const text = result.content[0]!.text
+  assert.match(text, /all must be a boolean/)
+  assert.ok(text.includes('true'), 'the error echoes the offending value')
+
+  const numeric = await callTool('proof_verify', { all: 1 }, 60_000)
+  assert.equal(numeric.isError, true, 'all: 1 is the same refusal')
+  assert.match(numeric.content[0]!.text, /all must be a boolean/)
+})
+
+test('W8-M2: a non-array changed is a tool error on both faces that take it', async () => {
+  const verify = await callTool('proof_verify', { changed: 'check.mjs' }, 60_000)
+  assert.equal(verify.isError, true, 'a bare string is not a change list')
+  assert.match(verify.content[0]!.text, /changed must be an array/)
+  assert.match(verify.content[0]!.text, /falling back to the derived change set/, 'the error names the divergence it refused')
+
+  const claim = await callTool('proof_claim', { claim: 'did the thing', changed: 'src/a.ts' }, 60_000)
+  assert.equal(claim.isError, true)
+  assert.match(claim.content[0]!.text, /changed must be an array/)
+
+  const entryPoints = await callTool('proof_claim', { claim: 'did the thing', entryPoints: 'src/index.ts' }, 60_000)
+  assert.equal(entryPoints.isError, true)
+  assert.match(entryPoints.content[0]!.text, /entryPoints must be an array/)
+})
+
+test('W8-L7: a claim past the 200-character marker bound carries a truncation warning', async () => {
+  const longClaim = `fixed the login redirect (${'and also '.repeat(30)}) and added a regression test`
+  assert.ok(longClaim.trim().length > 200, 'fixture: the claim exceeds the marker bound')
+  const verify = await callTool('proof_verify', { changed: ['check.mjs'], claim: longClaim }, 60_000)
+  assert.equal(verify.isError, undefined, `verify errored: ${verify.content[0]?.text}`)
+  const verifyValue = verify.structuredContent as { warning?: string }
+  assert.match(
+    verifyValue.warning ?? '',
+    /truncated to its first 200 characters/,
+    'the response says the chain record is shorter than the caller\'s words',
+  )
+
+  const claim = await callTool('proof_claim', { claim: longClaim }, 60_000)
+  assert.equal(claim.isError, undefined, `claim errored: ${claim.content[0]?.text}`)
+  const claimValue = claim.structuredContent as { warnings?: string[] }
+  assert.ok(
+    (claimValue.warnings ?? []).some(w => w.includes('truncated to its first 200 characters')),
+    `the claim card warns too: ${JSON.stringify(claimValue.warnings)}`,
+  )
+})
+
+test('the SLA quote description states the anchoring gate the engine actually enforces (W8-M1)', async () => {
+  const response = await client.request('tools/list', {})
+  assert.equal(response.error, undefined)
+  const tools = (response.result as { tools: { name: string; description: string }[] }).tools
+  const sla = tools.find(t => t.name === 'proof_sla_quote')!
+  assert.ok(
+    sla.description.includes('proof/verified marker'),
+    'the description names the on-chain evidence a quote is anchored to',
+  )
+  assert.ok(
+    sla.description.includes('grade the chain has actually REACHED') || sla.description.includes('reached'),
+    'the description says only reached grades are priced',
+  )
+  assert.ok(
+    sla.description.includes('ERROR') || sla.description.includes('refused'),
+    'the description says an unanchored grade is refused, not priced',
+  )
+})
+
+test('W8-L12: a failing chain audit makes proof_economics an isError response stamped untrusted', async () => {
+  // The ledger exists by this point (the priced-verify test minted one); the
+  // chain it rides on is broken by one appended garbage line — corrupt-lines
+  // fails audit.ok, and the replay must fail CLOSED (isError), not ride out
+  // as a success with a soft warning.
+  const logPath = join(fixtureStoreDir(), 'evidence.jsonl')
+  const original = await fsp.readFile(logPath, 'utf8')
+  try {
+    await fsp.appendFile(logPath, 'corrupt line that breaks the chain audit\n', 'utf8')
+    const result = await callTool('proof_economics', { computePerMs: 0.001 }, 60_000)
+    assert.equal(result.isError, true, 'a replay over a broken chain is an error, never a soft warning')
+    const value = result.structuredContent as {
+      untrusted?: boolean
+      chainAudit?: { ok?: boolean }
+      warning?: string
+      economics?: unknown
+    }
+    assert.equal(value.untrusted, true, 'the pseudo-ledger is stamped untrusted at the top level')
+    assert.equal(value.chainAudit?.ok, false, 'the audit verdict rides the response')
+    assert.ok(value.economics !== undefined, 'the ledger still rides for the auditor who wants to look')
+    assert.match(value.warning ?? '', /chain audit FAILED/)
+  } finally {
+    await fsp.writeFile(logPath, original, 'utf8')
+  }
+})
+
+test('W8-F3: readCappedLines survives a chunk boundary inside a multi-byte character', async () => {
+  const lines = [
+    '{"msg":"你好世界🎉","id":1}',
+    '{"msg":"café ñan 高橋 🚀","id":2}',
+  ]
+  const tick = async (): Promise<void> => new Promise(resolve => setImmediate(resolve))
+  for (const line of lines) {
+    const bytes = Buffer.from(`${line}\n`, 'utf8')
+    // Split at EVERY byte boundary: each prefix/suffix pair is a two-chunk
+    // delivery whose boundary may fall inside a code point — the exact shape
+    // that used to decode to two U+FFFD halves and answer "not valid JSON".
+    for (let split = 1; split < bytes.length - 1; split += 1) {
+      const pt = new PassThrough()
+      const iterator = readCappedLines(pt, 4096)[Symbol.asyncIterator]()
+      pt.write(bytes.subarray(0, split))
+      await tick()
+      pt.write(bytes.subarray(split))
+      await tick()
+      pt.end()
+      const first = await iterator.next()
+      assert.equal(first.done, false)
+      const value = first.value as { text?: string; oversized?: true }
+      assert.equal(value.oversized, undefined, `split ${split}: a small line is never over-cap`)
+      assert.equal(value.text, line, `split ${split}: the line round-trips byte-identically`)
+      assert.equal((await iterator.next()).done, true)
+    }
+  }
+})
+
+test('W8-F3: the transport cap is exact byte semantics — cap and cap+1 adjudicate cleanly', async () => {
+  const tick = async (): Promise<void> => new Promise(resolve => setImmediate(resolve))
+  const cap = 16
+  // One byte over cap: oversized; exactly at cap: legal.
+  for (const [payload, expectOversized] of [['12345678901234567', true], ['1234567890123456', false]] as const) {
+    const pt = new PassThrough()
+    const iterator = readCappedLines(pt, cap)[Symbol.asyncIterator]()
+    pt.write(Buffer.from(`${payload}\n`, 'utf8'))
+    await tick()
+    pt.end()
+    const first = await iterator.next()
+    const value = first.value as { text?: string; oversized?: true }
+    assert.equal(value.oversized !== undefined, expectOversized, `payload ${JSON.stringify(payload)} at cap ${cap}`)
+    if (!expectOversized) assert.equal(value.text, payload)
+  }
+})
+
+test('W8/G2: markerPayloads excludes suspect lines — an out-of-band marker twin is not chain fact', async () => {
+  const evidence0 = JSON.stringify({ v: 1, kind: 'evidence', at: '2026-10-06T00:00:00.000Z', payload: { evidenceId: 'e0' } })
+  const marker = (label: string, extra: Record<string, unknown>, prev: string, headRef: string) => JSON.stringify({
+    v: 2, kind: 'marker', at: '2026-10-06T00:00:00.000Z', prev,
+    payload: { label, ...extra, headRef },
+  })
+  const honestCreated = marker('delegation/created', { taskId: 'task-1', claim: 'honest obligation' }, 'prev-0', lineDigest(evidence0))
+  const honestVerdict = marker('delegation/verdict', { taskId: 'task-1' }, lineDigest(evidence0), lineDigest(honestCreated))
+  // The attacker replays the created marker at the tail: its headRef names a
+  // line that is NOT its physical predecessor — the position witness fails.
+  const replayedTwin = marker('delegation/created', { taskId: 'task-2', claim: 'injected obligation' }, 'prev-x', lineDigest(evidence0))
+  const log = [evidence0, honestCreated, honestVerdict, replayedTwin].join('\n') + '\n'
+  const deps = {
+    engine: { fsView: MemoryFs.of({ '/store/evidence.jsonl': log }) },
+    evidenceLogPath: '/store/evidence.jsonl',
+  } as unknown as McpEngineDeps
+
+  const records = await markerPayloads(deps, new Set(['delegation/created', 'delegation/verdict']))
+  assert.equal(records.length, 2, 'the honest pair survives; the replayed twin does not')
+  assert.deepEqual(records.map(r => (r.payload as { taskId: string }).taskId), ['task-1', 'task-1'])
+  assert.equal(records[0]?.at, '2026-10-06T00:00:00.000Z', 'the envelope timestamp rides along')
+
+  // Prefix matching (the economics replay's shape) with the same exclusion.
+  const injectedVerified = marker('proof/verified', { grade: 'proven', economics: { cost: 1 } }, 'prev-y', lineDigest(evidence0))
+  const log2 = [evidence0, honestCreated, injectedVerified].join('\n') + '\n'
+  const deps2 = {
+    engine: { fsView: MemoryFs.of({ '/store/evidence.jsonl': log2 }) },
+    evidenceLogPath: '/store/evidence.jsonl',
+  } as unknown as McpEngineDeps
+  const economics = await markerPayloads(deps2, new Set(), { labelPrefixes: ['proof/', 'claim/'] })
+  assert.equal(economics.length, 0, 'an injected proof/verified carrier is not a run')
+})
+
+test('W8/G2 end to end: an injected delegation twin appended to the live log never reaches the task overview', async () => {
+  const logPath = join(fixtureStoreDir(), 'evidence.jsonl')
+  const original = await fsp.readFile(logPath, 'utf8')
+  const lines = original.split('\n').filter(l => l.trim().length > 0)
+  const lastLine = lines[lines.length - 1] as string
+  // Out-of-band append: a created marker whose headRef names a line that is
+  // not its physical predecessor (the writer's position witness fails).
+  const injected = JSON.stringify({
+    v: 2, kind: 'marker', at: '2026-10-06T00:00:00.000Z', prev: lineDigest(lastLine),
+    payload: { label: 'delegation/created', taskId: 'task-evil', claim: 'obligation nobody delegated', headRef: lineDigest(lines[0] as string) },
+  })
+  try {
+    await fsp.writeFile(logPath, `${[...lines, injected].join('\n')}\n`, 'utf8')
+    const overview = await callTool('proof_task', {})
+    assert.equal(overview.isError, undefined, `overview errored: ${overview.content[0]?.text}`)
+    const tasks = (overview.structuredContent as { tasks: { taskId: string }[] }).tasks
+    assert.ok(
+      !tasks.some(t => t.taskId === 'task-evil'),
+      `the injected twin is excluded from the overview: ${JSON.stringify(tasks.map(t => t.taskId))}`,
+    )
+    assert.ok(tasks.some(t => t.taskId === 'task-1'), 'the honest delegations still list')
+  } finally {
+    await fsp.writeFile(logPath, original, 'utf8')
+  }
+})
+
+test('a relative DSH_PROOF_TRUST_DIR fails startup loudly, never lands in the CWD (X-H-15)', async () => {
+  const { code, stderr } = await spawnEntry({ DSH_PROOF_TRUST_DIR: 'relative-trust' })
+  assert.notEqual(code, 0, 'the server must die rather than resolve a trust root against the launcher CWD')
+  assert.match(stderr, /DSH_PROOF_TRUST_DIR/)
+  assert.match(stderr, /ABSOLUTE/)
+})
+
+test('a relative DSH_HOME fails startup loudly (X-H-15: it poisons every derived default)', async () => {
+  const { code, stderr } = await spawnEntry({ DSH_HOME: 'rel-home' })
+  assert.notEqual(code, 0)
+  assert.match(stderr, /DSH_HOME/)
+  assert.match(stderr, /ABSOLUTE/)
+})
+
+test('a relative DSH_PROOF_PTL_DIR fails startup loudly (W10-M2)', async () => {
+  const { code, stderr } = await spawnEntry({ DSH_PROOF_PTL_DIR: 'rel-ptl' })
+  assert.notEqual(code, 0)
+  assert.match(stderr, /DSH_PROOF_PTL_DIR/)
+  assert.match(stderr, /ABSOLUTE/)
 })
 
 test('a bundle past half the response limit is trimmed to manifest + file names (both wire copies counted)', async () => {

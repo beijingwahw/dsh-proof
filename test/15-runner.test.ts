@@ -142,6 +142,38 @@ test('RUNNER: a signal aborted before the run executes nothing and flags the bat
   assert.deepEqual(result.skippedIds, [], 'aborted is not skipped: nothing was budgeted away')
 })
 
+test('RUNNER (W15-L8): a signal that dies after the loop check but before the registration still aborts the check', async () => {
+  // The window: the worker's top-of-iteration check read the signal as live,
+  // then the signal aborted before runOne subscribed — an aborted signal
+  // never fires a new listener, so the inner controller the port sees stayed
+  // green and the check used to run to its own timeout as ordinary evidence.
+  // The registration is now atomic with a synchronous re-check. The window
+  // is forced deterministically through the injected clock: its second read
+  // (the worker's budget check — after the top check, before runOne's
+  // registration) kills the signal.
+  const controller = new AbortController()
+  let reads = 0
+  const clock = {
+    now: (): number => {
+      reads += 1
+      if (reads === 2) controller.abort()
+      return 1_700_000_000_000
+    },
+  }
+  const commands = new FakeCommands()
+  const result = await new VerificationRunner(commands, new FakeWorkspace(ROOT), clock)
+    .run([spec({ id: 'a' }), spec({ id: 'b' })], {
+      signal: controller.signal,
+      totalBudgetMs: 60_000, // forces the budget-check clock read inside the window
+    })
+
+  assert.equal(result.aborted, true)
+  assert.equal(result.records.length, 1)
+  assert.equal(result.records[0]?.status, 'aborted', 'the mid-window death reaches the port as an abort, not a green run')
+  assert.deepEqual(result.ranIds, ['a'])
+  assert.deepEqual(result.skippedIds, [])
+})
+
 // 4. killedBySignal -> 'error' (S1) -------------------------------------------
 
 test('RUNNER: an external signal kill is an honest error, not a timeout — and names the signal', async () => {

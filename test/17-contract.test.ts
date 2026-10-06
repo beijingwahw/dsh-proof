@@ -110,6 +110,37 @@ test('extractApiSurface: multi-line export lists, aliases and comments inside th
   assert.deepEqual(surface, ['m.ts#alpha', 'm.ts#delta', 'm.ts#gamma'])
 })
 
+test('W15-M4: inline `export { type X }` names the type on the surface — the type face cannot move silently', () => {
+  // TS ≥ 4.5 inline type modifiers (the isolatedModules/verbatimModuleSyntax
+  // house style). The token `type Foo` failed the IDENTIFIER test wholesale,
+  // so both before and after read the same (empty) surface and
+  // api-surface-unchanged was vacuously met while the public TYPE face moved.
+  const surface = extractApiSurface([{ rel: 't.ts', content: [
+    'export { type Foo }',
+    'export { type Bar as Baz }',
+    "export { type Qux, value } from './dep'",
+    'export type Named = number',   // declaration form — already worked
+    'export { plain }',
+  ].join('\n') }])
+  assert.deepEqual(surface, [
+    't.ts#Baz',
+    't.ts#Foo',
+    't.ts#Named',
+    't.ts#Qux',
+    't.ts#plain',
+    't.ts#value',
+  ])
+  // A binding genuinely NAMED `type` survives (the strip needs whitespace).
+  const named = extractApiSurface([{ rel: 'n.ts', content: 'export { type, other }' }])
+  assert.deepEqual(named, ['n.ts#other', 'n.ts#type'])
+  // And the surface diff actually fires on a type-only move (regression KAT
+  // for the vacuous-pass this fix closes).
+  const before = extractApiSurface([{ rel: 't.ts', content: 'export { type Foo }\nexport { keep }' }])
+  const after = extractApiSurface([{ rel: 't.ts', content: 'export { type Renamed }\nexport { keep }' }])
+  const diff = diffApiSurface(before, after)
+  assert.deepEqual(diff, { added: ['t.ts#Renamed'], removed: ['t.ts#Foo'] })
+})
+
 test('extractApiSurface: comment lines are skipped', () => {
   const surface = extractApiSurface([{ rel: 'c.ts', content: [
     '// export const commented = 1',

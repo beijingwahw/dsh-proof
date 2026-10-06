@@ -157,6 +157,15 @@ export interface NormalizeOptions {
  * normalized result is prefixed with `RAW_PLACEHOLDER_MARKER` (once), so a
  * literal-bearing output can never byte-equal a folded honest one.
  *
+ * W14-M3: the marker line's own text is in the detection set. Without it, a
+ * literal-free output that merely PRE-PRINTS the marker line normalised to
+ * exactly the marker + folded body — byte-equal to the marked product of a
+ * genuinely literal-bearing output — reopening the cross-class equality
+ * H-28 exists to close. With the marker text detected, a marker-bearing
+ * output normalises to `MARKER + k marker lines + folded body` (k preserved
+ * in the text itself), which is distinct from every k=0 class and from every
+ * other k.
+ *
  * Residual, documented: the marker separates the literal-bearing class from
  * the folded class; two DIFFERENT literal-bearing outputs can still agree
  * where the underlying folds already equate them (the pre-existing
@@ -166,6 +175,7 @@ export interface NormalizeOptions {
 const LITERAL_PLACEHOLDER_SHAPES: readonly RegExp[] = [
   /\$(?:WORKSPACE|HOME)(?![\w$-])/,
   /<(?:duration|timestamp)>/,
+  /\[raw output contained literal placeholders\]/,
 ]
 
 /** H-28: one-line escape prefix stating the raw output carried placeholder literals. */

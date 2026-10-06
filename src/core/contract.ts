@@ -183,6 +183,16 @@ function exportedNames(content: string): string[] {
  * Names from `export { a, b as c, d as "str-alias" }`. `b as c` exports the
  * *alias* `c` — that is the name importers bind — and a string alias is kept
  * verbatim (unquoted) because it is a legal export name.
+ *
+ * W15-M4: a leading `type ` modifier is stripped before the alias/identifier
+ * judgement — `export { type Foo }` / `export { type Foo as Bar }` (TS ≥ 4.5,
+ * the isolatedModules/verbatimModuleSyntax house style) exports exactly the
+ * name `Foo`/`Bar` to TS consumers, and the token `type Foo` fails the
+ * IDENTIFIER test wholesale, so the type face of the public API used to move
+ * silently (before/after both blind ⇒ `api-surface-unchanged` vacuously met).
+ * The strip requires whitespace after `type`, so a binding genuinely NAMED
+ * `type` (`export { type }`) survives; `export { type as Foo }` yields `Foo`
+ * under both the TS (type-only re-export) and plain-JS (alias) readings.
  */
 function braceListNames(text: string): string[] {
   const open = text.indexOf('{')
@@ -191,7 +201,7 @@ function braceListNames(text: string): string[] {
   const body = close >= 0 ? text.slice(open + 1, close) : text.slice(open + 1)
   const out: string[] = []
   for (const raw of body.split(',')) {
-    const segment = raw.trim()
+    const segment = raw.trim().replace(/^type\s+/, '')
     if (segment.length === 0) continue
     const aliased = /\bas\s+(.+)$/.exec(segment)
     const token = (aliased?.[1] ?? segment).trim()

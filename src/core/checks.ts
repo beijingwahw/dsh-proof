@@ -82,13 +82,26 @@ const DEFAULT_IGNORE_DIRS = [
 /** Discover every objective check the workspace declares. */
 export async function discoverChecks(fs: FsPort, root: string, options: DiscoverOptions = {}): Promise<CheckSpec[]> {
   const timeoutMs = options.timeoutMs ?? 120_000
+  // W14-L10: `??` only gates null/undefined, so an explicit NaN rode the spec
+  // into the runner as a real timeout (the same hole H-33 sealed at the
+  // excerpt layer). Refuse loudly: a non-finite timeout is a broken delivery,
+  // never a request for the default.
+  if (!Number.isFinite(timeoutMs)) {
+    throw new TypeError(`DiscoverOptions.timeoutMs must be a finite number of milliseconds (got ${timeoutMs})`)
+  }
   const scriptKinds = { ...DEFAULT_SCRIPT_KINDS, ...(options.scriptKinds ?? {}) }
   const found: CheckSpec[] = []
   const push = (spec: Omit<CheckSpec, 'id' | 'timeoutMs'> & { timeoutMs?: number }) => {
+    const resolved = spec.timeoutMs ?? timeoutMs
+    // Same gate for the per-entry spelling: `timeoutMs: NaN` in an explicit
+    // checks entry must not silently pass through the `??`.
+    if (!Number.isFinite(resolved)) {
+      throw new TypeError(`check "${spec.label}" timeoutMs must be a finite number of milliseconds (got ${resolved})`)
+    }
     found.push({
       ...spec,
       id: checkId(spec.source, spec.command, spec.cwd),
-      timeoutMs: spec.timeoutMs ?? timeoutMs,
+      timeoutMs: resolved,
     })
   }
 
@@ -259,11 +272,26 @@ export function checkId(source: CheckSource, command: readonly string[], cwd?: s
  * group, whitespace separates. The old `split(/\s+/)` shredded
  * `pytest -k "foo bar"` into `["pytest","-k","\"foo","bar\""]`, and the quote
  * fragments rode into argv, the label and the checkId material. Single and
- * double quotes both group (no escape processing beyond `\'` inside single
- * and `\"` inside double, matching the common shell reading); an unterminated
- * quote keeps the rest of the string as one token rather than inventing a
- * split the author never wrote. Behaviour for quote-free strings is
- * byte-identical to the old splitter, so every existing id stays put.
+ * double quotes both group; an unterminated quote keeps the rest of the
+ * string as one token rather than inventing a split the author never wrote.
+ * Behaviour for quote-free strings is byte-identical to the old splitter, so
+ * every existing id stays put.
+ *
+ * W14-L8, the two documented deviations from full POSIX shell grammar:
+ *
+ * - **Single quotes have no escapes** (POSIX semantics, fixed): inside `'…'`
+ *   every character is literal, backslash included, and only a bare `'`
+ *   closes. The old reader unescaped `\'` there, which POSIX never does.
+ * - **Double quotes escape only `\"`** (unchanged): the common shell reading;
+ *   `\\` inside double quotes stays a literal backslash.
+ * - **Outside quotes a backslash is LITERAL** (chosen, not POSIX): POSIX
+ *   makes `\x` the literal `x` and `a\ b` ONE word, which would silently
+ *   shred the Windows paths config authors legitimately write
+ *   (`C:\ws\bin\tool` → `C:wsbintool` under POSIX rules). Keeping the
+ *   backslash verbatim and splitting on real whitespace is deterministic,
+ *   survives Windows spellings, and mis-splits only the rare escaped-space
+ *   argv — a wrong-fail the config author sees immediately, never a silent
+ *   identity change.
  */
 function toArray(command: string | readonly string[]): string[] {
   if (typeof command !== 'string') return [...command]
@@ -276,9 +304,16 @@ function toArray(command: string | readonly string[]): string[] {
   }
   for (let i = 0; i < command.length; i += 1) {
     const ch = command[i] as string
-    if (quote !== undefined) {
-      if (ch === quote) { quote = undefined; continue }
-      if (ch === '\\' && i + 1 < command.length && command[i + 1] === quote) { current += quote; i += 1; continue }
+    if (quote === "'") {
+      // POSIX: no escape exists inside single quotes — the backslash is
+      // content, only a bare quote closes.
+      if (ch === "'") { quote = undefined; continue }
+      current += ch
+      continue
+    }
+    if (quote === '"') {
+      if (ch === '"') { quote = undefined; continue }
+      if (ch === '\\' && i + 1 < command.length && command[i + 1] === '"') { current += '"'; i += 1; continue }
       current += ch
       continue
     }

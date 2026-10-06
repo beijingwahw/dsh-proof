@@ -149,6 +149,131 @@ test('H-24: `from pkg import mod` binds the submodule, not only the package', as
   assert.ok(impactClosure(graph2, ['pkg/__init__.py']).has('app.py'), 'the package edge exists')
 })
 
+// ---------------------------------------------------------------------------
+// X-H-17 — the two H-24 regressions. (a) the name-list specifier for
+// `from . import x` was concatenated one dot too long ('..' + 'x' = '..x'),
+// which the resolver walked to the PARENT package — the highest-frequency
+// Python import form resolved to a file that is not the one it binds. (b)
+// H-24's `\./g → /` rewrite of every relative specifier's remainder deleted
+// every JS edge whose FILE NAME carries a dot. Both are missed edges → false
+// "untouched"; the fix direction is dual-candidate probing (both readings
+// emit edges, over-inclusion is the allowed direction).
+// ---------------------------------------------------------------------------
+
+test('X-H-17(a): `from . import x` binds the sibling pkg/x.py, not the parent package', async () => {
+  const files = {
+    '/ws/pkg/__init__.py': '',
+    '/ws/pkg/x.py': 'X = 1\n',
+    '/ws/pkg/main.py': 'from . import x\n',
+    '/ws/x.py': 'PARENT = 1\n',
+  }
+  const fs = MemoryFs.of(files)
+  const graph = await buildDependencyGraph(fs, '/ws', Object.keys(files).map(stripRoot))
+  // The sibling edge is the fix; the parent edge is the bug's dead endpoint.
+  assert.ok(impactClosure(graph, ['pkg/x.py']).has('pkg/main.py'), 'pkg/x.py is a dependency of pkg/main.py')
+  // The parent-package x.py is NOT what the statement binds (it only gained
+  // no edge before because the mangled '..x' resolved to the bare root 'x'
+  // candidate — which DID exist here, the silent mis-binding this test pins).
+  assert.ok(!impactClosure(graph, ['x.py']).has('pkg/main.py'), 'the parent package\'s x.py is not bound by `from . import x`')
+  // `from .. import x` climbs exactly one level out of the subpackage.
+  const files2 = {
+    '/ws/pkg/__init__.py': '',
+    '/ws/pkg/x.py': 'X = 1\n',
+    '/ws/pkg/sub/__init__.py': '',
+    '/ws/pkg/sub/deep.py': 'from .. import x\n',
+  }
+  const graph2 = await buildDependencyGraph(MemoryFs.of(files2), '/ws', Object.keys(files2).map(stripRoot))
+  assert.ok(impactClosure(graph2, ['pkg/x.py']).has('pkg/sub/deep.py'), 'from .. import x -> pkg/x.py')
+  // Site-level KAT of the specifier actually minted (the off-by-one itself).
+  const sites = extractImportSites('from . import x\n')
+  assert.deepEqual(sites.map(s => s.specifier), ['.', '.x'], 'module site "." + name site ".x" — never "..x"')
+})
+
+test('X-H-17(b): JS specifiers whose FILE NAME carries dots keep their edges — both readings probed', async () => {
+  // Angular convention: the file is x.component.ts, the specifier './x.component'.
+  const angular = {
+    '/ws/src/x.component.ts': 'export const c = 1\n',
+    '/ws/src/app.ts': "import { c } from './x.component'\n",
+  }
+  const g1 = await buildDependencyGraph(MemoryFs.of(angular), '/ws', Object.keys(angular).map(stripRoot))
+  assert.ok(impactClosure(g1, ['src/x.component.ts']).has('src/app.ts'), "'./x.component' -> src/x.component.ts (was rewritten to src/x/component)")
+
+  // TS NodeNext: the source is mod.ts, the mandatory spelling is './mod.js'.
+  const nodeNext = {
+    '/ws/src/mod.ts': 'export const m = 1\n',
+    '/ws/src/app.ts': "import { m } from './mod.js'\n",
+  }
+  const g2 = await buildDependencyGraph(MemoryFs.of(nodeNext), '/ws', Object.keys(nodeNext).map(stripRoot))
+  assert.ok(impactClosure(g2, ['src/mod.ts']).has('src/app.ts'), "'./mod.js' -> src/mod.ts via the emitted-extension strip (was rewritten to src/mod/js)")
+
+  // The Python reading still works: '.sub.mod' remains pkg/sub/mod.py.
+  const dotted = {
+    '/ws/pkg/sub/__init__.py': '',
+    '/ws/pkg/sub/mod.py': 'S = 1\n',
+    '/ws/pkg/main.py': 'from .sub.mod import S\n',
+  }
+  const g3 = await buildDependencyGraph(MemoryFs.of(dotted), '/ws', Object.keys(dotted).map(stripRoot))
+  assert.ok(impactClosure(g3, ['pkg/sub/mod.py']).has('pkg/main.py'), "'from .sub.mod import S' -> pkg/sub/mod.py (the slashed reading survives)")
+
+  // Dual-candidate: when BOTH readings exist on disk, both edges are emitted
+  // — the conservative direction is more edges, never fewer.
+  const both = {
+    '/ws/src/dotdir/mod.py': 'P = 1\n',
+    '/ws/src/dotdir/mod.ts': 'T = 1\n',
+    '/ws/src/app.ts': "import { p } from './dotdir.mod'\n",
+  }
+  const g4 = await buildDependencyGraph(MemoryFs.of(both), '/ws', Object.keys(both).map(stripRoot))
+  assert.ok(impactClosure(g4, ['src/dotdir/mod.py']).has('src/app.ts'), 'the Python reading keeps its edge')
+  assert.ok(impactClosure(g4, ['src/dotdir/mod.ts']).has('src/app.ts'), 'the JS dotted-name reading keeps its edge too')
+})
+
+// ---------------------------------------------------------------------------
+// W14-M4/M5 — the two Python statement shapes the line reader dropped.
+// ---------------------------------------------------------------------------
+
+test('W14-M4: semicolon-separated Python statements each carry their edges', async () => {
+  const files = {
+    '/ws/pkg/__init__.py': '',
+    '/ws/pkg/mod.py': 'X = 1\n',
+    '/ws/pkg/other.py': 'Y = 1\n',
+    '/ws/app.py': 'import pkg.mod; import pkg.other\n',
+    '/ws/app2.py': 'from pkg.mod import X; from pkg.other import Y\n',
+  }
+  const fs = MemoryFs.of(files)
+  const graph = await buildDependencyGraph(fs, '/ws', Object.keys(files).map(stripRoot))
+  assert.ok(impactClosure(graph, ['pkg/mod.py']).has('app.py'), 'first statement of `import a; import b` binds')
+  assert.ok(impactClosure(graph, ['pkg/other.py']).has('app.py'), 'SECOND statement of `import a; import b` binds too (both used to be dropped)')
+  assert.ok(impactClosure(graph, ['pkg/mod.py']).has('app2.py'), 'from-list head of the first `from x import y; from z import w` binds')
+  assert.ok(impactClosure(graph, ['pkg/other.py']).has('app2.py'), 'the SECOND `from z import w` statement binds (used to be eaten as a name)')
+  // Site-level: two bare statements mint two module sites.
+  const sites = extractImportSites('import pkg.mod; import pkg.other')
+  assert.deepEqual(sites.map(s => s.specifier), ['pkg.mod', 'pkg.other'])
+})
+
+test('W14-M5: multi-line parenthesised `from pkg import (…)` name lists carry every name edge', async () => {
+  const files = {
+    '/ws/pkg/__init__.py': '',
+    '/ws/pkg/mod.py': 'X = 1\n',
+    '/ws/pkg/helper.py': 'H = 1\n',
+    // black/isort formatting: paren opens on the first line, closes on a
+    // later one — the name list spans lines.
+    '/ws/app.py': 'from pkg import (\n    mod,\n    helper,\n)\n',
+  }
+  const fs = MemoryFs.of(files)
+  const graph = await buildDependencyGraph(fs, '/ws', Object.keys(files).map(stripRoot))
+  assert.ok(impactClosure(graph, ['pkg/__init__.py']).has('app.py'), 'the package edge survives as always')
+  assert.ok(impactClosure(graph, ['pkg/mod.py']).has('app.py'), 'the first continuation name binds (used to be dropped)')
+  assert.ok(impactClosure(graph, ['pkg/helper.py']).has('app.py'), 'the second continuation name binds too')
+  // Comments are legal inside the list and mint nothing.
+  const commented = {
+    '/ws/pkg/__init__.py': '',
+    '/ws/pkg/mod.py': 'X = 1\n',
+    '/ws/app.py': 'from pkg import (\n    # mod moved elsewhere\n    mod,  # trailing comment\n)\n',
+  }
+  const g2 = await buildDependencyGraph(MemoryFs.of(commented), '/ws', Object.keys(commented).map(stripRoot))
+  assert.ok(impactClosure(g2, ['pkg/mod.py']).has('app.py'), 'comment lines inside the list do not eat the names')
+})
+
 test('H-24/M-28: two imports on one line both carry edges — the second is not invisible', async () => {
   const files = {
     '/ws/a.ts': 'export const a = 1\n',
@@ -295,6 +420,25 @@ test('M-26: selection honours a `./`-prefixed narrow path filter end to end', as
   assert.equal(result.uncertain, false)
   assert.deepEqual(result.affected.map(c => c.id), ['src-check'], 'the ./-prefixed check is selectable, not dead')
   assert.deepEqual(result.untouched.map(c => c.id), ['docs-check'])
+})
+
+test('W14-L9: wildcard-all spellings that normalise to `*` are live, not dead', () => {
+  // `./*`, `/*` and `*/` all normalise to the bare wildcard, but the
+  // wildcard-all judgement used to run on the PRE-normalisation string —
+  // these three fell through to the literal comparison (`file === '*'`) and
+  // matched nothing, while their empty-residue sibling `./` matched
+  // everything. One family of spellings, one reading: wildcard-all.
+  for (const pattern of ['*', './*', '/*', '*/', './']) {
+    assert.ok(matches('src/a.ts', pattern), `pattern ${JSON.stringify(pattern)} matches everything`)
+    assert.ok(matches('docs/readme.md', pattern), `pattern ${JSON.stringify(pattern)} matches everything`)
+  }
+  // The narrow prefixed forms keep their exact semantics (no bleed).
+  assert.ok(!matches('docs/readme.md', './src/**'), 'normalised narrow forms still narrow')
+  assert.ok(matches('src/a.ts', './src/*'), 'direct children still match ./src/*')
+  // And `./*` itself, once normalised, IS wildcard-all — it cannot mean
+  // "root children only" in the five-form canon, and the fallback direction
+  // for an uninterpretable intent is over-inclusion (M9), same as `./`.
+  assert.ok(matches('src/a/b.ts', './*'), 'deep files match ./* — normalised to wildcard-all, over-inclusive by design')
 })
 
 test('graph reports truncation so callers can widen', async () => {

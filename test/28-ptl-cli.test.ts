@@ -28,10 +28,11 @@ import { buildBundle } from '../src/app/bundle.ts'
 import { deriveProofPaths } from '../src/adapters/shared/paths.ts'
 import { EvidenceStore, makeEvidence, snapshotWorkspace } from '../src/core/evidence.ts'
 import type { SignerPort } from '../src/core/ports.ts'
-import { lineDigest, walkChain } from '../src/core/trust.ts'
-import { loadPtl, ptlLeafHash } from '../src/core/transparency.ts'
-import type { SignedTreeHead, TransparencyLog } from '../src/core/transparency.ts'
-import { NodeFsPort } from '../src/node-ports.ts'
+import { canonicalJson } from '../src/core/hash.ts'
+import { GENESIS_PREV, checkpointSignedData, lineDigest, walkChain } from '../src/core/trust.ts'
+import { TransparencyLog, loadPtl, ptlLeafHash } from '../src/core/transparency.ts'
+import type { PtlEntry, SignedTreeHead } from '../src/core/transparency.ts'
+import { NodeEd25519Signer, NodeFsPort } from '../src/node-ports.ts'
 import { FakeClock, spec } from './helpers.ts'
 
 const ENTRY = fileURLToPath(new URL('../src/app/ptl-entry.ts', import.meta.url))
@@ -55,21 +56,25 @@ const AT = '2026-10-06T00:00:00.000Z'
 const WS = snapshotWorkspace('head1', ['src/a.ts'])
 const nodeFs = new NodeFsPort()
 
-/** Deterministic stand-in for the engine's key: same shape 09-trust uses. */
+/**
+ * Deterministic stand-in for an engine key this host does NOT hold material
+ * for: same shape 09-trust uses. v0.23: the fixture's MAIN signer is a real
+ * NodeEd25519 key loaded from <trustRoot>/keys (exactly what the CLI's
+ * selection rule verifies with — X-H-11 made verification mandatory, so the
+ * happy path must publish under a key the CLI can actually check); the fake
+ * remains for the refusal fixtures (an anchored key with no local material).
+ */
 class FakeSigner implements SignerPort {
-  readonly keyId = 'fake-key'
+  readonly keyId: string
+  constructor(keyId = 'fake-key') { this.keyId = keyId }
   async sign(data: string): Promise<string> { return `sig:${createHash('sha256').update(data).digest('hex')}` }
   async verify(data: string, signature: string): Promise<boolean> { return signature === `sig:${createHash('sha256').update(data).digest('hex')}` }
 }
 
 const paths = deriveProofPaths({ root: WS_ROOT, trustRoot: TRUST_DIR, evidenceStore: 'host' })
 const fakeSigner = new FakeSigner()
-const store = new EvidenceStore(nodeFs, paths.logPath, paths.baselinePath, new FakeClock(), {
-  signer: async () => fakeSigner,
-  anchorPath: paths.anchorPath,
-  workspaceKey: paths.workspaceKey,
-  checkpointEvery: 1000,
-})
+let store: EvidenceStore
+let engineKeyId = ''
 
 function evidence(id: string) {
   return makeEvidence(spec({ id }), { status: 'pass', exitCode: 0, durationMs: 5, output: 'pass\n' }, WS, new FakeClock())
@@ -111,11 +116,36 @@ function parseSingleLine(stdout: string): Record<string, unknown> {
   return JSON.parse(lines[0] as string) as Record<string, unknown>
 }
 
+/** A canonical one-line PTL entry for hand-forged logs (v0.23 fixtures). */
+function forgedEntry(i: number, over: Partial<PtlEntry> = {}): PtlEntry {
+  return {
+    v: 1,
+    workspaceKey: 'ws-forged',
+    keyId: 'forged-key',
+    count: 10 + i,
+    head: sha256Hex(`forged-head-${i}`),
+    at: AT,
+    sig: `forged-sig-${i}`,
+    ...over,
+  }
+}
+
 before(async () => {
   await fsp.rm(TMP, { recursive: true, force: true })
   await fsp.mkdir(WS_ROOT, { recursive: true })
   await fsp.mkdir(PTL_DIR, { recursive: true })
   await fsp.mkdir(EMPTY_WS, { recursive: true })
+  // v0.23 (X-H-11): the fixture's engine key is a REAL Ed25519 pair at
+  // <trustRoot>/keys — the exact material the CLI's must-verify selection
+  // rule adjudicates checkpoint signatures with.
+  const engineKey = await NodeEd25519Signer.load(join(TRUST_DIR, 'keys'))
+  engineKeyId = engineKey.keyId
+  store = new EvidenceStore(nodeFs, paths.logPath, paths.baselinePath, new FakeClock(), {
+    signer: async () => engineKey,
+    anchorPath: paths.anchorPath,
+    workspaceKey: paths.workspaceKey,
+    checkpointEvery: 1000,
+  })
   // Two records, then a signed checkpoint: the minimal chain worth publishing.
   await store.append(evidence('c1'))
   await store.append(evidence('c2'))
@@ -167,7 +197,7 @@ test('append publishes the latest signed checkpoint, lands the entry on disk and
   const published = JSON.parse(entryLines[0] as string) as { v: number; workspaceKey: string; sig: string }
   assert.equal(published.v, 1)
   assert.equal(published.workspaceKey, paths.workspaceKey, 'the leaf commits to the derived workspace identity')
-  assert.ok(published.sig.startsWith('sig:'), 'the engine checkpoint signature rides along verbatim')
+  assert.match(published.sig, /^[A-Za-z0-9+/]+={0,2}$/, 'the engine checkpoint signature rides along verbatim (real Ed25519, base64)')
 
   // v0.22 (H-07c): the operator key was minted OUTSIDE the log directory —
   // a key sitting next to the data it notarises is self-referential. The
@@ -418,11 +448,11 @@ test('H-06: a foreign-keyId checkpoint appended to the workspace log is never wh
     const published = JSON.parse(
       (await fsp.readFile(join(attackDir, 'ptl-entries.jsonl'), 'utf8')).split('\n')[0] as string,
     ) as { keyId: string; sig: string; count: number }
-    const honest = walk0.checkpoints.findLast(cp => cp.keyId === 'fake-key')
+    const honest = walk0.checkpoints.findLast(cp => cp.keyId === engineKeyId)
     assert.ok(honest !== undefined)
-    assert.equal(published.keyId, 'fake-key', 'the anchored key\'s checkpoint is the publication, not the positional tail')
+    assert.equal(published.keyId, engineKeyId, 'the anchored key\'s checkpoint is the publication, not the positional tail')
     assert.equal(published.count, honest.payload.count)
-    assert.ok(published.sig.startsWith('sig:'), 'the honest signature rode along — the attacker\'s never entered the tree')
+    assert.match(published.sig, /^[A-Za-z0-9+/]+={0,2}$/, 'the honest signature rode along — the attacker\'s never entered the tree')
   } finally {
     // Restore the honest tail so later tests see the pristine log.
     await fsp.writeFile(logPath, `${lines.join('\n')}\n`, 'utf8')
@@ -565,3 +595,213 @@ test('H-07c/M-63: a sth that promises more entries than the log holds is adjudic
   assert.equal(rewindOut.checks.consistency, false)
   assert.ok(rewindOut.notes.some(n => n.includes('rewound')), `got ${JSON.stringify(rewindOut.notes)}`)
 })
+
+// ---------------------------------------------------------------------------
+// v0.23 fix batch — the publication trust-root holes this CLI closed:
+// X-H-10 (planted sth.json laundering), X-H-11 (must-verify selection: the
+// no-key-material refusal and the tail-twin publication DoS), W9-M4 (a
+// disarmed anchor is a refusal, never a silent no-anchor publish), W9-M5
+// (cross-workspace identity laundering), W9-M6 (operator key before the log
+// is touched — no half-published entry), W9-M6b (self-verify: uncertain =
+// fail without the operator key), W9-M9 (badLines surfaced in verify).
+// ---------------------------------------------------------------------------
+
+test('X-H-10: a planted sth.json whose signature does not verify stops the publish — the operator never launders it', async () => {
+  // The attacker rewrites the entries into a forged history AND plants a
+  // self-consistent head over it (correct size, correct forged root, garbage
+  // signature). Consistency from the planted head would "prove" fine — the
+  // proof is minted from the same planted bytes — so the signature gate is
+  // the only thing standing between the forgery and a genuine operator
+  // signature over it.
+  const plantedDir = join(TMP, 'ptl-planted-sth')
+  await fsp.mkdir(plantedDir, { recursive: true })
+  const forged = [forgedEntry(0), forgedEntry(1), forgedEntry(2)]
+  await fsp.writeFile(join(plantedDir, 'ptl-entries.jsonl'), `${forged.map(e => canonicalJson(e)).join('\n')}\n`, 'utf8')
+  const { sth: honest } = await logSnapshot()
+  assert.ok(honest !== undefined, 'fixture: the shared log has a signed head (its logId is the operator identity)')
+  const planted = {
+    logId: honest.logId,
+    treeSize: forged.length,
+    root: new TransparencyLog(forged).merkleRoot(),
+    at: '2026-10-06T05:00:00.000Z',
+    sig: 'QUFBQQ==', // garbage — the attacker signed nothing
+  }
+  await fsp.writeFile(join(plantedDir, 'sth.json'), JSON.stringify(planted), 'utf8')
+
+  const { code, stdout, stderr } = await runCli(['append', '--log', plantedDir])
+  assert.equal(code, 1, 'the operator refuses to extend a head nobody can vouch for')
+  assert.equal(stdout.trim().length, 0, 'a refusal prints nothing on stdout')
+  assert.ok(stderr.includes('does not verify'), `stderr names the forgery: ${stderr}`)
+  assert.ok(stderr.includes('out-of-band'), `stderr names the remedy: ${stderr}`)
+  // The planted head is untouched by the refusal.
+  const after = JSON.parse(await fsp.readFile(join(plantedDir, 'sth.json'), 'utf8')) as { sig: string }
+  assert.equal(after.sig, 'QUFBQQ==', 'the refusal wrote nothing')
+})
+
+test('W9-M4: a disarmed anchor (stripped signature) is a loud refusal, never a silent no-anchor publish', async () => {
+  const anchorPath = paths.anchorPath
+  const honestAnchor = await fsp.readFile(anchorPath, 'utf8')
+  try {
+    const disarmed = { ...(JSON.parse(honestAnchor) as Record<string, unknown>), sig: '' }
+    await fsp.writeFile(anchorPath, JSON.stringify(disarmed), 'utf8')
+    const refusalDir = join(TMP, 'ptl-disarmed-anchor')
+    const { code, stdout, stderr } = await runCli(['append', '--log', refusalDir])
+    assert.equal(code, 1, 'a damaged anchor is tampering until proven otherwise')
+    assert.equal(stdout.trim().length, 0)
+    assert.ok(stderr.includes('DISARMED'), `the refusal names the disarmed anchor: ${stderr}`)
+    await assert.rejects(fsp.stat(join(refusalDir, 'ptl-entries.jsonl')), 'nothing was published while the trust root was disarmed')
+  } finally {
+    await fsp.writeFile(anchorPath, honestAnchor, 'utf8')
+  }
+})
+
+test('X-H-11: an anchor naming a key this host holds no material for is a loud refusal — keyId matching alone proves nothing', async () => {
+  // The workspace's checkpoints are signed (by a key this host genuinely
+  // cannot load — the fixture's deterministic signer, whose material does
+  // NOT live under this trust root's keys directory), and the anchor names
+  // that key. The old rule matched the keyId string and published without
+  // ever verifying anything; the new rule refuses and says what to provide.
+  const wsRoot = join(TMP, 'ws-foreign-anchor')
+  const trustRoot = join(TMP, 'trust-foreign-anchor')
+  await fsp.mkdir(wsRoot, { recursive: true })
+  await fsp.mkdir(trustRoot, { recursive: true })
+  const fPaths = deriveProofPaths({ root: wsRoot, trustRoot, evidenceStore: 'host' })
+  const fStore = new EvidenceStore(nodeFs, fPaths.logPath, fPaths.baselinePath, new FakeClock(), {
+    signer: async () => fakeSigner,
+    anchorPath: fPaths.anchorPath,
+    workspaceKey: fPaths.workspaceKey,
+    checkpointEvery: 1000,
+  })
+  await fStore.append(evidence('f1'))
+  await fStore.checkpoint()
+  await assert.rejects(fsp.stat(join(trustRoot, 'keys')), 'fixture: no engine key material at this trust root')
+
+  const { code, stdout, stderr } = await runCli(
+    ['append', '--log', join(TMP, 'ptl-foreign-anchor')],
+    { DSH_PROOF_ROOT: wsRoot, DSH_PROOF_TRUST_DIR: trustRoot },
+  )
+  assert.equal(code, 1)
+  assert.equal(stdout.trim().length, 0, 'a refusal prints nothing on stdout')
+  assert.ok(stderr.includes('no key material'), `stderr names the missing capability: ${stderr}`)
+  assert.ok(!stderr.includes('    at '), 'no stack traces, ever')
+})
+
+test('X-H-11/W9-M5: a garbage-signature twin at the tail cannot brick publication — the scan-back finds the earlier verifiable checkpoint', async () => {
+  // The attacker appends a well-formed checkpoint CLAIMING the anchored
+  // keyId with a garbage signature at the positional tail. The old rule
+  // (findLast + one-shot veto) refused to publish anything ever again; the
+  // new rule scans back to the newest checkpoint that actually verifies.
+  const logPath = paths.logPath
+  const lines = (await fsp.readFile(logPath, 'utf8')).split('\n').filter(l => l.trim().length > 0)
+  const walk0 = walkChain(lines)
+  const lastLine = lines[lines.length - 1] as string
+  const twin = JSON.stringify({
+    v: 2,
+    kind: 'checkpoint',
+    at: AT,
+    prev: lineDigest(lastLine),
+    payload: { count: walk0.records, head: sha256Hex('twin-head'), workspaceKey: paths.workspaceKey, at: AT },
+    sig: 'QUFBQQ==', // claims the anchored key, signs nothing
+    keyId: engineKeyId,
+  })
+  await fsp.writeFile(logPath, `${[...lines, twin].join('\n')}\n`, 'utf8')
+  try {
+    const twinDir = join(TMP, 'ptl-tail-twin')
+    const { code, stdout, stderr } = await runCli(['append', '--log', twinDir])
+    assert.equal(code, 0, `the earlier honest checkpoint is still publishable: ${stderr}`)
+    const out = parseSingleLine(stdout) as { sequence: number; treeSize: number }
+    assert.equal(out.treeSize, 1)
+    const published = JSON.parse(
+      (await fsp.readFile(join(twinDir, 'ptl-entries.jsonl'), 'utf8')).split('\n')[0] as string,
+    ) as { sig: string; keyId: string }
+    assert.equal(published.keyId, engineKeyId, 'the anchored key\'s honest checkpoint is the publication')
+    assert.match(published.sig, /^[A-Za-z0-9+/]+={0,2}$/, 'the VERIFIED checkpoint was published, not the positional-last twin')
+  } finally {
+    // Restore the honest tail so later tests see the pristine log.
+    await fsp.writeFile(logPath, `${lines.join('\n')}\n`, 'utf8')
+  }
+})
+
+test('W9-M5: a checkpoint signed for a FOREIGN workspace identity is refused, not laundered', async () => {
+  // A one-line chain whose checkpoint is genuinely signed by this trust
+  // root's engine key — for a DIFFERENT workspace. Without the cross-check,
+  // copying workspace A's chain into workspace B published A's signed
+  // checkpoint under B's identity; the log is a notary, not a laundering
+  // service.
+  const wsRoot = join(TMP, 'ws-cross')
+  const trustRoot = join(TMP, 'trust-cross')
+  await fsp.mkdir(wsRoot, { recursive: true })
+  const cPaths = deriveProofPaths({ root: wsRoot, trustRoot, evidenceStore: 'host' })
+  const key = await NodeEd25519Signer.load(join(trustRoot, 'keys'))
+  const payload = { count: 0, head: sha256Hex('cross-head'), workspaceKey: 'ws-somewhere-else', at: AT }
+  const envelope = {
+    v: 2,
+    kind: 'checkpoint',
+    at: AT,
+    prev: GENESIS_PREV,
+    payload,
+    sig: await key.sign(checkpointSignedData(payload)),
+    keyId: key.keyId,
+  }
+  await fsp.mkdir(join(cPaths.logPath, '..'), { recursive: true })
+  await fsp.writeFile(cPaths.logPath, `${JSON.stringify(envelope)}\n`, 'utf8')
+  const { code, stdout, stderr } = await runCli(
+    ['append', '--log', join(TMP, 'ptl-cross')],
+    { DSH_PROOF_ROOT: wsRoot, DSH_PROOF_TRUST_DIR: trustRoot },
+  )
+  assert.equal(code, 1)
+  assert.equal(stdout.trim().length, 0)
+  assert.ok(stderr.includes('signed for workspace'), `the refusal names the identity mismatch: ${stderr}`)
+})
+
+test('W9-M6: an operator key that cannot be loaded fails BEFORE the log is touched — no half-published entry', async () => {
+  const keyAsFile = join(TMP, 'operator-key-as-file')
+  await fsp.writeFile(keyAsFile, 'not a directory', 'utf8')
+  const fresh = join(TMP, 'ptl-operator-first')
+  await fsp.mkdir(fresh, { recursive: true })
+  const { code, stdout, stderr } = await runCli(['append', '--log', fresh, '--operator-key', keyAsFile])
+  assert.equal(code, 1, 'loading a key from a path that is a file fails loudly')
+  assert.equal(stdout.trim().length, 0)
+  assert.ok(stderr.length > 0, 'the failure speaks')
+  await assert.rejects(fsp.stat(join(fresh, 'ptl-entries.jsonl')), 'no entry was appended — the half-published state is unreachable')
+})
+
+test('W9-M6b: self-verify without the operator key FAILS — uncertain = fail on the no-bundle face too', async () => {
+  const { code, stdout, stderr } = await runCli(['verify', '--log', PTL_DIR, '--operator-key', join(TMP, 'no-such-operator-key')])
+  assert.equal(code, 1, `a head nobody verified must not carry a green self-check: ${stderr}`)
+  const out = parseSingleLine(stdout) as {
+    ok: boolean
+    checks: { rootMatch: boolean; headSignature?: boolean }
+    notes: string[]
+  }
+  assert.equal(out.ok, false)
+  assert.equal(out.checks.rootMatch, true, 'the tree itself is honest — the failure is the unadjudicated signature')
+  assert.equal(out.checks.headSignature, undefined, 'headSignature stays absent: never guessed')
+  assert.ok(
+    out.notes.some(n => n.includes('operator key absent') && n.includes('uncertain')),
+    `the absence is stated as a failure: ${JSON.stringify(out.notes)}`,
+  )
+})
+
+test('W9-M9: malformed lines in the entries file are surfaced and fail the self-check', async () => {
+  const damaged = join(TMP, 'ptl-badlines')
+  await fsp.mkdir(damaged, { recursive: true })
+  await fsp.copyFile(join(PTL_DIR, 'ptl-entries.jsonl'), join(damaged, 'ptl-entries.jsonl'))
+  await fsp.copyFile(join(PTL_DIR, 'sth.json'), join(damaged, 'sth.json'))
+  // Insert a garbage line AFTER the honest entries: no entry moves, the root
+  // still matches — the old self-check was blind to exactly this damage.
+  await fsp.appendFile(join(damaged, 'ptl-entries.jsonl'), 'this line is not json at all\n', 'utf8')
+  const { code, stdout } = await runCli(['verify', '--log', damaged])
+  assert.equal(code, 1)
+  const out = parseSingleLine(stdout) as {
+    ok: boolean
+    badLines: number
+    checks: { rootMatch: boolean }
+    notes: string[]
+  }
+  assert.equal(out.ok, false, 'physical damage the tree cannot speak for fails the audit')
+  assert.equal(out.badLines, 1, 'the damage is counted in the output')
+  assert.equal(out.checks.rootMatch, true, 'the readable prefix still agrees with the head — the damage is named, not smeared')
+  assert.ok(out.notes.some(n => n.includes('malformed')), JSON.stringify(out.notes))
+})
+

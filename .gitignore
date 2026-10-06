@@ -5,3 +5,4 @@ lib/
 .it-tmp/
 pack.log
 .deploy-key/
+.openclaw/

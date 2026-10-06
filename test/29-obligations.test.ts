@@ -28,6 +28,11 @@
  *    enters them, and a composer that refuses to fold circular responsibility.
  * 7. **Waiver visibility** — waived work is excused AND shown; forged work is
  *    neither excused nor hidden.
+ * 8. **Re-submission memory** (W7-8) — a booked forgery survives a clean
+ *    re-submission (`mergeSubmission`); **id re-derivation** (W7-7) — a
+ *    recorded obligation id that no longer addresses the record is a named
+ *    rewrite. Plus the X-H-07 pin: a never-submitted leaf composes
+ *    `unproven`, never a zero-blocker `proven`.
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -37,7 +42,7 @@ import { sha256 } from '../src/core/hash.ts'
 import type { ProofGrade } from '../src/core/evidence.ts'
 import {
   bundleFingerprint, childrenByParent, composeTaskVerdict, composeVerdict,
-  detectCycles, obligationIdOf,
+  detectCycles, mergeSubmission, obligationIdOf, obligationRewriteProblem,
   type DagNode, type DelegationSubmission, type ObligationWaiver, type TaskObligation,
 } from '../src/core/obligations.ts'
 
@@ -281,10 +286,13 @@ test('the composition matrix: every child state, waived and not, over every own 
     absent?: readonly string[]
   }
   // Expectations hand-annotated from the lattice, one child (task-7) per row:
-  //   broken work (forged/regressed) → parent regressed, waiver powerless;
-  //   missing work (stale/unproven/no-baseline/unsubmitted) → parent stale
-  //   unless waived; all children fine → the parent's own grade, with
-  //   undefined (pure delegation) reading as proven.
+  //   broken work (forged/regressed — child OR own) → regressed, waiver
+  //   powerless; missing work (stale/unproven/no-baseline/unsubmitted) →
+  //   stale unless waived; all children fine → the parent's own grade, with
+  //   undefined (pure delegation) reading as proven. X-H-18 pins the cross
+  //   product the old priority ordering laundered: own regressed × missing
+  //   child is REGRESSED, not a waivable stale — more bad news must never
+  //   make the verdict easier to waive.
   const rows: readonly Row[] = [
     // -- one PROVEN child: the verdict is the parent's own story --
     { name: 'proven child / pure delegation', child: 'proven', waived: false, own: undefined, grade: 'proven', ownFlag: true, absent: ['task-7'] },
@@ -306,6 +314,12 @@ test('the composition matrix: every child state, waived and not, over every own 
     // -- forged work: the loudest fact, immune to everything --
     { name: 'forged child', child: 'forged', waived: false, own: 'proven', grade: 'regressed', ownFlag: true, forged: ['task-7'], has: ['task-7 claimed proven but its artifact does not verify', 'task-7: manifest digests do not match file contents'] },
     { name: 'forged child WITH waiver → waiver is decoration', child: 'forged', waived: true, own: 'proven', grade: 'regressed', ownFlag: true, forged: ['task-7'], waivedList: ['task-7'], has: ['claimed proven but its artifact does not verify', 'waived by ops-lead'] },
+    // -- X-H-18: own broken work × missing child — the degradation is NOT
+    //    laundered into a waivable stale by the child's absence --
+    { name: 'own regressed + unsubmitted child → regressed (X-H-18)', child: 'unsubmitted', waived: false, own: 'regressed', grade: 'regressed', ownFlag: false, unproven: ['task-7'], has: ['task-7 has no submission on record', 'own workspace evidence is regressed'] },
+    { name: 'own regressed + stale child → regressed (X-H-18)', child: 'stale', waived: false, own: 'regressed', grade: 'regressed', ownFlag: false, unproven: ['task-7'], has: ['task-7 is not proven (stale)', 'own workspace evidence is regressed'] },
+    { name: 'own regressed + WAIVED unsubmitted child → still regressed (X-H-18: the waiver excuses the child, never the own work)', child: 'unsubmitted', waived: true, own: 'regressed', grade: 'regressed', ownFlag: false, waivedList: ['task-7'], has: ['own workspace evidence is regressed'], absent: ['has no submission'] },
+    { name: 'own stale + unsubmitted child → stale (missing work does not upgrade a mere process gap)', child: 'unsubmitted', waived: false, own: 'stale', grade: 'stale', ownFlag: false, unproven: ['task-7'], has: ['task-7 has no submission on record', 'own workspace evidence is stale'] },
   ]
 
   for (const r of rows) {
@@ -376,6 +390,61 @@ test('a childless task is its own evidence: own grade as-is, undefined reads as 
   const leaf = composeTaskVerdict('task-9', [node(9)], gradeMap([['task-9', 'no-baseline']]))
   assert.equal(leaf.grade, 'no-baseline')
   assert.deepEqual(leaf.blockers, ['own workspace evidence is no-baseline'])
+})
+
+test('X-H-07: a never-submitted leaf composes unproven — absence is not discharge', () => {
+  // No children, no submission, no engine measurement: the OLD ownLevelOf
+  // answered undefined ("pure delegation") and the lattice's fallback minted
+  // a zero-blocker proven out of pure absence. Nobody proved the claim, so
+  // the honest verdict is unproven.
+  const v = composeTaskVerdict('task-9', [node(9)], gradeMap([]))
+  assert.equal(v.grade, 'unproven')
+  assert.equal(v.own, false)
+  assert.deepEqual(v.forgedChildren, [])
+  assert.deepEqual(v.regressedChildren, [])
+  assert.deepEqual(v.unprovenChildren, [])
+  assert.deepEqual(v.blockers, ['own workspace evidence is unproven'])
+
+  // The default only fills pure absence — a measurement or a submission
+  // still speaks first.
+  assert.equal(composeTaskVerdict('task-9', [node(9)], gradeMap([['task-9', 'stale']])).grade, 'stale')
+  assert.equal(
+    composeTaskVerdict('task-9', [node(9, { submission: submission({ claimedGrade: 'stale' }) })], gradeMap([])).grade,
+    'stale',
+  )
+  // A pure delegator WITH children keeps the pure-delegation reading: the
+  // undefined own-grade means "delegated everything", and the children
+  // carry the verdict (see the flagship test).
+  const org = composeTaskVerdict(
+    'task-1',
+    [node(1), node(2, { obligation: obligation(2, { parentTaskId: 'task-1' }), submission: submission() })],
+    gradeMap([]),
+  )
+  assert.equal(org.grade, 'proven')
+})
+
+test('X-H-18 recursion: own-regressed middle + unsubmitted grandchild regresses the root', () => {
+  // The middle child honestly reports its own workspace regressed; its own
+  // subcontractor never submitted. The old priority folded the middle to a
+  // waivable 'stale' at the root — buying out the degradation with someone
+  // else's missing work. The own regression must survive the fold.
+  const tree = chain(
+    { submission: submission({ claimedGrade: 'regressed', artifactVerified: true }) },
+    childNode('unsubmitted', 3),
+  )
+  const root = composeTaskVerdict('task-1', tree, gradeMap([['task-1', 'proven']]))
+  assert.equal(root.grade, 'regressed')
+  assert.deepEqual(root.regressedChildren, ['task-2'], 'the middle carries its own regression up, not a laundered stale')
+
+  // Waiving the missing grandchild excuses the missing work — and ONLY the
+  // missing work: the middle's own degradation still holds the root.
+  const waivered = chain(
+    { submission: submission({ claimedGrade: 'regressed', artifactVerified: true }) },
+    { ...childNode('unsubmitted', 3), waiver: waiver() },
+  )
+  const waivedRoot = composeTaskVerdict('task-1', waivered, gradeMap([['task-1', 'proven']]))
+  assert.equal(waivedRoot.grade, 'regressed', 'waiver excuses missing work, never broken work')
+  assert.deepEqual(waivedRoot.regressedChildren, ['task-2'])
 })
 
 // ---------------------------------------------------------------------------
@@ -599,6 +668,35 @@ test('detectCycles: self-loops, disjoint cycles, dangling parents, and clean for
   assert.deepEqual(detectCycles([]), [])
 })
 
+test('W7-5: a duplicate taskId whose later copy self-parents is a detected cycle, not an unbounded fold', () => {
+  // task-2 was minted under task-1, then a second record re-registered
+  // task-2 under ITSELF. The old first-wins walk saw only the first record's
+  // parent edge, found no cycle — and the recursive fold grouped children by
+  // every record, chased task-2's children through its own duplicate, and
+  // blew the stack. Every recorded edge is walked now.
+  const duplicated: readonly TaskObligation[] = [
+    obligation(1),
+    obligation(2, { parentTaskId: 'task-1' }),
+    obligation(2, { parentTaskId: 'task-2' }),
+  ]
+  assert.deepEqual(detectCycles(duplicated), ['task-2 -> task-2'])
+  // The composer refuses with the cycle verdict instead of crashing.
+  const v = composeTaskVerdict('task-1', duplicated.map(o => ({ obligation: o })), gradeMap([]))
+  assert.equal(v.grade, 'unproven')
+  assert.equal(v.blockers[0], 'responsibility cycle detected')
+  assert.deepEqual(v.blockers.slice(1), ['cycle: task-2 -> task-2'])
+
+  // A duplicate that closes no cycle (same parent twice) is still no cycle:
+  // duplicated registration is a minting error the fold tolerates, exactly
+  // as before.
+  const benign: readonly TaskObligation[] = [
+    obligation(1),
+    obligation(2, { parentTaskId: 'task-1' }),
+    obligation(2, { parentTaskId: 'task-1' }),
+  ]
+  assert.deepEqual(detectCycles(benign), [])
+})
+
 test('composeTaskVerdict adjudicates the queried task OWN submission: self-forgery is named and capped', () => {
   // A delegated task composed over its own node: its submission is the one
   // fact in scope (the engine's submitDelegation → composeTaskVerdict path).
@@ -722,4 +820,56 @@ test('childrenByParent groups by parent, keeps roots under undefined, preserves 
   assert.deepEqual(map.get('task-2'), [o4])
   assert.equal(map.get('task-3'), undefined, 'no key for childless tasks')
   assert.equal(map.size, 3)
+})
+
+// ---------------------------------------------------------------------------
+// 8. Re-submission memory (W7-8) and id re-derivation (W7-7)
+// ---------------------------------------------------------------------------
+
+test('W7-8: a re-submission cannot launder a booked forgery — mergeSubmission keeps the flag sticky', () => {
+  const forged = submission({
+    claimedGrade: 'proven',
+    artifactVerified: false,
+    problems: ['digest mismatch'],
+  })
+  const clean = submission({ bundleRoot: sha256('clean-bundle') })
+
+  // Verdict fields are last-wins; the forgery flag rides on top of them.
+  const merged = mergeSubmission(forged, clean)
+  assert.equal(merged.priorForgery, true)
+  assert.equal(merged.claimedGrade, clean.claimedGrade)
+  assert.equal(merged.artifactVerified, clean.artifactVerified)
+  assert.equal(merged.bundleRoot, clean.bundleRoot)
+
+  // The composer reads the merged submission as forged: waiver-immune
+  // regressed, the task named in forgedChildren.
+  const v = composeTaskVerdict('task-5', [node(5, { submission: merged })], gradeMap([]))
+  assert.equal(v.grade, 'regressed')
+  assert.deepEqual(v.forgedChildren, ['task-5'])
+  const asChild = composeVerdict([node(5, { submission: merged })], 'proven')
+  assert.equal(asChild.grade, 'regressed')
+  assert.deepEqual(asChild.forgedChildren, ['task-5'])
+  const waived = composeVerdict(
+    [node(5, { submission: merged, waiver: waiver({ by: 'cto', reason: 'clean now, honest' }) })],
+    'proven',
+  )
+  assert.equal(waived.grade, 'regressed', 'a waiver cannot buy out a booked forgery')
+
+  // The clean-first order stays clean: no flag where no forgery was booked.
+  assert.equal(mergeSubmission(undefined, clean).priorForgery, undefined)
+  assert.equal(mergeSubmission(clean, clean).priorForgery, undefined)
+  assert.equal(mergeSubmission(undefined, forged).priorForgery, undefined, 'a LIVE forgery needs no flag — it is its own fact')
+  // Sticky across many re-submissions: forged → clean → clean still forged.
+  assert.equal(mergeSubmission(merged, clean).priorForgery, true)
+})
+
+test('W7-7: obligationRewriteProblem names a re-derived id that disagrees with the recorded one', () => {
+  const o = obligation(2, { parentTaskId: 'task-1' })
+  // No recorded id, or one that still matches → nothing to book.
+  assert.equal(obligationRewriteProblem(undefined, o), undefined)
+  assert.equal(obligationRewriteProblem(obligationIdOf(o), o), undefined)
+  // A recorded id addressing DIFFERENT bytes is a detectable rewrite.
+  const imposter = obligationIdOf({ ...o, claim: `${o.claim}!` })
+  const line = obligationRewriteProblem(imposter, o)
+  assert.match(line ?? '', /^recorded obligation id [0-9a-f]{16} does not match the re-derived [0-9a-f]{16} — the obligation was rewritten$/)
 })

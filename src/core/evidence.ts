@@ -269,7 +269,16 @@ export function snapshotWorkspace(
   }
   const head = a as string | null
   const dirty = [...(b ?? [])].sort()
-  return { head, dirty, dirtDigest: sha256(dirty.join('\n')) }
+  // W1-M8 (v0.23): length-prefixed encoding, not `join('\n')`. POSIX file
+  // names may contain `\n`, so `['a\nb']` and `['a', 'b']` hashed equal —
+  // "the same dirt" compared equal for different dirty sets. Each component
+  // is spelled `<length>:<exactly length chars>`, which is uniquely parseable,
+  // so the concatenation is injective over the list. The empty list still
+  // digests the empty string (a clean tree keeps its old digest); every other
+  // set now hashes differently than the v0.22 formula, which only affects
+  // FUTURE records' addresses — stored records keep their recorded digest and
+  // still address themselves under it.
+  return { head, dirty, dirtDigest: sha256(dirty.map(p => `${p.length}:${p}`).join('')) }
 }
 
 // ---------------------------------------------------------------------------
@@ -460,6 +469,20 @@ export function isProtectedMarkerLabel(label: unknown): boolean {
       || label === 'proof/verified')
 }
 
+/**
+ * X-H-08 (v0.23): the `baseline/*` labels that *change what the log believes
+ * about the baseline document* — `baseline/saved` (a new file's digest became
+ * the remembered truth) and `baseline/established` (the engine took a fresh
+ * anchor, with its own tamper/degradation metadata). An out-of-band append
+ * under either label re-defines the baseline the next session verifies
+ * against, which is why the pre-sign audit refuses to lend the host key over
+ * foreign ones (see `preSignAudit`). Informational `baseline/*` labels beyond
+ * these two (none today) would need the same treatment before being added.
+ */
+export function isBaselineMarkerLabel(label: unknown): boolean {
+  return label === 'baseline/saved' || label === 'baseline/established'
+}
+
 /** One marker line, read back with its tamper-evidence metadata. */
 export interface MarkerRecord {
   /** Index of the marker line within the log. */
@@ -480,6 +503,12 @@ export interface MarkerRecord {
 
 /**
  * Every marker line in a log snapshot, in order, with suspect flags.
+ *
+ * @internal Single-pass parsing primitive over raw lines. Kept exported for
+ * tests and for `EvidenceStore` internals; the trust-decision read surface is
+ * {@link createVerifiedView} (v0.23) — engine and tool consumers migrate there
+ * so suspect adjudication, the generational fallback and the single-read
+ * discipline live in exactly one place.
  *
  * Pure over the given lines — callers hand in the same physical snapshot the
  * rest of their judgement used (the TOCTOU rule: one read, many derivations).
@@ -502,12 +531,22 @@ export function readMarkers(lines: readonly string[], options: { readonly label?
   return out
 }
 
-/** The line indexes {@link readMarkers} would flag as suspect. */
+/**
+ * @internal The line indexes {@link readMarkers} would flag as suspect.
+ * Tests and the audit report consume this; trust decisions belong on
+ * {@link createVerifiedView}.
+ */
 export function suspectMarkerIndexes(lines: readonly string[]): readonly number[] {
   return readMarkers(lines).filter(m => m.suspect).map(m => m.index)
 }
 
-/** Whether the marker line at `index` is suspect under the H-32 rule. */
+/**
+ * @internal Whether the marker line at `index` is suspect under the H-32
+ * rule. NOTE: each call re-scans the whole log — never call it in a loop over
+ * markers (W1-L12/X-M-18: that is the O(n²)~O(n³) read amplification the
+ * verified view exists to kill). Kept for the engine's legacy read paths
+ * during migration and for tests.
+ */
 export function isSuspectMarker(lines: readonly string[], index: number): boolean {
   return suspectMarkerIndexes(lines).includes(index)
 }
@@ -535,6 +574,26 @@ export class EvidenceStore {
   private recordsSoFar = 0
   private sinceCheckpoint = 0
   private signerPromise: Promise<SignerPort | undefined> | undefined
+  /**
+   * W1-M3 (v0.23): the failure of the most recent signer-provider attempt,
+   * when that attempt REJECTED. The memoized promise settles `undefined` for
+   * both "no signer yet" and "provider failed" (the M15 retry semantics
+   * require the failure not be cached); this side channel carries WHICH of
+   * the two it was, so `checkpointInternal` can record a transient provider
+   * failure on the sigError channel instead of writing a naked unsigned
+   * checkpoint. Consumed on first read — a later `undefined` resolution is a
+   * fresh answer, not this failure.
+   */
+  private signerResolveError: string | undefined
+  /**
+   * X-H-08 (v0.23): digests of every `baseline/saved` / `baseline/established`
+   * marker line THIS process wrote (via `mark`/`saveBaseline`). Content
+   * addressing makes the set replay-proof: an attacker re-appending one of
+   * these lines verbatim keeps its digest but breaks the chain (its `prev`
+   * still points at its original predecessor); altering anything to re-chain
+   * it changes the digest out of the set. See `preSignAudit`.
+   */
+  private readonly selfBaselineMarkers = new Set<string>()
   /**
    * Single-flight tail for every log-mutating operation. Two concurrent
    * `append`/`mark`/`checkpoint` calls both read the same `this.tail`, both
@@ -614,32 +673,42 @@ export class EvidenceStore {
   }
 
   private async resolveSigner(): Promise<SignerPort | undefined> {
-    if (this.trust.signer === undefined) return undefined
-    // M15: only a SUCCESSFUL resolution is memoized. The old
-    // `this.signerPromise ??= this.trust.signer().catch(() => undefined)`
-    // cached the FIRST outcome, failure included — a transient provider error
-    // (key directory locked by an AV scan, a network blip) then poisoned every
-    // later checkpoint in this process: all of them landed unsigned, and since
-    // `unsignedCheckpoints` never empties while a signer is active again, the
-    // audit's `ok` could never recover either, even after the provider healed.
-    // Recovery semantics now: a rejected (or empty) resolution is NOT
-    // remembered — the next checkpoint retries the provider, so a healed
-    // signer resumes signing (and re-verifies) on the next boundary; a
-    // resolved signer is cached for the process lifetime, as before.
+    return (await this.resolveSignerEx()).signer
+  }
+
+  /**
+   * W1-M3 (v0.23): the adjudicated form of `resolveSigner`. A provider that
+   * REJECTS is a transient signing-capability failure — the same social
+   * reality as `sign()` throwing (M-33: an AV scan holding the key directory)
+   * — and the checkpoint boundary must record it on the sigError channel
+   * rather than writing a naked unsigned line that `unsignedCheckpoints`
+   * charges forever (no keyId, hence no possible recovery witness: one
+   * transient blip and the audit could never go green again, which is how
+   * operators learn to ignore reds). Memoization semantics are M15's, bitten
+   * open: only a SUCCESSFUL resolution is cached; a rejection or an empty
+   * resolution is retried on the next boundary.
+   */
+  private async resolveSignerEx(): Promise<{ readonly signer?: SignerPort; readonly error?: string }> {
+    if (this.trust.signer === undefined) return {}
     if (this.signerPromise === undefined) {
       const attempt = this.trust.signer().then(
         signer => {
           if (signer === undefined) this.signerPromise = undefined // no signer yet — ask again next time
           return signer
         },
-        () => {
+        error => {
           this.signerPromise = undefined // transient failure — retry on the next checkpoint
+          this.signerResolveError = errorMessage(error) // but THIS boundary must record it (W1-M3)
           return undefined
         },
       )
       this.signerPromise = attempt
     }
-    return this.signerPromise
+    const signer = await this.signerPromise
+    if (signer !== undefined) return { signer }
+    const error = this.signerResolveError
+    this.signerResolveError = undefined
+    return error === undefined ? {} : { error }
   }
 
   /**
@@ -697,19 +766,34 @@ export class EvidenceStore {
 
   private async markInternal(label: string, data: Record<string, unknown>): Promise<void> {
     await this.ensureTail()
+    // W1-M6 (v0.23): `label` is store-owned, exactly like `headRef` below.
+    // The old `{ label, ...data }` spread let any caller (or any future caller
+    // that forwards user-shaped objects, the way `economics/quote` spreads a
+    // quote) re-brand the line: `mark('session/start', { label: 'attest/human' })`
+    // landed as an attest marker. The accidental defence — a re-branded
+    // protected label lacked headRef and read back suspect — only held while
+    // no caller ever spread, which is not a property of the API. The caller's
+    // `label` key is dropped before the payload is built; honest callers never
+    // sent one, so their bytes (label first, then data, then headRef) are
+    // unchanged.
+    const { label: _callerLabel, ...callerData } = data
     const envelope: LogEnvelope = {
       v: 2,
       kind: 'marker',
       at: new Date(this.clock.now()).toISOString(),
       prev: this.tail,
       // H-32/M-A1-5: protected markers carry the chain head the writer saw at
-      // append time. The store writes it AFTER `data` so no caller field can
-      // override the witness, and it equals the line's own `prev` for every
-      // honest write — a marker replayed at, moved to, or injected at another
-      // position contradicts it and reads back as suspect (see `readMarkers`).
-      payload: { label, ...data, ...(isProtectedMarkerLabel(label) ? { headRef: this.tail } : {}) },
+      // append time, written AFTER the caller data so no field can override
+      // the witness; it equals the line's own `prev` for every honest write —
+      // a marker replayed at, moved to, or injected at another position
+      // contradicts it and reads back as suspect (see `readMarkers`).
+      payload: { label, ...callerData, ...(isProtectedMarkerLabel(label) ? { headRef: this.tail } : {}) },
     }
     await this.writeEnvelope(envelope)
+    // X-H-08: remember the digest of every baseline-family marker line THIS
+    // process wrote — the author set the pre-sign audit's unvouched-marker
+    // rule (see `preSignAudit`) checks foreign lines against.
+    if (isBaselineMarkerLabel(label)) this.selfBaselineMarkers.add(this.tail)
     this.recordsSoFar += 1
     this.sinceCheckpoint += 1
     await this.maybeCheckpoint()
@@ -728,7 +812,8 @@ export class EvidenceStore {
 
   private async checkpointInternal(): Promise<void> {
     await this.ensureTail()
-    const signer = await this.resolveSigner()
+    const resolved = await this.resolveSignerEx()
+    const signer = resolved.signer
     // H-27: never lend the host key to bytes that arrived behind the queue's
     // back. A signature is the one thing a rewriter cannot forge — and a
     // checkpoint signed over a rewritten chain would lift the out-of-band
@@ -767,6 +852,15 @@ export class EvidenceStore {
         sigError = errorMessage(error)
         keyId = signer.keyId
       }
+    } else if (resolved.error !== undefined) {
+      // W1-M3 (v0.23): the provider itself failed transiently — the same
+      // loud-degradation channel as a failing `sign()` above, instead of a
+      // naked unsigned line `unsignedCheckpoints` could never pardon (no
+      // keyId means no possible recovery witness; one blip red the audit
+      // forever). No keyId is stamped because a provider that never resolved
+      // never named one — the boundary documents the failure, and the next
+      // boundary (M15 retry semantics) signs again.
+      sigError = resolved.error
     }
     const envelope: LogEnvelope = {
       v: 2,
@@ -804,6 +898,11 @@ export class EvidenceStore {
    * unsigned checkpoint (transient signing failure) or an unverifiable
    * foreign one is NOT a reason to refuse — those have their own channels,
    * and refusing on them would make recovery from an honest blip impossible.
+   *
+   * X-H-08 (v0.23) adds the one *authorship* signal: a `baseline/saved` or
+   * `baseline/established` marker line sitting on the checkpoint-uncovered
+   * tail that THIS process never wrote (see `selfBaselineMarkers`). See the
+   * rule's full comment inline below.
    */
   private async preSignAudit(signer: SignerPort): Promise<string | undefined> {
     const lines = await this.fs.readLines(this.logPath)
@@ -812,13 +911,19 @@ export class EvidenceStore {
     if (walk.chainBreaks.length > 0) problems.push(`chain-breaks@${walk.chainBreaks.join(',')}`)
     if (walk.corruptLines.length > 0) problems.push(`corrupt-lines@${walk.corruptLines.join(',')}`)
     if (walk.malformedCheckpoints.length > 0) problems.push(`malformed@${walk.malformedCheckpoints.join(',')}`)
-    const headLiars = walk.checkpoints.filter(cp => cp.payload.head !== cp.expectedHead)
+    const headLiars = walk.checkpoints.filter(cp => cp.headLiared)
     if (headLiars.length > 0) problems.push(`head-liars@${headLiars.map(cp => cp.index).join(',')}`)
     const physicalTail = lines.length === 0 ? GENESIS_PREV : lineDigest(lines[lines.length - 1] as string)
     if (physicalTail !== this.tail) problems.push('physical-tail-moved-behind-the-queue')
     // Our own key must not already be vouching for a lie on this chain: a
     // checkpoint that names this signer but fails its signature is a forged
     // use of the host identity, and signing on top of it would bury it.
+    // The same pass derives the vouching boundary the X-H-08 rule below
+    // measures the tail against: the LAST checkpoint of THIS key whose
+    // signature this host actually verified. Only a verified signature of
+    // the host key vouches — a bare checkpoint line, or one under a foreign
+    // keyId, is appendable by anyone and must not launder what trails it.
+    let vouchedIndex = -1
     for (const cp of walk.checkpoints) {
       if (cp.sig === null || cp.keyId !== signer.keyId) continue
       let honest: boolean
@@ -827,8 +932,67 @@ export class EvidenceStore {
       } catch {
         honest = false
       }
-      if (!honest) { problems.push(`refuted-signature@${cp.index}`); break }
+      if (honest) vouchedIndex = cp.index
+      else { problems.push(`refuted-signature@${cp.index}`); break }
     }
+    // X-H-08 (v0.23): cross-session tail absorption. Between sessions (no
+    // store process alive — CLI invocations, MCP server restarts) an append
+    // of well-formed, correctly-chained, headRef-correct lines is invisible
+    // to every shape check above: nothing breaks, nothing lies structurally,
+    // and the next process's ensureTail absorbs the bytes as honest history.
+    // The one append whose laundering matters most is a foreign
+    // `baseline/saved`/`baseline/established` marker: it re-defines the
+    // baseline the next session verifies against, and the host key signing
+    // the next checkpoint would notarise it and lift the anchor over it.
+    //
+    // The rule: per baseline-family label, the NEWEST marker line physically
+    // after the last host-verified checkpoint (the signed tail — the only
+    // prefix the key already vouches for) must be one THIS process wrote
+    // (see `selfBaselineMarkers`). Newest-per-label, because marker reads
+    // are last-wins: an older foreign line sitting beneath a newer
+    // self-written one is a dead letter — it no longer answers anything —
+    // while a foreign line that IS the newest of its label is a live claim
+    // nobody authored, and the store refuses to lend it the key.
+    //
+    // Boundary notes, deliberately conservative and testable:
+    // - Both attack windows are covered by position alone: appended while a
+    //   process is alive (after the last verified checkpoint, before this
+    //   one) AND appended between sessions. The alternative sketched in the
+    //   survey — keying on the baseline file's mtime being later than engine
+    //   start — covers only part of the second window, needs cross-clock
+    //   comparability a shared or copied workspace cannot promise, and is
+    //   untestable against an in-memory clock; authorship-plus-position
+    //   catches strictly more of the marker channel, so mtime is not
+    //   consulted.
+    // - Honest restarts do not refuse: `saveBaseline` writes its marker and
+    //   checkpoints in the same breath, so a previous session's baseline
+    //   markers always sit at-or-below a verified checkpoint, and THIS
+    //   process's own newest markers are in the author set by construction.
+    // - The narrow honest casualty — a session dying between
+    //   `mark('baseline/…')` and its checkpoint, or one whose checkpoint
+    //   landed only as a sigError line (which vouches nothing) — leaves a
+    //   foreign-newest marker behind; the next session refuses ONCE and the
+    //   documented recovery is the re-anchor flow: `saveBaseline` (or the
+    //   engine's establish) writes a newer SELF-authored marker, superseding
+    //   the orphan, and signing resumes. (A deployment that adds a signer to
+    //   a previously unsigned workspace takes exactly one such refusal, on
+    //   the first boundary, before re-anchoring — by design.)
+    // - There is no automatic pardon beyond superseding, on purpose: any
+    //   pardon the store itself grants for an un-authored newest claim is a
+    //   pardon an attacker can forge the shape of. The refusal line stays on
+    //   the record (audit red via refusedToSign) even after recovery — the
+    //   store accused its log once, and the accusation is history.
+    const lastOfLabel = new Map<string, { index: number; self: boolean }>()
+    lines.forEach((line, index) => {
+      if (index <= vouchedIndex) return
+      const envelope = parseEnvelope(line)
+      if (envelope?.kind !== 'marker') return
+      const markerPayload = envelope.payload as { label?: unknown }
+      if (typeof markerPayload?.label !== 'string' || !isBaselineMarkerLabel(markerPayload.label)) return
+      lastOfLabel.set(markerPayload.label, { index, self: this.selfBaselineMarkers.has(lineDigest(line)) })
+    })
+    const unvouched = [...lastOfLabel.values()].filter(last => !last.self).map(last => last.index).sort((a, b) => a - b)
+    if (unvouched.length > 0) problems.push(`unvouched-baseline-marker@${unvouched.join(',')}`)
     // The anchor is the out-of-band high-water mark this checkpoint is about
     // to move. A disarmed anchor file (H-09) must not be quietly overwritten
     // by a fresh one — the tampering stays visible until a human looks. And
@@ -991,7 +1155,7 @@ export class EvidenceStore {
       }
     }
     for (const cp of walk.checkpoints) {
-      if (cp.payload.head !== cp.expectedHead) headMismatches.push(cp.index)
+      if (cp.headLiared) headMismatches.push(cp.index)
       if (cp.sig === null) {
         // H-27/H-32: a signature-less line is three different facts, and the
         // writer's own on-chain sigError note is what tells them apart.
@@ -1257,6 +1421,27 @@ export class EvidenceStore {
   }
 
   /**
+   * @internal One physical snapshot of the log lines, for the verified read
+   * layer ({@link createVerifiedView}) — so its `markers`/`bestCheckpoint`
+   * judgements derive from bytes the store itself read, not a second fs path
+   * the caller wires up. Not a general API: readers that need raw lines
+   * should say what they trust via the view.
+   */
+  async rawLines(): Promise<readonly string[]> {
+    return this.fs.readLines(this.logPath)
+  }
+
+  /**
+   * @internal The store's own signer provider (trust wiring), so
+   * {@link createVerifiedView} can adjudicate signatures by default when the
+   * caller does not inject one. `undefined` when the store was built without
+   * signing configured — the view then reports `unverifiable`, never guesses.
+   */
+  hostSigner(): (() => Promise<SignerPort | undefined>) | undefined {
+    return this.trust.signer
+  }
+
+  /**
    * v0.22 (L-A1-10): the last well-formed checkpoint, selected with the
    * audit's own anchor-answering rule — when the out-of-band anchor exists
    * and names a key, ONLY that key's well-formed checkpoints are candidates
@@ -1266,13 +1451,23 @@ export class EvidenceStore {
    * well-formed checkpoint of any key" (training export anchors) should use
    * this so a rewritten chain cannot smuggle a foreign checkpoint into an
    * anchor-shaped decision.
+   *
+   * W1-M7 (v0.23): an anchor file that exists but cannot be consulted —
+   * unparseable OR domain-invalid — is now a loud `undefined`, exactly the
+   * `latestSignedCheckpoint` rule, instead of a silent fall-back to the
+   * any-key pool (which let a foreign checkpoint win the training anchor on
+   * precisely the hosts an attacker had been at). No anchor file at all
+   * keeps the any-key semantics: "never anchored" is a deployment fact.
    */
   async lastWellFormedCheckpoint(): Promise<{ count: number; head: string; keyId: string | null; index: number } | undefined> {
     const walk = walkChain(await this.fs.readLines(this.logPath))
     const malformed = new Set(walk.malformedCheckpoints)
     const candidates = walk.checkpoints.filter(cp => !malformed.has(cp.index))
     if (candidates.length === 0) return undefined
-    const anchor = parseAnchor(this.trust.anchorPath === undefined ? undefined : await this.fs.readFile(this.trust.anchorPath))
+    const anchorRaw = this.trust.anchorPath === undefined ? undefined : await this.fs.readFile(this.trust.anchorPath)
+    const anchorOutcome = parseAnchorEx(anchorRaw)
+    if (anchorRaw !== undefined && anchorOutcome?.anchor === undefined) return undefined
+    const anchor = anchorOutcome?.anchor
     const pool = anchor !== undefined && anchor.keyId !== ''
       ? candidates.filter(cp => cp.keyId === anchor.keyId)
       : candidates
@@ -1317,6 +1512,173 @@ export class EvidenceStore {
     const saved = lastBaselineDigest(readMarkers(await this.fs.readLines(this.logPath), { label: 'baseline/saved' }))
     if (saved !== undefined && sha256(raw) !== saved) return undefined
     return verified.baseline
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The verified read layer (v0.23) — the one trust surface over the raw log
+// ---------------------------------------------------------------------------
+
+/** One marker as the verified read layer admits it. */
+export interface VerifiedMarkerView {
+  /** Index of the marker line within the log. */
+  readonly index: number
+  readonly label: string
+  readonly payload: Record<string, unknown>
+  /**
+   * The H-32 position test: the line's `headRef` does not match its physical
+   * predecessor. In a non-degraded generation suspect markers are simply not
+   * admitted (they stay visible via `audit().chain.suspectMarkers`); this
+   * flag is therefore only meaningful on degraded-generation records.
+   */
+  readonly suspect: boolean
+  /**
+   * X-H-06 (v0.23): present exactly when this record was admitted by the
+   * generational fallback — EVERY marker under the label is suspect, the
+   * shape of a log written before the headRef witness existed. The fallback
+   * reads them anyway (last-wins, lastBaselineDigest's rule): an upgraded
+   * deployment keeps exactly the history it had, instead of every protected
+   * marker evaporating into `delegation/*` DAG loss and `task-1` aliasing.
+   * Consumers that must refuse degraded trust can test for it.
+   */
+  readonly degraded?: true
+}
+
+/** {@link VerifiedChainView.markers} result. */
+export interface VerifiedMarkers {
+  /** The trusted pool in log order, filtered to `sinceLine` when given. */
+  readonly records: readonly VerifiedMarkerView[]
+  /** True when the pool is a degraded (all-suspect legacy) generation. */
+  readonly degraded: boolean
+  /** Last-wins trusted read — the last element of `records`, for lastBaselineDigest-shaped consumers. */
+  readonly last: VerifiedMarkerView | undefined
+}
+
+/** How the best checkpoint's signature fared under adjudication. */
+export type BestCheckpointSignature =
+  /** Selected and verified under the very key it names. */
+  | 'verified'
+  /** The key this checkpoint names actively refutes the signature — a forgery charge; publish paths must treat as none. */
+  | 'refuted'
+  /** No signer available (or it names a foreign key): a missing capability — the checkpoint data is still returned so downstream holders of the key can verify (X-H-10). */
+  | 'unverifiable'
+  /** No publishable candidate at all (also the loud-undefined anchor states of `latestSignedCheckpoint`). */
+  | 'none'
+
+/** {@link VerifiedChainView.bestCheckpoint} result. */
+export interface BestCheckpoint {
+  readonly signature: BestCheckpointSignature
+  /** The selected checkpoint (absent only for `none`). */
+  readonly checkpoint?: SignedCheckpointView
+  /**
+   * X-H-03 (v0.23): the selected checkpoint swears a head the walk does not
+   * corroborate at its position (`payload.head !== expectedHead`) — the
+   * replay/transplant shape. The signature can be perfectly honest over a
+   * payload that is lying about WHERE; publish and delegation paths must
+   * treat `signature === 'verified' && headLiared` as refuse, exactly as
+   * `preSignAudit`'s own head-liars rule does before signing.
+   */
+  readonly headLiared?: boolean
+}
+
+/** Options for {@link createVerifiedView}. */
+export interface VerifiedViewOptions {
+  /**
+   * Resolves the signer signatures are adjudicated under. Defaults to the
+   * store's own trust wiring (`hostSigner()`); inject one when the caller
+   * holds a different (e.g. anchor) key than the store writes with.
+   */
+  readonly signerProvider?: () => Promise<SignerPort | undefined>
+}
+
+/**
+ * v0.23: the unified verified read layer — the ONLY surface trust decisions
+ * should read markers and checkpoints through. Kills the "wired to a dead
+ * channel" family at the root: instead of every consumer hand-rolling its
+ * own parse + suspect + fallback (and each forgetting one of the three —
+ * the survey's X-H-01/X-H-06/X-M-18 findings), the three judgements live
+ * here, once:
+ *
+ * - `markers` — one physical read, one pass (the engine's per-marker
+ *   `isSuspectMarker` rescans were O(n²)~O(n³)); suspect position
+ *   adjudication; the generational fallback so legacy logs degrade instead
+ *   of evaporating; an optional `sinceLine` epoch window (baseline-generation
+ *   aware consumers pass the anchoring line's index).
+ * - `bestCheckpoint` — `latestSignedCheckpoint`'s selection with the
+ *   signature actually ADJUDICATED (`verified`/`refuted`/`unverifiable`)
+ *   and the X-H-03 head-liar mirror. The publish predicate is:
+ *   `signature === 'verified' && headLiared !== true`.
+ * - `audit` — passthrough, so verdict paths stop cherry-picking single
+ *   channels (X-H-09's `audit.ok` consumption lands on this surface).
+ */
+export interface VerifiedChainView {
+  markers(label: string, options?: { readonly sinceLine?: number }): Promise<VerifiedMarkers>
+  bestCheckpoint(): Promise<BestCheckpoint>
+  audit(): Promise<AuditReport>
+}
+
+/**
+ * Build the {@link VerifiedChainView} over a store. Pure read layer: it never
+ * mutates the log, never resolves a signer for writing, and holds no state
+ * between calls — every call takes its own physical snapshot (the M-32
+ * one-read-many-derivations discipline, one judgement per snapshot).
+ */
+export function createVerifiedView(store: EvidenceStore, options: VerifiedViewOptions = {}): VerifiedChainView {
+  const signerProvider = options.signerProvider ?? store.hostSigner()
+  return {
+    async markers(label, markerOptions = {}): Promise<VerifiedMarkers> {
+      // ONE physical read, ONE pass: readMarkers collects every line of the
+      // label with its suspect verdict in a single scan (W1-L12/X-M-18: the
+      // old per-marker isSuspectMarker calls re-parsed the whole log each
+      // time). The pool decision is then pure.
+      const all = readMarkers(await store.rawLines(), { label })
+      const trusted = all.filter(m => !m.suspect)
+      // X-H-06 generational fallback, lastBaselineDigest's rule lifted from
+      // "the last digest" to the whole record list: trusted markers win;
+      // when the ENTIRE label population is suspect (a log written before
+      // the headRef witness existed — every marker of every label is then
+      // suspect), the full list is read degraded rather than dropped, and
+      // last-wins consumers get the physically last record as before.
+      const degraded = trusted.length === 0 && all.length > 0
+      const pool = degraded ? all : trusted
+      const sinceLine = markerOptions.sinceLine
+      const records = (sinceLine === undefined ? pool : pool.filter(m => m.index >= sinceLine))
+        .map(m => (degraded ? { ...m, degraded: true as const } : m))
+      return { records, degraded, last: records[records.length - 1] }
+    },
+
+    async bestCheckpoint(): Promise<BestCheckpoint> {
+      // Selection is exactly `latestSignedCheckpoint`'s (anchor-key rule,
+      // malformed exclusion, loud undefined on an unusable anchor) — the
+      // audit's own "best" semantics; the view then adds what selection
+      // alone never did: adjudication of the selected signature and the
+      // head-liar mirror.
+      const best = await store.latestSignedCheckpoint()
+      if (best === undefined) return { signature: 'none' }
+      // Second read for the walk — append-only growth keeps the selected
+      // index stable, so a concurrent append cannot misalign the two; the
+      // flag is derived from the same walk the audit's headMismatches uses.
+      const walked = walkChain(await store.rawLines()).checkpoints.find(cp => cp.index === best.index)
+      const headLiared = walked?.headLiared ?? false
+      const signer = signerProvider === undefined ? undefined : await signerProvider().catch(() => undefined)
+      if (signer === undefined || signer.keyId !== best.keyId) {
+        // X-H-10 half: the payload, keyId and detached sig ride along so the
+        // transparency layer (which holds the publishing key) can verify the
+        // old head itself — "cannot adjudicate" must not mean "no data".
+        return { signature: 'unverifiable', checkpoint: best, headLiared }
+      }
+      let honest: boolean
+      try {
+        honest = await signer.verify(checkpointSignedData(best.payload), best.sig)
+      } catch {
+        honest = false // hostile input discipline: the auditor reports, never throws
+      }
+      return honest
+        ? { signature: 'verified', checkpoint: best, headLiared }
+        : { signature: 'refuted', checkpoint: best, headLiared }
+    },
+
+    audit: (): Promise<AuditReport> => store.audit(),
   }
 }
 

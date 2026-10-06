@@ -42,13 +42,35 @@ export function createLspResolver(
   options: LspResolverOptions = {},
 ): DefinitionResolverPort | undefined {
   if (lsp === undefined) return undefined
+  // W13-L10 (v0.23): `Math.max(1, NaN)` is NaN, and `setTimeout(NaN)` fires
+  // immediately — a NaN queryTimeoutMs used to time out every round-trip at
+  // 0ms and silently degrade the whole graph to approximate. A NaN budget
+  // was worse: `queries >= NaN` is always false, so the cap never held.
+  // Non-finite or non-positive overrides fall back to the defaults instead
+  // of poisoning the timer/counter that consumes them.
+  const finitePositive = (value: number | undefined, fallback: number): number =>
+    typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback
   return new CachingLspResolver(
-    lsp, root, fs, options.budget ?? 400, Math.max(1, options.queryTimeoutMs ?? 5_000),
+    lsp, root, fs,
+    Math.max(1, Math.floor(finitePositive(options.budget, 400))),
+    finitePositive(options.queryTimeoutMs, 5_000),
   )
 }
 
 class CachingLspResolver implements DefinitionResolverPort {
+  /**
+   * W13-L12 (v0.23): the cache key carries a per-file GENERATION, bumped
+   * every time the file's stat changes from the last-seen stat. The old key
+   * (`mtimeMs:size`) was ABA-blind: content A → B → A between two stats (a
+   * fast save loop, coarse mtime granularity) reproduced the pair and served
+   * the STALE first-A answers as if the file had never moved — silently
+   * pinning the graph to old definitions for the rest of the session. The
+   * generation makes every observed change a new key: a genuine
+   * restore-to-old-bytes costs one re-query, an ABA costs its stale cache.
+   */
   private readonly entries = new Map<string, { version: string; results: Map<string, string | null> }>()
+  private readonly lastStat = new Map<string, string>()
+  private readonly generations = new Map<string, number>()
   private queries = 0
   private readonly lsp: LspLike
   private readonly root: string
@@ -66,10 +88,16 @@ class CachingLspResolver implements DefinitionResolverPort {
 
   async resolveDefinition(file: string, line: number, character: number): Promise<string | null> {
     const stat = await this.fs.stat(`${this.root}/${file}`).catch(() => undefined)
-    const version = stat === undefined ? 'none' : `${stat.mtimeMs}:${stat.size}`
+    const statKey = stat === undefined ? 'none' : `${stat.mtimeMs}:${stat.size}`
+    // W13-L12: a stat that differs from the last one seen bumps the file's
+    // generation, so the cache key changes even when the stat PAIR repeats
+    // (the ABA shape); an unchanged stat reuses the current generation.
     let entry = this.entries.get(file)
-    if (entry === undefined || entry.version !== version) {
-      entry = { version, results: new Map() }
+    if (entry === undefined || this.lastStat.get(file) !== statKey) {
+      const generation = (this.generations.get(file) ?? -1) + 1
+      this.generations.set(file, generation)
+      this.lastStat.set(file, statKey)
+      entry = { version: `${generation}:${statKey}`, results: new Map() }
       this.entries.set(file, entry)
     }
     const positionKey = `${line}:${character}`

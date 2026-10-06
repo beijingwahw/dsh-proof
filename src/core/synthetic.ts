@@ -189,27 +189,40 @@ export function sandboxEntryFor(claimId: string, seq: number): string {
  * additions are a breaking change to what hosts must enforce at the
  * ptc-runtime tier, not a casual edit.
  *
+ * W15-M3 (v0.23) added the eval-grade execution seams that walk in through a
+ * CLEAN literal specifier: `node:vm` (`vm.runInThisContext` is `eval` with a
+ * function name — it used to pass all four import regexes AND the global
+ * screen) and `node:module` (the `createRequire` door; the escape itself is a
+ * documented residual, but the module NAME is statically sealable, so the
+ * door is). `node:inspector` stays out for now: it is an execution seam, but
+ * a strictly weaker one than vm, and the contract cost of list growth is
+ * real — additions belong to deliberate versioned changes like this one.
+ *
  * `'node:process'` is listed for the contract's sake (the engine's conjure
  * instruction and the tool prose render this list verbatim, and both
  * spellings must be named to the model); matching itself reduces through the
  * `node:` strip in `forbiddenModuleOf`, where the single `'process'` entry
- * answers for both.
+ * answers for both. `vm`/`module` follow the same convention.
  */
 export const FORBIDDEN_CAPABILITIES: readonly string[] = [
   'child_process', 'net', 'http', 'https', 'dgram', 'worker_threads', 'cluster',
   'dns', 'tls',
   'process', 'node:process',
+  'vm', 'node:vm',
+  'module', 'node:module',
 ]
 
 /**
  * H-31: zero-import outbound GLOBALS a synthetic script may never touch.
  * Node ≥ 18 ships `fetch` (and ≥ 22 `WebSocket`) on the global object — no
  * `import` text for the module screen to see — so a script with a clean
- * import section could still POST the workspace to any address. The screen
- * flags the call forms (`fetch(…)`, `new WebSocket(…)`) of every name here;
- * a local helper that happens to be called `fetch` is over-reported, the
- * deny-list's documented safe direction (refuse the inert script, never run
- * the live one).
+ * import section could still POST the workspace to any address. W15-M2: the
+ * screen flags every statically decidable call shape of every name here —
+ * direct `fetch(…)`, computed member `globalThis['fetch'](…)`, optional call
+ * `fetch?.(…)`, indirect `(0, fetch)(…)` and the alias declaration
+ * `const f = fetch` (see `screenScript`); a local helper that happens to be
+ * named `fetch` is over-reported, the deny-list's documented safe direction
+ * (refuse the inert script, never run the live one).
  */
 export const FORBIDDEN_GLOBALS: readonly string[] = ['fetch', 'WebSocket']
 
@@ -298,24 +311,29 @@ function forbiddenModuleOf(specifier: string): string | undefined {
  * `from`-clauses), bare side-effect imports, literal-specifier dynamic
  * imports and `require` calls of any `FORBIDDEN_CAPABILITIES` module — with
  * or without the `node:` prefix — plus `process.env` reads in member and
- * computed-member form, and (H-31) the call forms of the zero-import
- * outbound globals named by `FORBIDDEN_GLOBALS`. M11: all four import shapes
- * accept backtick-quoted specifiers (an uninterpolated template literal is
- * statically decidable), and specifiers are `\u`/`\x`-unescaped before the
- * deny-list sees them, so `'child_\u0070rocess'` screens as
- * `'child_process'`. The scan runs over the *raw text, comments included*:
- * a commented-out forbidden import is flagged rather than missed. That is
- * deliberate over-reporting — this is a deny-list, and for a screener the
- * safe direction is refusing an inert script, never running a live one.
+ * computed-member form, and (H-31) the zero-import outbound globals named by
+ * `FORBIDDEN_GLOBALS` in every statically decidable call shape (W15-M2:
+ * direct, computed-member, optional-call, indirect-call and alias-binding).
+ * M11: all four import shapes accept backtick-quoted specifiers (an
+ * uninterpolated template literal is statically decidable), and specifiers
+ * are `\u`/`\x`-unescaped before the deny-list sees them, so
+ * `'child_\u0070rocess'` screens as `'child_process'`. The scan runs over
+ * the *raw text, comments included*: a commented-out forbidden import is
+ * flagged rather than missed. That is deliberate over-reporting — this is a
+ * deny-list, and for a screener the safe direction is refusing an inert
+ * script, never running a live one.
  *
  * Admitted limits of static screening (this is a *screen*, not a sandbox):
- * computed specifiers (`import(buildName())`), aliases
- * (`createRequire`/`eval`/`new Function`) and case-mangled specifiers that
- * would simply fail at runtime are not caught — text cannot see runtime
- * values. The enforcement that actually bounds a runaway script is the
- * sandbox cwd restriction, the run timeout, the output cap and the host's
- * ptc-runtime profile; the screen's job is only to make the *easy* variants
- * fail loudly, before execution.
+ * computed specifiers (`import(buildName())`), runtime aliases that need no
+ * literal (`eval`/`new Function` — the eval-tier escapes themselves) and
+ * case-mangled specifiers that would simply fail at runtime are not caught —
+ * text cannot see runtime values. (W15-M3 closed the two module DOORS to
+ * eval-tier power: `node:vm` and `node:module` are denied by name, so the
+ * escapes now need an actual computed specifier, not a clean import.) The
+ * enforcement that actually bounds a runaway script is the sandbox cwd
+ * restriction, the run timeout, the output cap and the host's ptc-runtime
+ * profile; the screen's job is only to make the *easy* variants fail loudly,
+ * before execution.
  *
  * `fs` is deliberately allowed in both directions: a property test that
  * cannot read its fixture cannot test anything. The directory it may read is
@@ -350,10 +368,31 @@ export function screenScript(source: string): ScreenResult {
   }
   // H-31: the globals need no import, so this is the only line of defence the
   // static screen can offer them — the easiest exfiltration channel used to
-  // be the one the screen could not even see.
+  // be the one the screen could not even see. W15-M2: the direct call form
+  // (`fetch(…)`, `globalThis.fetch(…)` — the `\b` does not care what precedes
+  // the dot) is joined by every OTHER statically decidable shape the direct
+  // regex missed; each is built from the name at screening time so the list
+  // and the patterns cannot drift:
+  //   computed member  `globalThis['fetch'](…)` / `x["WebSocket"](…)`
+  //   optional call    `fetch?.(…)`
+  //   indirect call    `(0, fetch)(…)`
+  //   alias binding    `const f = fetch` / `const W = globalThis.WebSocket`
+  // An alias declaration is flagged on its own: the binding hand is
+  // statically visible even though the eventual call site is not. Over-
+  // reporting (a local helper genuinely named `fetch` bound then called)
+  // stays the deny-list's documented safe direction.
   for (const globalName of FORBIDDEN_GLOBALS) {
-    if (new RegExp(`\\b${globalName}\\s*\\(`).test(source)) {
-      findings.add(`use of global '${globalName}' (zero-import outbound capability — synthetic tests never need the network)`)
+    const shapes: readonly [pattern: RegExp, how: string][] = [
+      [new RegExp(`\\b${globalName}\\s*\\(`), 'call form'],
+      [new RegExp(`\\[\\s*(['"\`])${globalName}\\1\\s*\\]`), 'computed-member form'],
+      [new RegExp(`\\b${globalName}\\s*\\?\\.\\s*\\(`), 'optional-call form'],
+      [new RegExp(`\\(\\s*0\\s*,\\s*${globalName}\\s*\\)\\s*\\(`), 'indirect-call form'],
+      [new RegExp(`\\b(?:const|let|var)\\s+[\\w$]+\\s*=\\s*(?:globalThis\\s*\\.\\s*)?${globalName}\\b`), 'alias-binding form'],
+    ]
+    for (const [pattern, how] of shapes) {
+      if (pattern.test(source)) {
+        findings.add(`use of global '${globalName}' in ${how} (zero-import outbound capability — synthetic tests never need the network)`)
+      }
     }
   }
 

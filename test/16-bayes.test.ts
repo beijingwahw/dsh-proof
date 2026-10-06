@@ -19,7 +19,9 @@ import assert from 'node:assert/strict'
 import {
   BAYES_CONSTANTS, claimProbability, computePriors, posteriorHealthy,
   rankByInformationGain, summarizeHistory,
-  type CheckPrior, type CheckStats, type ClaimModel, type PriorInput,
+  assertFalsePassDomain, validateBayesKnobs,
+  DRIFTED_FALSE_PASS_DEFAULT,
+  type BayesKnobs, type CheckPrior, type CheckStats, type ClaimModel, type PriorInput,
 } from '../src/core/bayes.ts'
 import type { CheckStatus, Evidence } from '../src/core/evidence.ts'
 import type { DependencyGraph } from '../src/core/impact.ts'
@@ -581,7 +583,111 @@ test('BAYES: identical inputs produce deeply identical outputs, whatever order t
 })
 
 // ---------------------------------------------------------------------------
-// 7. Property sweep — the full (π, α) plane
+// 7. W6-F1/F2 — β domain validation (the total gate for every falsePass knob)
+// ---------------------------------------------------------------------------
+
+test('BAYES: assertFalsePassDomain accepts the open interval (0,1) on a fine grid and rejects everything outside', () => {
+  // Interior grid: from float dust above 0 to float dust below 1.
+  for (let beta = 0.001; beta < 1; beta += 0.0199) {
+    assert.doesNotThrow(() => assertFalsePassDomain(Number(beta.toFixed(4))), `β=${beta} is in the legal open interval`)
+  }
+  for (const legal of [0.02, 0.15, 0.5, 0.9, 0.999999]) {
+    assert.doesNotThrow(() => assertFalsePassDomain(legal), `β=${legal} is legal`)
+  }
+  // The endpoints are excluded because each collapses the channel: β=0 makes
+  // one forged pass certify (posterior exactly 1), β=1 makes a fail prove
+  // health (fail posterior exactly 1) — the measured H-03 reversals.
+  for (const illegal of [0, 1, -0.5, -1, 1.0000001, 0.9999999999 + 1e-9, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+    assert.throws(() => assertFalsePassDomain(illegal), RangeError, `β=${illegal} must be refused`)
+    assert.throws(() => assertFalsePassDomain(illegal), /\(0,1\)/, `the error names the domain for β=${illegal}`)
+  }
+})
+
+test('BAYES: the channel really does reverse at the endpoints — why the domain is open (KAT of the measured reversals)', () => {
+  // The reversals, transcribed in closed form (the gated posteriorHealthy
+  // refuses to compute them — that refusal IS the fix; this transcription is
+  // what it refuses to produce).
+  const channel = (pi: number, beta: number, obs: 'pass' | 'fail'): number => {
+    const givenHealthy = obs === 'pass' ? 0.95 : 0.05
+    const givenBroken = obs === 'pass' ? beta : 1 - beta
+    return (pi * givenHealthy) / (pi * givenHealthy + (1 - pi) * givenBroken)
+  }
+  // β=0: a pass posterior is EXACTLY 1 (one forged green certifies anything).
+  assert.equal(channel(0.9, 0, 'pass'), 1, 'β=0 ⇒ P(h|pass) = 1 — the H-03 inversion')
+  // β=1: a FAIL posterior is exactly 1 (a fail proves health).
+  assert.equal(channel(0.9, 1, 'fail'), 1, 'β=1 ⇒ P(h|fail) = 1 — nonsense, refused by the gate')
+  // β<0: the pass posterior EXCEEDS 1 (super-probability on reports).
+  assert.ok(channel(0.9, -0.5, 'pass') > 1, 'negative β ⇒ posterior above 1')
+  // And the module refuses to be the one computing any of the three:
+  for (const beta of [0, 1, -0.5, Number.NaN]) {
+    assert.throws(
+      () => posteriorHealthy(prior({ checkId: 'bad', priorHealthy: 0.9, falsePass: beta }), 'pass'),
+      RangeError,
+      `posteriorHealthy is the last line of defence for caller-constructed priors (β=${beta})`,
+    )
+  }
+})
+
+test('BAYES: validateBayesKnobs gates every knob; legal sets pass untouched', () => {
+  const legal: BayesKnobs[] = [
+    {},
+    { certifyTarget: 0.97 },
+    { syntheticFalsePass: 0.15, driftedFalsePass: 0.5 },
+    { certifyTarget: 0.5, syntheticFalsePass: 0.99, driftedFalsePass: 0.01 },
+  ]
+  for (const knobs of legal) assert.doesNotThrow(() => validateBayesKnobs(knobs), JSON.stringify(knobs))
+
+  // Each knob is refused alone, and the error names the offender.
+  assert.throws(() => validateBayesKnobs({ syntheticFalsePass: 0 }), /syntheticFalsePass/)
+  assert.throws(() => validateBayesKnobs({ syntheticFalsePass: 1 }), /syntheticFalsePass/)
+  assert.throws(() => validateBayesKnobs({ driftedFalsePass: Number.NaN }), /driftedFalsePass/)
+  assert.throws(() => validateBayesKnobs({ driftedFalsePass: -0.5 }), /driftedFalsePass/)
+  assert.throws(() => validateBayesKnobs({ driftedFalsePass: Number.POSITIVE_INFINITY }), /driftedFalsePass/)
+  // certifyTarget shares the OPEN interval: 0 certifies anything (every H2/
+  // H-03 threshold collapses to a tautology), 1 certifies nothing.
+  assert.throws(() => validateBayesKnobs({ certifyTarget: 0 }), /certifyTarget/)
+  assert.throws(() => validateBayesKnobs({ certifyTarget: 1 }), /certifyTarget/)
+  assert.throws(() => validateBayesKnobs({ certifyTarget: Number.NaN }), /certifyTarget/)
+})
+
+test('BAYES: computePriors gates its own syntheticFalsePass; posteriorHealthy gates caller-built priors', () => {
+  // The pure core does not wait for the engine/config boundary.
+  assert.throws(
+    () => computePriors({ specs: [spec({ id: 's', source: 'synthetic' })], changed: [], history: new Map(), fallbackCostMs: 1, syntheticFalsePass: 0 }),
+    /PriorInput\.syntheticFalsePass/,
+  )
+  assert.throws(
+    () => computePriors({ specs: [spec({ id: 's', source: 'synthetic' })], changed: [], history: new Map(), fallbackCostMs: 1, syntheticFalsePass: Number.NaN }),
+    /PriorInput\.syntheticFalsePass/,
+  )
+  assert.doesNotThrow(() =>
+    computePriors({ specs: [spec({ id: 's', source: 'synthetic' })], changed: [], history: new Map(), fallbackCostMs: 1, syntheticFalsePass: 0.3 }))
+  // And the module's own defaults satisfy the domain they export (a bad
+  // future edit to a constant fails at import time).
+  assert.doesNotThrow(() => assertFalsePassDomain(BAYES_CONSTANTS.falsePass))
+  assert.doesNotThrow(() => assertFalsePassDomain(DRIFTED_FALSE_PASS_DEFAULT))
+})
+
+test('BAYES (W6-F3 KAT): the per-tier one-pass posteriors the grinding-curve table claims', () => {
+  // The table in the DRIFTED_FALSE_PASS_DEFAULT doc comment, pinned as
+  // numbers so the comment cannot drift from the math it describes
+  // (β=0.5, α=0.05, cold priors 1−0.2s):
+  const one = (pi: number): number =>
+    posteriorHealthy(prior({ checkId: 'tier', priorHealthy: pi, falsePass: 0.5 }), 'pass')
+  // The table quotes four decimals; the tolerance pins those, not the ulp.
+  const close = (a: number, b: number): boolean => Math.abs(a - b) < 1e-4
+  assert.ok(close(one(0.8), 0.8837), `s=1.0 tier: ${one(0.8)}`)
+  assert.ok(close(one(0.86), 0.9211), `s=0.7 tier: ${one(0.86)}`)
+  assert.ok(close(one(0.9), 0.9448), `s=0.5 tier: ${one(0.9)}`)
+  // Every tier stays below the default 0.97 target on ONE pass — single-
+  // session certification remains impossible — and the s=0.5 tier is the
+  // closest, which is why the table names it the attacker's floor.
+  for (const pi of [0.8, 0.86, 0.9]) assert.ok(one(pi) < 0.97)
+  assert.ok(one(0.9) > one(0.86) && one(0.86) > one(0.8), 'higher tiers start closer to the target')
+})
+
+// ---------------------------------------------------------------------------
+// 8. Property sweep — the full (π, α) plane
 // ---------------------------------------------------------------------------
 
 test('BAYES: property sweep — posteriors stay interior and observation-respecting over the whole (π, α) grid', () => {

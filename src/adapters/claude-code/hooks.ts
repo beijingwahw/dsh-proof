@@ -69,6 +69,7 @@ import { applyObservation, computeDrift, emptySession, loadSession, saveSession,
 import type { DriftResult, GateOptions, StopFacts } from '../shared/gates.ts'
 import { decidePreToolUse, evaluateStop, hasBaselineOnDisk } from '../shared/gates.ts'
 import { buildPolicySection } from '../../dsh/prompt.ts'
+import { MCP_TOOLS } from '../../app/mcp-server.ts'
 
 /** One Claude Code hook event, as it arrives on stdin (unknown fields tolerated). */
 export interface CcHookPayload {
@@ -162,9 +163,40 @@ function preToolUseResponse(decision: 'ask' | 'deny', reason: string): Record<st
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
       permissionDecision: decision,
-      permissionDecisionReason: reason,
+      // W12-M1: reasons embed data (tool names in the ask ladder's text);
+      // whatever a reason carries is flattened before the host feeds it back
+      // to the model.
+      permissionDecisionReason: sanitizeBlockForModel(reason),
     },
   }
+}
+
+/**
+ * Host-render sanitization for any model-facing decision/block text (W12-M1).
+ *
+ * Drift narratives embed workspace FILE NAMES — attacker-controllable data —
+ * and a POSIX file name may legally contain newlines, so a crafted name used
+ * to arrive inside a Stop block reason (or a permission reason) as its own
+ * forged instruction line. At this render point the text is one flat string,
+ * so the honest fix is structural: every original newline becomes a visible
+ * ' | ' separator (a forged "instruction line" can no longer occupy a line of
+ * its own), other C0 control characters and DEL are dropped, and any single
+ * over-long segment (a padded payload) is capped. The producing side
+ * (observe.ts's driftNarrative) is the classifier owner's domain; this is the
+ * host's defense-in-depth render rule. Mirrored in
+ * adapters/opencode/plugin.ts — keep the two in lockstep.
+ */
+const HOST_RENDER_SEGMENT_CAP = 200
+
+export function sanitizeBlockForModel(text: string): string {
+  return text
+    .split(/\r?\n/)
+    .map(segment => {
+      const clean = segment.replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, '').trim()
+      return clean.length > HOST_RENDER_SEGMENT_CAP ? `${clean.slice(0, HOST_RENDER_SEGMENT_CAP)}…` : clean
+    })
+    .filter(segment => segment.length > 0)
+    .join(' | ')
 }
 
 /**
@@ -263,7 +295,28 @@ export async function handleStop(payload: CcHookPayload, env: CcAdapterEnv): Pro
       + `the observation window did not advance — one-time notices may repeat`)
   }
   if (outcome.reason === undefined) return undefined
-  return { decision: 'block', reason: outcome.reason }
+  // W12-M1: the reason is fed back to the model as why the turn may not end —
+  // the plugin's authoritative voice. Whatever data the block carries (drift
+  // narratives embed workspace file names, and POSIX names may contain
+  // newlines) is flattened here, at the render point.
+  return { decision: 'block', reason: sanitizeBlockForModel(outcome.reason) }
+}
+
+/**
+ * The concrete spelling of "the evidence store" for the DETECTED self-check,
+ * derived from the adapter's own paths (W12-M2) — never hardcoded: with
+ * DSH_PROOF_EVIDENCE_DIR='.evi' a hardcoded `.proof/evidence.jsonl` told the
+ * model to probe a file whose un-denied write is CORRECT behavior, and the
+ * self-check would misreport the guard as absent (or teach the model the
+ * check ignores what it writes). Workspace mode names the relative file the
+ * model can attempt; host mode (the default) names the absolute store under
+ * the trust root — exactly the absolute-path write the H-26 arm denies.
+ */
+function evidenceSelfCheckPath(paths: ProofPaths): string {
+  if (paths.evidenceStore === 'workspace') {
+    return paths.evidenceDir === '' ? 'evidence.jsonl in the workspace root' : `${paths.evidenceDir}/evidence.jsonl`
+  }
+  return paths.logPath
 }
 
 /**
@@ -272,16 +325,20 @@ export async function handleStop(payload: CcHookPayload, env: CcAdapterEnv): Pro
  * the hooks DO when they are wired, and this adapter cannot verify its own
  * wiring — a project-scope settings file can silently drop the PreToolUse
  * hook. The context therefore states the detection, not a guarantee, and
- * hands the model the one check that falsifies it.
+ * hands the model the one check that falsifies it — spelled from the derived
+ * paths, so the check tests the store that is actually guarded.
  */
-function mcpToolsLine(): string {
-  return 'On this host the proof verbs are MCP tools: proof_status, proof_baseline, proof_verify, proof_claim, proof_bundle '
-    + '(registered with `claude mcp add proof -- dsh-proof-mcp`). Call proof_verify after any significant change, before claiming the work done. '
+function mcpToolsLine(paths: ProofPaths): string {
+  return `On this host the proof surface is ${MCP_TOOLS.length} MCP tools (APP/1.4 frozen contract; registered with `
+    + '`claude mcp add proof -- dsh-proof-mcp`): '
+    + `${MCP_TOOLS.join(', ')}. Call proof_verify after any significant change, before claiming the work done. `
     + 'Note: files changed only through Bash are not path-attributed — prefer Write/Edit so drift attribution can see them.\n\n'
-    + 'Enforcement wiring: the gates above run through host hooks (.claude/settings.json). This context cannot '
-    + 'verify they are wired — a project-level settings file can omit or remove them, and hook wiring supplied by '
+    + 'Enforcement wiring: the gates above run through host hooks (.claude/settings.json), and they cover exactly '
+    + 'the tool names the configured PreToolUse matcher routes to them — a tool the matcher does not list never '
+    + 'reaches this gate (the shipped example lists only the known mutators). This context cannot verify they are '
+    + 'wired — a project-level settings file can omit or remove them, narrow the matcher, and hook wiring supplied by '
     + 'the repository travels with the repository. Treat enforcement as DETECTED, not guaranteed: if a write into '
-    + 'the evidence store (.proof/evidence.jsonl) is not denied, report that the guard is absent instead of assuming oversight.'
+    + `the evidence store (${evidenceSelfCheckPath(paths)}) is not denied, report that the guard is absent instead of assuming oversight.`
 }
 
 /**
@@ -311,7 +368,14 @@ export async function handleSessionStart(payload: CcHookPayload, env: CcAdapterE
     discovered: [],
     hasBaseline,
     requireBaseline: env.gate.requireBaseline,
-  })}\n\n${mcpToolsLine()}`
+  })}\n\n`
+    // W12-M15: the policy section says "no objective checks are discovered in
+    // this workspace" — true of what THIS ADAPTER can see (nothing: discovery
+    // is the engine's, behind the MCP tools). Without this qualifier a model
+    // in a repo full of check scripts would take the line as a workspace fact.
+    + 'Check discovery does not run in this host adapter — the line above is the adapter\'s view, not the '
+    + 'workspace\'s. Ask `proof_status` for the live discovered set before concluding the workspace declares no checks.'
+    + `\n\n${mcpToolsLine(env.paths)}`
   return {
     hookSpecificOutput: {
       hookEventName: 'SessionStart',

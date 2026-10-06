@@ -216,6 +216,24 @@ test('a jury probability unreadable as a probability degrades to abstain, never 
   assert.equal(attestationFactor(jury({ probability: -0.2 }), DEFAULT_TRUST_WEIGHTS), 1)
 })
 
+test('W15-M5: TrustWeights outside [0,1] are refused at the factor and fusion entries', () => {
+  // The "testimony can only weaken" invariant needs w ∈ [0,1]: a negative
+  // classB AMPLIFIES the claim product above 1 (p^w > 1), classB > 1 lets the
+  // fusion mixture extrapolate past both endpoints. The config path bounds
+  // these (Schema.percent), but the API takes bare numbers — it guards its
+  // own door, loudly.
+  for (const bad of [-0.5, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(() => attestationFactor(jury(), weights({ classB: bad })), TypeError, `classB=${bad} must be refused`)
+    assert.throws(() => attestationFactor(human(), weights({ classC: bad })), TypeError, `classC=${bad} must be refused`)
+    assert.throws(() => fuseConfidence(0.94, jury(), weights({ classB: bad })), TypeError, `classB=${bad} must be refused at fusion`)
+    assert.throws(() => fuseConfidence(0.94, human(), weights({ classC: bad })), TypeError, `classC=${bad} must be refused at fusion`)
+  }
+  for (const w of [0, 0.3, 0.7, 1]) {
+    assert.doesNotThrow(() => attestationFactor(jury(), weights({ classB: w, classC: w })), `w=${w} is a documented endpoint/interior`)
+    assert.doesNotThrow(() => fuseConfidence(0.94, jury(), weights({ classB: w, classC: w })), `w=${w} is legal at fusion`)
+  }
+})
+
 // ---------------------------------------------------------------------------
 // attestationFactor — Class C
 // ---------------------------------------------------------------------------

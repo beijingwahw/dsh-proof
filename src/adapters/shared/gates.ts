@@ -19,10 +19,10 @@
 import {
   WorkspaceWatch, driftNarrative, isMutationToolName, shellCommandMentionsPath,
 } from '../../dsh/observe.ts'
-import { absoluteInside, deriveProofPaths, touchesEvidencePath, workspaceKeyPair } from './paths.ts'
+import { absoluteInside, deriveProofPaths, foldHostPath, touchesEvidencePath, workspaceKeyPair } from './paths.ts'
 import type { ProofPaths } from './paths.ts'
 import type { AdapterSession, DriftResult } from './session.ts'
-import { addressOf, merkleRoot } from '../../core/hash.ts'
+import { addressOf, merkleRoot, sha256 } from '../../core/hash.ts'
 
 // Re-exported for the host adapters: the gate surface (StopFacts.drift,
 // evaluateStop's session parameter) is expressed in these types, so an
@@ -55,38 +55,96 @@ export type GateDecision =
   | { readonly action: 'deny'; readonly reason: string }
 
 /**
- * The command string of a shell-class call, from whichever key the host
- * spells it under: a plain string, or a string ARGV (joined — `['node',
- * '-e', 'fs.writeFileSync(...)']` is one command semantically, and a
- * space-join is all the conservative substring sweep needs). Anything else
- * (nested objects, mixed arrays) is not a command this layer can read — and
- * an unreadable command on a mutation-capable tool falls through to the
- * baseline ladder, never to a silent allow.
+ * X-H-13 bounds for the value sweep (part of the cross-face contract, see
+ * {@link sweepToolInputStrings}): deep enough to reach argv-in-object shapes,
+ * small enough that a hostile megabyte-blob input cannot make every gate call
+ * a regex party.
  */
-function shellCommandOf(toolInput: unknown): string | undefined {
-  if (toolInput === null || typeof toolInput !== 'object' || Array.isArray(toolInput)) return undefined
-  const record = toolInput as Record<string, unknown>
-  for (const key of ['command', 'cmd', 'script']) {
-    const value = record[key]
-    if (typeof value === 'string') return value
-    if (Array.isArray(value) && value.every(v => typeof v === 'string')) return value.join(' ')
+const SWEEP_MAX_DEPTH = 3
+const SWEEP_MAX_STRING = 8_192
+const SWEEP_MAX_STRINGS = 64
+
+/**
+ * Every string a tool call's input carries — VALUES, not keys (X-H-13).
+ *
+ * The N-1 fix enumerated command keys (`command`/`cmd`/`script`), and the
+ * audit walked around it with the fourth spelling (`{commandLine: …}`,
+ * `{code: …}`, `{cmdline: …}`), mixed argv (`['node','-e','…',0]` failed
+ * `every(string)` and vanished entirely) and nested objects
+ * (`{command:{cmd:'…'}}`) — a key-name list is a list, and lists recur the
+ * disease they were meant to cure. This sweep cannot be walked by renaming a
+ * key: any string under any key (to depth 3, each ≤ 8k, at most 64 strings)
+ * is returned; a string ARRAY under any key is argv-shaped and joins into one
+ * string (its string elements only — object elements recurse one level
+ * deeper); a mixed array joins its string elements and still reaches the
+ * needle inside them.
+ *
+ * The price, deliberately paid (宁误拦 — rather over-block than miss): a
+ * mutation call whose CONTENT legitimately mentions the store
+ * (`write {content: 'see .proof/evidence.jsonl'}`) is denied once, with a
+ * reason saying exactly why; a string over 8k or past the 64th is NOT swept
+ * (documented under-deny window — the bounds exist so a hostile input blob
+ * cannot turn the gate into a CPU sink, and no real command string observed
+ * in the wild carries a store path past 8k).
+ *
+ * CROSS-FACE CONTRACT (the "one sweep" rule, mirroring foldHostPath's):
+ * dsh/observe.ts exports `sweepToolInputStrings` with exactly these
+ * semantics and src/index.ts consumes it, so the adapter gates and the DSH
+ * plugin face cannot drift into the two-sides-split pattern this codebase's
+ * audit history keeps re-finding (X-H-16's lesson in the reverse direction).
+ * This local definition is that contract verbatim; it retires into an import
+ * from observe.ts the moment that export lands (grep-confirmed absent while
+ * this batch was written) — semantics MUST move in lockstep from then on.
+ */
+function sweepToolInputStrings(toolInput: unknown): string[] {
+  const out: string[] = []
+  const push = (value: string): void => {
+    if (out.length < SWEEP_MAX_STRINGS && value.length > 0 && value.length <= SWEEP_MAX_STRING) {
+      out.push(value)
+    }
   }
-  return undefined
+  const visit = (value: unknown, depth: number): void => {
+    if (out.length >= SWEEP_MAX_STRINGS || depth > SWEEP_MAX_DEPTH) return
+    if (typeof value === 'string') {
+      push(value)
+      return
+    }
+    if (value === null || typeof value !== 'object') return
+    if (Array.isArray(value)) {
+      const strings = value.filter(item => typeof item === 'string') as string[]
+      if (strings.length > 0) push(strings.join(' '))
+      for (const item of value) {
+        if (typeof item === 'object' && item !== null) visit(item, depth + 1)
+      }
+      return
+    }
+    for (const child of Object.values(value as Record<string, unknown>)) {
+      if (typeof child === 'string') push(child)
+      else visit(child, depth + 1)
+    }
+  }
+  visit(toolInput, 0)
+  return out
 }
 
 /**
  * Every spelling of the store and trust artifacts a shell command must not
  * name. `shellCommandMentionsPath` folds case and separators on both sides,
  * so one spelling per target is enough (`.proof/evidence.jsonl` also catches
- * `.PROOF\EVIDENCE.JSONL`). Substring semantics are the conservative
- * direction on purpose — `cd .proof && …`, `> .proof/evidence.jsonl` and
+ * `.PROOF\EVIDENCE.JSONL`). Since X-H-12 the segments and roots here go
+ * through `foldHostPath` — the ONE fold — so a configured `evidenceDir` like
+ * `a/..` collapses to the degenerate root case in the TEXTUAL sweep exactly
+ * like it already did in the structural one (W11-L-H: the two sweeps used to
+ * disagree about what the store is, and `echo x > evidence.jsonl` slipped
+ * between them). Substring semantics are the conservative direction on
+ * purpose — `cd .proof && …`, `> .proof/evidence.jsonl` and
  * `rm -rf <trustRoot>/anchors/<key>` must all land; the price is an
  * occasional over-denied call whose reason says exactly why.
  */
 function guardedShellTargets(root: string, options: GateOptions): string[] {
   const targets: string[] = []
   if (options.evidenceStore === 'workspace') {
-    const dir = options.evidenceDir.replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/\/+$/, '')
+    const dir = foldHostPath(options.evidenceDir)
     if (dir !== '') {
       // The bare store directory, the artifacts inside it, and the
       // root-anchored spellings an absolute command would use.
@@ -96,18 +154,27 @@ function guardedShellTargets(root: string, options: GateOptions): string[] {
       // artifact file names themselves.
       targets.push('evidence.jsonl', 'baseline.json')
     }
-    const anchored = `${root.replace(/\/+$/, '')}/${dir}`.replace(/\/+$/, '')
+    const anchored = foldHostPath(`${root.replace(/\/+$/, '')}/${options.evidenceDir}`)
     targets.push(anchored, `${anchored}/evidence.jsonl`, `${anchored}/baseline.json`)
   }
   if (options.trustRoot !== undefined && options.trustRoot.length > 0) {
     // Trust-side artifacts are never legitimately agent-writable in EITHER
-    // store mode: the anchor mirrors every checkpoint and the host-mode store
-    // lives here too. Both identity keys are listed — a migrated deployment
-    // still holds state under the legacy one.
-    const trust = options.trustRoot.replace(/\\/g, '/').replace(/\/+$/, '')
-    const pair = workspaceKeyPair(root)
-    for (const key of pair.normalized === pair.legacy ? [pair.normalized] : [pair.normalized, pair.legacy]) {
-      targets.push(`${trust}/anchors/${key}`, `${trust}/workspaces/${key}/evidence.jsonl`, `${trust}/workspaces/${key}/baseline.json`)
+    // store mode: the anchor mirrors every checkpoint, the host-mode store
+    // lives here, and (W11-M3) the adapter session ledgers record the
+    // shellUsed/firedNotices facts the drift narrative speaks with — deleting
+    // or forging one must not be a command away. Both identity keys are
+    // listed: a migrated deployment still holds state under the legacy one.
+    const trust = foldHostPath(options.trustRoot)
+    if (trust !== '') {
+      const pair = workspaceKeyPair(root)
+      for (const key of pair.normalized === pair.legacy ? [pair.normalized] : [pair.normalized, pair.legacy]) {
+        targets.push(
+          `${trust}/anchors/${key}`,
+          `${trust}/workspaces/${key}/evidence.jsonl`,
+          `${trust}/workspaces/${key}/baseline.json`,
+          `${trust}/adapter-sessions/${key}`,
+        )
+      }
     }
   }
   return [...new Set(targets)].filter(t => t.length > 0)
@@ -131,11 +198,24 @@ function guardedShellTargets(root: string, options: GateOptions): string[] {
  *    unknown-name default of MUTATION — `MultiEdit` and `NotebookEdit` (real
  *    host mutators the old word-regex could not see) take this path like
  *    every other mutator, and `notebook_path` extracts like every path key.
- * 1b. DENY — a shell-class tool whose command string names the evidence
- *    store or the trust artifacts (H-02, v0.13 H9③ at last closed at the
- *    gate): `bash {command:'echo x > .proof/evidence.jsonl'}` carries no
- *    structured path key, so the structural sweep above is blind to it by
- *    construction. The command is swept textually, conservatively.
+ * 1a. DENY — a mutation tool naming, by absolute path, any trust-side
+ *    artifact directory (host-mode store, anchors, adapter session ledgers —
+ *    H-26 plus W11-M3) in EITHER store mode: the trust root is where the
+ *    process being audited keeps its commitments, and no agent tool call is
+ *    ever a legitimate writer there. The absolute candidates fold through
+ *    `foldHostPath` (X-H-12: `\\?\`-prefixed and drive-relative spellings of
+ *    the same directory compare the same).
+ * 1b. DENY — ANY call (mutator or not) one of whose input strings names the
+ *    evidence store or the trust artifacts (X-H-13): the sweep reads VALUES,
+ *    not key names — `{commandLine: …}`, `{code: …}`, mixed argv and nested
+ *    command objects are all just strings now. The read-only roster exempts
+ *    ONLY the structured path check above (reading the store is legitimate);
+ *    it no longer exempts the textual sweep: a read-named tool CARRYING a
+ *    command string is an execution signal (`grep {command: 'echo x >
+ *    .proof/evidence.jsonl'}` was the audit's PoC #4). Accepted over-deny
+ *    (宁误拦): a string that legitimately mentions the store — including a
+ *    read tool's own file_path — is denied once with a reason saying why;
+ *    the proof MCP tools remain the sanctioned read route.
  * 2. ASK — a mutation with provably no baseline under requireBaseline 'ask'.
  *    `hasBaseline === undefined` means "unknown" and never blocks (mirrors
  *    index.ts, where a baseline probe that throws passes the call through).
@@ -152,10 +232,11 @@ export function decidePreToolUse(
   options: GateOptions,
   hasBaseline: boolean | undefined,
 ): GateDecision {
-  if (isMutationToolName(toolName) && (options.evidenceStore === 'workspace' || options.trustRoot !== undefined)) {
+  const mutation = isMutationToolName(toolName)
+  const targets = guardedShellTargets(root, options)
+  if (mutation && (options.evidenceStore === 'workspace' || options.trustRoot !== undefined)) {
     const candidates = WorkspaceWatch.pathsIn(toolInput, { contentKeys: true })
-    let touches = false
-    let hostMode = false
+    let verdict: 'store' | 'trust' | undefined
     if (options.evidenceStore === 'workspace') {
       // pure derivation: this sweep only consumes root/evidenceDir/evidenceStore
       // (the key is never read here), so the identity probe is skipped.
@@ -164,53 +245,61 @@ export function decidePreToolUse(
         evidenceStore: options.evidenceStore,
         evidenceDir: options.evidenceDir,
       }, { pure: true })
-      touches = candidates.some(candidate => touchesEvidencePath(candidate, paths))
-    } else {
-      // H-26 structured half: host mode moves the store under the trust root,
-      // outside the workspace — a workspace-RELATIVE path cannot reach it, but
-      // an ABSOLUTE path into `<trustRoot>/workspaces/<key>` is precisely the
-      // "the store is outside the sandbox" promise this guard must keep. Both
-      // identity spellings are swept (a migrated deployment may still hold
-      // its store under the legacy key), the same pair the shell rule lists.
-      hostMode = true
-      const trust = options.trustRoot!.replace(/\\/g, '/').replace(/\/+$/, '')
+      if (candidates.some(candidate => touchesEvidencePath(candidate, paths))) verdict = 'store'
+    }
+    if (verdict === undefined && options.trustRoot !== undefined && options.trustRoot.length > 0) {
+      // H-26 structured half + W11-M3, unified across store modes: the
+      // host-mode store, the anchors and the adapter session ledgers all live
+      // under the trust root — an ABSOLUTE path into any of them is the write
+      // this guard exists to refuse, in workspace mode just as much as in
+      // host mode (only the store's location differs). Both identity
+      // spellings are swept (a migrated deployment may still hold its state
+      // under the legacy key), the same pair the shell rule lists.
+      const trust = foldHostPath(options.trustRoot)
       const pair = workspaceKeyPair(root)
       const keys = pair.normalized === pair.legacy ? [pair.normalized] : [pair.normalized, pair.legacy]
-      const storeDirs = keys.map(key => `${trust}/workspaces/${key}`)
-      touches = candidates.some(candidate => storeDirs.some(dir => absoluteInside(candidate, dir)))
+      const guardedDirs = keys.flatMap(key => [
+        `${trust}/workspaces/${key}`,
+        `${trust}/anchors/${key}`,
+        `${trust}/adapter-sessions/${key}`,
+      ])
+      if (candidates.some(candidate => guardedDirs.some(dir => absoluteInside(candidate, dir)))) verdict = 'trust'
     }
-    if (touches) {
-      return {
-        action: 'deny',
-        reason: hostMode
-          ? 'dsh-proof: this call writes into the host-side verification evidence store by absolute '
-            + 'path — the store lives outside the workspace precisely so the agent it audits cannot '
-            + 'edit it. Evidence changes go through a human, never through your own tools.'
-          : 'dsh-proof: this call writes into the verification evidence store, which must not be '
+    if (verdict !== undefined) {
+      return verdict === 'store'
+        ? {
+          action: 'deny',
+          reason: 'dsh-proof: this call writes into the verification evidence store, which must not be '
             + 'modified by the agent it is meant to audit. Evidence changes go through host mode '
             + '(store outside the workspace) or a human — never through your own tools.',
+        }
+        : {
+          action: 'deny',
+          reason: 'dsh-proof: this call writes into the trust-side verification artifacts (evidence store, '
+            + 'anchors, session ledgers) by absolute path — they live outside the workspace precisely so the '
+            + 'agent they audit cannot edit them. Evidence changes go through a human, never through your own tools.',
+        }
+    }
+  }
+  // X-H-13: the textual sweep runs for EVERY tool name — the capability gate
+  // moved from "is this name a mutator" (a list, walked around by read-named
+  // tools carrying commands) to "does this call carry a string that names the
+  // store" (a property of the input). Empty targets (no workspace store, no
+  // trust root — the historical GateOptions contract) disarm it as before.
+  if (targets.length > 0) {
+    for (const value of sweepToolInputStrings(toolInput)) {
+      if (shellCommandMentionsPath(value, targets)) {
+        return {
+          action: 'deny',
+          reason: 'dsh-proof: this command names the verification evidence store or its trust files, '
+            + 'which must not be modified by the agent they are meant to audit. Command strings cannot be '
+            + 'path-checked structurally, so any mention of the store is refused — run the command without '
+            + 'the evidence paths, or route evidence changes through a human.',
+        }
       }
     }
   }
-  if (isMutationToolName(toolName)) {
-    const command = shellCommandOf(toolInput)
-    // N-1 (red team, v0.22): the sweep is gated on CAPABILITY, not on a name
-    // list — any mutation-class call that carries a command string is swept,
-    // because hosts mint runner names faster than lists collect them
-    // (`sh`, `python`, `node`, `powershell`, `cmd`, `eval`, … all execute
-    // commands; only the read-only roster is exempt).
-    if (command !== undefined && command.length > 0
-      && shellCommandMentionsPath(command, guardedShellTargets(root, options))) {
-      return {
-        action: 'deny',
-        reason: 'dsh-proof: this command names the verification evidence store or its trust files, '
-          + 'which must not be modified by the agent they are meant to audit. Command strings cannot be '
-          + 'path-checked structurally, so any mention of the store is refused — run the command without '
-          + 'the evidence paths, or route evidence changes through a human.',
-      }
-    }
-  }
-  if (isMutationToolName(toolName) && hasBaseline === false && options.requireBaseline === 'ask') {
+  if (mutation && hasBaseline === false && options.requireBaseline === 'ask') {
     return {
       action: 'ask',
       reason: `dsh-proof: no verification baseline exists yet, and \`${toolName}\` mutates the workspace. `
@@ -283,24 +372,45 @@ function baselineSelfAddress(parsed: BaselineFileShape): string | undefined {
  * JSON with a string `baselineId` — and in workspace mode the baseline file
  * sits in the agent-writable area, so a 20-byte `{"baselineId":"forged"}`
  * permanently dismissed the baseline gate (ask ladder released, notices
- * silenced). True now requires the file to address ITSELF: the check
- * evidence addresses must merkle to the recorded root, and the recorded
- * id must equal the address of exactly that material — the same identity
- * `buildBaseline` computes. A forged file that satisfies this is a fully
- * self-consistent baseline, which is a strictly harder lie than 20 bytes and
- * the strongest statement this layer can make without the signing key (the
- * chain's `baseline/saved` digest remains the engine-side authority).
+ * silenced). True requires the file to address ITSELF: the check evidence
+ * addresses must merkle to the recorded root, and the recorded id must equal
+ * the address of exactly that material — the same identity `buildBaseline`
+ * computes.
+ *
+ * W11-M4: self-address alone was five lines away with the package's own
+ * exports (`addressOf` and `merkleRoot` are public) — an EMPTY self-consistent
+ * baseline released the ladder as surely as a forged one. Two closures:
+ * - `chainDigest` (optional): when the caller can see the evidence chain, the
+ *   digest the chain's non-suspect `baseline`/`saved` marker recorded for the
+ *   baseline FILE BYTES — a matching digest is the engine-side authority
+ *   (H-23's rule mirrored here); any mismatch (including a hand-recomputed
+ *   self-consistent forgery) is false.
+ * - Without a chain to bind to, the floor rises instead: at least one check
+ *   and a parseable `createdAt` are required. The price is honest over-deny:
+ *   a genuine zero-check baseline (a project with no discovered checks) reads
+ *   as "no baseline" and keeps the ladder armed — one ask per mutation,
+ *   versus a five-line forgery the old check accepted as history.
  */
 export async function hasBaselineOnDisk(
   paths: ProofPaths,
   readFile: (abs: string) => Promise<string | undefined>,
+  chainDigest?: string,
 ): Promise<boolean> {
   const raw = await readFile(paths.baselinePath)
   if (raw === undefined) return false
+  // Chain binding first: bytes the engine never saved are not a baseline,
+  // whatever they say about themselves.
+  if (chainDigest !== undefined && sha256(raw) !== chainDigest) return false
   try {
     const parsed = JSON.parse(raw) as BaselineFileShape
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return false
     if (typeof parsed.baselineId !== 'string') return false
+    if (chainDigest === undefined) {
+      // The no-chain floor (W11-M4): without bytes to bind to, an empty
+      // self-consistent baseline is trivially mintable — see the doc above.
+      if (!Array.isArray(parsed.checks) || parsed.checks.length === 0) return false
+      if (typeof parsed.createdAt !== 'string' || Number.isNaN(Date.parse(parsed.createdAt))) return false
+    }
     return baselineSelfAddress(parsed) === parsed.baselineId
   } catch {
     return false

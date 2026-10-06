@@ -223,6 +223,29 @@ export interface TrustWeights {
 export const DEFAULT_TRUST_WEIGHTS: TrustWeights = { classB: 0.7, classC: 0.9, humanProbability: 0.95 }
 
 /**
+ * W15-M5: `TrustWeights.classB`/`classC` must lie in the CLOSED interval
+ * [0,1] (0 = "no trust, no evidence" and 1 = "testify at full weight" are
+ * both documented, meaningful endpoints — only the outside is nonsense).
+ * The module's own invariant ("testimony can only weaken": p^w ≤ 1, and the
+ * fusion mixture never overshooting either endpoint) depends on it — a
+ * negative w AMPLIFIES the claim product above 1, w > 1 extrapolates the
+ * `(1−w)·current + w·p` mixture past both of its endpoints. The plugin
+ * config path already bounds these (`Schema.percent()`), but this module's
+ * API takes bare numbers, so it guards its own door: refuse loudly at the
+ * factor and fusion entries instead of trusting every upstream forever.
+ */
+function assertTrustWeights(weights: TrustWeights): void {
+  for (const [name, value] of [['classB', weights.classB], ['classC', weights.classC]] as const) {
+    if (!Number.isFinite(value) || value < 0 || value > 1) {
+      throw new TypeError(
+        `TrustWeights.${name} must lie in [0,1] — got ${value}. Outside it testimony can only forge: `
+        + 'a negative exponent amplifies the claim product, a weight above 1 extrapolates the fusion past both endpoints.',
+      )
+    }
+  }
+}
+
+/**
  * The claim-probability factor an attestation contributes — the same currency
  * `claimProbability` (core/bayes.ts) multiplies together over machine checks.
  *
@@ -252,6 +275,7 @@ export const DEFAULT_TRUST_WEIGHTS: TrustWeights = { classB: 0.7, classC: 0.9, h
  * structurally impossible, number field notwithstanding.)
  */
 export function attestationFactor(att: Attestation, weights: TrustWeights): number {
+  assertTrustWeights(weights)
   if (att.kind === 'attest/jury') {
     // Abstention is deliberately factor 1, not a penalty: "I cannot tell" is
     // the absence of evidence, and absence of evidence must not be booked as
@@ -315,6 +339,7 @@ export function attestationFactor(att: Attestation, weights: TrustWeights): numb
  * level. A rejection multiplies in the heavy discount via `attestationFactor`.
  */
 export function fuseConfidence(current: number, att: Attestation, weights: TrustWeights): number {
+  assertTrustWeights(weights)
   if (!isUsableProbability(current)) return current
   if (att.kind === 'attest/human') {
     // Endorse: the number stands (risk acceptance, grade-level unlock).

@@ -26,6 +26,7 @@ import {
   type HumanAttestation, type JuryAttestation,
 } from '../core/attest.ts'
 import { SYNTHETIC_DIR_DEFAULT } from '../core/synthetic.ts'
+import { readMarkers } from '../core/evidence.ts'
 import { sha256 } from '../core/hash.ts'
 
 // ---------------------------------------------------------------------------
@@ -719,8 +720,10 @@ function createVerifyTool(engine: ProofEngine, touched?: () => readonly string[]
       assertActive(exec)
       const parsed = (args ?? {}) as { changed?: string[]; all?: boolean; claim?: string }
       // M-54: element-level validation — a non-string entry is a parameter
-      // error, never a silently narrowed change set.
-      const changedList = checkedChanged(parsed.changed, 'proof_verify')
+      // error, never a silently narrowed change set. W13-M5: each element is
+      // also capped on its way to the engine (an unbounded "path" froze
+      // megabytes into every record that quoted the change set).
+      const changedList = checkedChanged(parsed.changed, 'proof_verify')?.map(capToolString)
       const outcome = await engine.verify({
         ...(changedList !== undefined ? { changed: changedList } : {}),
         ...(parsed.all === true ? { all: true } : {}),
@@ -851,20 +854,29 @@ function createClaimTool(engine: ProofEngine, touched?: () => readonly string[],
       // proven, with "Infinityms" printed in the obligation detail. NaN is
       // the same disease on the other branch. F7 adds the twin gate at the
       // contract-parsing layer; this is the tool-boundary one.
+      // W13-M6 (v0.23): 1e308 is finite but not a budget either — the same
+      // vacuous-truth disease one absurd magnitude later. The ceiling is
+      // 1e12 ms (≈ 11.6 days): a benchmark slower than that is not a
+      // benchmark, and everything above it can only be an unviolable budget
+      // dressed as a number.
       if (parsed.budgetMs !== undefined
-        && (typeof parsed.budgetMs !== 'number' || !Number.isFinite(parsed.budgetMs) || parsed.budgetMs <= 0)) {
+        && (typeof parsed.budgetMs !== 'number' || !Number.isFinite(parsed.budgetMs)
+          || parsed.budgetMs <= 0 || parsed.budgetMs > 1e12)) {
         throw new Error(`proof_claim: budgetMs must be a finite positive number of milliseconds `
-          + `(got ${typeof parsed.budgetMs === 'number' ? String(parsed.budgetMs) : `a ${typeof parsed.budgetMs}`}) — an infinite or NaN budget can never be exceeded, which is not a budget at all`)
+          + `(got ${typeof parsed.budgetMs === 'number' ? String(parsed.budgetMs) : `a ${typeof parsed.budgetMs}`}) — `
+          + `an infinite, NaN or absurd (>1e12) budget can never be exceeded, which is not a budget at all`)
       }
       // M-54: element-level validation, same discipline as proof_verify.
-      const changedList = checkedChanged(parsed.changed, 'proof_claim')
+      // W13-M5: elements capped like proof_verify's.
+      const changedList = checkedChanged(parsed.changed, 'proof_claim')?.map(capToolString)
       // M-49/L7 (v0.23): `entryPoints` is not consumed by the surface check
       // (see its schema description) — forwarded onto the contract object
       // only, and an all-non-string list forwards NOTHING rather than `[]`:
       // once the parameter goes live, "override with the empty set" and
-      // "derive from package.json" must never share a shape.
+      // "derive from package.json" must never share a shape. W13-M5: each
+      // forwarded element is capped.
       const entryPoints = Array.isArray(parsed.entryPoints)
-        ? parsed.entryPoints.filter((e): e is string => typeof e === 'string')
+        ? parsed.entryPoints.filter((e): e is string => typeof e === 'string').map(capToolString)
         : undefined
       const claim = capToolString(parsed.claim)
       // ζ typed-contract path: a `kind` binds the claim to its obligations via
@@ -1057,6 +1069,22 @@ function createJurySubmitTool(engine: ProofEngine, evidenceLogPath?: string): To
         throw new Error(`proof_jury_submit: probability must be a finite number in [0,1] `
           + `(got ${typeof parsed.probability === 'string' ? JSON.stringify(parsed.probability) : String(parsed.probability)})`)
       }
+      // W15-M1 (v0.23): the WRITE side refuses incoherent testimony. The
+      // reader (core/attest.ts's private isCoherentJury) has always skipped
+      // `reject @ 0.99` / `uphold @ 0.01` — a verdict contradicting its own
+      // probability in one payload — so recording one here produced a chain
+      // line no consumer could ever read: dead evidence at best, a
+      // cherry-pickable half (verdict for the obligation layer, number for
+      // the fusion layer) at worst. Mirror the read-side rule at the boundary
+      // — refuse, name the fix, keep the two layers in lockstep with the
+      // reader's ≥/≤ 0.5 thresholds. `abstain` carries no direction and is
+      // coherent at any probability.
+      if ((parsed.verdict === 'uphold' && parsed.probability < 0.5)
+        || (parsed.verdict === 'reject' && parsed.probability > 0.5)) {
+        throw new Error(`proof_jury_submit: verdict and probability must agree — 'uphold' needs `
+          + `probability ≥ 0.5 and 'reject' needs ≤ 0.5 (got ${parsed.verdict} @ ${parsed.probability}); `
+          + `abstain carries no direction. An incoherent record is skipped by every reader, so it is refused here.`)
+      }
       if (typeof parsed.reasoning !== 'string' || parsed.reasoning.trim().length === 0) {
         throw new Error('proof_jury_submit: reasoning is required — the verbatim deliberation output that lands on the chain')
       }
@@ -1087,9 +1115,10 @@ function createJurySubmitTool(engine: ProofEngine, evidenceLogPath?: string): To
         rubricVersion: request.rubricVersion ?? RUBRIC_V1,
         // The submitter's declaration, recorded as exactly that: an LLM's
         // self-report is not a signature, and a replay that disagrees is the
-        // audit that catches it.
+        // audit that catches it. W13-M5: capped like every other string that
+        // rides from an argument onto the chain.
         model: typeof parsed.model === 'string' && parsed.model.trim().length > 0
-          ? parsed.model
+          ? capToolString(parsed.model)
           : 'session-model (unverified)',
         // The host exposes no isolated-model seam yet: this deliberation ran
         // inside the authoring session's own context, and honesty demands
@@ -1307,9 +1336,11 @@ function createConjureTool(engine: ProofEngine): ToolDefinition {
         throw new Error(`proof_conjure: paths is required — the workspace-relative file(s) the conjured test `
           + `must exercise (got ${Array.isArray(parsed.paths) ? 'an empty list' : 'nothing usable'})`)
       }
+      // W13-M5: the paths ride onto the request record like the claim does —
+      // each capped before it can freeze unbounded bytes into a marker.
       const { request, template, instruction } = await engine.conjureRequest({
         claim: capToolString(parsed.claim),
-        paths: parsed.paths as string[],
+        paths: (parsed.paths as string[]).map(capToolString),
       })
       return {
         claimId: request.claimId,
@@ -1447,7 +1478,19 @@ function escapeRegExp(value: string): string {
 // never to a throw, and (per the guards above) absence means refusal.
 // ---------------------------------------------------------------------------
 
-/** Marker payloads under the given labels, in log order (newest last). */
+/**
+ * Marker payloads under the given labels, in log order (newest last).
+ *
+ * W13/X-H-05 (v0.23): the read is now VERIFIED — `readMarkers` (core/
+ * evidence.ts, the one chain-side rule) flags every protected marker whose
+ * `headRef` contradicts its physical position, and this read excludes them.
+ * The old raw `JSON.parse` loop read last-wins over ALL lines, so a marker
+ * appended out of band (the audited agent's shell echo-ing a forged
+ * `attest/jury-requested` line with a prompt of its own choosing) became
+ * "the pending request" and bound the next verdict to the FORGED prompt —
+ * jury prompt injection through the chain itself. A suspect line here is
+ * absence: the submit refuses, and the log's integrity is audit()'s charge.
+ */
 async function markerPayloads(
   engine: ProofEngine,
   logPath: string | undefined,
@@ -1455,21 +1498,10 @@ async function markerPayloads(
 ): Promise<Record<string, unknown>[]> {
   if (logPath === undefined) return []
   try {
-    const found: Record<string, unknown>[] = []
-    for (const line of await engine.fsView.readLines(logPath)) {
-      let envelope: { kind?: unknown; payload?: unknown }
-      try {
-        envelope = JSON.parse(line) as { kind?: unknown; payload?: unknown }
-      } catch {
-        continue
-      }
-      if (envelope?.kind !== 'marker') continue
-      const payload = envelope.payload
-      if (typeof payload !== 'object' || payload === null) continue
-      const record = payload as Record<string, unknown>
-      if (labels.has(String(record.label))) found.push(record)
-    }
-    return found
+    const lines = await engine.fsView.readLines(logPath)
+    return readMarkers(lines, { excludeSuspect: true })
+      .filter(marker => labels.has(marker.label))
+      .map(marker => marker.payload)
   } catch {
     // An unreadable log cannot invent testimony; every caller degrades to
     // absence (the log's own integrity is audit()'s charge, not this read's).
@@ -1495,6 +1527,10 @@ async function latestJuryRequest(
 /**
  * Highest recorded generation of one attestation kind for one claim, −1 when
  * none exists — the next record lands at +1, whatever the chain's history.
+ * W13 (v0.23): rides the VERIFIED read above, so an out-of-band gen bump
+ * (a suspect `attest/jury` line with gen 999) cannot push the next honest
+ * deliberation to gen 1000 — forged generations are absent here by the same
+ * headRef rule that refuses forged prompts.
  */
 async function maxAttestationGen(
   engine: ProofEngine,

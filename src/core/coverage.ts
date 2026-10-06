@@ -114,16 +114,29 @@ function anyRangeExecuted(fn: unknown): boolean {
  * folded, trailing-slash-stripped root, and a prefix comparison that is
  * case-insensitive exactly when the root is drive-form — Windows servers
  * routinely disagree with the host on drive-letter case while POSIX roots
- * stay case-sensitive. Reimplemented here rather than imported because the
- * core must not depend on the DSH adapter layer (`core` never imports `dsh`).
+ * stay case-sensitive. One deliberate divergence (W15-L8): this copy strips
+ * a `?query`/`#fragment` suffix before comparing, because V8 coverage URLs
+ * may carry a cache-bust query while LSP document URIs never do.
+ * Reimplemented here rather than imported because the core must not depend
+ * on the DSH adapter layer (`core` never imports `dsh`).
  */
 function fileUrlToRelative(url: string, root: string): string | null {
   if (!url.startsWith('file:')) return null
+  // W15-L8: a coverage URL may carry a cache-bust query or fragment
+  // (`file:///src/x.mjs?bust=1`) — the executed FILE is the path part, and a
+  // literal `?…` must be percent-encoded (%3F) to be part of a real file URL,
+  // so cutting at the first raw `?`/`#` never truncates a genuine path.
+  // Matching the query verbatim used to leave executed code permanently
+  // "uncovered" (the changed file never equalled the queried spelling), the
+  // gate blocking on workspaces that cache-bust — conservative, but factually
+  // wrong about what ran.
+  const queryCut = url.search(/[?#]/)
+  const bareUrl = queryCut >= 0 ? url.slice(0, queryCut) : url
   let path: string
-  if (url.startsWith('file:///')) {
-    path = `/${decodeURIComponentSafe(url.slice('file:///'.length))}`
-  } else if (url.startsWith('file://')) {
-    path = decodeURIComponentSafe(url.slice('file://'.length))
+  if (bareUrl.startsWith('file:///')) {
+    path = `/${decodeURIComponentSafe(bareUrl.slice('file:///'.length))}`
+  } else if (bareUrl.startsWith('file://')) {
+    path = decodeURIComponentSafe(bareUrl.slice('file://'.length))
   } else {
     return null
   }

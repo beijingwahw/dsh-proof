@@ -54,6 +54,15 @@ export interface CommandPort {
 
 export interface CommandRunOptions {
   readonly cwd: string
+  /**
+   * Cooperative wall-clock budget for one run, in milliseconds. MUST be a
+   * finite positive number: the Node port refuses to spawn on anything else
+   * (naming the bug in `spawnError`) because `setTimeout` coerces NaN and
+   * out-of-domain values into an instant kill that would be booked as a
+   * timeout — a death-cause lie. Budgets beyond Node's 2^31-1 timer domain
+   * are clamped to it (the nearest a timer can come to "effectively
+   * unlimited"), never coerced down to 1ms.
+   */
   readonly timeoutMs: number
   readonly signal: AbortSignal
   /** Environment overlay applied on top of the inherited environment. */

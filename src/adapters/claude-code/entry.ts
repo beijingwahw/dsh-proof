@@ -7,8 +7,10 @@
  * Claude Code feeds one JSON object (the hook payload) on stdin and reads a
  * single line of JSON from stdout; exit 0 always, exit 0 with no output means
  * "no action". Wiring lives in examples/claude-code.settings.json; the tool
- * surface itself (proof_status/proof_baseline/proof_verify/proof_claim/
- * proof_bundle) rides MCP: `claude mcp add proof -- dsh-proof-mcp`.
+ * surface itself — the thirteen frozen MCP names of the APP/1.4 contract
+ * (proof_status/proof_baseline/proof_verify/proof_claim/proof_bundle and
+ * eight more; the single source is MCP_TOOLS in src/app/mcp-server.ts) —
+ * rides MCP: `claude mcp add proof -- dsh-proof-mcp`.
  *
  * Failure posture, per event:
  *   - a payload that does not parse: PreToolUse answers `ask` (a gate that
@@ -49,6 +51,12 @@ function preAsk(reason: string): string {
  * arrived: a truncated payload fails JSON.parse downstream, and for
  * pre-tool-use that honestly answers `ask` — a gate that cannot read its
  * input must not wave the mutation through.
+ *
+ * The cap counts real BYTES (W12-L10): the pre-v0.24 check compared
+ * `buffer.length` against a constant named *_BYTES, but a JS string's length
+ * counts UTF-16 code units — a CJK-heavy payload could buffer ~8 million
+ * bytes before tripping a "4 MB" cap. The limit and the fail-closed posture
+ * were never wrong; only the label was.
  */
 const STDIN_LIMIT_BYTES = 4 * 1024 * 1024
 const STDIN_DEADLINE_MS = 10_000
@@ -62,6 +70,7 @@ function readStdin(): Promise<string> {
     }
     stdin.setEncoding('utf8')
     let buffer = ''
+    let receivedBytes = 0
     let settled = false
     const settle = (): void => {
       if (settled) return
@@ -78,7 +87,8 @@ function readStdin(): Promise<string> {
     stdin.on('data', (chunk: string) => {
       if (settled) return
       buffer += chunk
-      if (buffer.length > STDIN_LIMIT_BYTES) settle()
+      receivedBytes += Buffer.byteLength(chunk, 'utf8')
+      if (receivedBytes > STDIN_LIMIT_BYTES) settle()
     })
     stdin.on('end', settle)
     stdin.on('error', settle)
@@ -131,6 +141,10 @@ async function main(): Promise<void> {
 // — breaking the "exit 0 always" contract for nothing the host can use.
 // The answer is best-effort; silence is already the protocol's no-action.
 process.stdout.on('error', () => { /* the pipe is gone; nothing left to say */ })
+// W12-L11: the same holds for stderr — console.error and process.stderr.write
+// after the host closed the pipe raise the same unhandled 'error' event, and
+// a diagnostics sink must never be the thing that breaks exit-0-always.
+process.stderr.on('error', () => { /* the pipe is gone; nothing left to say */ })
 
 function writeOut(line: string): void {
   try {

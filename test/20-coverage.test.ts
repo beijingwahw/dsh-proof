@@ -85,6 +85,27 @@ test('parse: outside-root, root-adjacent, node_modules and node: urls are droppe
   assert.deepEqual(parsed.loadedNotExecuted, [])
 })
 
+test('W15-L8: a cache-bust query or fragment on the URL still matches the file it executed', () => {
+  // Workspaces that bust V8's script cache get `?v=…` on the coverage URL;
+  // matching the query verbatim used to leave the executed file permanently
+  // "uncovered" — the gate blocking on exactly the workspaces that
+  // instrument. The executed FILE is the path part; the suffix is cut before
+  // comparison (a literal `?` in a real path is %3F, so the cut never
+  // truncates a genuine path).
+  const parsed = parseV8CoverageReport(v8Report([
+    { url: 'file:///C:/ws/src/x.mjs?bust=1', counts: [1] },
+    { url: 'file:///C:/ws/src/y.mjs#fragment', counts: [0] },
+    { url: 'file:///C:/ws/src/q%3Fmark.ts?also-query', counts: [2] },
+  ]), ROOT)
+  assert.ok(parsed)
+  assert.deepEqual(parsed.executed, ['src/q?mark.ts', 'src/x.mjs'], 'query and fragment are stripped, percent-escapes still decode')
+  assert.deepEqual(parsed.loadedNotExecuted, ['src/y.mjs'], 'loaded-but-not-executed survives the same cut')
+  // End to end: the changed file counts as executed, the gate does not block.
+  const summary = summarizeCoverage({ changed: ['src/x.mjs'], executedSets: [parsed.executed] })
+  assert.deepEqual(summary.changedExecuted, ['src/x.mjs'])
+  assert.deepEqual(summary.changedUncovered, [], 'no false uncovered-change from a cache-bust suffix')
+})
+
 test('parse: drive-letter case and backslash root compare case-insensitively', () => {
   const parsed = parseV8CoverageReport(v8Report([
     { url: 'file:///c:/WS/src/low.ts', counts: [1] },

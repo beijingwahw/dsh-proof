@@ -122,6 +122,49 @@ export interface BundleAnchor {
 }
 
 /**
+ * The verifier's view of the anchor key: the identity half of the
+ * prover/auditor asymmetry. A signer the PRODUCER holds can mint checkpoints
+ * and anchors; this object can only *check* them — a keyId to match against,
+ * and a verify that adjudicates a detached signature over the exact bytes
+ * `checkpointSignedData` serialises. `verify` may throw (a hostile or broken
+ * key implementation must never crash the auditor): a throw counts as a
+ * failed verification, never as a rejected promise.
+ */
+export interface BundleAnchorSigner {
+  readonly keyId: string
+  readonly verify: (data: string, sig: string) => Promise<boolean>
+}
+
+/**
+ * The optional second argument `verifyBundle` accepts (v0.23, X-H-02): the
+ * caller's anchor signer, without which the checkpoint-signature three-state
+ * (`verified` / `invalid` / `unverified`) can never say anything but
+ * `unverified`. Engines adjudicating submitted bundles pass the anchor key
+ * they hold; direct callers may pass one too. The signer may also be passed
+ * bare (the pre-options positional form) — both shapes below are accepted.
+ */
+export interface VerifyBundleOptions {
+  /** The verifier's view of the key the bundle's signatures name. */
+  readonly anchorSigner?: BundleAnchorSigner
+}
+
+/**
+ * Normalise the optional second argument: a bare signer, or an options
+ * object carrying one. Anything without a non-empty string `keyId` and a
+ * callable `verify` is treated as "no signer" — a malformed capability is a
+ * missing capability, never a crash.
+ */
+function anchorSignerOf(option: unknown): BundleAnchorSigner | undefined {
+  if (option === null || typeof option !== 'object') return undefined
+  const candidate = 'anchorSigner' in option ? (option as { anchorSigner?: unknown }).anchorSigner : option
+  if (candidate === null || typeof candidate !== 'object') return undefined
+  const signer = candidate as Partial<BundleAnchorSigner>
+  if (typeof signer.keyId !== 'string' || signer.keyId.length === 0) return undefined
+  if (typeof signer.verify !== 'function') return undefined
+  return { keyId: signer.keyId, verify: signer.verify as BundleAnchorSigner['verify'] }
+}
+
+/**
  * What `verifyBundle` can report as a chain mode. `legacy`/`unsigned` come
  * verbatim from `walkChain`. `signed` is reported ONLY when at least one
  * checkpoint signature was actually adjudicated against a key the verifier
@@ -152,6 +195,18 @@ export interface BundleVerification {
   readonly malformedCheckpoints: readonly number[]
   /** Records appended after the last checkpoint (chain-covered, not checkpoint-covered). */
   readonly tailRecords: number
+  /**
+   * Checkpoints whose self-declared `payload.head` disagrees with the chain
+   * digest the walk computed at their position (`expectedHead`), present and
+   * non-zero only when such checkpoints exist (v0.23, X-H-03). An honest
+   * writer always stamps the walked head, so a disagreement means the
+   * checkpoint was replayed from another chain position or chains onto a
+   * rewritten prefix — a keyless contradiction, named in `problems` whether
+   * or not a signer was at hand, and charged against `checkpointSignature`
+   * when the lying checkpoint's signature itself verified (a genuine
+   * signature over a planted position is a replay, not proof of this chain).
+   */
+  readonly headLiars?: number
   /** `legacy` / `unsigned` / `signed` / `signed-unverified` — see `BundleChainMode`. */
   readonly chainMode: BundleChainMode
   /** Anchor facts, when the bundle carries an `anchor.json` that parses. */
@@ -241,10 +296,20 @@ export function buildBundle(
  * 3. **Chain walk** — `walkChain` over the log's lines; breaks, corrupt
  *    lines and malformed checkpoints are passed through verbatim as
  *    problems; a log with no lines at all is itself a problem (an empty
- *    bundle is not a clean verdict). Signature-bearing checkpoints get
- *    their signatures actually adjudicated when the caller's signer holds
- *    the named key — otherwise the mode honestly says
- *    `signed-unverified`, never `signed`.
+ *    bundle is not a clean verdict), and so is a log whose lines carry ZERO
+ *    evidence/marker records — a structurally intact, content-empty log
+ *    (v0.23, W10-M5: the single `count: 0` checkpoint is the shape) is not
+ *    verifiable evidence either. Signature-bearing checkpoints get their
+ *    signatures actually adjudicated when the caller's signer holds the
+ *    named key — otherwise the mode honestly says `signed-unverified`,
+ *    never `signed`. Two walk-level facts ride the verdict as problems
+ *    (v0.23): checkpoints whose `payload.head` disagrees with the walked
+ *    `expectedHead` (X-H-03 — a replayed or rewritten position; when such a
+ *    checkpoint's signature VERIFIED, the adjudication is charged invalid),
+ *    and records riding behind the last checkpoint that no checkpoint
+ *    covers (X-H-04 — `tailRecords` stays a field, but a covered-prefix
+ *    bundle with an uncovered tail no longer reads as clean, which is the
+ *    piggyback channel a forger appends self-chained records into).
  * 4. **Anchor** (when carried) — parsed with core's `parseAnchor`; its head
  *    is compared against the chain's last checkpoint. When the caller
  *    supplies a signer, the anchor's detached signature over
@@ -252,10 +317,15 @@ export function buildBundle(
  *    under the same burden-of-proof rules as `EvidenceStore.audit()`: only a
  *    key that *is* the named keyId, over an anchor that *carries*
  *    `workspaceKey`, gets to refute — a missing capability is never an
- *    accusation. When the signature was not adjudicable, the anchor's
- *    identity fields (keyId, count, workspaceKey) are cross-checked against
- *    the chain and manifest instead — contradictions provable without any
- *    key.
+ *    accusation. A verify that THROWS counts as failed, never as a rejected
+ *    promise (v0.23, W10-L8). When the signature was not adjudicable, the
+ *    anchor's identity fields (keyId, count, workspaceKey) are
+ *    cross-checked against the chain and manifest instead — contradictions
+ *    provable without any key. The keyId cross-check answers to the chain's
+ *    signing identity even when the LAST checkpoint carries none (v0.23,
+ *    W10-L9: a stripped final keyId no longer hides a foreign anchor key —
+ *    the most recent signature-bearing checkpoint's keyId speaks for the
+ *    chain).
  * 5. **Baseline** (when carried) — parsed; its `baselineId` must still
  *    address the same material `buildBaseline` hashed (`createdAt`,
  *    `workspace`, `checkIds`, `root`).
@@ -272,9 +342,10 @@ export function buildBundle(
  */
 export async function verifyBundle(
   bundle: ProofBundle,
-  anchorSigner?: { keyId: string; verify: (data: string, sig: string) => Promise<boolean> },
+  options?: BundleAnchorSigner | VerifyBundleOptions,
 ): Promise<BundleVerification> {
   const problems: string[] = []
+  const anchorSigner = anchorSignerOf(options)
 
   // Untrusted input: the bundle may be hand-crafted, so read it defensively.
   const raw = (bundle ?? {}) as unknown as Partial<ProofBundle>
@@ -375,6 +446,18 @@ export async function verifyBundle(
   if (typeof evidenceLog === 'string' && lines.length === 0) {
     problems.push('evidence log is empty: no records and no checkpoints — the bundle carries nothing to verify')
   }
+  // W10-M5 (v0.23): zero LINES was already a problem; zero RECORDS is the
+  // subtler shape — a log whose every line is a checkpoint (the single
+  // `count: 0` checkpoint is the canonical form) walks clean, chains clean,
+  // and carries no evidence whatsoever. Structure without content is not
+  // verifiable evidence: the aggregate verdict must refuse to read as
+  // "proven something" exactly as it does for the empty log.
+  if (typeof evidenceLog === 'string' && lines.length > 0 && walk.records === 0) {
+    problems.push(
+      `evidence log carries no records: ${lines.length} line(s) but not one evidence or marker record`
+      + ' — structurally intact and content-empty is not verifiable evidence',
+    )
+  }
   for (const index of walk.chainBreaks) {
     problems.push(`chain break at line ${index}: prev does not match the previous line's digest`)
   }
@@ -388,6 +471,35 @@ export async function verifyBundle(
   for (const index of walk.malformedCheckpoints) {
     problems.push(`malformed checkpoint at line ${index}: its self-reported count does not match the records the walk counted`)
   }
+  // X-H-04 (v0.23): the uncovered tail. `tailRecords` has always been
+  // reported as a field; it was never a problem, so a forger could append
+  // arbitrary self-chained records behind one signed checkpoint and ride
+  // the covered prefix's clean verdict (the delegation path gates on
+  // `problems`, which never saw the tail). Records riding behind the last
+  // checkpoint are unverifiable BY that checkpoint — that is a problem now,
+  // whenever the chain HAS a checkpoint to ride behind. A checkpoint-less
+  // chain stays clean as ever: its `unsigned` mode already says nothing
+  // vouches for it, and there is no covered prefix to launder through.
+  if (walk.checkpoints.length > 0 && walk.tailRecords > 0) {
+    problems.push(
+      `${walk.tailRecords} record(s) ride behind the last checkpoint, unverifiable by it`
+      + ' — the checkpointed prefix does not vouch for the tail',
+    )
+  }
+  // X-H-03 (v0.23): the head-liar. An honest writer stamps the chain digest
+  // at the checkpoint's position into `payload.head` — exactly what
+  // `walkChain` recomputes as `expectedHead`. A checkpoint that disagrees
+  // is either replayed from another position/chain (its signature may
+  // verify: the payload WAS signed, somewhere else) or sits on a rewritten
+  // prefix. The contradiction is keyless, so it is named whether or not a
+  // signer was at hand; the crypto charge below only sharpens it.
+  const headLiars = walk.checkpoints.filter(cp => cp.payload.head !== cp.expectedHead)
+  for (const cp of headLiars) {
+    problems.push(
+      `checkpoint head does not match the walked chain position at line ${cp.index}`
+      + ` (walk expected ${cp.expectedHead}, checkpoint declares ${cp.payload.head})`,
+    )
+  }
 
   // Checkpoint-signature adjudication (H-05): `walkChain` reports `signed`
   // for any checkpoint that merely CARRIES a `sig` — presence, not proof.
@@ -396,7 +508,12 @@ export async function verifyBundle(
   // hold, facing a checkpoint that names that very keyId, gets to refute);
   // when no held key matches, the honest answer is `unverified`, and the
   // chain mode says `signed-unverified` so no consumer mistakes signature
-  // fields for verified signatures.
+  // fields for verified signatures. X-H-03 (v0.23): a checkpoint whose
+  // signature VERIFIES but whose head lies about its position is charged
+  // invalid — a genuine signature over a planted position is a replay, not
+  // proof of this chain. Supply side (X-H-02): the signer arrives via the
+  // options object (or the legacy positional form), so engines and direct
+  // callers alike can reach this code at all.
   let checkpointSignature: 'verified' | 'invalid' | 'unverified' | undefined
   let chainMode: BundleChainMode = walk.mode
   if (walk.mode === 'signed') {
@@ -407,16 +524,35 @@ export async function verifyBundle(
       chainMode = 'signed-unverified'
     } else {
       let allValid = true
+      const verifiedIndexes = new Set<number>()
       for (const cp of adjudicable) {
         let valid: boolean
         try {
           valid = await anchorSigner!.verify(checkpointSignedData(cp.payload), cp.sig as string)
         } catch {
+          // W10-L8 discipline on the checkpoint side too: a throwing key
+          // implementation is a failed verification, never a crash.
           valid = false
         }
-        if (!valid) {
+        if (valid) {
+          verifiedIndexes.add(cp.index)
+        } else {
           allValid = false
           problems.push(`checkpoint signature invalid at line ${cp.index} (keyId ${JSON.stringify(cp.keyId)})`)
+        }
+      }
+      // X-H-03: the replay charge. The signature was minted over this exact
+      // payload — but the walk just proved the payload's head does not name
+      // this chain position, so the only honest source of the signature is
+      // another log. Verified-and-lied invalidates the adjudication.
+      const replayed = headLiars.filter(cp => verifiedIndexes.has(cp.index))
+      if (replayed.length > 0) {
+        allValid = false
+        for (const cp of replayed) {
+          problems.push(
+            `checkpoint signature replays at line ${cp.index}: it verifies against the named key`
+            + ' but its payload.head names another chain position — a replayed checkpoint, not proof of this chain',
+          )
         }
       }
       checkpointSignature = allValid ? 'verified' : 'invalid'
@@ -455,7 +591,18 @@ export async function verifyBundle(
           workspaceKey: parsed.workspaceKey,
           at: parsed.at,
         })
-        if (!(await anchorSigner!.verify(signed, parsed.sig))) problems.push('anchor signature invalid')
+        // W10-L8 (v0.23): a bare await here let a throwing key
+        // implementation reject the whole verification promise — a hostile
+        // or broken signer crashing its auditor is a denial-of-service
+        // bypass of the verdict, the exact shape core's audit refuses. A
+        // throw is a failed verification, nothing more.
+        let valid: boolean
+        try {
+          valid = await anchorSigner!.verify(signed, parsed.sig)
+        } catch {
+          valid = false
+        }
+        if (!valid) problems.push('anchor signature invalid')
       } else if (lastCheckpoint !== undefined) {
         // The keyless floor (M-57): the signature covers count, head,
         // workspaceKey and at — so when it WAS adjudicated, its verdict
@@ -466,9 +613,19 @@ export async function verifyBundle(
         // counts, foreign keyIds and workspace-key swaps are contradictions
         // provable without any key, and they stop riding along beside the
         // one affirmative boolean (`headMatchesChain`) as if they agreed.
-        if (lastCheckpoint.keyId !== null && parsed.keyId !== lastCheckpoint.keyId) {
+        // W10-L9 (v0.23): the keyId the anchor must answer to is the
+        // chain's SIGNING identity, not merely the last line's field. A
+        // final checkpoint whose keyId was stripped (or never written — an
+        // honestly unsigned boundary over a signed history) used to blank
+        // this cross-check entirely, letting a foreign anchor keyId ride
+        // beside the very checkpoints that name the real one. When the last
+        // checkpoint carries no keyId, the most recent signature-bearing
+        // checkpoint's keyId speaks for the chain instead.
+        const chainKeyId = lastCheckpoint.keyId
+          ?? walk.checkpoints.findLast(cp => cp.sig !== null && cp.sig.length > 0 && cp.keyId !== null)?.keyId
+        if (chainKeyId !== undefined && parsed.keyId !== chainKeyId) {
           problems.push(
-            `anchor keyId ${JSON.stringify(parsed.keyId)} does not match the last checkpoint's keyId ${JSON.stringify(lastCheckpoint.keyId)}`,
+            `anchor keyId ${JSON.stringify(parsed.keyId)} does not match the chain's signing keyId ${JSON.stringify(chainKeyId)}`,
           )
         }
         if (parsed.count !== lastCheckpoint.payload.count) {
@@ -550,6 +707,7 @@ export async function verifyBundle(
     corruptLines: [...walk.corruptLines],
     malformedCheckpoints: [...walk.malformedCheckpoints],
     tailRecords: walk.tailRecords,
+    ...(headLiars.length > 0 ? { headLiars: headLiars.length } : {}),
     chainMode,
     ...(anchor !== undefined ? { anchor } : {}),
     ...(baselineId !== undefined ? { baselineId } : {}),

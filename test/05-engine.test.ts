@@ -1113,7 +1113,13 @@ test('κ (H32): a suspect-flagged attestation is withheld from the fusion and co
   await fs.appendLine(`${ROOT}/.proof/evidence.jsonl`, flagged)
 
   const outcome = await engine.verifyContract({ contract: { kind: 'llm-jury', claim } })
-  assert.equal(outcome.report.grade, 'proven', 'the clean gen-0 witness decides; the flagged line is not testimony')
+  // v0.23 (X-H-09): the impostor's line broke the chain (`prev` points
+  // nowhere), so the chain under this verdict fails its own audit and the
+  // grade caps at stale — but the H32 story this test pins is unchanged and
+  // still visible below: the fusion was decided by the CLEAN gen-0 witness
+  // (the impostor never reached it) and the withheld count is on the record.
+  assert.equal(outcome.report.grade, 'stale', 'the chain the impostor broke fails its own audit — the grade caps at stale')
+  assert.equal(outcome.auditFailed, true, 'the cap is the audit failure, not a judgment about the claim')
   assert.equal(outcome.contract.attestations?.length, 1)
   assert.equal(outcome.contract.attestations?.[0]?.gen, 0)
   assert.ok(fs.log.some(l => l.includes('"claim/jury"') && l.includes('"suspectAttestations":1')),

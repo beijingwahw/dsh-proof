@@ -72,6 +72,15 @@ async function mintSth(log: TransparencyLog, at: string): Promise<SignedTreeHead
   return { ...payload, sig: await op.sign(sthSignedData(payload)) }
 }
 
+/**
+ * v0.23 (X-H-10): the operator-side head verifier handed to savePtlHead.
+ * FakeOperator is stateless and deterministic (the signature is a function
+ * of keyId + data), so a fresh instance verifies every head the default
+ * operator minted — exactly the "caller holds the operator key" contract.
+ */
+const holdsUnderDefaultOperator = async (sth: SignedTreeHead): Promise<boolean> =>
+  new FakeOperator().verify(sthSignedData(sth), sth.sig)
+
 /** Flip one hex character (position defaults to the first) — a minimal forgery. */
 function flipHex(h: string, at = 0): string {
   return `${h.slice(0, at)}${h[at] === '0' ? '1' : '0'}${h.slice(at + 1)}`
@@ -520,14 +529,16 @@ test('savePtlHead round-trips and advances; the identical head re-saves idempote
   // prefix consistency against them, so the log has to be real.
   for (const e of shared) await appendPtlEntry(fs, DIR, e)
   const sthA = await mintSth(new TransparencyLog(shared.slice(0, 3)), '2026-10-06T01:00:00.000Z')
+  // The FIRST head is a cold start: no prior commitment, no verification.
   await savePtlHead(fs, DIR, sthA)
   assert.deepEqual((await loadPtl(fs, DIR)).sth, sthA)
-  // Same head again: allowed (idempotent re-assertion).
-  await savePtlHead(fs, DIR, sthA)
+  // Same head again: allowed (idempotent re-assertion) — and v0.23 (X-H-10):
+  // the stored head's signature is adjudicated first, and it holds.
+  await savePtlHead(fs, DIR, sthA, { verifyExistingHead: holdsUnderDefaultOperator })
   assert.deepEqual((await loadPtl(fs, DIR)).sth, sthA)
   // Advance: bigger tree, later timestamp, consistent prefix.
   const sthB = await mintSth(new TransparencyLog(shared), '2026-10-06T02:00:00.000Z')
-  await savePtlHead(fs, DIR, sthB)
+  await savePtlHead(fs, DIR, sthB, { verifyExistingHead: holdsUnderDefaultOperator })
   assert.deepEqual((await loadPtl(fs, DIR)).sth, sthB)
   assert.equal(
     verifyConsistency(sthA.treeSize, sthA.root, sthB.treeSize, sthB.root,
@@ -550,7 +561,7 @@ test('savePtlHead (v0.22): a LONGER head over a rewritten history is refused —
   fs.mutate(ENTRIES_PATH, `${rewritten.map(e => canonicalJson(e)).join('\n')}\n`)
   const sthAttack = await mintSth(new TransparencyLog(rewritten), '2026-10-06T02:00:00.000Z')
   await assert.rejects(
-    () => savePtlHead(fs, DIR, sthAttack),
+    () => savePtlHead(fs, DIR, sthAttack, { verifyExistingHead: holdsUnderDefaultOperator }),
     /refusing to sign a head that does not extend the published history/,
     'M-60: size growth without a consistency proof from the OLD head is a rewrite, not an append',
   )
@@ -561,7 +572,7 @@ test('savePtlHead (v0.22): a LONGER head over a rewritten history is refused —
   await appendPtlEntry(fs, DIR, entry(50))
   const grown = (await loadPtl(fs, DIR)).log
   const sthHonest = await mintSth(grown, '2026-10-06T03:00:00.000Z')
-  await savePtlHead(fs, DIR, sthHonest)
+  await savePtlHead(fs, DIR, sthHonest, { verifyExistingHead: holdsUnderDefaultOperator })
   assert.equal((await loadPtl(fs, DIR)).sth!.treeSize, 4)
 })
 
@@ -580,14 +591,24 @@ test('savePtlHead (v0.22): operator identity flips, unparseable timestamps, and 
   await assert.rejects(() => savePtlHead(fs, DIR, flipped), /refusing to change the transparency log operator/)
 
   // An `at` that is not a parseable instant is refused outright (A2-L1): a
-  // garbage stamp could wedge every later honest comparison.
-  const wedged = { ...opA, at: 'zzzz' } as SignedTreeHead
-  await assert.rejects(() => savePtlHead(fs, DIR, wedged), /timestamp cannot be parsed/)
+  // garbage stamp could wedge every later honest comparison. The head is
+  // RE-SIGNED over the garbage stamp so it passes the X-H-10 signature gate
+  // first — the timestamp refusal is what is under test, not the signature.
+  const wedgeOp = new FakeOperator()
+  const wedgeUnsigned = { logId: 'log-operator', treeSize: 2, root: new TransparencyLog(leaves).merkleRoot(), at: 'zzzz' }
+  const wedged: SignedTreeHead = { ...wedgeUnsigned, sig: await wedgeOp.sign(sthSignedData(wedgeUnsigned)) }
+  await assert.rejects(
+    () => savePtlHead(fs, DIR, wedged, { verifyExistingHead: holdsUnderDefaultOperator }),
+    /timestamp cannot be parsed/,
+  )
 
   // A head promising more entries than the file holds is disconnected, and
   // the disconnect is adjudicated instead of surfacing as a RangeError later.
   const beyond = await mintSth(new TransparencyLog(variedLeaves(9)), '2026-10-06T02:00:00.000Z')
-  await assert.rejects(() => savePtlHead(fs, DIR, beyond), /refusing to sign a head over 9 entries while the log holds 2/)
+  await assert.rejects(
+    () => savePtlHead(fs, DIR, beyond, { verifyExistingHead: holdsUnderDefaultOperator }),
+    /refusing to sign a head over 9 entries while the log holds 2/,
+  )
 
   assert.equal((await loadPtl(fs, DIR)).sth!.logId, opA.logId, 'nothing was clobbered')
 })
@@ -596,20 +617,21 @@ test('savePtlHead refuses every rewind: smaller tree, same tree different root, 
   const fs = MemoryFs.of({})
   const at1 = '2026-10-06T02:00:00.000Z'
   await savePtlHead(fs, DIR, await mintSth(new TransparencyLog(variedLeaves(9)), at1))
+  const holds = { verifyExistingHead: holdsUnderDefaultOperator }
 
   // (1) truncated tree: treeSize goes backwards.
   await assert.rejects(
-    async () => savePtlHead(fs, DIR, await mintSth(new TransparencyLog(variedLeaves(7)), '2026-10-06T03:00:00.000Z')),
+    async () => savePtlHead(fs, DIR, await mintSth(new TransparencyLog(variedLeaves(7)), '2026-10-06T03:00:00.000Z'), holds),
     /refusing to rewind the transparency head/,
   )
   // (2) rewritten tree: same size, different root.
   await assert.rejects(
-    async () => savePtlHead(fs, DIR, await mintSth(new TransparencyLog(variedLeaves(10).slice(0, 9)), '2026-10-06T03:00:00.000Z')),
+    async () => savePtlHead(fs, DIR, await mintSth(new TransparencyLog(variedLeaves(10).slice(0, 9)), '2026-10-06T03:00:00.000Z'), holds),
     /refusing to rewind the transparency head/,
   )
   // (3) timestamp regression — even with a LARGER tree, `at` may not go back.
   await assert.rejects(
-    async () => savePtlHead(fs, DIR, await mintSth(new TransparencyLog(variedLeaves(12)), '2026-10-06T01:00:00.000Z')),
+    async () => savePtlHead(fs, DIR, await mintSth(new TransparencyLog(variedLeaves(12)), '2026-10-06T01:00:00.000Z'), holds),
     /refusing to rewind the transparency head/,
   )
   // Nothing was clobbered by the refused writes.
@@ -684,7 +706,10 @@ test('THE SPLIT-VIEW DETECTOR: truncating the tail is refused by the head guard 
   // The guard: the operator refuses to sign the truncated state, exactly as
   // it refuses a forged STH from elsewhere landing in the head file.
   const truncatedSth = await mintSth(truncated.log, '2026-10-06T05:00:00.000Z')
-  await assert.rejects(() => savePtlHead(fs, DIR, truncatedSth), /refusing to rewind the transparency head/)
+  await assert.rejects(
+    () => savePtlHead(fs, DIR, truncatedSth, { verifyExistingHead: holdsUnderDefaultOperator }),
+    /refusing to rewind the transparency head/,
+  )
   assert.equal((await loadPtl(fs, DIR)).sth!.root, sth.root, 'the published head is untouched')
 })
 
@@ -766,4 +791,128 @@ test('concurrent appendPtlEntry calls serialise: every entry lands, exactly once
   // And the whole file is newline-terminated — no torn line can survive the
   // atomic whole-file commit even under racing writers.
   assert.ok(fs.files.get(ENTRIES_PATH)!.endsWith('\n'))
+})
+
+// ---------------------------------------------------------------------------
+// v0.23 fix batch — X-H-10 (the stored head's own signature) and W9-M8
+// (read failure is not absence). The planted-head attack this batch closes:
+// sth.json lives in the log directory, so a log-writer can plant ANY
+// self-consistent head it likes; savePtlHead used to reason from it as its
+// trust baseline without ever checking WHO signed it — the operator's next
+// honest append minted a fresh, genuinely-signed head over the attacker's
+// chosen history.
+// ---------------------------------------------------------------------------
+
+test('X-H-10: a planted head whose signature does not verify is refused — the operator never launders it', async () => {
+  const fs = MemoryFs.of({})
+  const honest = variedLeaves(3)
+  for (const e of honest) await appendPtlEntry(fs, DIR, e)
+  // The attacker rewrites the entries AND plants a head over the rewrite:
+  // self-consistent root/size, garbage signature.
+  const planted = variedLeaves(4)
+  fs.mutate(ENTRIES_PATH, `${planted.map(e => canonicalJson(e)).join('\n')}\n`)
+  const plantedLog = new TransparencyLog(planted)
+  const plantedHead: SignedTreeHead = {
+    logId: 'log-operator',
+    treeSize: plantedLog.size,
+    root: plantedLog.merkleRoot(),
+    at: '2026-10-06T01:00:00.000Z',
+    sig: 'GARBAGE-BASE64-PLANTED',
+  }
+  fs.mutate(HEAD_PATH, canonicalJson(plantedHead))
+
+  // The honest operator's next head over the (attacker-controlled) disk
+  // state: consistency with the planted head would "prove" fine — it was
+  // minted from the same planted bytes — but the signature gate refuses.
+  const grown = (await loadPtl(fs, DIR)).log
+  const next = await mintSth(grown, '2026-10-06T02:00:00.000Z')
+  await assert.rejects(
+    () => savePtlHead(fs, DIR, next, { verifyExistingHead: holdsUnderDefaultOperator }),
+    /stored tree head's signature does not verify/,
+    'the planted baseline is refused before any consistency math launders it',
+  )
+  // The planted head is untouched — the refusal wrote nothing.
+  assert.equal((await loadPtl(fs, DIR)).sth!.sig, 'GARBAGE-BASE64-PLANTED')
+})
+
+test('X-H-10 fail-closed: no verifier callback and a throwing verifier are both refusals, never passes', async () => {
+  const fs = MemoryFs.of({})
+  const leaves = variedLeaves(2)
+  for (const e of leaves) await appendPtlEntry(fs, DIR, e)
+  const sth = await mintSth(new TransparencyLog(leaves), '2026-10-06T01:00:00.000Z')
+  await savePtlHead(fs, DIR, sth) // cold start: no callback needed
+
+  const advance = await mintSth(new TransparencyLog([...leaves, entry(9)]), '2026-10-06T02:00:00.000Z')
+  // No callback at all: "cannot verify" is a refusal (uncertain = fail), not
+  // the old silent pass over an unchecked baseline.
+  await assert.rejects(
+    () => savePtlHead(fs, DIR, advance),
+    /without verifying the stored head's signature.*uncertain = fail/s,
+  )
+  // A callback that throws (locked key material, transient I/O): refusal,
+  // with the underlying reason carried through.
+  await assert.rejects(
+    () => savePtlHead(fs, DIR, advance, {
+      verifyExistingHead: async () => { throw new Error('key directory locked by a scanner') },
+    }),
+    /key directory locked by a scanner/,
+  )
+  assert.equal((await loadPtl(fs, DIR)).sth!.treeSize, 2, 'nothing was clobbered')
+})
+
+test('X-H-10 boundary: a stored head over ZERO entries is an adjudicated refusal, never a producer-side RangeError', async () => {
+  const fs = MemoryFs.of({})
+  const leaves = variedLeaves(2)
+  for (const e of leaves) await appendPtlEntry(fs, DIR, e)
+  // A planted size-0 head — even one carrying a GENUINE operator signature
+  // (the worst case: it passes the signature gate and then used to drive
+  // consistencyProof(0, N) outside the RFC domain as a RangeError).
+  const emptySth = await mintSth(new TransparencyLog([]), '2026-10-06T01:00:00.000Z')
+  assert.equal(emptySth.treeSize, 0, 'fixture: the empty-tree head')
+  fs.mutate(HEAD_PATH, canonicalJson(emptySth))
+  const advance = await mintSth(new TransparencyLog(leaves), '2026-10-06T02:00:00.000Z')
+  await assert.rejects(
+    () => savePtlHead(fs, DIR, advance, { verifyExistingHead: holdsUnderDefaultOperator }),
+    /refusing to extend a stored head over 0 entries/,
+    'adjudicated as a refusal, not surfaced as RangeError: 0->2 outside the log',
+  )
+})
+
+test('W9-M8: an entries file that exists but cannot be read refuses the append — the log is never rewritten to one line', async () => {
+  // FsPort.readFile folds "absent" and "read failed" into the same
+  // `undefined`. The old append turned a failed read (EBUSY/EPERM/AV lock)
+  // into `${''}${line}` — the whole history replaced by the new line.
+  class UnreadableEntries extends MemoryFs {
+    override async readFile(path: string): Promise<string | undefined> {
+      if (path === ENTRIES_PATH) return undefined // the read fails...
+      return super.readFile(path) // ...while stat (inherited) still sees the file
+    }
+  }
+  const fs = new UnreadableEntries()
+  const e0 = entry(0)
+  fs.files.set(ENTRIES_PATH, `${canonicalJson(e0)}\n`)
+  await assert.rejects(
+    () => appendPtlEntry(fs, DIR, entry(1)),
+    /exists but could not be read.*never masquerade as an empty log/s,
+    'a read failure must refuse, not rewrite from an empty snapshot',
+  )
+  assert.equal(fs.files.get(ENTRIES_PATH), `${canonicalJson(e0)}\n`, 'the history is untouched')
+})
+
+test('W9-M8: an sth.json that exists but cannot be read is not a cold start', async () => {
+  class UnreadableHead extends MemoryFs {
+    override async readFile(path: string): Promise<string | undefined> {
+      if (path === HEAD_PATH) return undefined
+      return super.readFile(path)
+    }
+  }
+  const fs = new UnreadableHead()
+  fs.files.set(HEAD_PATH, canonicalJson(await mintSth(new TransparencyLog(variedLeaves(2)), '2026-10-06T01:00:00.000Z')))
+  for (const e of variedLeaves(2)) await appendPtlEntry(fs, DIR, e)
+  const advance = await mintSth((await loadPtl(fs, DIR)).log, '2026-10-06T02:00:00.000Z')
+  await assert.rejects(
+    () => savePtlHead(fs, DIR, advance, { verifyExistingHead: holdsUnderDefaultOperator }),
+    /exists but could not be read.*unknown prior commitment/s,
+    'an unreadable prior commitment must not be signed over as if there were none',
+  )
 })

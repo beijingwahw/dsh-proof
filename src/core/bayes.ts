@@ -131,17 +131,125 @@ const SYNTHETIC_FALSE_PASS_DEFAULT = 0.15
  * digested — an *unreviewed* body. Higher than the synthetic tier (0.15)
  * because a drifted body is not merely self-authored, it is a body that
  * replaced one the baseline had already vouched for, chosen by the same hand
- * that owns the claim and never screened by anyone: at 0.5 a single pass
- * under it moves a cold prior (≤0.9) to ≈0.94 — visibly short of the default
- * 0.97 target, so a rewritten `"test": "node -e \"\""` cannot certify on one
- * forged green. Exported (unlike its synthetic sibling) because the ENGINE
+ * that owns the claim and never screened by anyone.
+ *
+ * W6-F3 — the honest grinding curve, per impact tier (measured, lib/core/
+ * bayes.js, β=0.5, α=0.05, default target 0.97; "n greens" counts post-drift
+ * pass observations folded from the cold prior, one decisive record per
+ * check per session, with the firstSeen boundary costing ≈2 sessions of
+ * lag — engine.ts drops this-run records recorded at or before the drift
+ * marker's timestamp):
+ *
+ * | s (impact tier)                 | cold π | 1 pass → | greens to re-cross 0.97 | ≈ sessions |
+ * |---------------------------------|--------|----------|--------------------------|------------|
+ * | 1.0 direct                      | 0.800  | 0.8837   | 13                       | ≈15        |
+ * | 0.7 bare-prefix                 | 0.860  | 0.9211   | 8                        | ≈10        |
+ * | 0.5 wildcard / distance-1       | 0.900  | 0.9448   | 4                        | ≈6         |
+ *
+ * The k=13 claim in the original H-03 note holds ONLY at s=1.0 (direct-hit
+ * rewrites). s=0.5 is the FLOOR of what an attacker self-selects into: any
+ * check declared with `paths: ['*']` (or reached only through one
+ * approximate hop) sits there, and 4 forged greens — roughly six sessions —
+ * re-cross the target. One forged green remains short of the line at every
+ * tier (single-session certification is still impossible), but "multiple
+ * honest observations" is tier-dependent, not the flat k=13 the old comment
+ * implied. The chain keeps a visible scriptDrift marker per session; what it
+ * does NOT have is any counter that escalates after N consecutive un-
+ * re-anchored drifts — that mechanism, or a per-tier β, is the recorded
+ * follow-up. Exported (unlike its synthetic sibling) because the ENGINE
  * applies it as a map rewrite over drifted ids — `computePriors` cannot know
  * which bodies drifted — and the engine's option default must be this one
  * number, not a second copy of it. Same discipline otherwise: NOT in
- * BAYES_CONSTANTS, overridable per deployment (`EngineOptions.driftedFalsePass`),
- * an admitted modelling guess rather than a law.
+ * BAYES_CONSTANTS, overridable per deployment (`EngineOptions.driftedFalsePass`,
+ * domain-gated by `assertFalsePassDomain` below), an admitted modelling guess
+ * rather than a law.
  */
 export const DRIFTED_FALSE_PASS_DEFAULT = 0.5
+
+/**
+ * W15-L12: the one true default for `certifyTarget` — the number behind
+ * "proven (p≈0.97)". It lives HERE (the graded-trust module, which core owns
+ * free of host-side imports) so every mirror of it references ONE binding:
+ * the config schema's default (config.ts imports this constant), the
+ * engine's EngineOptions fallback, and the narrative's display fallback in
+ * core/regression.ts. Re-typing 0.97 in each place is how the display and
+ * the gate silently disagree the day one of them moves.
+ */
+export const DEFAULT_CERTIFY_TARGET = 0.97
+
+// ---------------------------------------------------------------------------
+// W6-F1/F2: knob domain validation — the total gate for every β the model
+// consumes, exported for the engine/config layers to consume at their own
+// construction boundaries. The pure core refuses to compute with a β outside
+// its domain instead of producing the quiet reversals measured in the audit:
+// β=0 makes one forged pass posterior-exactly-1 (H-03 inverted: the host
+// tightened and thereby disarmed), β=1 makes a fail prove health, a negative
+// β amplifies the claim product past 1 (p^w-style overflow, super-probability
+// on reports), and NaN folds NaN into every factor and confidence readout.
+// ---------------------------------------------------------------------------
+
+/**
+ * Assert that β (a falsePass rate) lies in the OPEN interval (0, 1), rejecting
+ * non-finite values (NaN, ±Infinity). Both endpoints are excluded because
+ * each collapses the binary channel the whole model rests on: at β=0 every
+ * pass certifies, at β=1 every fail certifies health. Throws `RangeError`.
+ */
+export function assertFalsePassDomain(beta: number, knob = 'falsePass'): void {
+  if (!Number.isFinite(beta) || beta <= 0 || beta >= 1) {
+    throw new RangeError(
+      `${knob} must lie in the open interval (0,1) — got ${beta}. `
+      + 'β=0 makes one forged pass certify; β=1 makes a fail prove health; '
+      + 'non-finite values fold NaN into every factor. Refusing to compute (W6-F1).',
+    )
+  }
+}
+
+/**
+ * The Bayesian knobs a host may set, validated as one batch at the
+ * construction boundary (engine options / plugin config). Every β runs
+ * through `assertFalsePassDomain`; `certifyTarget` gets the same OPEN (0,1)
+ * domain for the symmetric reason — target 0 certifies anything (every H2/
+ * H-03 threshold collapses to a tautology), target 1 certifies nothing, and
+ * both are configuration errors, not policy choices, because neither can
+ * ever produce a meaningful verdict. Callers that construct the engine or
+ * parse its config should call this once with whatever knobs they received;
+ * `computePriors` independently gates its own `syntheticFalsePass` argument,
+ * so the pure core stays defended even when called directly.
+ *
+ * Note for hosts tightening β: the certify threshold interacts with it. At
+ * the default β=0.5/α=0.05/cold-π=0.9 (the s=0.5 tier above), a target at or
+ * below ≈0.9448 lets a SINGLE forged green cross the line — tightening the
+ * target without considering the tier is how a host re-opens what H-03
+ * closed. (See the W6-F3 table at `DRIFTED_FALSE_PASS_DEFAULT`.)
+ */
+export interface BayesKnobs {
+  readonly certifyTarget?: number
+  readonly syntheticFalsePass?: number
+  readonly driftedFalsePass?: number
+}
+
+/** Validate a partial knob set; throws `RangeError` naming the offender. */
+export function validateBayesKnobs(knobs: BayesKnobs): void {
+  if (knobs.syntheticFalsePass !== undefined) assertFalsePassDomain(knobs.syntheticFalsePass, 'syntheticFalsePass')
+  if (knobs.driftedFalsePass !== undefined) assertFalsePassDomain(knobs.driftedFalsePass, 'driftedFalsePass')
+  if (knobs.certifyTarget !== undefined) {
+    const target = knobs.certifyTarget
+    if (!Number.isFinite(target) || target <= 0 || target >= 1) {
+      throw new RangeError(
+        `certifyTarget must lie in the open interval (0,1) — got ${target}. `
+        + 'target 0 certifies anything, target 1 certifies nothing; neither is a policy choice. Refusing (W6-F2).',
+      )
+    }
+  }
+}
+
+// Self-check at module load: the model's own defaults must satisfy the domain
+// it exports — a future edit to any constant that silently leaves (0,1)
+// fails here, at the earliest possible moment, instead of producing the
+// reversals assertFalsePassDomain exists to prevent.
+assertFalsePassDomain(BAYES_CONSTANTS.falsePass, 'BAYES_CONSTANTS.falsePass')
+assertFalsePassDomain(SYNTHETIC_FALSE_PASS_DEFAULT, 'SYNTHETIC_FALSE_PASS_DEFAULT')
+assertFalsePassDomain(DRIFTED_FALSE_PASS_DEFAULT, 'DRIFTED_FALSE_PASS_DEFAULT')
 
 function clamp(value: number, low: number, high: number): number {
   return Math.min(high, Math.max(low, value))
@@ -282,6 +390,13 @@ export interface PriorInput {
  *   (assumption 3).
  */
 export function computePriors(input: PriorInput): Map<string, CheckPrior> {
+  // W6-F1: the pure core gates its own knob — a syntheticFalsePass of 0/1/NaN
+  // computes the H-03 reversals instead of refusing, and direct callers do
+  // not pass through the engine/config boundaries that validateBayesKnobs
+  // guards. Cheap (one comparison) and load-bearing.
+  if (input.syntheticFalsePass !== undefined) {
+    assertFalsePassDomain(input.syntheticFalsePass, 'PriorInput.syntheticFalsePass')
+  }
   const changed = [...new Set(input.changed)].sort()
   const distance = input.graph === undefined ? undefined : closureDistances(input.graph, changed)
   const out = new Map<string, CheckPrior>()
@@ -465,12 +580,20 @@ function matchesByBarePrefix(file: RelPath, pattern: string): boolean {
  *     P(h|obs) = π·P(obs|h) / [π·P(obs|h) + (1−π)·P(obs|broken)]
  *
  * with P(pass|h) = 1−α, P(pass|broken) = β, P(fail|h) = α, P(fail|broken) = 1−β.
- * All four terms are strictly positive over the parameter ranges the rest of
- * this module produces, so the result is always in (0,1) — no degenerate
- * zeros to guard. Plain floating point; π ∈ [0.05, 0.999] keeps every
- * numerator and denominator comfortably away from underflow.
+ * All four terms are strictly positive over the parameter domain — β is
+ * domain-gated at every entry (`assertFalsePassDomain`: open interval (0,1),
+ * non-finite refused), including here for caller-constructed priors — so the
+ * result is always in (0,1), no degenerate zeros to guard. Plain floating
+ * point; π ∈ [0.05, 0.999] keeps every numerator and denominator comfortably
+ * away from underflow.
  */
 export function posteriorHealthy(prior: CheckPrior, observed: 'pass' | 'fail'): number {
+  // W6-F1, last line of defence: priors are constructed by callers too (the
+  // engine rewrites `falsePass` over drifted ids), so the "strictly positive
+  // terms" premise below is enforced here rather than assumed — the measured
+  // failure was not an exception but a SILENT reversal (β=0 ⇒ pass posterior
+  // exactly 1; β=1 ⇒ fail posterior exactly 1; β<0 ⇒ posteriors above 1).
+  assertFalsePassDomain(prior.falsePass, 'CheckPrior.falsePass')
   const pi = prior.priorHealthy
   const givenHealthy = observed === 'pass' ? 1 - prior.falseFail : prior.falseFail
   const givenBroken = observed === 'pass' ? prior.falsePass : 1 - prior.falsePass

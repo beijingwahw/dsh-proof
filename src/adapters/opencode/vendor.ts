@@ -18,9 +18,9 @@
  * Nothing here pretends to be a complete OpenCode API: it is the list of
  * things dsh-proof's adapter calls, and the runtime duck-typing in plugin.ts
  * is the actual authority. If OpenCode renames a field, the adapter goes idle
- * and says so on stderr — the five MCP tools (proof_status/baseline/verify/
- * claim/bundle) keep working regardless, because they ride the MCP server,
- * not this plugin surface.
+ * and says so on stderr — the MCP tools (the thirteen frozen APP/1.4 names,
+ * `MCP_TOOLS` in src/app/mcp-server.ts) keep working regardless, because
+ * they ride the MCP server, not this plugin surface.
  *
  * @module dsh-proof/adapters/opencode/vendor
  */

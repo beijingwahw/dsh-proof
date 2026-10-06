@@ -31,10 +31,17 @@
  */
 
 import { homedir } from 'node:os'
+import { Buffer } from 'node:buffer'
 
 import type { ProofEngine } from '../engine.ts'
 import { NodeEd25519Signer, SystemClock } from '../node-ports.ts'
 import type { FsPort, SignerPort } from '../core/ports.ts'
+// v0.23 (W8/G2): marker read-back goes through core/evidence's suspect-aware
+// reader — the MCP face's own line walks used to read markers back without
+// the H-32 position witness, so an injected or replayed `delegation/*` /
+// `proof/verified` line rode the overview and the economics replay as if the
+// chain had corroborated it.
+import { readMarkers } from '../core/evidence.ts'
 // v0.18 (§6): the transparency-log domain — leaf hashing, Merkle proofs and
 // tree-head verification, all recomputed from the log's own bytes.
 import { loadPtl, ptlLeafHash, verifyConsistency, verifyInclusion, verifyTreeHead } from '../core/transparency.ts'
@@ -303,7 +310,12 @@ const ECONOMICS_DESCRIPTION =
 
 const SLA_QUOTE_DESCRIPTION =
   'Price a service-level agreement over a verification grade — the INSURANCE reading of what proof leaves '
-  + 'undetected. The premium is pure risk pricing: premium = coverageAmount × (1 − confidence), the expected '
+  + 'undetected. ANCHORED PRICING (v0.22 engine semantics): a quote is written only for a grade the evidence '
+  + 'chain has actually REACHED — the engine requires a proof/verified marker carrying that grade before '
+  + 'anything is priced (an SLA prices evidence the chain reached, never a grade the caller asserts). Ask for '
+  + 'a grade no verification ever produced and the answer is an ERROR naming the anchoring rule, not a quote '
+  + '— never a silent downgrade to an offer. Within the anchored grades, the premium is pure risk pricing: '
+  + 'premium = coverageAmount × (1 − confidence), the expected '
   + 'loss the run\'s residual risk (`pUndetected` = 1 − confidence) leaves open; the offer carries the '
   + 'deductible and coverage amount verbatim. Honest underwriting, three doors: a `proven` grade earns an '
   + 'OFFER; a `regressed` grade is honestly REFUSED (denied — a run that already failed its own baseline is '
@@ -337,7 +349,7 @@ const MCP_TOOL_LIST: ToolDescriptor[] = [
           description: 'Files this session changed, relative to the workspace root. Omit to use the derived change set.',
         },
         all: { type: 'boolean', description: 'Ignore impact analysis and re-run every discovered check.' },
-        claim: { type: 'string', description: 'The claim being verified, for the record.' },
+        claim: { type: 'string', description: 'The claim being verified, for the record. Recorded on the boundary marker BOUNDED to 200 characters (trimmed first): a longer claim is truncated on the chain, and the response carries a warning when that happened.' },
         economics: {
           type: 'object',
           description: 'Price this run as it verifies: a rate card (computePerMs required > 0, the USD cost of a '
@@ -576,9 +588,12 @@ const MCP_TOOL_LIST: ToolDescriptor[] = [
         grade: {
           type: 'string',
           enum: ['proven', 'regressed', 'stale', 'unproven', 'no-baseline'],
-          description: 'The verification grade the quote is written against — one of the five-grade scale. The '
-            + 'grade decides the door: proven earns an offer, regressed is honestly denied, stale goes to manual '
-            + 'underwriting.',
+          description: 'The verification grade the quote is written against — one of the five-grade scale '
+            + 'that the chain has actually REACHED: the engine anchors pricing to a proof/verified marker '
+            + 'carrying this grade, and a grade no verification ever produced is refused with an error '
+            + '(an SLA prices evidence the chain reached, not a grade the caller asserts). Within the '
+            + 'anchored grades, the grade decides the door: proven earns an offer, regressed is honestly '
+            + 'denied, stale goes to manual underwriting.',
         },
         coverageAmount: {
           type: 'number',
@@ -742,9 +757,32 @@ async function callVerifyTool(deps: McpEngineDeps, args: Record<string, unknown>
   // the ENGINE records it — VerifyOptions.claim rides the proof/verified
   // boundary marker (bounded to 200 chars), byte-for-byte the same record the
   // DSH tool face forwards. The MCP face must not diverge from what session
-  // logs record, so it forwards instead of dropping.
+  // logs record, so it forwards instead of dropping. W8-L7 (v0.23): the bound
+  // is no longer silent — a claim the chain will truncate carries a warning
+  // in the response (the boundary between what the caller said and what the
+  // record keeps is exactly where silent divergence used to live).
   if (args.claim !== undefined && typeof args.claim !== 'string') {
     return toolError({ error: `proof_verify: claim must be a string (got ${JSON.stringify(args.claim)})` })
+  }
+  // W8-M2 (v0.23): the loud-argument discipline covers `all` and the array
+  // arguments too. `all: "true"` / `all: 1` used to be silently ignored by
+  // the `=== true` check — a caller thinking it asked for a full re-run got
+  // the impact analysis instead, and the un-run checks' regressions went
+  // unattributed. A non-array `changed` used to fall back to the derived
+  // change set the same way. Both are tool errors now: a foreign agent must
+  // be told its argument was not understood, never served a narrower run
+  // it believes was wider.
+  if (args.all !== undefined && typeof args.all !== 'boolean') {
+    return toolError({
+      error: `proof_verify: all must be a boolean (got ${JSON.stringify(args.all)})`
+        + ' — a truthy non-boolean is refused rather than silently ignored: all: "true" once meant "run the impact analysis anyway"',
+    })
+  }
+  if (args.changed !== undefined && !Array.isArray(args.changed)) {
+    return toolError({
+      error: `proof_verify: changed must be an array of file paths (got ${JSON.stringify(args.changed)})`
+        + ' — a non-array value is refused rather than silently falling back to the derived change set',
+    })
   }
   const changed = stringArray(args.changed)
   const rate = rateCardOf(args.economics)
@@ -760,9 +798,15 @@ async function callVerifyTool(deps: McpEngineDeps, args: Record<string, unknown>
     outcome.report, outcome.changed, outcome.checks, outcome.selection, outcome.attribution, outcome.degraded,
     outcome.schedule, outcome.coverage,
   )
-  if (changed.droppedNonString > 0) {
-    return toolResult({ ...verified, warning: droppedWarning('proof_verify', 'changed', changed.droppedNonString) })
+  const warnings: string[] = []
+  if (changed.droppedNonString > 0) warnings.push(droppedWarning('proof_verify', 'changed', changed.droppedNonString))
+  if (typeof args.claim === 'string' && args.claim.trim().length > 200) {
+    warnings.push(
+      `proof_verify: the claim is recorded on the chain truncated to its first 200 characters (${args.claim.trim().length} given)`
+      + ' — the marker record is the bound; say it in 200 characters if the full text must survive',
+    )
   }
+  if (warnings.length > 0) return toolResult({ ...verified, warning: warnings.join('; ') })
   return toolResult(verified)
 }
 
@@ -799,11 +843,35 @@ async function callClaimTool(deps: McpEngineDeps, args: Record<string, unknown>)
   if (args.review !== undefined && typeof args.review !== 'string') {
     return toolError({ error: `proof_claim: review must be a string (got ${JSON.stringify(args.review)})` })
   }
+  // W8-M2 (v0.23): a non-array `changed`/`entryPoints` is a tool error, never
+  // a silent fall-back to the derived change set (under-attribution is the
+  // exact hazard the drop-counting was built to surface — a whole non-array
+  // value used to evaporate without even a count).
+  if (args.changed !== undefined && !Array.isArray(args.changed)) {
+    return toolError({
+      error: `proof_claim: changed must be an array of file paths (got ${JSON.stringify(args.changed)})`
+        + ' — a non-array value is refused rather than silently falling back to the derived change set',
+    })
+  }
+  if (args.entryPoints !== undefined && !Array.isArray(args.entryPoints)) {
+    return toolError({
+      error: `proof_claim: entryPoints must be an array of strings (got ${JSON.stringify(args.entryPoints)})`
+        + ' — a non-array value is refused rather than silently dropped',
+    })
+  }
   const changed = stringArray(args.changed)
   const entryPoints = stringArray(args.entryPoints)
   const warnings: string[] = []
   if (changed.droppedNonString > 0) warnings.push(droppedWarning('proof_claim', 'changed', changed.droppedNonString))
   if (entryPoints.droppedNonString > 0) warnings.push(droppedWarning('proof_claim', 'entryPoints', entryPoints.droppedNonString))
+  // W8-L7 (v0.23): the claim is recorded on the contract/markers bounded to
+  // 200 characters — say so when the record truncates the caller's words.
+  if (claim.trim().length > 200) {
+    warnings.push(
+      `proof_claim: the claim is recorded on the chain truncated to its first 200 characters (${claim.trim().length} given)`
+      + ' — the marker record is the bound; say it in 200 characters if the full text must survive',
+    )
+  }
   if (isClaimKind(args.kind)) {
     const contract: ClaimContract = {
       kind: args.kind,
@@ -1334,43 +1402,95 @@ function summarizeClaim(claim: string): string {
 }
 
 /**
+ * One marker record as this face reads it back: the label, the envelope
+ * timestamp, and the payload verbatim.
+ */
+export interface McpMarkerRecord {
+  readonly label: string
+  readonly at: string | null
+  readonly payload: Record<string, unknown>
+}
+
+/**
+ * v0.23 (W8 / G2 contract): every marker payload on the evidence chain under
+ * the given labels (exact match) or label prefixes, in log order — with the
+ * H-32 SUSPECT lines excluded.
+ *
+ * This face's marker read-backs (`taskOverview`, `latestEconomicsMarker`)
+ * used to walk the raw log lines themselves, matching labels and nothing
+ * else — the exact shape of the jury-prompt injection the DSH face fixed by
+ * filtering suspect markers in its own `markerPayloads`. A marker whose
+ * `headRef` (the chain head the writer saw at append time) does not match
+ * the digest of the line physically before it was replayed, moved or
+ * injected, and must not be read as chain fact: an out-of-band
+ * `delegation/created` twin or a forged `proof/verified` economics carrier
+ * would otherwise ride the overview and the ledger replay as if the chain
+ * had corroborated it. The physical snapshot is read once (raw bytes, split
+ * on the real line boundaries — `readLines` filters blank lines, which would
+ * shift the positions the witness is judged against) and every derivation
+ * comes from that one snapshot.
+ *
+ * Exported (not private) so the cross-face contract is greppable and
+ * unit-pinnable: `markerPayloads` on this face mirrors dsh/tools.ts's
+ * same-named reader, suspect filtering included.
+ */
+export async function markerPayloads(
+  deps: McpEngineDeps,
+  labels: ReadonlySet<string>,
+  options: { readonly labelPrefixes?: readonly string[] } = {},
+): Promise<McpMarkerRecord[]> {
+  const raw = await deps.engine.fsView.readFile(deps.evidenceLogPath)
+  if (raw === undefined) return []
+  // One physical snapshot: `readMarkers` judges each marker's headRef witness
+  // against the line physically before it, so the lines handed to it are the
+  // raw split (blank lines included — their removal would shift positions),
+  // and the envelope timestamp is re-read from the same array by index.
+  const lines = raw.split('\n')
+  const found: McpMarkerRecord[] = []
+  for (const marker of readMarkers(lines)) {
+    // Suspect lines are skipped, never read: the position test is the
+    // cheapest corroboration this face has, and a line that cannot vouch
+    // for where it sits is not chain fact.
+    if (marker.suspect) continue
+    const labelMatches = labels.has(marker.label)
+      || (options.labelPrefixes?.some(prefix => marker.label.startsWith(prefix)) ?? false)
+    if (!labelMatches) continue
+    const envelope = JSON.parse(lines[marker.index] ?? '{}') as { at?: unknown }
+    found.push({
+      label: marker.label,
+      at: typeof envelope.at === 'string' ? envelope.at : null,
+      payload: marker.payload,
+    })
+  }
+  return found
+}
+
+/**
  * The whole-task overview, read back off the evidence chain the way the DSH
  * attestation tools read markers (dsh/tools.ts's markerPayloads precedent):
- * parse each line, keep the engine's own `delegation/created` and
- * `delegation/verdict` labels (matched EXACTLY — the engine mints exactly
- * those two, and a loose `includes()` would fold any future label into a
- * submission signal). Defensive by construction against bad shapes: a field
- * with the wrong shape is skipped, not guessed at. Absence is distinguished
- * from content (v0.22): a missing log reports `logPresent: false` so the
- * caller sees "nothing recorded yet", never a silent fake-empty chain.
+ * keep the engine's own `delegation/created` and `delegation/verdict` labels
+ * (matched EXACTLY — the engine mints exactly those two, and a loose
+ * `includes()` would fold any future label into a submission signal), with
+ * suspect lines excluded by {@link markerPayloads}. Defensive by
+ * construction against bad shapes: a field with the wrong shape is skipped,
+ * not guessed at. Absence is distinguished from content (v0.22): a missing
+ * log reports `logPresent: false` so the caller sees "nothing recorded yet",
+ * never a silent fake-empty chain.
  */
 async function taskOverview(deps: McpEngineDeps): Promise<{ tasks: TaskOverviewEntry[]; logPresent: boolean }> {
   const tasks = new Map<string, TaskOverviewEntry>()
   const raw = await deps.engine.fsView.readFile(deps.evidenceLogPath)
   if (raw === undefined) return { tasks: [], logPresent: false }
-  const lines = raw.split('\n')
-  for (const line of lines) {
-    if (line.trim().length === 0) continue
-    let envelope: { kind?: unknown; payload?: unknown }
-    try {
-      envelope = JSON.parse(line) as { kind?: unknown; payload?: unknown }
-    } catch {
-      continue
-    }
-    if (envelope?.kind !== 'marker') continue
-    const payload = envelope.payload
-    if (typeof payload !== 'object' || payload === null) continue
-    const record = payload as Record<string, unknown>
-    const label = typeof record.label === 'string' ? record.label : ''
-    if (label !== 'delegation/created' && label !== 'delegation/verdict') continue
-    const taskId = record.taskId
+  for (const record of await markerPayloads(deps, new Set(['delegation/created', 'delegation/verdict']))) {
+    const label = record.label
+    const taskId = record.payload.taskId
     if (typeof taskId !== 'string') continue
     if (label === 'delegation/created') {
-      const claim = record.claim
+      const claim = record.payload.claim
       if (typeof claim !== 'string') continue
-      const parentTaskId = typeof record.parentTaskId === 'string' ? record.parentTaskId : null
+      const parentTaskId = typeof record.payload.parentTaskId === 'string' ? record.payload.parentTaskId : null
       tasks.set(taskId, { taskId, parentTaskId, claim: summarizeClaim(claim), submitted: false })
-    } else if (tasks.has(taskId)) {
+    } else if (label === 'delegation/verdict' && tasks.has(taskId)) {
       // A landed submission (`delegation/verdict` — the engine's exact label
       // for "a submission was adjudicated").
       const entry = tasks.get(taskId)!
@@ -1660,38 +1780,26 @@ interface EconomicsMarker {
 /**
  * The most recent proof/claim boundary marker on the evidence chain whose
  * payload carries an `economics` object — the ledger a rate-carrying
- * verification recorded. Same defensive read as `taskOverview`: the raw log
- * is read through the engine's own fs port, a missing log is distinguished
- * from a scanned-but-empty one (v0.22 — a read failure must not masquerade
- * as "this chain never priced anything"), and any line with the wrong shape
- * is skipped, not guessed at. Newest wins: the chain is an append-only log,
- * so the LAST matching marker in file order is the last one minted.
+ * verification recorded. Same defensive read as `taskOverview`, and (v0.23,
+ * W8) the same suspect filter via {@link markerPayloads}: only the
+ * verification boundaries can carry a ledger — a delegation or synthetic
+ * marker with a stray `economics` field is not a run's account — and a
+ * `proof/verified` line injected out of band is not a run either. A missing
+ * log is distinguished from a scanned-but-empty one (v0.22 — a read failure
+ * must not masquerade as "this chain never priced anything"). Newest wins:
+ * the chain is an append-only log, so the LAST matching marker in file order
+ * is the last one minted.
  */
 async function latestEconomicsMarker(deps: McpEngineDeps): Promise<{ marker?: EconomicsMarker; logPresent: boolean }> {
   const raw = await deps.engine.fsView.readFile(deps.evidenceLogPath)
   if (raw === undefined) return { logPresent: false }
   let found: EconomicsMarker | undefined
-  for (const line of raw.split('\n')) {
-    if (line.trim().length === 0) continue
-    let envelope: { kind?: unknown; at?: unknown; payload?: unknown }
-    try {
-      envelope = JSON.parse(line) as { kind?: unknown; at?: unknown; payload?: unknown }
-    } catch {
-      continue
-    }
-    if (envelope?.kind !== 'marker') continue
-    const payload = envelope.payload
-    if (typeof payload !== 'object' || payload === null) continue
-    const record = payload as Record<string, unknown>
-    const label = typeof record.label === 'string' ? record.label : ''
-    // Only the verification boundaries can carry a ledger — a delegation or
-    // synthetic marker with a stray `economics` field is not a run's account.
-    if (!label.startsWith('proof/') && !label.startsWith('claim/')) continue
-    const economics = record.economics
+  for (const record of await markerPayloads(deps, new Set(), { labelPrefixes: ['proof/', 'claim/'] })) {
+    const economics = record.payload.economics
     if (typeof economics !== 'object' || economics === null || Array.isArray(economics)) continue
     found = {
-      label,
-      at: typeof envelope.at === 'string' ? envelope.at : null,
+      label: record.label,
+      at: record.at,
       economics: economics as Record<string, unknown>,
     }
   }
@@ -1735,13 +1843,15 @@ async function callEconomicsTool(deps: McpEngineDeps, args: Record<string, unkno
   // v0.22 (M-51): replaying a marker is quoting LOG BYTES, and a writer who
   // can touch evidence.jsonl can forge one — the hash chain detects rewrites
   // after the fact, it does not prevent the write. So the replay is guarded
-  // by a real chain audit whose verdict rides the response; a failing audit
-  // names the tools that adjudicate (proof_status for the workspace chain,
-  // proof_log_verify for the published mirror) instead of vouching for bytes
-  // it did not check.
+  // by a real chain audit whose verdict rides the response.
+  // v0.23 (W8-L12): a FAILING audit now fails the TOOL (isError: true), the
+  // same fail-closed direction the audit-throw path already had — a consumer
+  // that keys on isError alone used to take the replayed pseudo-ledger for a
+  // normal result. The ledger still rides the response (for the auditor who
+  // wants to look), stamped `untrusted: true`.
   const audit = await deps.engine.audit()
   const chainOk = audit.ok
-  return toolResult({
+  const value = {
     label: found.label,
     ...(found.at !== null ? { at: found.at } : {}),
     economics: found.economics,
@@ -1756,8 +1866,15 @@ async function callEconomicsTool(deps: McpEngineDeps, args: Record<string, unkno
       + `can forge a marker, so this call ran a chain audit first (ok: ${chainOk}). On failure treat the ledger as `
       + 'suspect and adjudicate with proof_status (workspace chain) or proof_log_verify (published mirror). The '
       + 'rate above is the card you asked under, priced against nothing',
-    ...(chainOk ? {} : { warning: `chain audit FAILED (ok: false) — the replayed ledger may be forged; run proof_status / proof_log_verify before trusting it` }),
-  })
+  }
+  if (!chainOk) {
+    return toolError({
+      ...value,
+      untrusted: true,
+      warning: 'chain audit FAILED (ok: false) — the replayed ledger may be forged; run proof_status / proof_log_verify before trusting it',
+    })
+  }
+  return toolResult(value)
 }
 
 async function callSlaQuoteTool(deps: McpEngineDeps, args: Record<string, unknown>): Promise<McpToolResult> {
@@ -2003,13 +2120,23 @@ type CappedLine = { text: string } | { oversized: true }
  * Bytes of an over-cap line are DISCARDED as they arrive (only the first
  * cap-crossing chunk is inspected), so neither a giant single line nor a
  * giant unterminated tail can grow the buffer without bound.
+ *
+ * v0.23 (W8-F3): lines are split at the BYTE level (the buffer stays bytes;
+ * 0x0A is searched in the byte stream; only complete lines are decoded).
+ * The old shape decoded each chunk to UTF-8 as it arrived, so a multi-byte
+ * character straddling a chunk boundary was decoded twice — one U+FFFD per
+ * half — and a perfectly legal CJK/emoji JSON line was answered with a
+ * parse error. Byte-level splitting makes the boundary invisible (a UTF-8
+ * continuation byte is never 0x0A, so a newline can never sit inside a code
+ * point) and makes `capBytes` exact byte semantics for free. Exported for
+ * the transport unit tests that pin the boundary-crossing behaviour.
  */
-function readCappedLines(input: NodeJS.ReadableStream, capBytes: number): AsyncIterable<CappedLine> {
+export function readCappedLines(input: NodeJS.ReadableStream, capBytes: number): AsyncIterable<CappedLine> {
   type Pending = { item: CappedLine | undefined; error?: Error }
   const queue: Pending[] = []
   let wake: ((entry: Pending) => void) | undefined
   let finished = false
-  let buffer = ''
+  let buffer = Buffer.alloc(0)
   let discarding = false
 
   const push = (entry: Pending): void => {
@@ -2022,36 +2149,41 @@ function readCappedLines(input: NodeJS.ReadableStream, capBytes: number): AsyncI
     }
   }
   const onChunk = (chunk: unknown): void => {
-    const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk as Uint8Array).toString('utf8')
+    // String chunks (a readable pushed as strings) are encoded once, up
+    // front; Buffer/Uint8Array chunks are wrapped without copying semantics
+    // changing — everything downstream is bytes.
+    const bytes = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : Buffer.from(chunk as Uint8Array)
     if (discarding) {
-      const nl = text.indexOf('\n')
+      const nl = bytes.indexOf(0x0A)
       if (nl < 0) return // still inside the oversized line — keep discarding
       discarding = false
       push({ item: { oversized: true } }) // the discarded line is complete
-      buffer = text.slice(nl + 1)
+      buffer = bytes.subarray(nl + 1)
     } else {
-      buffer += text
+      buffer = buffer.length === 0 ? bytes : Buffer.concat([buffer, bytes])
     }
-    let nl = buffer.indexOf('\n')
+    let nl = buffer.indexOf(0x0A)
     while (nl >= 0) {
-      const line = buffer.slice(0, nl)
-      buffer = buffer.slice(nl + 1)
-      push({ item: Buffer.byteLength(line, 'utf8') > capBytes ? { oversized: true } : { text: line } })
-      nl = buffer.indexOf('\n')
+      const line = buffer.subarray(0, nl)
+      buffer = buffer.subarray(nl + 1)
+      push({ item: line.length > capBytes ? { oversized: true } : { text: line.toString('utf8') } })
+      nl = buffer.indexOf(0x0A)
     }
     // An unterminated tail already past the cap: start discarding now — the
     // single {oversized} marker is pushed when its newline (or the stream's
     // end) eventually arrives.
-    if (!discarding && buffer.length > 0 && Buffer.byteLength(buffer, 'utf8') > capBytes) {
+    if (!discarding && buffer.length > 0 && buffer.length > capBytes) {
       discarding = true
-      buffer = ''
+      buffer = Buffer.alloc(0)
     }
   }
   const onEnd = (): void => {
     if (finished) return
     finished = true
     if (discarding) push({ item: { oversized: true } })
-    else if (buffer.length > 0) push({ item: { text: buffer } })
+    else if (buffer.length > 0) {
+      push({ item: buffer.length > capBytes ? { oversized: true } : { text: buffer.toString('utf8') } })
+    }
     push({ item: undefined })
   }
   const onError = (error: Error): void => {

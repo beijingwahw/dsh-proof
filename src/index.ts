@@ -22,11 +22,16 @@ import * as nodePath from 'node:path'
 import type { Config } from './config.ts'
 import { ProofEngine } from './engine.ts'
 import { createProofTools } from './dsh/tools.ts'
-import { WorkspaceWatch, driftNarrative, isMutationToolName, shellCommandMentionsPath, toWorkspaceRelative } from './dsh/observe.ts'
+import {
+  WorkspaceWatch, driftNarrative, isMutationToolName, shellCommandMentionsPath,
+  sweepToolInputStrings, toWorkspaceRelative,
+} from './dsh/observe.ts'
+import { absoluteInside, workspaceKeyPair } from './adapters/shared/paths.ts'
 import { buildPolicySection } from './dsh/prompt.ts'
 import { createLspResolver } from './dsh/lsp-impact.ts'
 import { attachTeamBridge, createTeamBridge } from './dsh/agent-team.ts'
 import { sha256 } from './core/hash.ts'
+import { readMarkers } from './core/evidence.ts'
 import { NodeFsPort } from './node-ports.ts'
 import type { FsPort } from './core/ports.ts'
 import type {
@@ -176,73 +181,114 @@ export function apply(ctx: Context, config: Config): void {
     log(`registered tool ${tool.name}`)
   }
   // -- evidence-store guard: the log must not be agent-writable ------------
-  // In `workspace` mode the log still lives inside the project, so mutation
-  // tools touching it are routed through user approval. In `host` mode the
-  // log is outside the sandboxed workspace and needs no gate.
-  if (config.evidenceStore === 'workspace') {
-    // Both sides of the comparison are lowercased and forward-slashed (H10).
-    // Case: Windows describes one directory as `.proof`, `.PROOF` or `.Proof`
-    // — a case-sensitive compare let the agent write the evidence log by
-    // changing one letter's case (toWorkspaceRelative preserves the case the
-    // tool sent). The price is that on a genuinely case-sensitive filesystem
-    // a sibling `.PROOF` directory also matches — acceptable: it gates at
-    // worst one extra write through user approval. The adapter layer guards
-    // with the same fold (src/adapters/shared/paths.ts `touchesEvidencePath`);
-    // keep the two in lockstep. Backslashes: a Windows config `'.\proof'`
-    // names the same directory as `./proof` — normalize before collapsing,
-    // as the candidate side (toWorkspaceRelative) already does.
-    const evidenceSegment = collapseSegments(
-      config.evidenceDir.replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/\/+$/, ''),
-    ).toLowerCase()
-    const touchesEvidence = (candidate: string): boolean => {
-      // The guard must reason in one path space. A candidate is first projected
-      // onto the workspace's relative space (absolute host-style paths, either
-      // slash flavour, drive case and all) and its `.`/`..` detours collapsed;
-      // otherwise "can the agent write the evidence log" degenerates into a
-      // string-matching puzzle the agent can simply walk around.
-      const rel = toWorkspaceRelative(candidate, root)
-      if (rel === undefined) return false
-      const target = collapseSegments(rel).toLowerCase()
-      return target === evidenceSegment || target.startsWith(`${evidenceSegment}/`)
-    }
-    // H-02: shell-class tools carry no structured path keys — their command
-    // string is the whole attack surface, so the guard sweeps it textually
-    // (conservatively; see observe.ts `shellCommandMentionsPath`). The
-    // targets: the store directory itself, every file inside it, and the
-    // trust-root file names — a deployment that misplaces the trust root
-    // inside the workspace gets the same protection for its keys and anchors.
-    const shellGuardTargets = [
-      evidenceSegment,
-      ...SHELL_GUARDED_FILE_NAMES.map(name => `${evidenceSegment}/${name}`),
-      ...SHELL_GUARDED_FILE_NAMES,
-    ]
-    host.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
-      if (!isMutationToolName(exec.name)) return next()
-      // H-02: a shell command string names no path key, so `pathsIn` is
-      // structurally blind to it — `bash {command: 'echo x >
-      // .proof/evidence.jsonl'}` used to pass this gate with nothing asked.
-      // A store-naming command is refused outright: a shell can rewrite
-      // anything (the reason says so), and "was that redirect really a
-      // write?" is not a question to resolve by parsing shell syntax.
-      // N-1: capability-gated, not name-gated — any mutation-class call
-      // carrying a command string is swept (hosts mint runner names faster
-      // than lists collect them; the read-only roster is the only exempt).
-      if (isMutationToolName(exec.name)) {
-        const command = shellCommandOf(exec.arguments)
-        if (command !== undefined && shellCommandMentionsPath(command, shellGuardTargets)) {
-          return {
-            kind: 'deny',
-            reason: 'dsh-proof: this shell command names the verification evidence store, which must not be '
-              + 'modified by the agent it is meant to audit — a shell can rewrite anything, so a '
-              + 'store-naming command is refused rather than parsed for intent.',
-          }
+  // X-H-16 (v0.23): the guard is registered in BOTH store modes. v0.22 fixed
+  // only the adapter face (gates.ts' host branch) — on this, the DSH plugin
+  // face, the guard stayed wrapped in the `workspace` branch, so under the
+  // DEFAULT deployment (host mode) an absolute path straight into
+  // `<trustRoot>/workspaces/<key>` and every store-naming command string
+  // passed with nothing asked. Workspace mode keeps its relative-space `ask`
+  // below; host mode adds the structured deny the gates' host branch already
+  // answers with.
+  //
+  // Both sides of every comparison are lowercased and forward-slashed (H10).
+  // Case: Windows describes one directory as `.proof`, `.PROOF` or `.Proof`
+  // — a case-sensitive compare let the agent write the evidence log by
+  // changing one letter's case (toWorkspaceRelative preserves the case the
+  // tool sent). The price is that on a genuinely case-sensitive filesystem
+  // a sibling `.PROOF` directory also matches — acceptable: it gates at
+  // worst one extra write through user approval. The adapter layer guards
+  // with the same fold (src/adapters/shared/paths.ts `touchesEvidencePath`);
+  // keep the two in lockstep. Backslashes: a Windows config `'.\proof'`
+  // names the same directory as `./proof` — normalize before collapsing,
+  // as the candidate side (toWorkspaceRelative) already does.
+  const evidenceSegment = collapseSegments(
+    config.evidenceDir.replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/\/+$/, ''),
+  ).toLowerCase()
+  const touchesEvidence = (candidate: string): boolean => {
+    // The guard must reason in one path space. A candidate is first projected
+    // onto the workspace's relative space (absolute host-style paths, either
+    // slash flavour, drive case and all) and its `.`/`..` detours collapsed;
+    // otherwise "can the agent write the evidence log" degenerates into a
+    // string-matching puzzle the agent can simply walk around.
+    const rel = toWorkspaceRelative(candidate, root)
+    if (rel === undefined) return false
+    const target = collapseSegments(rel).toLowerCase()
+    return target === evidenceSegment || target.startsWith(`${evidenceSegment}/`)
+  }
+  // X-H-16: host mode denies ABSOLUTE candidates into the host-side store —
+  // `${trustRoot}/workspaces/<key>` for BOTH identity spellings, the same
+  // storeDir set the adapter gates' host branch sweeps. The fold comparison
+  // is paths.ts `absoluteInside`, which runs BOTH sides through G4's exported
+  // `foldHostPath` — the ONE fold (device prefixes, drive-relative forms,
+  // separators, case, trailing-dot deformation, `..` collapse) this face and
+  // the adapter face are contractually in lockstep on; this file folds
+  // nothing of its own here. A workspace-relative path cannot reach a store
+  // that lives outside the workspace; an absolute one is exactly the H-26
+  // write this branch exists to refuse.
+  const trustFolded = trustRoot.replace(/\\/g, '/').replace(/\/+$/, '')
+  const identityPair = workspaceKeyPair(root)
+  const identityKeys = identityPair.normalized === identityPair.legacy
+    ? [identityPair.normalized]
+    : [identityPair.normalized, identityPair.legacy]
+  const hostStoreDirs = identityKeys.map(key => `${trustFolded}/workspaces/${key}`)
+  // The value-sweep target set. Workspace mode lists the store segment and
+  // its two artifact files under their store-qualified spellings; BOTH modes
+  // list the trust-side artifacts (the anchor dirs and the host-mode store
+  // files), mirroring gates.ts `guardedShellTargets`: keys and anchors are
+  // never legitimately agent-writable in either mode. X-H-13 (v0.23): the
+  // BARE artifact file names (`evidence.jsonl`, …) are deliberately NOT
+  // sweep targets any more — the sweep now reads every string value of every
+  // call, and a bare name would deny any string that so much as names such a
+  // file under ANY directory (a differently-named store's sibling, a
+  // deployment's own anchor.json). The signing-key pair stays bare: no
+  // legitimate workspace file carries those names, so a mention of either is
+  // worth refusing wherever it points.
+  const shellGuardTargets = [...new Set([
+    ...(config.evidenceStore === 'workspace'
+      ? [evidenceSegment, `${evidenceSegment}/evidence.jsonl`, `${evidenceSegment}/baseline.json`]
+      : []),
+    ...SIGNING_KEY_FILE_NAMES,
+    ...hostStoreDirs,
+    ...hostStoreDirs.map(dir => `${dir}/evidence.jsonl`),
+    ...hostStoreDirs.map(dir => `${dir}/baseline.json`),
+    ...identityKeys.map(key => `${trustFolded}/anchors/${key}`),
+  ])].filter(target => target.length > 0)
+  host.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
+    // X-H-13 (v0.23): VALUE SWEEP. The old guard read one command string out
+    // of three key spellings and only on mutation-class names —
+    // `{commandLine: …}`, `{code: …}`, mixed argv and read-only-listed names
+    // carrying store-writing commands all passed measured. The sweep now
+    // collects EVERY string value of EVERY call (see
+    // `sweepToolInputStrings`: no key is enumerated, no name exempt — the
+    // read-only roster included, a NAME is not a capability) and refuses the
+    // call when any of them mentions a guarded target. A string that names
+    // the store cannot be path-checked structurally or parsed for intent, so
+    // any mention is refused — 宁误拦: the price is denying a genuinely
+    // read-only call that names the store (a grep for `evidence.jsonl`, a
+    // Read of the log), which costs one refused call with the reason below;
+    // the plugin's own proof_* tools read the log through the engine's fs
+    // port, never through host tool calls, so verification itself is not in
+    // this blast radius.
+    for (const value of sweepToolInputStrings(exec.arguments)) {
+      if (shellCommandMentionsPath(value, shellGuardTargets)) {
+        return {
+          kind: 'deny',
+          reason: 'dsh-proof: this call names the verification evidence store or its trust files in a '
+            + 'string argument, which must not be modified by the agent it is meant to audit — '
+            + 'string values cannot be path-checked structurally or parsed for intent, so any '
+            + 'store-naming value is refused rather than guessed at.',
         }
       }
-      // contentKeys: the guard prefers over-detection — a `move {source:
-      // '.proof/evidence.jsonl', dest: …}` carries the log out through the
-      // very key the watcher excludes as content-noise. A false positive here
-      // costs one approval prompt; a false negative costs the log.
-      const paths = WorkspaceWatch.pathsIn(exec.arguments, { contentKeys: true })
+    }
+    if (!isMutationToolName(exec.name)) return next()
+    // contentKeys: the guard prefers over-detection — a `move {source:
+    // '.proof/evidence.jsonl', dest: …}` carries the log out through the
+    // very key the watcher excludes as content-noise. A false positive here
+    // costs one approval prompt; a false negative costs the log. (The value
+    // sweep above already denies most of these; this structured layer stays
+    // for the shapes the sweep's bounds cannot see into.)
+    const paths = WorkspaceWatch.pathsIn(exec.arguments, { contentKeys: true })
+    if (config.evidenceStore === 'workspace') {
       if (!paths.some(touchesEvidence)) return next()
       return {
         kind: 'ask',
@@ -252,8 +298,21 @@ export function apply(ctx: Context, config: Config): void {
           'zh-CN': 'dsh-proof：拒绝写入证据日志？',
         },
       }
-    })
-  }
+    }
+    // X-H-16: host mode — an absolute path into the trust-side store is the
+    // one spelling that reaches it, and it is denied outright (the store
+    // lives outside the workspace precisely so the agent it audits cannot
+    // edit it; there is nothing here a user approval could legitimize).
+    if (paths.some(candidate => hostStoreDirs.some(dir => absoluteInside(candidate, dir)))) {
+      return {
+        kind: 'deny',
+        reason: 'dsh-proof: this call writes into the host-side verification evidence store by '
+          + 'absolute path — the store lives outside the workspace precisely so the agent it '
+          + 'audits cannot edit it. Evidence changes go through a human, never through your own tools.',
+      }
+    }
+    return next()
+  })
   // -- policy gate: no baseline, no unreviewed mutation --------------------
   if (config.requireBaseline !== 'off') {
     host.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
@@ -432,6 +491,25 @@ export function apply(ctx: Context, config: Config): void {
       // edges) land on the chain as observation markers — stderr is ephemeral,
       // a re-linkable mapping is evidence.
       mark: (label, payload) => engine.storeView.mark(label, payload),
+      // W7-M9: the persisted mapping is read back through the same verified
+      // read the λ tools use (suspect lines excluded), so a restarted bridge
+      // re-adopts its predecessor's hostId→engineId edges instead of
+      // forgetting them and re-minting the children as roots.
+      mappings: async () => {
+        try {
+          return readMarkers(await engine.fsView.readLines(evidenceLogPath), {
+            label: 'agent-team/delegated',
+            excludeSuspect: true,
+          })
+            .map(marker => marker.payload as { hostTaskId?: unknown; engineTaskId?: unknown })
+            .filter((payload): payload is { hostTaskId: string; engineTaskId: string } =>
+              typeof payload.hostTaskId === 'string' && payload.hostTaskId.length > 0
+              && typeof payload.engineTaskId === 'string' && payload.engineTaskId.length > 0)
+            .map(payload => ({ hostTaskId: payload.hostTaskId, engineTaskId: payload.engineTaskId }))
+        } catch {
+          return []
+        }
+      },
     })
     const attached = attachTeamBridge(ctx, bridge, stderrLine)
     log(`agent-team bridge ${attached ? 'attached' : 'idle: no delegation seam'} (experimental)`)
@@ -573,34 +651,15 @@ function isAbsoluteHostPath(p: string): boolean {
 }
 
 /**
- * H-02: file names whose mention in a shell command string means the command
- * touches the proof trust fabric — the store's log and baseline, the anchor
- * file, and the Ed25519 signing-key pair (node-ports names). Matched as
- * substrings after separator/case folding by `shellCommandMentionsPath`.
+ * H-02/X-H-13: the Ed25519 signing-key pair's file names (node-ports'
+ * spellings). A string value naming either is worth refusing wherever it
+ * points — the key pair IS the trust fabric, and no legitimate workspace
+ * file carries these names. Matched as segment-boundaried substrings after
+ * separator/case folding by `shellCommandMentionsPath`.
  */
-const SHELL_GUARDED_FILE_NAMES: readonly string[] = [
-  'evidence.jsonl', 'baseline.json', 'anchor.json',
+const SIGNING_KEY_FILE_NAMES: readonly string[] = [
   'proof-signing-key.pem', 'proof-signing-key.pub.pem',
 ]
-
-/**
- * H-02: the command string a shell-class tool call carries, when it carries
- * one — `command`/`cmd`/`script` as a string, or a string argv vector joined
- * with spaces. Anything else is undefined (no guesswork: the guard then falls
- * back to the structured-path check).
- */
-function shellCommandOf(args: unknown): string | undefined {
-  if (args === null || typeof args !== 'object') return undefined
-  const record = args as Record<string, unknown>
-  for (const key of ['command', 'cmd', 'script']) {
-    const value = record[key]
-    if (typeof value === 'string') return value
-    if (Array.isArray(value) && value.length > 0 && value.every(item => typeof item === 'string')) {
-      return value.join(' ')
-    }
-  }
-  return undefined
-}
 
 /**
  * Collapse `.` and `..` segments in a workspace-relative path (`a/../b` ->

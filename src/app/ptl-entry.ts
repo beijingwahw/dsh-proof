@@ -18,18 +18,25 @@
  *       Extract the latest publishable checkpoint from the current
  *       workspace's evidence chain and append it to the log at <dir>, then
  *       sign and save a fresh STH with the operator key. Selection is
- *       anchor-gated (identical to the engine's `latestSignedCheckpoint`):
- *       with an anchor on record only checkpoints signed by the ANCHORED key
- *       are publishable — never a positionally-later checkpoint under some
- *       foreign keyId; without an anchor a checkpoint is publishable only
- *       when its signature actually verifies under the local engine key
- *       ($TRUST_DIR/keys). No anchor and no verifiable key is a loud
- *       refusal: publication needs a trust root.
+ *       anchor-gated AND signature-verified (v0.23, X-H-11): with an anchor
+ *       on record only checkpoints signed by the ANCHORED key are
+ *       candidates, without one only checkpoints under the local engine
+ *       key ($TRUST_DIR/keys) — and whichever branch runs, the chosen
+ *       checkpoint's signature must actually VERIFY under key material
+ *       this host holds. A keyId string match alone proves nothing (a
+ *       forged checkpoint can claim any keyId it likes), and a candidate
+ *       key with no local key material is a loud refusal naming what to
+ *       provide — never a best-effort publish of unverifiable bytes. The
+ *       operator key is resolved BEFORE the log is touched, so a key
+ *       problem cannot leave a published-but-headless entry behind.
  *   dsh-proof-ptl head --log <dir>
  *       Print the current STH, or {"empty":true}.
  *   dsh-proof-ptl verify --log <dir> [--bundle <bundle.json>] [--operator-key <keydir>]
  *       No --bundle: self-check (recomputed merkle root === STH root, tree
- *       sizes agree, plus the STH signature when an operator key is at hand).
+ *       sizes agree, the STH signature adjudicated — and a head that cannot
+ *       be adjudicated, because no operator key is at hand, FAILS the check:
+ *       uncertain = fail, same as the bundle face; malformed lines in the
+ *       entries file are counted, surfaced and fail the check too).
  *       With --bundle: audit the bundle's manifest.transparency record against
  *       the log — leaf match, inclusion, consistency (non-rewrite), the
  *       operator's signature over the bundle-PINNED published head, the
@@ -62,7 +69,7 @@
  */
 
 import { deriveProofPaths } from '../adapters/shared/paths.ts'
-import { checkpointSignedData, parseAnchor, walkChain } from '../core/trust.ts'
+import { checkpointSignedData, parseAnchorEx, walkChain } from '../core/trust.ts'
 import type { WalkedCheckpoint } from '../core/trust.ts'
 import {
   appendPtlEntry, loadPtl, ptlLeafHash, savePtlHead, sthSignedData, verifyInclusion,
@@ -201,29 +208,43 @@ async function headSignatureHolds(
 /**
  * Extract the workspace's latest publishable checkpoint and publish it.
  *
- * Selection rule (v0.22, H-06 — now genuinely identical to the engine's
- * `latestSignedCheckpoint`, where the doc used to claim it): walk the
- * evidence log (`core/trust.walkChain`), keep well-formed checkpoints (one
- * whose self-reported `count` the walk itself refutes is a lying checkpoint,
- * and a lying checkpoint is never worth publishing even when it is signed)
- * that carry a non-empty `sig` and `keyId`, then:
+ * Selection rule (v0.23, X-H-11 — one uniform predicate: the chosen
+ * checkpoint must VERIFY): walk the evidence log (`core/trust.walkChain`),
+ * keep well-formed checkpoints (one whose self-reported `count` the walk
+ * itself refutes is a lying checkpoint, and a lying checkpoint is never
+ * worth publishing even when it is signed) that carry a non-empty `sig` and
+ * `keyId`, then:
  *
- * - With an out-of-band anchor on record naming a key: only the LAST
- *   checkpoint signed by that very key is publishable — never a
- *   positionally-later checkpoint under some foreign keyId an attacker
- *   appended. The anchor is the trust root of the publication; nothing on
- *   the chain is entitled to stand in for it.
- * - Without a usable anchor: a checkpoint is publishable only when this
- *   host holds the engine key (`<trustRoot>/keys`) that can VERIFY its
- *   signature — and the verification must pass.
- * - Neither: loud refusal. A publication without any trust root would
- *   notarise whoever last wrote to the workspace log, which is exactly the
- *   laundering the PTL exists to prevent.
+ * - With an out-of-band anchor on record naming a key: the candidates are
+ *   the checkpoints signed by that very key — never a positionally-later
+ *   checkpoint under some foreign keyId an attacker appended. The anchor is
+ *   the trust root of the publication; nothing on the chain is entitled to
+ *   stand in for it. An anchor document that cannot be parsed, or one in a
+ *   state no honest writer produces (empty keyId, stripped signature,
+ *   impossible count — H-09's disarm family), is a LOUD refusal, never a
+ *   silent fall-through to the no-anchor branch (v0.23, W9-M4): a damaged
+ *   anchor is tampering until proven otherwise.
+ * - Without a usable anchor: the candidates are the checkpoints under the
+ *   local engine key (`<trustRoot>/keys`).
+ * - In EITHER branch the chosen candidate's signature must verify under key
+ *   material this host actually holds. The candidates are scanned newest
+ *   first and the first VERIFIABLE one wins, so one appended
+ *   garbage-signature twin at the tail (a positional-last veto) cannot
+ *   brick publication while an earlier verifiable checkpoint exists
+ *   (v0.23, W9-M5); when none verifies, the refusal lists every rejected
+ *   candidate. An anchored key with no local key material is a loud
+ *   refusal naming exactly what to provide — publishing bytes nobody can
+ *   verify is the notarising of forgeries.
  *
- * Whenever the local engine key matches the selected checkpoint's keyId,
- * the checkpoint signature itself is verified before the entry enters the
- * tree — a checkpoint whose `sig` does not verify under the key it names is
- * refused, not published.
+ * Order of operations (v0.23, W9-M6): every read-side refusal happens
+ * first, then the operator key is loaded, and only then is the log touched.
+ * A key-directory typo or a locked key used to leave an appended entry with
+ * no head over it — the half-published state the engine face promises
+ * never to produce; now the CLI cannot produce it either. And the leaf's
+ * workspace identity must agree with the identity the CHECKPOINT SIGNATURE
+ * covers (`payload.workspaceKey`, v0.23 W9-M5): a chain copied into a
+ * foreign workspace is refused instead of laundered into the log under the
+ * new workspace's key.
  */
 async function runAppend(fs: NodeFsPort, logDir: string, operatorKeyDir: string): Promise<number> {
   const paths = workspacePaths()
@@ -236,31 +257,71 @@ async function runAppend(fs: NodeFsPort, logDir: string, operatorKeyDir: string)
   if (signed.length === 0) {
     return fail('no signed checkpoint to publish — run proof_baseline/proof_verify first（checkpoint 由引擎签名）')
   }
+  // W9-M4 (v0.23): the anchor is adjudicated through parseAnchorEx — a file
+  // that exists but cannot be consulted (unparseable) or that sits in a
+  // state no honest writer produces (invalid/disarmed) is a refusal, not
+  // "as good as no anchor": silently switching selection semantics on a
+  // damaged trust root is exactly the disarm the anchor exists to prevent.
+  // (A read that fails on a file that exists is likewise refused — W9-M10.)
   const anchorRaw = await fs.readFile(paths.anchorPath)
-  const anchor = parseAnchor(anchorRaw)
+  if (anchorRaw === undefined && (await fs.stat(paths.anchorPath)) !== undefined) {
+    return fail(
+      `cannot read the anchor file ${paths.anchorPath} (the file exists but the read failed)`
+      + ' — refusing to publish against an unreadable trust root; retry, or restore the anchor from a known-good copy',
+    )
+  }
+  const anchorOutcome = parseAnchorEx(anchorRaw)
+  if (anchorOutcome?.problem !== undefined) {
+    return fail(
+      anchorOutcome.problem === 'unparseable'
+        ? `the anchor on record is not a parseable anchor document (${paths.anchorPath})`
+          + ' — publication is refused instead of silently proceeding as if no anchor existed (the out-of-band defence cannot be consulted; restore or repair the anchor file first)'
+        : `the anchor on record is DISARMED (${paths.anchorPath}: empty keyId, a stripped signature, or an impossible count — a shape no honest writer produces)`
+          + ' — publication is refused instead of silently proceeding as if no anchor existed (a disarmed anchor is tampering until proven otherwise; restore it from a known-good copy)',
+    )
+  }
+  const anchor = anchorOutcome?.anchor
   // The local engine key, loaded ONLY when it already exists: a verify-side
   // selection must never mint a key. Missing key is a missing capability.
   const engineKeyDir = `${paths.trustRoot}/keys`
   const engineSigner = (await fs.stat(engineKeyDir)) === undefined ? undefined : await NodeEd25519Signer.load(engineKeyDir)
 
-  let chosen: WalkedCheckpoint | undefined
-  if (anchor !== undefined && anchor.keyId !== '') {
-    chosen = signed.findLast(cp => cp.keyId === anchor.keyId)
-    if (chosen === undefined) {
+  // -- candidate set + the key material that will verify the choice --------
+  let candidates: readonly WalkedCheckpoint[]
+  let verifier: { keyId: string; verify: (data: string, sig: string) => Promise<boolean> } | undefined
+  if (anchor !== undefined) {
+    candidates = signed.filter(cp => cp.keyId === anchor.keyId)
+    if (candidates.length === 0) {
       return fail(
         `no checkpoint signed by the anchored key ${JSON.stringify(anchor.keyId)} on this chain`
         + ' — the anchor is the publication trust root, and no later checkpoint under another key may stand in for it'
         + ' (a foreign-keyId checkpoint appended to the workspace log is exactly the forgery this rule refuses)',
       )
     }
+    if (engineSigner !== undefined && engineSigner.keyId === anchor.keyId) {
+      verifier = engineSigner
+    }
+    if (verifier === undefined) {
+      // X-H-11 (v0.23): the anchor names a key this host holds no material
+      // for. A keyId string match proves nothing — the checkpoints could all
+      // be forgeries claiming the anchored identity — so publication under
+      // an unverifiable anchor is refused, naming the remedy.
+      return fail(
+        `refusing to publish: the anchor names key ${JSON.stringify(anchor.keyId)} but this host holds no key material that can verify it`
+        + ` (no matching key under ${engineKeyDir}) — a checkpoint whose signature cannot be verified is not publishable, whatever keyId it claims`
+        + ' (X-H-11: keyId matching without verification is the forgery shape). Provide the anchor/engine key material —'
+        + ' point DSH_PROOF_TRUST_DIR at the trust root holding the workspace key, or run on the host that anchors this workspace',
+      )
+    }
   } else if (engineSigner !== undefined) {
-    chosen = signed.findLast(cp => cp.keyId === engineSigner.keyId)
-    if (chosen === undefined) {
+    candidates = signed.filter(cp => cp.keyId === engineSigner.keyId)
+    if (candidates.length === 0) {
       return fail(
         `no anchor on record and no checkpoint signed by the local engine key (${engineSigner.keyId})`
         + ' — without an anchor, publication is only possible for checkpoints this host can verify',
       )
     }
+    verifier = engineSigner
   } else {
     return fail(
       'refusing to publish: no trust root — the workspace has no anchor on record and no engine key'
@@ -270,23 +331,61 @@ async function runAppend(fs: NodeFsPort, logDir: string, operatorKeyDir: string)
     )
   }
 
-  // Verify the checkpoint's own signature whenever the named key is at
-  // hand: the log is a notary, but the notary must not notarise a forgery it
-  // was perfectly able to catch.
-  if (engineSigner !== undefined && chosen.keyId === engineSigner.keyId && chosen.sig !== null) {
-    let holds: boolean
+  // -- the selection itself: newest-first, first signature that VERIFIES ---
+  // W9-M5 (v0.23): scanning back for the first verifiable candidate means an
+  // attacker's appended garbage-signature twin (positional last under the
+  // anchored/local keyId) can no longer veto publication while an earlier
+  // verifiable checkpoint exists — fail-closed against forgeries, available
+  // against DoS.
+  const rejected: string[] = []
+  let chosen: WalkedCheckpoint | undefined
+  for (let i = candidates.length - 1; i >= 0; i -= 1) {
+    const cp = candidates[i] as WalkedCheckpoint
+    let holds = false
     try {
-      holds = await engineSigner.verify(checkpointSignedData(chosen.payload), chosen.sig)
+      holds = await verifier.verify(checkpointSignedData(cp.payload), cp.sig as string)
     } catch {
       holds = false
     }
-    if (!holds) {
-      return fail(
-        `checkpoint signature does not verify under the local engine key (${chosen.keyId})`
-        + ' — refusing to publish a forged checkpoint',
-      )
+    if (holds) {
+      chosen = cp
+      break
     }
+    rejected.push(`log line ${cp.index} (count ${cp.payload.count})`)
   }
+  if (chosen === undefined) {
+    return fail(
+      `refusing to publish: every candidate checkpoint under the ${anchor !== undefined ? 'anchored' : 'local engine'} key (${verifier.keyId})`
+      + ` failed signature verification — rejected: ${rejected.join(', ')}.`
+      + ' A checkpoint whose signature does not verify under the key it names is a forgery, and the log is a notary, not a laundering service',
+    )
+  }
+
+  // W9-M5 (v0.23): the published leaf is keyed by the workspace identity the
+  // DERIVATION computes, and that identity must agree with the one the
+  // checkpoint SIGNATURE covers (`payload.workspaceKey`). Without the
+  // cross-check, copying workspace A's chain into workspace B and running
+  // the CLI there would enter A's honestly-signed checkpoint into the log
+  // under B's identity — a cross-workspace laundering no later reader could
+  // see. (A checkpoint that predates the field signs `null` — nothing to
+  // cross-check, and the derived identity is all there is.)
+  const signedWorkspace = chosen.payload.workspaceKey
+  if (signedWorkspace !== null && signedWorkspace !== paths.workspaceKey) {
+    return fail(
+      `refusing to publish: the selected checkpoint is signed for workspace ${JSON.stringify(signedWorkspace)}`
+      + ` but this workspace derives ${JSON.stringify(paths.workspaceKey)} — a chain copied into a foreign workspace is not this workspace's evidence`
+      + ' (point DSH_PROOF_ROOT at the workspace the chain belongs to, or rebuild the baseline here)',
+    )
+  }
+
+  // W9-M6 (v0.23): the operator key is loaded and proven usable BEFORE the
+  // log is mutated. After this point every failure mode of the head mint
+  // (a typo'd key directory minting a wrong-identity key, a locked key
+  // directory, a full disk) can still strike — but it strikes BEFORE any
+  // entry is appended, so the CLI cannot leave the half-published state
+  // (an entry on the public log with no signed head over it) the engine
+  // face already refuses to produce.
+  const operator = await NodeEd25519Signer.load(operatorKeyDir)
 
   // The published leaf is the checkpoint itself, re-committed under the
   // workspace identity the log indexes by: count/head/at from the signed
@@ -311,7 +410,6 @@ async function runAppend(fs: NodeFsPort, logDir: string, operatorKeyDir: string)
   // resolveOperatorKeyDir) so no rewrite of the log can rotate the very
   // identity that vouches for it.
   const { log } = await loadPtl(fs, logDir)
-  const operator = await NodeEd25519Signer.load(operatorKeyDir)
   const unsigned = {
     logId: operator.keyId,
     treeSize: log.size,
@@ -319,7 +417,13 @@ async function runAppend(fs: NodeFsPort, logDir: string, operatorKeyDir: string)
     at: new Date().toISOString(),
   }
   const sth: SignedTreeHead = { ...unsigned, sig: await operator.sign(sthSignedData(unsigned)) }
-  await savePtlHead(fs, logDir, sth)
+  // X-H-10 (v0.23): the head already stored in the log directory is
+  // attacker-controllable storage, and savePtlHead reasons from it as its
+  // trust baseline — so the operator key in hand also adjudicates the
+  // stored head's own signature before the new one is signed over it.
+  await savePtlHead(fs, logDir, sth, {
+    verifyExistingHead: async existing => operator.verify(sthSignedData(existing), existing.sig),
+  })
 
   process.stdout.write(`${JSON.stringify({
     sequence,
@@ -353,14 +457,30 @@ async function runHead(fs: NodeFsPort, logDir: string): Promise<number> {
  * and the commitment drifted apart (rewrite, truncation, or a stale head).
  * A log with entries but no head on record says so explicitly: "currently
  * promises nothing" is a state worth naming, not a silent pass.
+ *
+ * v0.23 (W9-M6/M7 — the no-bundle face catches up with the bundle face's
+ * "uncertain = fail" discipline):
+ * - a head on record whose signature could not be adjudicated (no operator
+ *   key at hand) FAILS the self-check instead of passing on `rootMatch`
+ *   alone — a commitment nobody verified is exactly the uncertainty the
+ *   bundle face already refuses to wave through;
+ * - `badLines > 0` (malformed/whitespace lines loadPtl counted while
+ *   loading) FAILS too and is surfaced in the output — physical damage the
+ *   readable prefix cannot speak for used to be invisible whenever the
+ *   damage did not move the root.
  */
 async function runSelfVerify(fs: NodeFsPort, logDir: string, operatorKeyDir: string): Promise<number> {
-  const { log, sth, headOvercommits } = await loadPtl(fs, logDir)
+  const { log, sth, badLines, headOvercommits } = await loadPtl(fs, logDir)
   const notes: string[] = []
   if (headOvercommits && sth !== undefined) {
     notes.push(`sth.json promises ${sth.treeSize} entries but the log holds ${log.size} — head and log are disconnected`)
   } else if (sth === undefined && log.size > 0) {
     notes.push(`no signed head on record (sth.json missing or unreadable) while the log holds ${log.size} entries`)
+  }
+  if (badLines > 0) {
+    notes.push(
+      `${badLines} malformed line(s) in ptl-entries.jsonl — the readable prefix still verifies, but the log file carries bytes the tree does not speak for`,
+    )
   }
   const rootMatch = sth !== undefined && sth.treeSize === log.size && log.merkleRoot() === sth.root
 
@@ -369,10 +489,10 @@ async function runSelfVerify(fs: NodeFsPort, logDir: string, operatorKeyDir: str
   if (operator !== undefined && sth !== undefined) {
     headSignature = await headSignatureHolds(sth, operator)
   } else if (sth !== undefined) {
-    notes.push('operator key absent — head signature not verified')
+    notes.push('operator key absent — head signature not verified (uncertain = fail)')
   }
 
-  const ok = rootMatch && headSignature !== false
+  const ok = rootMatch && headSignature === true && badLines === 0
   process.stdout.write(`${JSON.stringify({
     ok,
     treeSize: sth?.treeSize ?? log.size,
@@ -380,6 +500,7 @@ async function runSelfVerify(fs: NodeFsPort, logDir: string, operatorKeyDir: str
       rootMatch,
       ...(headSignature !== undefined ? { headSignature } : {}),
     },
+    ...(badLines > 0 ? { badLines } : {}),
     ...(notes.length > 0 ? { notes } : {}),
   })}\n`)
   return ok ? 0 : 1
@@ -444,8 +565,13 @@ async function runBundleVerify(
     publishedHead: Partial<SignedTreeHead>; inclusionProof: readonly string[]
   }>
 
-  const { log, sth, headOvercommits } = await loadPtl(fs, logDir)
+  const { log, sth, badLines, headOvercommits } = await loadPtl(fs, logDir)
   const notes: string[] = []
+  if (badLines > 0) {
+    notes.push(
+      `${badLines} malformed line(s) in ptl-entries.jsonl — the audited prefix is readable, but the log file itself is not sound`,
+    )
+  }
 
   // ① the leaf the bundle claims, at the position it claims.
   const sequence = typeof t.sequence === 'number' && Number.isSafeInteger(t.sequence) ? t.sequence : -1
@@ -528,10 +654,14 @@ async function runBundleVerify(
     headSignature = await headSignatureHolds(sth, operator)
   }
 
+  // W9-M7 (v0.23): physical damage (badLines) fails the audit — the checks
+  // above speak for the readable prefix, and a log whose FILE carries bytes
+  // the tree does not account for is not a sound publication record.
   const ok = leafMatch && inclusion && consistency !== false
     && (logIdMatch === undefined || logIdMatch)
     && headSignature !== false
     && publishedHeadSig === true
+    && badLines === 0
   process.stdout.write(`${JSON.stringify({
     ok,
     checks: {
@@ -544,6 +674,7 @@ async function runBundleVerify(
     },
     sequence,
     treeSize: sth?.treeSize ?? log.size,
+    ...(badLines > 0 ? { badLines } : {}),
     ...(notes.length > 0 ? { notes } : {}),
   })}\n`)
   return ok ? 0 : 1

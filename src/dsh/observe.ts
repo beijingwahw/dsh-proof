@@ -32,8 +32,19 @@ import { sha256 } from '../core/hash.ts'
  * the false charge. Callers that must not miss (the evidence guard) pass
  * `{contentKeys: true}` to re-admit the key.
  */
-const PATH_KEYS = ['path', 'file', 'file_path', 'filePath', 'target', 'filename', 'dest', 'destination', 'notebook_path']
+const PATH_KEYS = ['path', 'file', 'file_path', 'filePath', 'target', 'filename', 'dest', 'destination', 'notebook_path', 'dir']
 const PATH_ARRAY_KEYS = ['paths', 'files', 'targets', 'globs', 'patterns']
+
+/**
+ * X-H-14 (v0.23): key matching is CASE-INSENSITIVE. Hosts spell the same key
+ * as `FileName`, `FILE_PATH` or `Path` — the case-sensitive `includes` used to
+ * extract nothing from `{FileName: '.proof/evidence.jsonl'}`, so even the
+ * guard's over-detecting `contentKeys` view could not see a store write the
+ * tool named under one capital letter. Values keep their case (only the ROOT
+ * comparison folds); keys fold here, once, into the sets `pathsIn` consults.
+ */
+const PATH_KEY_SET = new Set(PATH_KEYS.map(key => key.toLowerCase()))
+const PATH_ARRAY_KEY_SET = new Set(PATH_ARRAY_KEYS.map(key => key.toLowerCase()))
 
 /**
  * Tool-name classification — the single source both adapter layers consult
@@ -78,7 +89,14 @@ export const MUTATION_TOOL_NAMES: readonly string[] = [
  */
 export const SHELL_TOOL_NAMES: readonly string[] = [
   'bash', 'shell', 'exec', 'run_code', 'run_command', 'terminal', 'process',
-  'task', 'npm', 'pnpm', 'yarn', 'pip', 'cargo', 'go', 'make',
+  // W13-M8 (v0.23): 'task' is gone. Hosts spell their todo/planner tools
+  // 'task' far more often than their shell, and the name used to flip the
+  // session's shellUsed fact — permanently demoting every later "changed
+  // outside your tool calls" to "indistinguishable" on the strength of a
+  // checklist call. A host whose 'task' really is a runner still lands in the
+  // mutation class (unknown names default there); only the shell FACT is no
+  // longer minted from the name alone.
+  'npm', 'pnpm', 'yarn', 'pip', 'cargo', 'go', 'make',
   // Host spellings the pre-v0.23 enum missed (Gemini et al.) — their calls
   // never flipped the session's shellUsed fact, silently keeping the H9b
   // "changed outside your tool calls" accusation alive.
@@ -133,30 +151,109 @@ export function isShellToolName(toolName: string): boolean {
 }
 
 /**
- * H-02: does a shell command string mention any of the guarded targets?
+ * H-02: does a command string mention any of the guarded targets?
  *
  * The command string is the one argument shape `pathsIn` structurally cannot
  * see (a `bash {command: 'echo x > .proof/evidence.jsonl'}` names no path
  * key), so the evidence-store guard needs a conservative textual sweep: path
  * separators are normalized (`\` → `/`, both spell a redirect target on
  * Windows), everything is case-folded the way the guard's path comparison
- * already folds (H10), and any target appearing as a substring — the bare
- * store directory, a file inside it, or a trusted file name such as
- * `evidence.jsonl` / `baseline.json` / `anchor.json` / the signing-key files —
- * is a hit. Substring, not word-boundary, on purpose: `cd .proof && rm *`
- * and `>.PROOF/EVIDENCE.jsonl` must both land. False positives cost one
- * denied shell call with a reason saying why; a false negative costs the
- * chain.
+ * already folds (H10), and any target appearing as a *segment-delimited*
+ * substring — the bare store directory, a file inside it, or a trusted file
+ * name such as `evidence.jsonl` / `baseline.json` / `anchor.json` / the
+ * signing-key files — is a hit.
+ *
+ * X-H-13 (v0.23): the match is segment-boundaried, not a raw substring. The
+ * END of a hit requires the next character (if any) to be outside
+ * `[A-Za-z0-9_-]` — a dot stays a clean end, so the Win32 trailing-dot
+ * deformation (`.proof.`) still hits while `.proof-synthetic` (a DIFFERENT
+ * directory — it is where proof_conjure scaffolds the sandbox the model is
+ * INSTRUCTED to write into) and `anchor.jsonl` (not `anchor.json`) do not.
+ * The START additionally treats `.` and `-` as name characters, so a target
+ * segment never matches inside a LONGER name that merely extends it: with
+ * the store at `proof`, the string `.proof/evidence.jsonl` (a genuinely
+ * different, dotted directory) must NOT hit. Quoting (`"`.proof`"`), `/`-
+ * delimiters, string ends and the NUL truncation model all still hit. With
+ * the sweep now running over every string value of every call (see
+ * {@link sweepToolInputStrings}), that precision is what keeps the plugin's
+ * own conjure protocol callable and a differently-named store directory
+ * distinct. False positives still cost one denied call with a reason saying
+ * why; a false negative costs the chain.
  */
+const SEGMENT_INNER_CHAR = /[A-Za-z0-9_-]/
+const SEGMENT_HEAD_CHAR = /[A-Za-z0-9_.-]/
+
 export function shellCommandMentionsPath(command: string, targets: readonly string[]): boolean {
   if (typeof command !== 'string' || command.length === 0) return false
   const haystack = command.replace(/\\/g, '/').toLowerCase()
   for (const target of targets) {
     if (typeof target !== 'string' || target.length === 0) continue
     const needle = target.replace(/\\/g, '/').toLowerCase()
-    if (haystack.includes(needle)) return true
+    if (needle.length === 0) continue
+    let from = 0
+    for (;;) {
+      const at = haystack.indexOf(needle, from)
+      if (at < 0) break
+      const before = at > 0 ? haystack.charAt(at - 1) : ''
+      const after = at + needle.length < haystack.length ? haystack.charAt(at + needle.length) : ''
+      const startsClean = before === '' || !SEGMENT_HEAD_CHAR.test(before)
+      const endsClean = after === '' || !SEGMENT_INNER_CHAR.test(after)
+      if (startsClean && endsClean) return true
+      from = at + 1
+    }
   }
   return false
+}
+
+/**
+ * X-H-13 (v0.23): every string value in a tool call's arguments, collected
+ * for the guard's value sweep — the death of the key-name whitelist.
+ *
+ * The pre-v0.23 command sweep read exactly three keys (`command`/`cmd`/
+ * `script`), so `{commandLine: …}`, `{code: …}` and mixed argv vectors
+ * carried store-writing commands straight through every gate; before that,
+ * the shell TOOL-NAME list was the hole. Names and keys are both attacker
+ * spellings — this sweep enumerates NEITHER: it walks the argument object's
+ * values (arrays contribute their elements individually; nested objects
+ * recurse) and hands back every string it finds, and the guard refuses any
+ * call whose ANY string value mentions a protected path.
+ *
+ * Bounds, so a hostile payload cannot turn the sweep into a cost attack:
+ * depth ≤ 3, at most 64 strings, each swept up to its first 8192 characters
+ * (a longer string contributes its head — skipping it wholesale would make
+ * `command: ' '.repeat(9000) + 'rm .proof'` a length-shaped bypass, while
+ * the tail beyond the cap is the same blind spot every bounded sweep has).
+ * Cycles are guarded by a visited set. The deliberate false-positive surface:
+ * a read-only tool naming the store (`grep {pattern: 'evidence.jsonl'}`, a
+ * Read of the log) is denied too — 宁误拦, one denied call with a reason
+ * beats one rewritten chain, and the plugin's own proof_* tools read the log
+ * through the engine's port, not through host tool calls.
+ */
+const SWEEP_MAX_DEPTH = 3
+const SWEEP_MAX_STRINGS = 64
+const SWEEP_MAX_STRING = 8192
+
+export function sweepToolInputStrings(toolInput: unknown): string[] {
+  const out: string[] = []
+  const visited = new Set<unknown>()
+  const full = (): boolean => out.length >= SWEEP_MAX_STRINGS
+  const visit = (value: unknown, depth: number): void => {
+    if (full()) return
+    if (typeof value === 'string') {
+      if (value.length > 0) out.push(value.slice(0, SWEEP_MAX_STRING))
+      return
+    }
+    if (value === null || typeof value !== 'object') return
+    if (depth > SWEEP_MAX_DEPTH) return
+    if (visited.has(value)) return
+    visited.add(value)
+    for (const item of Array.isArray(value) ? value : Object.values(value as Record<string, unknown>)) {
+      visit(item, depth + 1)
+      if (full()) return
+    }
+  }
+  visit(toolInput, 0)
+  return out
 }
 
 export interface DriftReport {
@@ -215,11 +312,11 @@ export class WorkspaceWatch {
    */
   static pathsIn(args: unknown, options: { contentKeys?: boolean } = {}): string[] {
     const keys = options.contentKeys === true
-      ? [...PATH_KEYS, 'source']
-      : PATH_KEYS
+      ? new Set([...PATH_KEY_SET, 'source'])
+      : PATH_KEY_SET
     const arrayKeys = options.contentKeys === true
-      ? [...PATH_ARRAY_KEYS, 'sources']
-      : PATH_ARRAY_KEYS
+      ? new Set([...PATH_ARRAY_KEY_SET, 'sources'])
+      : PATH_ARRAY_KEY_SET
     const out = new Set<string>()
     // `underPathKey`: this value sits directly beneath a key that names paths.
     // Only there may an array's bare strings be read as paths (H9a): a bare
@@ -242,7 +339,8 @@ export class WorkspaceWatch {
         return
       }
       for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
-        const isPathKey = keys.includes(key) || arrayKeys.includes(key)
+        // X-H-14: the key comparison folds case on both sides.
+        const isPathKey = keys.has(key.toLowerCase()) || arrayKeys.has(key.toLowerCase())
         if (typeof val === 'string') {
           if (isPathKey) out.add(val)
         } else {
@@ -251,7 +349,13 @@ export class WorkspaceWatch {
       }
     }
     visit(args, 0, false)
-    return [...out].filter(p => looksLikePath(p))
+    // W13-M3 (v0.23): no `looksLikePath` filter on the way out. Every string
+    // in `out` already sits under a key that ENDORSES it as a path, and the
+    // old heuristics filter rejected exactly the key-endorsed values that
+    // carry no separator: a bare `{file: 'Makefile'}` or `{path: 'README'}`
+    // never recorded a touch, so the agent's own edit of such a file read as
+    // external drift. The key is the path authority; the shape is not.
+    return [...out]
   }
 
   /**
@@ -341,10 +445,14 @@ export class WorkspaceWatch {
       const current = await this.fingerprint(rel)
       const recorded = this.fingerprints.get(rel)
       if (current === undefined) {
-        if (recorded !== undefined) {
-          // File disappeared under us.
+        // W13-M2 (v0.23): a file the agent itself deleted through a tool is
+        // the agent's own work, not drift — the vanished branch used to push
+        // it into `drifted` even with `touched` set, accusing the agent of
+        // "changes outside your tool calls" for its own `rm`. Only a file
+        // that vanished with NO claiming tool call is drift.
+        if (recorded !== undefined && !this.touched.has(rel)) {
           drifted.push(rel)
-          if (this.read.has(rel) && !this.touched.has(rel)) staleReads.push(rel)
+          if (this.read.has(rel)) staleReads.push(rel)
         }
         continue
       }
@@ -394,6 +502,14 @@ export class WorkspaceWatch {
  * Drive-absolute paths compare against the root case-insensitively: the same
  * Windows workspace legitimately arrives as `C:\…` from the host and as
  * `c:/…` from tools and language servers. POSIX stays case-sensitive.
+ *
+ * W13-L11 (v0.23): the relative branch folds `.`/`..` segments and refuses
+ * the ones that ESCAPE. `../outside.txt` used to pass through verbatim and
+ * the fingerprinter then read `${root}/../outside.txt` — a file OUTSIDE the
+ * workspace, whose later external change reported as workspace drift; and
+ * `a/../../b` walked out the same way. A relative path whose folded form
+ * still carries a leading `..` names no workspace file and yields undefined,
+ * exactly like an absolute path outside the root.
  */
 export function toWorkspaceRelative(raw: string, root: string): string | undefined {
   if (raw.length === 0 || raw.length > 4096) return undefined
@@ -409,13 +525,23 @@ export function toWorkspaceRelative(raw: string, root: string): string | undefin
   if (normalized.startsWith('/')) {
     return normalized.startsWith(`${normalizedRoot}/`) ? normalized.slice(normalizedRoot.length + 1) : undefined
   }
-  return normalized.replace(/^\.\//, '')
+  const folded = foldRelativeSegments(normalized.replace(/^\.\//, ''))
+  return folded.startsWith('../') || folded === '..' ? undefined : folded
 }
 
-function looksLikePath(value: string): boolean {
-  if (value.length === 0 || value.length > 4096) return false
-  if (/\s/.test(value) && !/[/.\\]/.test(value)) return false
-  return /[/.\\]/.test(value) || /^[A-Za-z0-9_-]+$/.test(value) === false
+/**
+ * Collapse `.` and `..` segments in an already-relative path. A leading `..`
+ * that would escape the root is KEPT (`..` cannot pop past nothing), so the
+ * caller can recognize and refuse the escape; interior detours fold away.
+ */
+function foldRelativeSegments(rel: string): string {
+  const out: string[] = []
+  for (const segment of rel.split('/')) {
+    if (segment === '' || segment === '.') continue
+    if (segment === '..' && out.length > 0 && out[out.length - 1] !== '..') out.pop()
+    else out.push(segment)
+  }
+  return out.join('/')
 }
 
 /**

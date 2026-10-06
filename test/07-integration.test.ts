@@ -127,12 +127,20 @@ test('INTEGRATION: the plugin never claims PROVEN on a workspace with no objecti
     workspace: new FakeWorkspace(bare),
     clock: new SystemClock(),
   })
-  await eng.establishBaseline()
+  const anchored = await eng.establishBaseline()
+  // v0.23 (W2-M2): a workspace with zero discovered checks anchors NOTHING —
+  // an empty check pool would anchor an empty truth, and every later verify
+  // against it graded the void. The abort is on the record with its reason;
+  // with no baseline the verify below honestly reports `no-baseline`, which
+  // is still exactly "never PROVEN" — the headline this test has always
+  // pinned — now one step earlier, at the anchor that would have lied.
+  assert.equal(anchored.baseline.aborted, true, 'a zero-check workspace anchors nothing')
+  const markerLine = (await eng.fsView.readLines(join(bare, '.proof', 'evidence.jsonl')))
+    .find(l => l.includes('"baseline/aborted"'))
+  assert.ok(markerLine !== undefined, 'the refusal is a chain fact')
+  assert.ok(markerLine.includes('"no-checks-discovered"'), `the reason names the empty pool (got ${markerLine.slice(0, 200)})`)
   const outcome = await eng.verify({ changed: ['README.md'] })
-  // Tightened from `notEqual('proven')`: with discovered === 0, decideGrade
-  // falls through has-baseline / no-regressions / no-unverified and lands on
-  // the explicit "nothing objective speaks for the claim" branch — the exact
-  // grade is `unproven`, not merely "anything but proven".
-  assert.equal(outcome.report.grade, 'unproven', 'with nothing objective to run, the honest grade is exactly unproven')
+  assert.equal(outcome.report.grade, 'no-baseline', 'with nothing anchored and nothing to run, the honest grade is no-baseline')
   assert.equal(outcome.report.discovered, 0)
+  assert.notEqual(outcome.report.grade, 'proven')
 })

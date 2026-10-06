@@ -19,6 +19,10 @@ import type { DependencyGraph } from './impact.ts'
 import type { ChangeProvenance } from './changeset.ts'
 import type { GradedProofReport } from './report.ts'
 import { firstInformativeLine } from './excerpt.ts'
+// W15-L12: the certify-target display default is IMPORTED from the config
+// module, not re-typed here — the day the config default moves, this
+// narrative moves with it instead of silently disagreeing.
+import { DEFAULT_CERTIFY_TARGET } from '../config.ts'
 
 /** The minimum a report needs to decide who owns a red check. */
 export interface AttributionInput {
@@ -163,14 +167,12 @@ export function regressionNarrative(checks: readonly AttributedCheck[]): string[
 }
 
 /**
- * The display default for the certify target in the narrative — mirrors
- * `certifyTarget`'s config default ("proven (p≈0.97)"). Callers that know the
- * run's actual target can pass it; the plain `ProofReport` carries only the
- * posterior, not the threshold it was certified against.
+ * Plain-language summary of what is and is not proven. The certify-target
+ * fallback for the display is the config module's own default (see the
+ * import above). Callers that know the run's actual target pass it; the
+ * plain `ProofReport` carries only the posterior, not the threshold it was
+ * certified against.
  */
-const DEFAULT_CERTIFY_TARGET = 0.97
-
-/** Plain-language summary of what is and is not proven. */
 export function proofNarrative(report: ProofReport, certifyTarget: number = DEFAULT_CERTIFY_TARGET): string {
   const s = report.summary
   const parts = [
@@ -202,14 +204,16 @@ export function proofNarrative(report: ProofReport, certifyTarget: number = DEFA
     && coverage.uncovered.length === 0
     ? ', change-executed'
     : ''
-  if (
-    coverage !== undefined && coverage.basis === 'v8'
-    && coverage.uncovered.length > 0 && report.grade === 'unproven'
-  ) {
+  if (coverage !== undefined && coverage.basis === 'v8' && coverage.uncovered.length > 0) {
     // Paths coverage said "a check owns this file"; execution coverage says
     // "and then no green check ever ran a line of it". That gap is the claim
     // this whole dimension exists to catch, so the narrative names the files
-    // and points at the remedy the toolset already has.
+    // and points at the remedy the toolset already has. W15-L11: the naming
+    // is decoupled from the grade — a `stale` or `regressed` run with
+    // uncovered changes used to fall between this branch and the
+    // change-executed tail, and "the change was never executed" vanished
+    // from the story precisely when the report was already bad enough to
+    // need it most.
     const named = coverage.uncovered.slice(0, 3).join(', ')
     parts.push(`unexecuted change (${named}) — proof_conjure can synthesize a test that executes them`)
   }

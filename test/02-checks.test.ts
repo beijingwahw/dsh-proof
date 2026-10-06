@@ -212,6 +212,48 @@ test('B6-L3: a quoted config command string splits shell-words style, not on raw
   })()
 })
 
+test('W14-L8: single quotes have no escapes (POSIX); outside-quote backslashes are literal (documented choice)', () => {
+  return (async () => {
+    // POSIX: inside '…' every character is literal, backslash included, and
+    // only a bare quote closes. The old reader unescaped \' there.
+    const fs0 = MemoryFs.of({})
+    const literalBackslash = await discoverChecks(fs0, '/ws', { checks: [{ label: 't', command: "echo 'a\\'" }] })
+    assert.deepEqual(literalBackslash[0]?.command, ['echo', 'a\\'], "the backslash is content and the bare quote closes — 'a\\'")
+    const inner = await discoverChecks(MemoryFs.of({}), '/ws', { checks: [{ label: 't', command: "echo 'it\\'s'" }] })
+    assert.deepEqual(inner[0]?.command, ['echo', 'it\\s'], 'close at the bare quote, then the rest reopens and runs to end')
+    // Double quotes still unescape \" (the common shell reading, unchanged).
+    const dq = await discoverChecks(MemoryFs.of({}), '/ws', { checks: [{ label: 't', command: 'echo "a\\"b"' }] })
+    assert.deepEqual(dq[0]?.command, ['echo', 'a"b'])
+    // Outside quotes a backslash stays LITERAL: Windows paths survive
+    // (`C:\ws\bin\tool` would be shredded to `C:wsbintool` under POSIX
+    // escaping) — the documented deviation, pinned here.
+    const win = await discoverChecks(MemoryFs.of({}), '/ws', { checks: [{ label: 't', command: 'C:\\ws\\bin\\tool --flag' }] })
+    assert.deepEqual(win[0]?.command, ['C:\\ws\\bin\\tool', '--flag'])
+  })()
+})
+
+test('W14-L10: a non-finite timeoutMs is refused loudly, not passed through the ?? gate', async () => {
+  // `NaN ?? fallback` is NaN — ?? only catches null/undefined — so an
+  // explicit NaN used to ride the spec into the runner (the same hole H-33
+  // sealed at the excerpt layer). Refuse at both spellings.
+  await assert.rejects(
+    discoverChecks(MemoryFs.of({}), '/ws', { timeoutMs: Number.NaN }),
+    /timeoutMs must be a finite number of milliseconds/,
+  )
+  await assert.rejects(
+    discoverChecks(MemoryFs.of({}), '/ws', { timeoutMs: Number.POSITIVE_INFINITY }),
+    /timeoutMs must be a finite number of milliseconds/,
+  )
+  await assert.rejects(
+    discoverChecks(MemoryFs.of({}), '/ws', { checks: [{ label: 't', command: ['x'], timeoutMs: Number.NaN }] }),
+    /timeoutMs must be a finite number of milliseconds/,
+  )
+  // Legal values are untouched — including 0/negative, which stay the
+  // caller's policy (the gate is about non-finite delivery, not taste).
+  const zero = await discoverChecks(MemoryFs.of({}), '/ws', { checks: [{ label: 't', command: ['x'], timeoutMs: 0 }] })
+  assert.equal(zero[0]?.timeoutMs, 0)
+})
+
 test('B6-L4: perf script names are not promoted to benchmark checks by name alone', () => {
   return (async () => {
     // A script merely NAMED bench/benchmark/perf:bench is usually a

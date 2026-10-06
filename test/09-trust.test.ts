@@ -12,8 +12,8 @@ import { promises as fsp } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 
-import { EvidenceStore, buildBaseline, makeEvidence, snapshotWorkspace } from '../src/core/evidence.ts'
-import { GENESIS_PREV, checkpointSignedData, lineDigest } from '../src/core/trust.ts'
+import { EvidenceStore, buildBaseline, makeEvidence, snapshotWorkspace, createVerifiedView } from '../src/core/evidence.ts'
+import { GENESIS_PREV, checkpointSignedData, lineDigest, walkChain } from '../src/core/trust.ts'
 import { addressOf, sha256 } from '../src/core/hash.ts'
 import type { SignerPort } from '../src/core/ports.ts'
 import { ProofEngine } from '../src/engine.ts'
@@ -615,7 +615,7 @@ test('M15: an anchor file that exists but cannot parse is surfaced as anchorUnre
   assert.equal((await neverAnchored.audit()).anchorUnreadable, false)
 })
 
-test('M15 + unsignedCheckpoints: a transient signer failure is not memoized — the next checkpoint signs again', async () => {
+test('M15/W1-M3: a rejected signer PROVIDER lands on the sigError channel — not a naked unsigned line', async () => {
   const fs = MemoryFs.of({})
   const signer = new FakeSigner()
   let broken = true
@@ -628,7 +628,7 @@ test('M15 + unsignedCheckpoints: a transient signer failure is not memoized — 
     workspaceKey: 'ws',
   })
   await store.append(evidence('c1'))
-  await store.checkpoint() // provider rejects: an unsigned checkpoint lands
+  await store.checkpoint() // provider rejects: the boundary must RECORD the failure
 
   // Recovery: the provider heals. The store must RETRY it — the old code
   // cached the first failure forever, so every later checkpoint stayed
@@ -638,10 +638,18 @@ test('M15 + unsignedCheckpoints: a transient signer failure is not memoized — 
   await store.checkpoint()
 
   const audit = await store.audit()
-  // The real channel trigger: a sig-less checkpoint while a signer is (again)
-  // active is exactly what unsignedCheckpoints exists to name.
-  assert.deepEqual(audit.chain.unsignedCheckpoints, [1], 'the first checkpoint is unsigned and the host key is back — charged')
-  assert.equal(audit.ok, false)
+  // W1-M3 (v0.23): the provider-reject form used to write a NAKED unsigned
+  // checkpoint — no sigError, no keyId — which unsignedCheckpoints charged
+  // forever (no keyId means no recovery witness is even possible: one AV
+  // scan holding the key directory red-flagged the log for life). It is the
+  // same social reality as sign() throwing (M-33 above), and now lands on
+  // the same channel: sigError recorded, excused under the recovery witness
+  // the healed second checkpoint provides. Pin changed from
+  // unsignedCheckpoints=[1] / ok=false to the sigError-channel semantics.
+  assert.deepEqual(audit.chain.sigErrorCheckpoints, [1], 'the failed boundary names its reason on the transient channel')
+  assert.deepEqual(audit.chain.unsignedCheckpoints, [], 'a provider-reject blip is not a stripped signature')
+  assert.deepEqual(audit.chain.refusedToSign, [], 'and it is certainly not a refusal — the store was willing, the provider was not')
+  assert.equal(audit.ok, true, 'recovery is real: the anchor was lifted at count 2 by the healed signer')
   // Proof the SECOND checkpoint was signed (the retry worked): the anchor is
   // only ever written by a successful sign(), and it covers count 2.
   const anchorRaw = await fs.readFile(ANCHOR)
@@ -651,6 +659,11 @@ test('M15 + unsignedCheckpoints: a transient signer failure is not memoized — 
   assert.equal(anchor.keyId, 'fake-key')
   assert.equal(audit.chain.checkpoints, 2)
   assert.equal(audit.chain.mode, 'signed')
+  // And the first boundary's line honestly carries the failure it had.
+  const cp1 = JSON.parse((await fs.readLines(LOG))[1] as string) as { sigError?: string; keyId?: string; sig?: string }
+  assert.equal(cp1.sig, undefined)
+  assert.match(String(cp1.sigError), /key directory locked/, 'the reason is on the chain, not swallowed')
+  assert.equal(cp1.keyId, undefined, 'a provider that never resolved never named a key — no keyId is invented')
 })
 
 test('badCheckpoints: a tampered checkpoint payload is refuted by the host key (the forgery channel)', async () => {
@@ -1080,4 +1093,266 @@ test('L-A1-11: a v2 line of an unknown kind is malformed, not silently chained',
   const audit = await auditor(fs).audit()
   assert.deepEqual(audit.chain.malformedCheckpoints, [1], 'unknown-kind lines are named on the loud channel')
   assert.equal(audit.ok, false)
+})
+
+// -- X-H-08: cross-session tail absorption (v0.23) -------------------------------
+//
+// THE ADVERSARY III: no store process is alive (CLI invocation gap, MCP server
+// restart). The agent appends to the log tail: a self-addressed fake evidence
+// record (recomputed with this package's own exported functions) and a
+// `baseline/saved` marker whose headRef is CORRECTLY computed for its physical
+// position — so it chains perfectly, is not suspect, and remembers the digest
+// of a doctored baseline document. v0.22 absorbed all of it as honest history
+// and the next checkpoint SIGNED the attack bytes and lifted the anchor over
+// them (audit stayed green the whole time — the notarisation was silent).
+// The pre-sign audit now refuses: the newest baseline-family marker on the
+// checkpoint-uncovered tail was authored by no live process.
+
+test('X-H-08: a between-sessions baseline/saved absorption is refused, not notarised', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1', 'fail'))
+  const honest = buildBaseline([evidence('c1', 'fail')], WS, new FakeClock())
+  await store.saveBaseline(honest) // marker (self-written) + signed checkpoint + anchor
+  const anchorBefore = await fs.readFile(ANCHOR)
+
+  // The attack window: session 1 is dead. Everything appended is perfectly
+  // shaped — chained, self-addressed, headRef exact — which is exactly why no
+  // shape check can see it.
+  const lines = await fs.readLines(LOG)
+  let prev = lineDigest(lines[lines.length - 1] as string)
+  const fakeLine = JSON.stringify({
+    v: 2, kind: 'evidence', at: '2026-10-05T00:00:00.000Z', prev, payload: evidence('npm/never-ran-critical'),
+  })
+  prev = lineDigest(fakeLine)
+  const forged = buildBaseline([evidence('c1', 'pass')], WS, new FakeClock())
+  const forgedBytes = JSON.stringify(forged, null, 2)
+  fs.mutate(BASE, forgedBytes)
+  const twinMarker = JSON.stringify({
+    v: 2, kind: 'marker', at: '2026-10-05T00:00:01.000Z', prev,
+    payload: { label: 'baseline/saved', digest: sha256(forgedBytes), bytes: forgedBytes.length, headRef: prev },
+  })
+  fs.mutate(LOG, `${[...lines, fakeLine, twinMarker].join('\n')}\n`)
+
+  // Session 2: a fresh process absorbs the bytes as history — but the first
+  // boundary must refuse to lend them the host key.
+  const session2 = trustedStore(fs).store
+  await session2.checkpoint()
+  const audit = await session2.audit()
+  assert.equal(audit.chain.refusedToSign!.length, 1, 'the store accuses its own log instead of notarising the tail')
+  assert.equal(audit.ok, false, 'v0.22 kept this audit GREEN while the anchor was lifted onto the attack')
+  assert.equal(await fs.readFile(ANCHOR), anchorBefore, 'the out-of-band high-water mark is not moved over the absorption')
+  const refusal = (await fs.readLines(LOG)).find(l => l.includes('trust/checkpoint-refused'))
+  assert.match(String(refusal), /unvouched-baseline-marker/, 'the refusal names the authorless baseline claim')
+
+  // Recovery is the documented re-anchor flow: THIS process saves a baseline,
+  // its marker supersedes the orphan as the newest of the label, and signing
+  // resumes. The old refusal stays on the record (history, not amnesia).
+  await session2.saveBaseline(buildBaseline([evidence('c1', 'fail')], WS, new FakeClock()))
+  await session2.append(evidence('c2'))
+  await session2.checkpoint() // no second refusal: the tail's newest claim is self-authored now
+  const recovered = await session2.audit()
+  assert.equal(recovered.chain.refusedToSign!.length, 1, 'exactly one refusal — recovery does not loop')
+  assert.notEqual(await fs.readFile(ANCHOR), anchorBefore, 'the anchor lifts again over the re-anchored, honest tail')
+  assert.equal(recovered.chain.checkpoints, 4, 'signed checkpoints resumed after the refusal and the re-anchor')
+})
+
+test('X-H-08 control: an honest restart over a previous session\'s baseline never refuses', async () => {
+  const fs = MemoryFs.of({})
+  const first = trustedStore(fs).store
+  await first.append(evidence('c1'))
+  await first.saveBaseline(buildBaseline([evidence('c1')], WS, new FakeClock()))
+  // The marker sits at-or-below session 1's signed checkpoint — vouched-for,
+  // inherited history. Session 2 appends and checkpoints: no refusal.
+  const second = trustedStore(fs).store
+  await second.append(evidence('c2'))
+  await second.checkpoint()
+  const audit = await second.audit()
+  assert.deepEqual(audit.chain.refusedToSign, [])
+  assert.equal(audit.ok, true, 'an inherited, checkpoint-covered baseline marker is legitimate history')
+  assert.equal(audit.chain.checkpoints, 2)
+})
+
+test('X-H-08: a foreign baseline/established tail marker is refused too (and superseded by a self-written one)', async () => {
+  const fs = MemoryFs.of({})
+  const first = trustedStore(fs).store
+  await first.append(evidence('c1'))
+  await first.checkpoint() // a verified vouching boundary
+
+  // The attack: an authorless `baseline/established` (the engine's re-anchor
+  // record) lands on the covered tail's end.
+  const lines = await fs.readLines(LOG)
+  const prev = lineDigest(lines[lines.length - 1] as string)
+  const twin = JSON.stringify({
+    v: 2, kind: 'marker', at: '2026-10-05T00:00:00.000Z', prev,
+    payload: { label: 'baseline/established', reason: 'never happened', headRef: prev },
+  })
+  fs.mutate(LOG, `${[...lines, twin].join('\n')}\n`)
+
+  const session2 = trustedStore(fs).store
+  await session2.checkpoint()
+  assert.equal((await session2.audit()).chain.refusedToSign!.length, 1, 'both baseline-family labels are protected')
+
+  // Superseding, per label: a NEWER marker of the same label authored by THIS
+  // process makes the orphan a dead letter — last-wins reads never consult it.
+  await session2.mark('baseline/established', { reason: 'operator re-anchor after refusal' })
+  await session2.checkpoint()
+  const recovered = await session2.audit()
+  assert.equal(recovered.chain.refusedToSign!.length, 1, 'no second refusal: the newest claim of the label is self-authored')
+  assert.equal(recovered.chain.checkpoints, 3)
+})
+
+// -- X-H-03: headLiared on the walk (v0.23) ---------------------------------------
+//
+// The walk always recorded expectedHead; nothing outside preSignAudit compared
+// it, so a legitimately-SIGNED checkpoint replayed at another position passed
+// every signature check while swearing a head it never saw. The verdict is now
+// a first-class field the bundle/publish layers consume.
+
+test('X-H-03: walk.checkpoints expose headLiared — honest false, replayed true', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1'))
+  await store.append(evidence('c2'))
+  await store.checkpoint()
+
+  // Honest: the checkpoint's head is the digest of the physically previous line.
+  const honest = walkChain(await fs.readLines(LOG))
+  assert.equal(honest.checkpoints.length, 1)
+  assert.equal(honest.checkpoints[0]?.headLiared, false)
+  assert.equal(honest.checkpoints[0]?.payload.head, honest.checkpoints[0]?.expectedHead)
+
+  // The replay (the headMismatches shape): copy the signed checkpoint to the
+  // tail re-chained — signature verifies, position is a lie.
+  const lines = await fs.readLines(LOG)
+  const cp = JSON.parse(lines[2] as string) as Record<string, unknown>
+  const copy = JSON.stringify({ ...cp, prev: lineDigest(lines[2] as string) })
+  fs.mutate(LOG, `${[...lines, copy].join('\n')}\n`)
+  const replayed = walkChain(await fs.readLines(LOG))
+  assert.equal(replayed.checkpoints[0]?.headLiared, false, 'the original still tells the truth where it sits')
+  assert.equal(replayed.checkpoints[1]?.headLiared, true, 'the replay swears a head from another position')
+})
+
+// -- W1-L10: CRLF tolerance in the chain digest (v0.23) ---------------------------
+
+test('W1-L10: an externally CRLF-rewritten log keeps its chain; mid-line tampering still breaks it', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1'))
+  await store.append(evidence('c2'))
+  await store.checkpoint()
+  assert.equal((await store.audit()).ok, true)
+
+  // git autocrlf / a CRLF editor re-terminates every line. JSON.parse tolerates
+  // the trailing \r; v0.22 digested it — every prev link mass-failed, loud and
+  // unrecoverable, indistinguishable from real tampering. Digests now normalize
+  // the line terminator: the honest chain walks clean again.
+  const lines = await fs.readLines(LOG)
+  fs.mutate(LOG, `${lines.join('\r\n')}\r\n`)
+  const crlfAudit = await auditor(fs).audit()
+  assert.deepEqual(crlfAudit.chain.breaks, [], 'a CRLF rewrite is not a rewrite of content')
+  assert.equal(crlfAudit.ok, true)
+
+  // A real edit in the MIDDLE of a line is still a different digest: the next
+  // line's prev no longer matches. Tolerance extends only to the terminator
+  // byte no honest writer ever produced.
+  const back = (await fs.readLines(LOG)).map(l => l.replace(/\r$/, ''))
+  back[0] = (back[0] as string).replace('"head1"', '"headX"')
+  fs.mutate(LOG, `${back.join('\n')}\n`)
+  const tampered = await auditor(fs).audit()
+  assert.ok(tampered.chain.breaks.length > 0, 'mid-line tampering is still detected')
+  assert.equal(tampered.ok, false)
+})
+
+// -- W1-M7: lastWellFormedCheckpoint anchor parity (v0.23) -------------------------
+
+test('W1-M7: lastWellFormedCheckpoint fails loudly on an unusable anchor, like latestSignedCheckpoint', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  for (const id of ['c1', 'c2', 'c3', 'c4', 'c5']) await store.append(evidence(id))
+  await store.checkpoint() // fake-key, count 5
+  await store.append(evidence('c6'))
+  const lines = await fs.readLines(LOG)
+  const prev = lineDigest(lines[lines.length - 1] as string)
+  fs.mutate(LOG, `${[...lines, forgedCheckpointLine(prev, '6', 'foreign-key')].join('\n')}\n`)
+
+  // Sanity: a healthy anchor constrains the answer to the anchored key.
+  assert.equal((await store.lastWellFormedCheckpoint())?.keyId, 'fake-key')
+
+  // Unparseable anchor: the old code silently fell back to the any-key pool and
+  // the foreign checkpoint won. Parity with latestSignedCheckpoint is loud.
+  fs.mutate(ANCHOR, '{not json at all')
+  assert.equal(await store.lastWellFormedCheckpoint(), undefined, 'unparseable anchor: no silent any-key fallback')
+  assert.equal(await store.latestSignedCheckpoint(), undefined, 'parity: the publish path said undefined all along')
+
+  // Domain-invalid anchor (the H-09 disarm shape): same loud answer.
+  fs.mutate(ANCHOR, JSON.stringify({ v: 1, keyId: '', count: 1, head: 'ff'.repeat(32), sig: 'x', at: 't' }))
+  assert.equal(await store.lastWellFormedCheckpoint(), undefined, 'invalid anchor: nothing is publishable')
+
+  // No anchor file at all keeps the any-key semantics (never anchored ≠ attacked).
+  const anchorless = new EvidenceStore(fs, LOG, BASE, new FakeClock())
+  assert.equal((await anchorless.lastWellFormedCheckpoint())?.count, 6)
+})
+
+// -- v0.23: the verified read layer's bestCheckpoint adjudication ------------------
+
+test('createVerifiedView.bestCheckpoint: verified / refuted / unverifiable / none, with the X-H-03 mirror', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  const view = createVerifiedView(store)
+
+  // An unsigned chain has nothing publishable.
+  const unsignedFs = MemoryFs.of({})
+  const unsignedStore = new EvidenceStore(unsignedFs, LOG, BASE, new FakeClock())
+  await unsignedStore.append(evidence('c1'))
+  assert.equal((await createVerifiedView(unsignedStore).bestCheckpoint()).signature, 'none')
+
+  // Honest signed chain: selected, signature adjudicated under the very key it
+  // names, head corroborated.
+  await store.append(evidence('c1'))
+  await store.checkpoint()
+  const good = await view.bestCheckpoint()
+  assert.equal(good.signature, 'verified')
+  assert.equal(good.headLiared, false)
+  assert.equal(good.checkpoint?.keyId, 'fake-key')
+  assert.equal(good.checkpoint?.payload.count, 1)
+
+  // Refuted: the payload is edited under a kept signature — structure stays
+  // well-formed (count still matches the walk), the signed bytes no longer
+  // exist, and adjudication does what selection alone never did (the X-H-11
+  // predicate). Editing `count` instead would trip the malformed exclusion
+  // first and answer 'none' — a different, already-covered charge.
+  const lines = await fs.readLines(LOG)
+  lines[lines.length - 1] = (lines[lines.length - 1] as string).replace('"workspaceKey":"ws"', '"workspaceKey":"WS"')
+  fs.mutate(LOG, `${lines.join('\n')}\n`)
+  assert.equal((await view.bestCheckpoint()).signature, 'refuted', 'a checkpoint the key refutes is not publishable')
+
+  // Unverifiable: this host holds a DIFFERENT key — a missing capability, and
+  // (X-H-10's evidence-side half) the payload rides along so a key-holder
+  // downstream can verify the old head itself.
+  const foreign: SignerPort = { keyId: 'another-key', sign: async () => 'x', verify: async () => false }
+  const foreignView = createVerifiedView(store, { signerProvider: async () => foreign })
+  const unverifiable = await foreignView.bestCheckpoint()
+  assert.equal(unverifiable.signature, 'unverifiable')
+  assert.notEqual(unverifiable.checkpoint, undefined)
+  assert.equal(typeof unverifiable.checkpoint?.sig, 'string')
+
+  // The X-H-03 mirror on the selection: replay the (honestly signed) checkpoint
+  // at the tail — signature verifies, position is a lie, and the view says BOTH.
+  const fs2 = MemoryFs.of({})
+  const s2 = trustedStore(fs2).store
+  await s2.append(evidence('c1'))
+  await s2.append(evidence('c2'))
+  await s2.checkpoint()
+  const l2 = await fs2.readLines(LOG)
+  const cp = JSON.parse(l2[2] as string) as Record<string, unknown>
+  fs2.mutate(LOG, `${[...l2, JSON.stringify({ ...cp, prev: lineDigest(l2[2] as string) })].join('\n')}\n`)
+  const replayed = await createVerifiedView(s2).bestCheckpoint()
+  assert.equal(replayed.signature, 'verified', 'the signature is honest — over a payload lying about WHERE')
+  assert.equal(replayed.headLiared, true, 'and only the head-liar mirror says so: publish predicates need both checks')
+
+  // Passthrough: the view's audit is the store's audit, not a second opinion.
+  const byView = await createVerifiedView(s2).audit()
+  assert.equal(byView.ok, (await s2.audit()).ok)
+  assert.equal(byView.total, 2)
 })

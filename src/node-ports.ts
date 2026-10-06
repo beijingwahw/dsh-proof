@@ -199,6 +199,30 @@ export class NodeCommandPort implements CommandPort {
     if (options.signal?.aborted) {
       return { exitCode: null, output: '', durationMs: 0, aborted: true }
     }
+    // W15-L8(b): the timeout budget must be a finite positive number before
+    // it reaches a timer. `Math.max(1, NaN)` is NaN and `setTimeout(NaN)`
+    // fires in ~0ms; Node silently clamps anything above 2^31-1 to 1ms too —
+    // so NaN, ±Infinity, zero and negatives each became an INSTANT kill
+    // booked as `timedOut` ("ran too slow") when nothing ever ran, and a
+    // caller asking for an enormous budget got the same 1ms death. A budget
+    // that is not a finite positive number is a caller bug: refuse to spawn
+    // and name it (the runner books the spawnError as a plain `error`
+    // outcome — loud, honest, and NOT misattributed to slowness). A finite
+    // positive budget beyond Node's timer domain is clamped to it, which is
+    // the closest a timer can come to "effectively unlimited" without the
+    // silent 1ms coercion.
+    const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+      ? Math.min(options.timeoutMs, 2_147_483_647)
+      : undefined
+    if (timeoutMs === undefined) {
+      return {
+        exitCode: null,
+        output: '',
+        durationMs: 0,
+        aborted: false,
+        spawnError: `invalid timeoutMs ${String(options.timeoutMs)} — refusing to spawn with a budget that could only misreport the death cause`,
+      }
+    }
     // Child environment, computed once so the Windows shim resolver sees the
     // same PATH the child will: inherited environment first, deterministic
     // color/CI defaults on top of it, caller overlay last — hosts stay free
@@ -293,8 +317,10 @@ export class NodeCommandPort implements CommandPort {
       // H-18(b): settle safety nets. `close` = exit + stdio EOF; a descendant
       // holding an inherited pipe can keep EOF away long after (on POSIX,
       // forever). These timers force the promise to settle with the facts the
-      // port already holds instead of hanging the caller's batch. Both are
-      // cleared by `finish` on the normal path.
+      // port already holds instead of hanging the caller's batch. All are
+      // cleared by `finish` on the normal path — including (W15-L9) the
+      // SIGKILL escalation timers a kill registers, so a settled result never
+      // leaves a live group-kill aimed at a possibly-recycled pid behind.
       const settleTimers: NodeJS.Timeout[] = []
 
       const finish = (
@@ -345,7 +371,7 @@ export class NodeCommandPort implements CommandPort {
       const forceSettle = (reason: string): void => {
         if (exitSeen !== undefined) {
           if (timedOut && exitSeen.code === null) {
-            finish(null, `timed out after ${options.timeoutMs}ms (${reason})`, undefined, true)
+            finish(null, `timed out after ${timeoutMs}ms (${reason})`, undefined, true)
             return
           }
           finish(
@@ -362,21 +388,29 @@ export class NodeCommandPort implements CommandPort {
         finish(null, `${reason}: no exit within the deadline`, undefined, timedOut || undefined)
       }
 
-      const onAbort = () => { aborted = true; killChild(child) }
+      const onAbort = () => {
+        aborted = true
+        const escalation = killChild(child)
+        if (escalation !== undefined) settleTimers.push(escalation)
+      }
       options.signal.addEventListener('abort', onAbort, { once: true })
 
       const timer = setTimeout(() => {
         timedOut = true
-        killChild(child)
-      }, Math.max(1, options.timeoutMs))
+        const escalation = killChild(child)
+        if (escalation !== undefined) settleTimers.push(escalation)
+      }, timeoutMs)
 
       // H-18(b) absolute backstop: even `exit` refusing to arrive (kill
       // escalation failing, platform weirdness) must not hang the batch
       // forever. Fires after the full kill window (budget + grace + the
       // SIGTERM→SIGKILL escalation) and settles with the no-exit shape above.
+      // W15-L8b: the sum is clamped to Node's timer domain — a clamped
+      // near-2^31 budget plus grace would otherwise overflow back into the
+      // silent 1ms coercion the entry clamp exists to prevent.
       settleTimers.push(setTimeout(
         () => forceSettle('kill deadline exceeded'),
-        Math.max(1, options.timeoutMs) + this.settleGraceMs + 2_500,
+        Math.min(timeoutMs + this.settleGraceMs + 2_500, 2_147_483_647),
       ))
 
       // Always feed the decoders (their buffered partial bytes must not
@@ -406,7 +440,7 @@ export class NodeCommandPort implements CommandPort {
         if (timedOut && code === null) {
           // The spawnError text stays (consumers match on it), but the
           // first-class `timedOut` fact is what the runner reads now.
-          finish(null, `timed out after ${options.timeoutMs}ms`, undefined, true)
+          finish(null, `timed out after ${timeoutMs}ms`, undefined, true)
           return
         }
         // H-18(d)/B7-M1: a child that trapped our SIGTERM and exited BY CODE
@@ -420,7 +454,7 @@ export class NodeCommandPort implements CommandPort {
   }
 }
 
-function killChild(child: ReturnType<typeof spawn>): void {
+function killChild(child: ReturnType<typeof spawn>): NodeJS.Timeout | undefined {
   // H-18: take the whole process tree down, not just the direct child.
   // POSIX: the child was spawned detached (group leader), so a negative pid
   // signals the entire group — grandchildren included — which is what
@@ -439,8 +473,17 @@ function killChild(child: ReturnType<typeof spawn>): void {
   }
   try {
     groupKill('SIGTERM')
-    setTimeout(() => { groupKill('SIGKILL') }, 2_000).unref()
-  } catch { /* already gone */ }
+    // W15-L9: the SIGTERM→SIGKILL escalation timer is RETURNED so the caller
+    // can register it in the same settle list `finish` clears. Left to its
+    // own devices it fires two seconds after every timeout kill, long after
+    // the CommandResult settled — and if the dead child's pid/pgid was
+    // recycled inside that window, the group SIGKILL lands on an innocent
+    // process group. unref keeps the process lifetime honest either way.
+    return setTimeout(() => { groupKill('SIGKILL') }, 2_000).unref()
+  } catch {
+    /* already gone */
+    return undefined
+  }
 }
 
 /**

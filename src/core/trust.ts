@@ -29,9 +29,23 @@ import { canonicalJson, sha256 } from './hash.ts'
 /** `prev` of the first line ever appended to a log. */
 export const GENESIS_PREV = sha256('dsh-proof/chain/genesis')
 
-/** sha256 of one appended log line (excluding its trailing newline). */
+/**
+ * sha256 of one appended log line (excluding its trailing newline).
+ *
+ * W1-L10 (v0.23): trailing `\r` is stripped before digesting. `JSON.stringify`
+ * never emits a raw `\r` — a carriage return can only ride a line that was
+ * externally re-terminated (git autocrlf, a CRLF editor) — so honest lines
+ * hash identically with or without the strip and **every existing chain
+ * digest is unchanged**. Without the normalization, one CRLF rewrite of the
+ * file mass-invalidated every `prev` link: loud, but indistinguishable from
+ * real tampering and unrecoverable by honest means. Chosen over the stricter
+ * "a `\r`-carrying line is itself corrupt" reading precisely because it never
+ * breaks an old chain: tolerance extends only to a byte no honest writer
+ * ever produced. (A `\r` in the *middle* of a line is not a line terminator
+ * and still changes the digest — mid-line edits remain fully detected.)
+ */
 export function lineDigest(line: string): string {
-  return sha256(line)
+  return sha256(line.endsWith('\r') ? line.replace(/\r+$/, '') : line)
 }
 
 /** What a checkpoint attests: how many records, and the chain head at that point. */
@@ -80,6 +94,17 @@ export interface WalkedCheckpoint {
   readonly sigError: string | null
   /** Chain head the walker expected at this position. */
   readonly expectedHead: string
+  /**
+   * X-H-03 (v0.23): `payload.head !== expectedHead` — the checkpoint swears a
+   * chain head the walk does not corroborate at its physical position. The
+   * walk has always recorded `expectedHead`; this is the pre-computed verdict
+   * over it, exported so the bundle/publish layers (verifyBundle,
+   * transparency) consume ONE derivation instead of re-deriving — or, as the
+   * survey found, not comparing at all. A legitimately-signed checkpoint
+   * replayed or transplanted at another position is exactly the shape where
+   * the signature verifies and only this flag says the position is a lie.
+   */
+  readonly headLiared: boolean
   /**
    * Records (evidence + marker lines) the walker counted *before* this
    * checkpoint line — exactly what an honest writer stamps into
@@ -180,6 +205,7 @@ export function walkChain(lines: readonly string[]): ChainWalk {
             keyId: typeof envelope.keyId === 'string' ? envelope.keyId : null,
             sigError: typeof envelope.sigError === 'string' ? envelope.sigError : null,
             expectedHead: prevDigest,
+            headLiared: payload.head !== prevDigest,
             expectedCount,
           })
           if (!isWellFormedCount(payload.count, expectedCount)) malformedCheckpoints.push(index)

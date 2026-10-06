@@ -20,7 +20,10 @@
  *    size rewinds, same-size root swaps, timestamp rewinds (parsed as
  *    instants, refusing unparseable stamps), operator-identity flips, and
  *    — since v0.22 — any larger tree whose old→new prefix consistency
- *    cannot be proven from the entries on disk.
+ *    cannot be proven from the entries on disk; and — since v0.23 (X-H-10)
+ *    — a stored head whose own signature does not verify under the
+ *    operator key the caller holds (a planted `sth.json` must never become
+ *    the baseline the operator's next signature vouches for).
  *
  * The log is a *dumb notary*: it does NOT verify the workspace signatures it
  * carries (that is the auditor's job, done with the workspace public key);
@@ -638,6 +641,22 @@ async function appendPtlEntryInternal(
   const { sequence, duplicate } = log.append(entry)
   if (duplicate) return { sequence, duplicate }
   const raw = await fs.readFile(entriesPath)
+  // X-H-15b/W9-M8 (v0.23): "does not exist" and "could not be read" are
+  // different facts, and the write below can only tell them apart if we do.
+  // FsPort.readFile folds every read failure (EBUSY/EPERM from an AV scan,
+  // EISDIR, a transient lock) into `undefined` — the same answer it gives for
+  // a file that was never there. Writing `${''}${line}` behind a FAILED read
+  // would replace the whole log with one line: the exact destruction a
+  // transparency log exists to make impossible. So when the path exists
+  // (stat answers) but its bytes did not arrive, the append refuses loudly;
+  // the operator retries or restores, and the history survives.
+  if (raw === undefined && (await fs.stat(entriesPath)) !== undefined) {
+    throw new Error(
+      `${entriesPath} exists but could not be read (read failed; the file is present by stat)`
+      + ' — refusing to rewrite the log from an unread snapshot: a read failure must never masquerade as an empty log.'
+      + ' Retry the publish, or restore the file from a known-good copy.',
+    )
+  }
   if (raw !== undefined && raw.length > 0 && !raw.endsWith('\n')) {
     throw new Error(
       `${entriesPath} ends in a torn (unterminated) line — refusing to append behind a partial write.`
@@ -649,12 +668,50 @@ async function appendPtlEntryInternal(
 }
 
 /**
+ * Options for {@link savePtlHead} (v0.23, X-H-10).
+ */
+export interface SavePtlHeadOptions {
+  /**
+   * Adjudicate the STORED head's own signature before any new head is signed
+   * over the history it anchors. The caller holds the operator key (both
+   * production callers are about to sign with it anyway), so it hands the key
+   * in as a callback: `true` iff `existing.sig` verifies under that key.
+   *
+   * Why the stored head must be verified at all: every refusal below (no
+   * rewinds, no root swaps, prefix consistency) reasons FROM the stored head
+   * as its trust anchor — and `sth.json` lives in the log directory, where a
+   * log-writer can plant any self-consistent forgery it likes. Without this
+   * check the operator's next honest append mints a fresh VALID signature
+   * over the attacker's chosen baseline (the consistency proof is generated
+   * and verified against the same planted bytes, so it always passes). With
+   * it, extending a head nobody can vouch for is refused: restore the head
+   * from an out-of-band pinned copy instead.
+   *
+   * Fail-closed by contract: a stored head that CANNOT be verified — no
+   * callback supplied, or a callback that throws — is treated exactly like
+   * one that fails verification ("uncertain = fail", the same discipline the
+   * verify face applies to an unkeyed publication signature). A log's FIRST
+   * head (nothing stored yet) needs no verification; there is no prior
+   * commitment to extend.
+   */
+  readonly verifyExistingHead?: (sth: SignedTreeHead) => Promise<boolean>
+}
+
+/**
  * Persist a signed tree head, refusing every way a new head could fail to
  * be an honest extension of the published one:
  *
  * - a different `logId` — the operator's public identity is part of what
  *   auditors pin; a silent identity flip mid-log would let a rewritten
  *   history wear a "fresh" operator's signature (M-60/A2-M3);
+ * - a stored head over ZERO entries — no honest publisher of this log
+ *   mints one (heads are signed after appends), and "extending" it would
+ *   drive the consistency recursion outside its RFC 6962 domain (`0 < m`)
+ *   as a producer-side RangeError (v0.23: adjudicated as a refusal instead
+ *   of surfacing as a crash);
+ * - a stored head whose own signature does not verify under the caller's
+ *   operator key — the planted-head forgery X-H-10 closes (see
+ *   {@link SavePtlHeadOptions.verifyExistingHead});
  * - `treeSize` smaller than the stored one (a truncated log);
  * - same `treeSize` but a different `root` (a rewritten log);
  * - an `at` earlier than the stored one — timestamps are compared as
@@ -673,14 +730,66 @@ async function appendPtlEntryInternal(
  * is no prior commitment to extend. Any refusal throws, loudly: once an
  * operator has signed a head, the only honest next head extends it.
  */
-export async function savePtlHead(fs: FsPort, dir: string, sth: SignedTreeHead): Promise<void> {
+export async function savePtlHead(
+  fs: FsPort, dir: string, sth: SignedTreeHead, options?: SavePtlHeadOptions,
+): Promise<void> {
   const headPath = under(dir, HEAD_FILENAME)
-  const existing = parseSthFile(await fs.readFile(headPath))
+  const headRaw = await fs.readFile(headPath)
+  // Same read-failure discipline as the entries file (W9-M8): a head that is
+  // present but unreadable must not be folded into "no head on record" —
+  // cold-start semantics would then sign over a history whose prior
+  // commitment simply failed to load.
+  if (headRaw === undefined && (await fs.stat(headPath)) !== undefined) {
+    throw new Error(
+      `${headPath} exists but could not be read (read failed; the file is present by stat)`
+      + ' — refusing to treat an unreadable head as "no head on record" and sign over an unknown prior commitment.'
+      + ' Retry, or restore sth.json from an out-of-band pinned copy.',
+    )
+  }
+  const existing = parseSthFile(headRaw)
   if (existing !== undefined) {
     if (sth.logId !== existing.logId) {
       throw new Error(
         `refusing to change the transparency log operator (logId ${JSON.stringify(existing.logId)} -> ${JSON.stringify(sth.logId)})`
         + ' — operator rotation requires explicitly retiring this log directory and starting a new one',
+      )
+    }
+    if (existing.treeSize < 1) {
+      // A planted `treeSize: 0` head used to surface as
+      // `RangeError: consistencyProof: 0->N outside the log` from the
+      // producer recursion — adjudicated here as a refusal (W9-H1 boundary).
+      throw new Error(
+        `refusing to extend a stored head over ${existing.treeSize} entries — no honest publisher of this log signs an empty tree`
+        + ' (a stored size-0 head is damage or a planting; restore sth.json from an out-of-band pinned copy)',
+      )
+    }
+    // X-H-10: the stored head is the baseline every check below reasons from,
+    // so its own signature is adjudicated FIRST — with the caller's operator
+    // key, under the identity the logId check just pinned. Fail-closed on
+    // every "cannot verify" shape: no callback, a throwing callback, a false
+    // verdict.
+    const verify = options?.verifyExistingHead
+    if (verify === undefined) {
+      throw new Error(
+        `refusing to sign a new head over the stored one (treeSize ${existing.treeSize}) without verifying the stored head's signature`
+        + ' — no operator key was supplied (SavePtlHeadOptions.verifyExistingHead absent): uncertain = fail.'
+        + ' The caller holds the operator key it is about to sign with; extend only heads that key can vouch for',
+      )
+    }
+    let existingHolds: boolean
+    try {
+      existingHolds = await verify(existing)
+    } catch (error) {
+      throw new Error(
+        `refusing to sign a new head: verifying the stored head's signature failed (${error instanceof Error ? error.message : String(error)})`
+        + ' — restore sth.json from an out-of-band pinned copy before publishing again',
+      )
+    }
+    if (existingHolds !== true) {
+      throw new Error(
+        `refusing to sign a new head: the stored tree head's signature does not verify under the operator key (logId ${JSON.stringify(existing.logId)}, treeSize ${existing.treeSize})`
+        + ' — sth.json is attacker-controllable storage, and a planted head whose signature does not hold is a forgery, not a baseline.'
+        + ' Restore sth.json from an out-of-band pinned copy (a previously published STH) before publishing again',
       )
     }
     const sthAt = Date.parse(sth.at)

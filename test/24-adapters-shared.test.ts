@@ -18,13 +18,17 @@ import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-import { deriveProofPaths, normalizeWorkspaceRoot, resolveAdapterEnv, touchesEvidencePath, workspaceKeyPair } from '../src/adapters/shared/paths.ts'
+import {
+  assertAbsoluteTrustRoot, deriveProofPaths, foldHostPath, normalizeWorkspaceRoot, resolveAdapterEnv,
+  touchesEvidencePath, workspaceKeyPair,
+} from '../src/adapters/shared/paths.ts'
 import {
   applyObservation, computeDrift, emptySession, loadSession, saveSession, sessionPath, windowStart,
 } from '../src/adapters/shared/session.ts'
 import { decidePreToolUse, evaluateStop, hasBaselineOnDisk } from '../src/adapters/shared/gates.ts'
 import type { AdapterSession, DriftResult } from '../src/adapters/shared/session.ts'
 import type { StopFacts } from '../src/adapters/shared/gates.ts'
+import { Config } from '../src/config.ts'
 
 import { addressOf, merkleRoot, sha256 } from '../src/core/hash.ts'
 import { ProofEngine } from '../src/engine.ts'
@@ -157,6 +161,16 @@ test('deriveProofPaths: existing legacy-key state on disk is probed, not orphane
     deriveProofPaths({ root: 'C:\\ws\\proj', trustRoot: '/trust' }, { pure: true, exists: () => true }).workspaceKey,
     pair.normalized,
   )
+
+  // W11-M5: the adapter session ledger is trust-side state too. A legacy
+  // deployment whose anchors/workspaces migrated but whose session dir did
+  // not must keep its identity — otherwise every ledger (shellUsed,
+  // firedNotices, fingerprints) silently orphans on the next hook process and
+  // the drift narrative goes back to authoritatively accusing the agent.
+  const legacySessionsOnly = deriveProofPaths({ root: 'C:\\ws\\proj', trustRoot: '/trust' },
+    { exists: p => p === `/trust/adapter-sessions/${pair.legacy}`, warn: () => undefined })
+  assert.equal(legacySessionsOnly.workspaceKey, pair.legacy,
+    'a legacy session ledger alone keeps the legacy identity (the probe covers adapter-sessions/)')
 })
 
 test('deriveProofPaths: a trust root inside the workspace is warned about, never silently accepted (M-47)', () => {
@@ -200,6 +214,48 @@ test('deriveProofPaths: resolveAdapterEnv is the one parser for the DSH_PROOF_* 
   assert.equal(parsed.enforceTurnEnd, false)
   assert.equal(resolveAdapterEnv({ DSH_PROOF_DRIFT: '1' }).driftDetection, true, 'any non-off spelling means on (default-on)')
   assert.equal(resolveAdapterEnv({ DSH_PROOF_DRIFT: '' }).driftDetection, undefined, 'empty is unset')
+  // W11-L10: the ladder folds case + whitespace — 'ASK'/'ask\n' used to fall
+  // to undefined and the `?? 'warn'` defaults then SILENTLY downgraded
+  // ask→warn, breaking the "never a silent stricter/weaker mode" contract.
+  assert.equal(resolveAdapterEnv({ DSH_PROOF_REQUIRE_BASELINE: 'ASK' }).requireBaseline, 'ask')
+  assert.equal(resolveAdapterEnv({ DSH_PROOF_REQUIRE_BASELINE: ' ask\n' }).requireBaseline, 'ask')
+  assert.equal(resolveAdapterEnv({ DSH_PROOF_REQUIRE_BASELINE: 'Off' }).requireBaseline, 'off')
+  assert.equal(resolveAdapterEnv({ DSH_PROOF_REQUIRE_BASELINE: 'nonsense ' }).requireBaseline, undefined,
+    'garbage is still unset — the caller default applies, loudly documented there')
+})
+
+test('deriveProofPaths: a RELATIVE trust root fails loudly, never silently lands in the workspace (X-H-15)', () => {
+  // The pre-v0.23 containment check was lexical and blind to relative values:
+  // 'rel/trust' does not start with the workspace root, so it never warned —
+  // and the derivation then happily wrote keys, anchors and the host-mode
+  // store against the process CWD (an agent-writable workspace; the audit's
+  // four-part PoC got a private key PEM written into the CWD). A relative
+  // trust root is a deployment misconfiguration, and misconfigurations fail
+  // loudly at derivation time.
+  for (const bad of ['rel/trust', '.trust', './trust', '..', 'trust', 'C:rel']) {
+    assert.throws(() => deriveProofPaths({ root: '/ws', trustRoot: bad }, { pure: true }),
+      /RELATIVE/i, `trustRoot ${JSON.stringify(bad)} must throw at derivation`)
+  }
+  // Drive-relative 'C:rel' counts as relative: it resolves against the
+  // per-drive current directory — the workspace, for a hook process.
+  assert.throws(() => assertAbsoluteTrustRoot('C:rel'), /RELATIVE/i)
+  // Every absolute spelling passes: slash root, drive, UNC, device-prefixed.
+  for (const good of ['/trust', 'C:/trust', 'c:\\trust', '//server/share/trust', String.raw`\\?\C:\trust`]) {
+    assert.doesNotThrow(() => assertAbsoluteTrustRoot(good), `${JSON.stringify(good)} is absolute`)
+  }
+  assert.doesNotThrow(() => deriveProofPaths({ root: '/ws', trustRoot: '/trust' }, { pure: true }))
+
+  // DSH_HOME inherits the same rule: a relative home makes the DEFAULT trust
+  // root relative, and the derivation throws instead of resolving into CWD.
+  const previous = process.env.DSH_HOME
+  try {
+    process.env.DSH_HOME = 'rel-home'
+    assert.throws(() => deriveProofPaths({ root: '/ws' }, { pure: true }), /RELATIVE/i,
+      'a relative DSH_HOME must fail as loudly as a relative DSH_PROOF_TRUST_DIR')
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+  }
 })
 
 test('deriveProofPaths: root defaults to the POSIX-spelled cwd', () => {
@@ -283,6 +339,80 @@ test('touchesEvidencePath: Win32 deformations — trailing dots/spaces per segme
     'a UNC root case variant is the same workspace — the guard folds the root too')
   assert.equal(touchesEvidencePath(String.raw`\\SERVER\SHARE\ws\.PROOF\evidence.jsonl`, uncPaths), true,
     'backslash + case variants of a UNC root still hit')
+})
+
+test('foldHostPath: THE one fold — device prefixes, drive-relative projection, case, dots, detours, NUL (X-H-12)', () => {
+  // Device-namespace prefixes fold away: `\\?\`, `//?/`, `\\.\` and the
+  // `\\?\UNC\` sub-form all name the same files as their plain spellings
+  // (Node's fs passes them through to CreateFile verbatim — the W11 devpath
+  // PoC wrote into the store through exactly these spellings while every
+  // lexical guard compared as false).
+  assert.equal(foldHostPath(String.raw`\\?\C:\WS\.PROOF\evidence.jsonl`), 'c:/ws/.proof/evidence.jsonl')
+  assert.equal(foldHostPath('//?/C:/WS/.proof/x'), 'c:/ws/.proof/x')
+  assert.equal(foldHostPath(String.raw`\\.\C:\ws\.proof\x`), 'c:/ws/.proof/x')
+  assert.equal(foldHostPath(String.raw`\\?\UNC\Server\Share\ws\.proof\x`), '//server/share/ws/.proof/x')
+  // Separators, drive case and segment case fold; trailing dots/spaces per
+  // segment fold; '.'/'..' segments collapse lexically; a leading '..' on a
+  // RELATIVE path survives as the escape marker.
+  assert.equal(foldHostPath(String.raw`C:\WS\.PROOF\EVIDENCE.jsonl`), 'c:/ws/.proof/evidence.jsonl')
+  assert.equal(foldHostPath('.proof./evidence.jsonl. '), '.proof/evidence.jsonl')
+  assert.equal(foldHostPath('/ws/foo/../.proof/./x'), '/ws/.proof/x')
+  assert.equal(foldHostPath('../evil/x'), '../evil/x')
+  assert.equal(foldHostPath('.'), '', 'the degenerate segment collapses to nothing')
+  assert.equal(foldHostPath('a/..'), '', 'a/.. collapses to nothing too — same store-root case (W11-L-H)')
+  assert.equal(foldHostPath(''), '')
+  // '..' above an absolute root clamps (C:/.. is C:/), it does not escape.
+  assert.equal(foldHostPath('C:/../ws/x'), 'c:/ws/x')
+  // NUL truncation is modelled, not rejected: the OS keeps the prefix, so the
+  // fold keeps it too (rejecting was the under-deny — the write happened).
+  assert.equal(foldHostPath('.proof/evidence.jsonl\0junk'), '.proof/evidence.jsonl')
+
+  // Drive-relative projection (the second X-H-12 vector): `C:foo` resolves
+  // against the C-drive's current directory. For this process's own drive
+  // that IS process.cwd() — the hook contract (CWD = workspace root) is what
+  // turns `C:.proof/x` into the store path; a drive the CWD is not on gets
+  // the drive root (fresh-process per-drive-CWD semantics, the documented
+  // approximation).
+  const cwdDrive = /^([A-Za-z]):/.exec(process.cwd())?.[1]?.toLowerCase()
+  const sampleDrive = cwdDrive ?? 'c'
+  const sample = `${sampleDrive}:.proof/x`
+  const cwdFolded = foldHostPath(process.cwd())
+  if (cwdDrive !== undefined) {
+    assert.equal(foldHostPath(sample), `${cwdFolded}/.proof/x`,
+      'C:foo on the CWD\'s own drive projects against the CWD')
+  } else {
+    assert.equal(foldHostPath(sample), `${sampleDrive}:/.proof/x`,
+      'with no drive-letter CWD, the projection falls to the drive root')
+  }
+  const foreignDrive = cwdDrive === 'q' ? 'z' : 'q'
+  assert.equal(foldHostPath(`${foreignDrive}:foo/bar`), `${foreignDrive}:/foo/bar`,
+    'a drive the process is not on projects against the drive root')
+  // Idempotence: folding a folded path changes nothing (guards fold BOTH
+  // sides; a non-idempotent fold would make the two sides incomparable).
+  const folded = foldHostPath(String.raw`\\?\C:\Ws\.PROOF.\x\\y/./z..txt `)
+  assert.equal(foldHostPath(folded), folded)
+})
+
+test('touchesEvidencePath: X-H-12 — device-prefixed and drive-relative spellings of the store hit like plain ones', () => {
+  const ws = deriveProofPaths({ root: 'C:/ws', trustRoot: '/trust', evidenceStore: 'workspace' }, { pure: true })
+  assert.equal(touchesEvidencePath(String.raw`\\?\C:\ws\.proof\evidence.jsonl`, ws), true, 'backslash device prefix')
+  assert.equal(touchesEvidencePath('//?/C:/ws/.proof/evidence.jsonl', ws), true, 'forward-slash device prefix')
+  assert.equal(touchesEvidencePath(String.raw`\\?\C:\WS\.PROOF.\EVIDENCE.jsonl`, ws), true,
+    'device prefix + case + trailing-dot deformations together')
+  // Host mode: the absolute containment sweep folds the same way. (Normal
+  // template with doubled backslashes — inside String.raw a `\` before `${`
+  // would escape the interpolation and pin nothing.)
+  const host = deriveProofPaths({ root: 'C:/ws', trustRoot: 'C:/trust' }, { pure: true })
+  const devStore = `\\\\?\\C:\\trust\\workspaces\\${host.workspaceKey}\\evidence.jsonl`
+  assert.equal(touchesEvidencePath(devStore, host), true, 'host-mode store via device prefix')
+  // A device-prefixed path into some OTHER directory is still nobody's business.
+  assert.equal(touchesEvidencePath(String.raw`\\?\C:\tmp\notes.md`, ws), false)
+
+  // The 4096 blind spot is gone: over-long candidates used to be rejected by
+  // the projection exactly when the `\\?\` prefix made such paths writable.
+  const longName = `${'a'.repeat(5000)}.ts`
+  assert.equal(touchesEvidencePath(`.proof/${longName}`, ws), true,
+    'a >4096-byte candidate inside the store still compares')
 })
 
 // ===========================================================================
@@ -424,6 +554,58 @@ after(async () => {
 const realReader = (abs: string): Promise<string | undefined> =>
   fsp.readFile(abs, 'utf8').catch(() => undefined)
 
+test('X-H-12 (NTFS adversarial): device-prefixed and drive-relative writes REALLY land in the store — and the guard sees them', async () => {
+  // Win32-only semantics (the audit's W11-devpath.cjs rewrite): on any other
+  // platform there is no `\\?\` passthrough and no per-drive CWD, so the
+  // guard-level pins above already carry the contract.
+  if (process.platform !== 'win32') return
+  const wsRoot = `${SESSION_TMP}/devpath-ws`
+  const store = `${wsRoot}/.proof`
+  await fsp.mkdir(store, { recursive: true })
+  const paths = deriveProofPaths({ root: wsRoot, evidenceStore: 'workspace' }, { pure: true })
+  const gates = { evidenceStore: 'workspace' as const, evidenceDir: '.proof', requireBaseline: 'off' as const }
+  const exists = async (p: string): Promise<boolean> => fsp.readFile(p, 'utf8').then(() => true, () => false)
+
+  // (1) The attack is real, not theoretical: Node's fs hands `\\?\` straight
+  // to CreateFile, and the write lands in the store.
+  const devBack = `\\\\?\\${store.replace(/\//g, '\\')}\\dev.jsonl`
+  await fsp.writeFile(devBack, 'x')
+  assert.equal(await exists(`${store}/dev.jsonl`), true,
+    'the device-prefixed write physically landed in the store (W11 devpath PoC)')
+  // (2) The guard folds the same spelling and denies the tool call that
+  // carried it.
+  assert.equal(touchesEvidencePath(devBack, paths), true, 'the backslash device prefix hits after the fold')
+  assert.equal(decidePreToolUse('write', { file_path: devBack }, wsRoot, gates, true).action, 'deny')
+  const devFwd = `//?/${store}/dev2.jsonl`
+  await fsp.writeFile(devFwd, 'x')
+  assert.equal(await exists(`${store}/dev2.jsonl`), true, 'the forward-slash device form lands too')
+  assert.equal(touchesEvidencePath(devFwd, paths), true, 'and hits the same fold')
+
+  // (3) Drive-relative: `<drive>:.proof/x` resolves against the per-drive
+  // current directory, which for this process's own drive is the CWD — the
+  // hook contract puts the workspace root there, so the spelling names the
+  // store. Chdir into the workspace to reproduce the hook's world exactly.
+  const drive = wsRoot[0]
+  const previousCwd = process.cwd()
+  process.chdir(wsRoot)
+  try {
+    const drvRel = `${drive}:.proof/drvrel.jsonl`
+    await fsp.writeFile(drvRel, 'x')
+    assert.equal(await exists(`${store}/drvrel.jsonl`), true,
+      'the drive-relative write physically landed in the store (per-drive CWD = workspace root)')
+    assert.equal(touchesEvidencePath(drvRel, paths), true, 'the drive-relative spelling hits after projection')
+    assert.equal(decidePreToolUse('write', { file_path: drvRel }, wsRoot, gates, true).action, 'deny')
+    // Command-string form of the same vector.
+    assert.equal(
+      decidePreToolUse('bash', { command: `echo x > ${drvRel}` }, wsRoot, gates, true).action,
+      'deny',
+      'the textual sweep sees the drive-relative spelling as a bare store-relative hit',
+    )
+  } finally {
+    process.chdir(previousCwd)
+  }
+})
+
 test('a session survives its process: save in one, load in the next, byte for byte', async () => {
   const dir = `${SESSION_TMP}/nested/deeper`
   const session: AdapterSession = {
@@ -540,11 +722,12 @@ test('decidePreToolUse: the evidence-store guard denies writes, detours and case
     'deny',
     'H10: the case variant hits, and contentKeys:true catches the source key a move smuggles through',
   )
-  assert.equal(
-    decidePreToolUse('read', { file_path: '.proof/evidence.jsonl' }, ROOT, WS_GATES, true).action,
-    'allow',
-    'reading the log back is legitimate (the proof tools do it) — the guard is about writes',
-  )
+  // X-H-13 note: this call now DENIES — the textual value sweep reads strings,
+  // not keys, and cannot tell a read tool's file_path from a command string.
+  // Reading the log back through the model-facing proof MCP tools remains the
+  // sanctioned route; 宁误拦 — the over-deny is one blocked call, the
+  // under-deny was `grep {command: 'echo x > .proof/evidence.jsonl'}`.
+  // (Pinned explicitly in the X-H-13 test below.)
   assert.equal(
     decidePreToolUse('write', { file_path: 'src/a.ts' }, ROOT, WS_GATES, true).action,
     'allow',
@@ -718,18 +901,192 @@ test('decidePreToolUse: N-1 — the command sweep is capability-gated, not name-
     'deny',
     'a string-argv command naming the store is denied',
   )
-  // The capability gate still respects the read-only roster: a read-class
-  // tool with a stray command key is not an execution vector.
+  // X-H-13: the read-only roster no longer exempts the textual sweep — a
+  // read-NAMED tool carrying a command string is an execution signal (audit
+  // PoC #4: `grep {command: 'echo x > .proof/evidence.jsonl'}` used to pass).
+  // The roster still exempts the STRUCTURAL path sweep only.
   assert.equal(
     decidePreToolUse('read', { command: 'cat .proof/evidence.jsonl' }, ROOT, gates, true).action,
-    'allow',
-    'read-class tools are exempt from the command sweep',
+    'deny',
+    'read-class tools carrying a store-naming command string are swept too',
+  )
+  // And the accepted over-deny, pinned on purpose: a read tool naming the
+  // store PATH is denied as well — the sweep cannot tell keys apart, and
+  // 宁误拦. The proof MCP tools remain the sanctioned read route.
+  assert.equal(
+    decidePreToolUse('read', { file_path: '.proof/evidence.jsonl' }, ROOT, gates, true).action,
+    'deny',
+    'a read tool naming the store is denied — one blocked call beats one laundered write',
   )
   // Honest runner commands keep passing — over-deny is the price, not the goal.
   assert.equal(
     decidePreToolUse('python', { command: 'python -m pytest tests/' }, ROOT, gates, true).action,
     'allow',
     'an honest unlisted-runner command passes',
+  )
+})
+
+test('decidePreToolUse: X-H-13 — the command sweep reads VALUES, not key names (every spelling of a command key)', () => {
+  const gates = { ...WS_GATES, trustRoot: '/trust' }
+  // The audit walked the v0.22 key list with the fourth spelling; a value
+  // sweep cannot be walked by renaming a key. Every one of these used to be
+  // `shellCommandOf → undefined → ALLOW`.
+  const needle = 'echo x > .proof/evidence.jsonl'
+  const shapes: Array<[string, unknown]> = [
+    ['a fourth command key', { commandLine: needle }],
+    ['a code-execution key', { code: `fs.writeFileSync('.proof/evidence.jsonl','x')` }],
+    ['mixed argv (non-string element used to void the join)', { command: ['node', '-e', needle, 0] }],
+    ['nested command object', { command: { cmd: needle } }],
+    ['an args array', { args: [needle] }],
+    ['a nested nest', { tool: { spec: { commandLine: needle } } }],
+  ]
+  for (const [name, input] of shapes) {
+    const verdict = decidePreToolUse('my_runner', input, ROOT, gates, true)
+    assert.equal(verdict.action, 'deny', `${name}: the VALUE is swept wherever it sits`)
+    if (verdict.action === 'deny') assert.match(verdict.reason, /command names the verification evidence store/i)
+  }
+  // The documented over-deny, pinned on purpose (宁误拦): a mutation call
+  // whose CONTENT legitimately mentions the store is denied once, with a
+  // reason — the alternative was laundering writes through content keys.
+  assert.equal(
+    decidePreToolUse('write', { file_path: 'docs/notes.md', content: 'see .proof/evidence.jsonl for the log' }, ROOT, gates, true).action,
+    'deny',
+    'content mentioning the store is the accepted over-deny price',
+  )
+})
+
+test('decidePreToolUse: X-H-13 bounds — depth ≤ 3, single string ≤ 8k, at most 64 strings', () => {
+  const gates = { ...WS_GATES, trustRoot: '/trust' }
+  const needle = 'echo x > .proof/evidence.jsonl'
+  // Depth: a command nested three levels down is reachable…
+  assert.equal(
+    decidePreToolUse('run', { a: { b: { c: { commandLine: needle } } } }, ROOT, gates, true).action,
+    'deny',
+    'depth-3 nesting is still swept',
+  )
+  // …a fourth level is past the bound and NOT swept — the bound exists so a
+  // hostile blob cannot turn the gate into a regex sink; pinned as the
+  // documented window, not as a promise.
+  assert.equal(
+    decidePreToolUse('run', { a: { b: { c: { d: { commandLine: needle } } } } }, ROOT, gates, true).action,
+    'allow',
+    'past depth 3 the sweep stops (bound pinned deliberately)',
+  )
+  // 8k: a longer command string is not swept (same trade).
+  assert.equal(
+    decidePreToolUse('run', { commandLine: `${'x'.repeat(9_000)} ${needle}` }, ROOT, gates, true).action,
+    'allow',
+    'a >8k string is past the bound',
+  )
+  assert.equal(
+    decidePreToolUse('run', { commandLine: `${'x'.repeat(1_000)} ${needle}` }, ROOT, gates, true).action,
+    'deny',
+    'a ≤8k string carrying the needle is swept',
+  )
+  // 64 strings: with 63 clean values the needle lands inside the bound…
+  const within: Record<string, string> = {}
+  for (let i = 0; i < 63; i++) within[`k${i}`] = `clean-${i}`
+  within.cmd = needle
+  assert.equal(decidePreToolUse('run', within, ROOT, gates, true).action, 'deny', 'within 64 strings the needle lands')
+  // …with 64 clean values first, the needle is the 65th string and is not
+  // swept — the bound is pinned deliberately (see the sweep's doc).
+  const past: Record<string, string> = {}
+  for (let i = 0; i < 64; i++) past[`k${i}`] = `clean-${i}`
+  past.cmd = needle
+  assert.equal(decidePreToolUse('run', past, ROOT, gates, true).action, 'allow',
+    'past 64 strings the sweep stops (bound pinned deliberately)')
+})
+
+test('decidePreToolUse: X-H-14 consumer side — unknown or case-variant PATH KEYS cannot smuggle the store', () => {
+  // The key-name fold (PATH_KEYS toLowerCase) is observe.ts's own fix on the
+  // extractor face; this pins the CONSUMER promise of the gates: whatever key
+  // spelling a mutation tool hides the store under — a key the extractor does
+  // not know yet, or a case variant of one it does — the call still denies,
+  // because the X-H-13 value sweep reads the string wherever it sits. The
+  // pin holds both before and after the extractor-side fold lands.
+  for (const input of [
+    { FileName: '.proof/evidence.jsonl' },
+    { FILE_PATH: '.proof/evidence.jsonl' },
+    { file_path: '.PROOF/evidence.jsonl' },
+  ]) {
+    assert.equal(
+      decidePreToolUse('write', input, ROOT, { ...WS_GATES, requireBaseline: 'ask' }, false).action,
+      'deny',
+      `the gate denies the store under any key spelling: ${JSON.stringify(input)}`,
+    )
+  }
+})
+
+test('decidePreToolUse: W11-M3 — absolute writes into anchors and adapter sessions are denied in BOTH store modes', () => {
+  const TRUST = '/trust/proof-home'
+  const pair = workspaceKeyPair(ROOT)
+  const keys = pair.normalized === pair.legacy ? [pair.normalized] : [pair.normalized, pair.legacy]
+
+  // Host mode (the audit's PoC #12: the structural sweep used to guard only
+  // workspaces/<key> — the anchor, the chain's trust root, was a free write).
+  const hostGates = { ...HOST_GATES, trustRoot: TRUST }
+  for (const key of keys) {
+    for (const target of [
+      `${TRUST}/anchors/${key}/anchor.json`,
+      `${TRUST}/adapter-sessions/${key}/ledger.json`,
+      `${TRUST}/workspaces/${key}/evidence.jsonl`,
+    ]) {
+      const verdict = decidePreToolUse('write', { file_path: target }, ROOT, hostGates, true)
+      assert.equal(verdict.action, 'deny', `host mode: an absolute write into ${target} is denied`)
+      if (verdict.action === 'deny') assert.match(verdict.reason, /absolute/, 'the reason names the absolute-path vector')
+    }
+  }
+  // Device-prefixed spellings of the same targets fold the same way (X-H-12):
+  // a drive-style trust root with its `\\?\` spelling of the anchors write.
+  const winTrust = 'C:/trust'
+  const winPair = workspaceKeyPair('C:/ws')
+  const winKeys = winPair.normalized === winPair.legacy ? [winPair.normalized] : [winPair.normalized, winPair.legacy]
+  for (const key of winKeys) {
+    const devSpelled = `\\\\?\\C:\\trust\\anchors\\${key}\\anchor.json`
+    assert.equal(
+      decidePreToolUse('write', { file_path: devSpelled }, 'C:/ws', { ...HOST_GATES, trustRoot: winTrust }, true).action,
+      'deny',
+      'a device-prefixed write into the anchors is denied after the fold',
+    )
+  }
+
+  // Workspace mode with a trust root guards the same artifacts: the trust
+  // side is where the audited process keeps its commitments regardless of
+  // where the WORKSPACE store sits.
+  const wsGates = { ...WS_GATES, trustRoot: TRUST }
+  assert.equal(
+    decidePreToolUse('write', { file_path: `${TRUST}/anchors/${keys[0]}/anchor.json` }, ROOT, wsGates, true).action,
+    'deny',
+    'workspace mode: an absolute write into the anchors is denied too',
+  )
+  // And the textual sweep names the session ledgers as targets (W11-M3's
+  // `rm -rf <trust>/adapter-sessions/<key>` used to be a free command).
+  assert.equal(
+    decidePreToolUse('bash', { command: `rm -rf ${TRUST}/adapter-sessions/${keys[0]}` }, ROOT, wsGates, true).action,
+    'deny',
+    'a command destroying the adapter session ledger is denied',
+  )
+  // An absolute path OUTSIDE the trust artifacts is still nobody's business.
+  assert.equal(
+    decidePreToolUse('write', { file_path: '/tmp/scratch/notes.md' }, ROOT, hostGates, true).action,
+    'allow',
+    'absolute paths outside the trust artifacts pass',
+  )
+})
+
+test('decidePreToolUse: W11-L-H — evidenceDir that collapses at runtime (a/..) guards the same files in BOTH sweeps', () => {
+  // The schema rejects this spelling now (config pin below); the gate still
+  // folds defensively. The two sweeps must agree on what the store IS: the
+  // structural side always collapsed a/.. to the workspace root, the textual
+  // side used to keep the literal segment — `echo x > evidence.jsonl` slipped
+  // between them (audit PoC #7b).
+  const collapsed = { evidenceStore: 'workspace' as const, evidenceDir: 'a/..', requireBaseline: 'off' as const }
+  const paths = deriveProofPaths({ root: ROOT, trustRoot: '/trust', evidenceStore: 'workspace', evidenceDir: 'a/..' }, { pure: true })
+  assert.equal(touchesEvidencePath('evidence.jsonl', paths), true, 'structural side: the root-level log by name')
+  assert.equal(
+    decidePreToolUse('bash', { command: 'echo x > evidence.jsonl' }, ROOT, collapsed, true).action,
+    'deny',
+    'textual side: the same file by the same bare name',
   )
 })
 
@@ -783,6 +1140,72 @@ test('hasBaselineOnDisk: true only for a baseline that ADDRESSES ITSELF — a 20
     false,
     'parsable but not a baseline',
   )
+})
+
+test('hasBaselineOnDisk: chain binding and the no-chain floor (W11-M4)', async () => {
+  const paths = deriveProofPaths({ root: ROOT, trustRoot: '/trust' })
+  const checks = [
+    { checkId: 'package.json:test', evidenceId: sha256('e1') },
+    { checkId: 'package.json:build', evidenceId: sha256('e2') },
+  ]
+  const workspace = { head: 'h1', dirty: ['src/a.ts'], dirtDigest: sha256('src/a.ts') }
+  const createdAt = '2026-10-06T10:00:00.000Z'
+  const real = JSON.stringify({
+    baselineId: addressOf({ createdAt, workspace, checkIds: checks.map(c => c.checkId), root: merkleRoot(checks.map(c => c.evidenceId)) }),
+    createdAt,
+    workspace,
+    checks,
+    root: merkleRoot(checks.map(c => c.evidenceId)),
+  })
+
+  // With the chain's recorded digest: matching bytes are the engine's truth;
+  // ANY divergence is false — including a hand-recomputed self-consistent
+  // forgery, which is exactly what the digest makes impossible to pass off.
+  assert.equal(await hasBaselineOnDisk(paths, memoryReader({ [paths.baselinePath]: real }), sha256(real)), true,
+    'bytes matching the chain digest are a real baseline')
+  assert.equal(await hasBaselineOnDisk(paths, memoryReader({ [paths.baselinePath]: real }), sha256('anything-else')), false,
+    'bytes diverging from the chain digest are not, however self-consistent')
+
+  // The audit's PoC #5: an EMPTY self-consistent baseline is five lines away
+  // with the package's own exports (addressOf + merkleRoot are public). With
+  // no chain to bind to, the floor rises instead — at least one check and a
+  // parseable createdAt.
+  const emptyMaterial = {
+    createdAt: '1970-01-01T00:00:00.000Z',
+    workspace: {},
+    checkIds: [] as string[],
+    root: merkleRoot([]),
+  }
+  const emptyForged = JSON.stringify({
+    baselineId: addressOf(emptyMaterial),
+    ...emptyMaterial,
+    checks: [],
+  })
+  assert.equal(await hasBaselineOnDisk(paths, memoryReader({ [paths.baselinePath]: emptyForged })), false,
+    'the no-chain floor: a self-addressed but EMPTY forgery is not a baseline')
+  assert.equal(
+    await hasBaselineOnDisk(paths, memoryReader({ [paths.baselinePath]: JSON.stringify({ ...JSON.parse(real), createdAt: 'not-a-date' }) })),
+    false,
+    'the no-chain floor: an unparseable createdAt is not a baseline',
+  )
+  // The floor's honest over-deny, pinned deliberately: a genuine ZERO-check
+  // baseline (a project nothing was discovered in) reads as "no baseline" and
+  // keeps the ladder armed — one ask per mutation, not a five-line forgery.
+  const zeroCheckMaterial = {
+    createdAt,
+    workspace,
+    checkIds: [] as string[],
+    root: merkleRoot([]),
+  }
+  const zeroCheck = JSON.stringify({
+    baselineId: addressOf(zeroCheckMaterial),
+    ...zeroCheckMaterial,
+    checks: [],
+  })
+  assert.equal(await hasBaselineOnDisk(paths, memoryReader({ [paths.baselinePath]: zeroCheck })), false,
+    'a real zero-check baseline is the accepted over-deny (chain-digest callers exempt it)')
+  assert.equal(await hasBaselineOnDisk(paths, memoryReader({ [paths.baselinePath]: zeroCheck }), sha256(zeroCheck)), true,
+    'with the chain digest binding it, the same zero-check file is honoured')
 })
 
 function stopFacts(over: Partial<StopFacts> = {}): StopFacts {
@@ -928,4 +1351,56 @@ test('THE TURN THAT WOULD NOT END CLEANLY: three processes, one session file, on
   // the IDE's edit remains a fact until a tool sees the file again.
   assert.ok(stillDrifting.drifted.includes('src/lib.ts'))
   assert.match(verdict.block ?? '', /src\/lib\.ts/, 'unchanged facts must keep blocking, not wear out')
+})
+
+// ===========================================================================
+// config.ts — domain pins for the path/knob schema faces owned here
+// ===========================================================================
+
+test('Config schema: syntheticDir keeps the conjure sandbox inside the workspace (W11-M-D)', () => {
+  // The sandbox must be a real subdirectory: degenerate, escaping and
+  // absolute spellings are rejected loudly instead of parking proof_conjure
+  // outside the workspace ('../x'), at its root ('.'), or on another drive.
+  for (const bad of ['../x', 'a/../x', '.', './', '', 'C:/abs', '/abs', 'a/..']) {
+    assert.throws(() => Config({ syntheticDir: bad } as never), /match regexp/,
+      `syntheticDir ${JSON.stringify(bad)} is rejected`)
+  }
+  // Legal spellings keep passing, including the documented default.
+  assert.equal((Config({} as never) as { syntheticDir: string }).syntheticDir, '.proof-synthetic')
+  assert.equal((Config({ syntheticDir: 'proof-sandbox' } as never) as { syntheticDir: string }).syntheticDir, 'proof-sandbox')
+  assert.equal((Config({ syntheticDir: '.proof-synthetic' } as never) as { syntheticDir: string }).syntheticDir, '.proof-synthetic')
+})
+
+test('Config schema: evidenceDir rejects runtime-collapsing segments (W11-L-H) and degenerate ones (M-48)', () => {
+  for (const bad of ['.', './', '', '/abs', 'a/..', 'a\\..', 'a/../b']) {
+    assert.throws(() => Config({ evidenceDir: bad } as never), /match regexp/,
+      `evidenceDir ${JSON.stringify(bad)} is rejected`)
+  }
+  assert.equal((Config({} as never) as { evidenceDir: string }).evidenceDir, '.proof')
+  assert.equal((Config({ evidenceDir: './proof2/' } as never) as { evidenceDir: string }).evidenceDir, './proof2/')
+  assert.equal((Config({ evidenceDir: 'proof2' } as never) as { evidenceDir: string }).evidenceDir, 'proof2')
+})
+
+test('Config schema: the κ/certify knobs live on the OPEN interval (0,1) (W6-F2 / W11-M5)', () => {
+  // percent() is a closed [0,1]; κ=0 neutralises every B/C discount (p^0=1 —
+  // grade inflation by configuration) and certifyTarget:0 certified nothing
+  // required nothing. The schema domain is the open interval now; the
+  // EngineOptions direct-construction face is validated on the engine side.
+  for (const knob of ['certifyTarget', 'classBTrust', 'classCTrust'] as const) {
+    assert.throws(() => Config({ [knob]: 0 } as never), /expected number >= 0\.01/, `${knob}: 0 is out of domain`)
+    assert.throws(() => Config({ [knob]: 1 } as never), /expected number <= 0\.99/, `${knob}: 1 is out of domain`)
+    const inside = Config({ [knob]: 0.5 } as never) as unknown as Record<string, number>
+    assert.equal(inside[knob], 0.5, `${knob}: mid-band values pass`)
+  }
+  const defaults = Config({} as never) as unknown as Record<string, number>
+  assert.equal(defaults.certifyTarget, 0.97)
+  assert.equal(defaults.classBTrust, 0.7)
+  assert.equal(defaults.classCTrust, 0.9)
+})
+
+test('Config schema: impactGraphLimit and lspQueryBudget keep positive domains (W11-L-E)', () => {
+  assert.throws(() => Config({ impactGraphLimit: 0 } as never), /expected number >= 1/)
+  assert.throws(() => Config({ lspQueryBudget: 0 } as never), /expected number >= 1/)
+  assert.throws(() => Config({ impactGraphLimit: -5 } as never), /expected number >= 1/)
+  assert.equal((Config({ lspQueryBudget: 12 } as never) as { lspQueryBudget: number }).lspQueryBudget, 12)
 })

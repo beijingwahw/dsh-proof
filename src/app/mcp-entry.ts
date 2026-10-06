@@ -15,7 +15,10 @@
  * drift was H-21: a hook watching `.evi` while this server wrote `.proof`):
  *   DSH_PROOF_ROOT            workspace root the server verifies (default cwd)
  *   DSH_PROOF_TRUST_DIR       trust root for keys/anchors (default $DSH_HOME/proof,
- *                             the same derivation src/index.ts applies)
+ *                             the same derivation src/index.ts applies). MUST be
+ *                             absolute (v0.23, X-H-15): a relative trust root —
+ *                             or a relative DSH_HOME it derives from — is a loud
+ *                             startup error, never a CWD-relative silent landing
  *   DSH_PROOF_EVIDENCE_STORE  'host' (default; evidence outside the workspace)
  *                             or 'workspace' (evidence inside it). Any OTHER
  *                             non-empty value is a loud startup error — a
@@ -25,7 +28,10 @@
  *   DSH_PROOF_EVIDENCE_DIR    workspace-mode store segment (default '.proof'),
  *                             the same variable the adapter hooks honour
  *   DSH_PROOF_PTL_DIR         transparency-log directory for proof_publish /
- *                             proof_log_verify (default <trustRoot>/ptl)
+ *                             proof_log_verify (default <trustRoot>/ptl). When
+ *                             set explicitly it MUST be absolute (v0.23,
+ *                             W10-M2) — same rule, same reason as the trust
+ *                             root above
  *   DSH_PROOF_SERVER_VERSION  serverInfo.version override (default
  *                             MCP_DEFAULT_VERSION from mcp-server.ts)
  *   DSH_HOME                  harness home used by the trust-root default
@@ -66,6 +72,35 @@ function failStartup(message: string): never {
   process.exit(1)
 }
 
+/**
+ * v0.23 (X-H-15 entry half + W10-M2): a trust-root-shaped path must be
+ * ABSOLUTE, or the server refuses to start.
+ *
+ * Why: a relative `DSH_PROOF_TRUST_DIR` (or a relative `DSH_HOME`, from
+ * which the trust-root default derives) resolves against whatever the
+ * current working directory happens to be — the spawned server inherits the
+ * harness's CWD, so the SAME environment silently pointed the keys, anchors
+ * and operator key at a different physical directory on every spawn, and a
+ * workspace-mode CWD put the private key PEM inside the agent-writable
+ * workspace (guard lifted, key beside the data it notarises). The PTL
+ * directory (`DSH_PROOF_PTL_DIR`) is the same shape of input: a relative
+ * spelling once escaped every trust-boundary check and resolved per-CWD.
+ *
+ * Exported so the other entries (and the wiring tests) pin the SAME rule —
+ * a fail-fast check is only as good as every face applying it.
+ */
+export function assertAbsoluteTrustRoot(value: string, name: string): string {
+  if (!nodePath.isAbsolute(value)) {
+    failStartup(
+      `${name} must be an ABSOLUTE path (got ${JSON.stringify(value)})`
+      + ' — a relative trust-root path resolves against the launcher\'s current directory,'
+      + ' which can silently move keys, anchors and the operator key into the agent-writable workspace;'
+      + ' set an absolute path',
+    )
+  }
+  return value
+}
+
 async function main(): Promise<void> {
   // H-21 (v0.22): the DSH_PROOF_* contract is parsed by the shared resolver
   // — the same function the Claude Code hooks and the OpenCode plugin use —
@@ -73,9 +108,22 @@ async function main(): Promise<void> {
   // server process. Precedence (env beats code default) is layered HERE.
   const resolved = resolveAdapterEnv(process.env)
   const root = resolved.root ?? process.cwd()
+  // X-H-15 (v0.23): a relative DSH_HOME poisons every default derived from
+  // it (the trust root below), so it is refused before anything is built.
+  const homeFromEnv = process.env.DSH_HOME
+  if (typeof homeFromEnv === 'string' && homeFromEnv.length > 0) {
+    assertAbsoluteTrustRoot(homeFromEnv, 'DSH_HOME')
+  }
   // Trust root: keys and anchors live with the host, never in the workspace —
   // same precedence as the plugin (env wins, then DSH_HOME-derived default).
+  // X-H-15 (v0.23): an explicit relative DSH_PROOF_TRUST_DIR used to fall
+  // through to the CWD-relative interpretation with every guard quietly
+  // lifted; now it is a loud startup failure.
   const trustRoot = resolved.trustRoot ?? nodePath.join(dshHome(), 'proof')
+  assertAbsoluteTrustRoot(
+    trustRoot,
+    resolved.trustRoot !== undefined ? 'DSH_PROOF_TRUST_DIR' : 'the trust root (default $DSH_HOME/proof)',
+  )
   // The evidence store mode is a two-value switch: anything else non-empty is
   // an operator error, and a silent fallback to host mode would point the
   // guard at a phantom store while the real log writes elsewhere.
@@ -87,10 +135,15 @@ async function main(): Promise<void> {
   // v0.18 (§6): the public transparency log. Default <trustRoot>/ptl — beside
   // the keys and anchors, never inside the agent-writable workspace, so the
   // published tree and the operator key (<ptlDir>/operator-key) live on the
-  // host side of the trust boundary. An explicit DSH_PROOF_PTL_DIR wins.
+  // host side of the trust boundary. An explicit DSH_PROOF_PTL_DIR wins —
+  // and (v0.23, W10-M2) must be ABSOLUTE like the trust root it overrides:
+  // a relative spelling resolved per-CWD, escaping every trust-boundary
+  // check (an explicit PTL dir inside the workspace would put the published
+  // log AND the bootstrapped operator key in the agent-writable area).
   const ptlDir = (() => {
     const explicit = process.env.DSH_PROOF_PTL_DIR
-    return typeof explicit === 'string' && explicit.length > 0 ? explicit : nodePath.join(trustRoot, 'ptl')
+    if (typeof explicit !== 'string' || explicit.length === 0) return nodePath.join(trustRoot, 'ptl')
+    return assertAbsoluteTrustRoot(explicit, 'DSH_PROOF_PTL_DIR')
   })()
   // M-39/H-21 (MCP half): the workspace identity is derived through the SAME
   // derivation the adapters use — normalised root spelling, legacy-key

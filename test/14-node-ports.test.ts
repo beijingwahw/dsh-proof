@@ -269,6 +269,44 @@ test('NODE-PORTS: an already-aborted signal returns without spawning', async () 
   assert.ok(wallMs < 3_000, `run() took ${wallMs}ms — an aborted signal must not wait on a live child`)
 })
 
+test('NODE-PORTS (W15-L8b): a non-finite or non-positive timeoutMs is refused before spawning — never booked as a timeout', async () => {
+  // NaN made `Math.max(1, NaN)` NaN and `setTimeout(NaN, …)` fire in ~0ms;
+  // Node silently clamps Infinity (and anything above 2^31-1) to 1ms. Every
+  // one of those shapes used to kill the child instantly and report it as
+  // `timedOut` — "ran too slow" about a process that never ran. A budget
+  // that is not a finite positive number is a caller bug: the port refuses
+  // to spawn and names it, so the evidence books a plain error instead of a
+  // misattributed death cause.
+  for (const timeoutMs of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 0, -5]) {
+    const startedAt = Date.now()
+    const result = await commands.run(
+      [process.execPath, '-e', 'setTimeout(() => process.stdout.write("late"), 3000)'],
+      { cwd: WORKSPACE, timeoutMs, signal: AbortSignal.timeout(10_000) },
+    )
+    const wallMs = Date.now() - startedAt
+    assert.equal(result.exitCode, null, `timeoutMs ${timeoutMs}: nothing ran, so there is no exit code`)
+    assert.equal(result.aborted, false)
+    assert.equal(result.timedOut, undefined, `timeoutMs ${timeoutMs}: the death cause must not say "too slow"`)
+    assert.match(result.spawnError ?? '', /invalid timeoutMs/, `timeoutMs ${timeoutMs}: the refusal names the bug`)
+    assert.ok(wallMs < 3_000, `timeoutMs ${timeoutMs}: run() took ${wallMs}ms — no child was ever spawned`)
+    assert.equal(result.output, '')
+  }
+})
+
+test('NODE-PORTS (W15-L8b): a finite positive budget beyond Node\'s timer domain is clamped, not coerced to a 1ms kill', async () => {
+  // 3e9 ms is beyond setTimeout's 2^31-1 domain: Node coerces it to 1ms —
+  // an instant timeout death for a budget that asked for ~35 days. The port
+  // clamps to the timer domain instead, which is the closest a timer can
+  // come to "effectively unlimited": the quick command below completes.
+  const result = await commands.run(
+    [process.execPath, '-e', "process.stdout.write('survived')"],
+    { cwd: WORKSPACE, timeoutMs: 3_000_000_000, signal: AbortSignal.timeout(10_000) },
+  )
+  assert.equal(result.exitCode, 0, result.spawnError ?? result.output)
+  assert.equal(result.output, 'survived')
+  assert.equal(result.timedOut, undefined)
+})
+
 test('NODE-PORTS: multi-byte UTF-8 across stdout chunk boundaries captures exactly', async () => {
   // 200k x (3-byte U+5BF9) = 600 KB through a ~64 KB pipe: boundaries land
   // mid-character constantly. Evidence digests are only stable if capture is

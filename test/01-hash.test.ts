@@ -78,6 +78,32 @@ test('H-28: output that already carries a literal placeholder can never imperson
   assert.ok(!normalizeOutput('x'.repeat(100), { root: '/r' }).includes('[raw output'))
 })
 
+test('W14-M3: an output that PRE-PRINTS the marker line cannot collide with a marked one', () => {
+  // The marker text itself carries neither `$WORKSPACE`/`$HOME` nor
+  // `<duration>`/`<timestamp>`, so an output whose first line IS the marker
+  // used to normalise to exactly `MARKER + folded body` — byte-equal to the
+  // marked product of a genuinely literal-bearing output. The marker line is
+  // in the detection set now: marker-bearing outputs normalise to
+  // `MARKER + k marker lines + folded body` (k preserved in the text), a
+  // class no k=0 output can reach.
+  const forged = '[raw output contained literal placeholders]\ntook 5ms and 5ms too'
+  const real = 'took 5ms and <duration> too'
+  const a = normalizeOutput(forged)
+  const b = normalizeOutput(real)
+  assert.notEqual(a, b, 'the pre-printed marker line must not reopen the cross-class equality')
+  assert.notEqual(sha256(a), sha256(b), 'different digests — same digest must imply same observable output')
+  assert.equal(a.split('[raw output contained literal placeholders]').length - 1, 2, 'the forged marker line is itself marked (k = 1 visible beyond the prefix)')
+  assert.equal(b.split('[raw output contained literal placeholders]').length - 1, 1, 'the literal-bearing honest output carries exactly the one prefix marker')
+
+  // Two marker-line counts stay distinct from each other too (k lives in the bytes).
+  assert.notEqual(
+    sha256(normalizeOutput('[raw output contained literal placeholders]\nplain output')),
+    sha256(normalizeOutput('[raw output contained literal placeholders]\n[raw output contained literal placeholders]\nplain output')),
+  )
+  // And honest literal-free output remains byte-identical to before this fix.
+  assert.equal(normalizeOutput('plain output'), 'plain output')
+})
+
 test('normalised output addressing ignores cosmetic differences', () => {
   const a = normalizeOutput('x=1\n', { root: '/r' })
   const b = normalizeOutput('x=1 \r\n', { root: '/r' })

@@ -648,7 +648,23 @@ v0.16 与 v0.17 是对核心判定面的两轮深读；v0.22 把同一纪律一�
 
 诚实边界照例如下（本仓库家规）——审计**刻意留下**的三处：shell 命令匹配是**保守子串扫描**（改写后避开全部受卫拼法的命令仍可能溜过；守卫宁可误拦，漏过归因的仍由漂移检测兜底）；V8 覆盖防御是**隔离 + mtime 时间窗，不是密码学保证**（能把带窗口内 mtime 的文件写进本轮目录的进程仍能击穿它——v0.22 把伪造成本从「继承环境变量」抬到「赢下与引擎时钟的赛跑」，没有把它变成不可能）；未配置信任根的部署里，**PTL 操作者密钥可能仍落在它公证的日志目录旁边**（`<ptlDir>/ptl-operator-key`）——显式传 `--operator-key`（或设 `DSH_PROOF_OPERATOR_KEY_DIR` / 信任根）即可分离。
 
-测试 720 → 855（+135，对抗占比很高：审计的 PoC——漂移先验洗白、凭空 bundle、`reject@0.99`、shell 直写证据库、`MultiEdit` 直通、覆盖 profile 预埋、quoteId 碰撞——如今全部钉成必须失败的可执行攻击）。配置维持 33 项——未审查体 β 走引擎级 `EngineOptions.driftedFalsePass`（缺省 0.5），是与 `syntheticFalsePass` 同层的可覆盖建模猜测，不进 cordis.yml；其余一切修复都是关上的门，不是旋钮。
+测试 720 → 857（+137，对抗占比很高：审计的 PoC——漂移先验洗白、凭空 bundle、`reject@0.99`、shell 直写证据库、`MultiEdit` 直通、覆盖 profile 预埋、quoteId 碰撞——如今全部钉成必须失败的可执行攻击）。配置维持 33 项——未审查体 β 走引擎级 `EngineOptions.driftedFalsePass`（缺省 0.5），是与 `syntheticFalsePass` 同层的可覆盖建模猜测，不进 cordis.yml；其余一切修复都是关上的门，不是旋钮。
+
+---
+
+## 五·二十八、统一验证读取（v0.23.0）：每个信任决策只走一扇门
+
+v0.22 把审计账全数兑付——随后第二轮 **23 个 agent 的普查又逐行读完了结果**，提交 19 条新高危，其中 **42% 是修复自己引入的**。这个数字本身就是设计指令。反复发作的病从来不是缺少防御，而是**写了却没人咨询的防御**——没人递钥匙的验签器、没人读的审计裁决、恰好漏掉一个调用点的 suspect 过滤。所以 v0.23 不是再砌一层墙，而是三个让「砌墙却忘了开门」难以重犯的结构性动作。
+
+**动作一：统一验证读取。** 一切信任消费者如今经同一个导出视图读链（`core/evidence.ts` 的 `createVerifiedView`）：单遍读取（一次走链完成 suspect 位置判定、可用即验签、代际回退——某 label 全部 marker 皆 suspect 的升级前旧日志，返回最后一条并带 `degraded` 标，而不是静默忘记整个部署的历史）。裸解析路径全部转 `@internal`——未来的消费者想接错线都找不到那扇门。经这扇门，v0.22 的四条最重死通道全部接活：`submitDelegation` 现在真把 `anchorSigner` 递给 `verifyBundle`（三态验签终于有了生产调用方）；引擎的漂移边界扫描与其余读者同样过滤 suspect；MCP 面的 marker 读取走同一视图；而 `audit().ok`——v0.22 的判定从未咨询过它——如今与 `baselineTampered` 同乘四路消费者：过不了自己审计的链铸不出 `proven`，无论哪个单一通道是干净的。
+
+**动作二：纪元感知。** v0.22 的漂移时间切片问「链上何时首次记录此 id 的漂移」——这个答案跨越基线世代，drift → 重锚 → drift 的循环让每个新身体继承上一个身体重挣的历史。边界改为**世代化**：只有当前基线锚点之后的 marker 才算数；委派任务号从验证后的 marker 计数以 `max + 1` 派生，升级（或 suspect 清洗）不再把 `task-1` 回卷到既有义务上。同一纪元纪律关掉尾部吸收洗白：`preSignAudit` 拒绝为本进程从未写出的 `baseline/saved`/`baseline/established` 行公证（作者身份+位置双证），`savePtlHead` 拒绝延伸自己无法验签的存量头——**不确定=失败**，CLI 面、引擎面、bundle 面一视同仁，因为发布谓词处处都是「所选 checkpoint 验签通过，否则拒绝发布」。
+
+**动作三：值扫描，不枚举。** 名单病饿死了。命令扫描不再枚举键名（`command`/`cmd`/`script`——v0.22 查了三个、漏了无数个）：变更类调用携带的**每一个字符串值**都过受卫拼法扫描——`{commandLine:…}`、`{code:…}`、argv 向量、还没人命名的键，全在同一张网里。路径层同样待遇：唯一的 `foldHostPath`（设备命名空间前缀剥离、盘符相对 `C:x` 投影、大小写、分隔符、尾点形变——曾经散在四份互不一致实现里的一切折叠）成为**唯一**折叠，守卫、DSH 面与引擎导出约束共同消费；`\\?\` 前缀与盘符相对写入不再掉进四份半吊子折叠的缝里。相对的 `DSH_PROOF_TRUST_DIR`/`DSH_HOME` 现在是响亮的启动失败，而不是把钥匙静默搬进工作区。
+
+其余账目，逐项点名：**bundle 验证**镜像核心的 head-liar 检查（假链头上的**重放**签名判 `invalid` 而非 `verified`）、把搭载在最后一个 checkpoint 之后的记录从脚注升格为 problem、拒绝结构完好但记录为空的日志；**委派组合**不再把未提交叶子默认成 `proven`（没人证明过的叶子是 `unproven`）、own-`regressed` 的子不再被缺失兄弟洗成可豁免 `stale`——豁免赦免缺失的工作，从不赦免劣化的证据；**require 档覆盖门**的合成排除改锚定池成员身份而非记录字段（自删脚本如今记 `error` 不记 pass）；**贝叶斯旋钮域**在一切边界被校验（`driftedFalsePass:0` 不再把漂移防御反转成一发认证、`certifyTarget:0` 不再让门槛塌缩）；`proof_*` 工具调用豁免 OpenCode 的基线 ask（ask 曾死锁唯一能解开它的工具）；合成筛检抓计算成员与别名形态（`globalThis['fetch']`、`(0, fetch)`、`const f = fetch`）并拒绝 `node:vm`/`node:module`；Python 影响对带点 specifier 双向解析（`./x.component` 是文件名；`from . import x` 到兄弟而非祖父）加分号语句与括号导入表；漂移重挣阶梯按影响档如实记载——通配检查的新身体约 4 次诚实绿灯即重越 0.97，直改命中需约 13 次，这是诚实的数字，不是好听的数字。
+
+全部的验收门：第三轮普查自己的 PoC 攻击对着这份代码**重跑**——九个里八个如今恰好死在它们曾经穿过的那道缝上（被吸收的尾部拿不到签名、伪造 STH 拿不到延伸、未提交叶子组合出 `unproven`、重放 checkpoint 报 `invalid`），第九个由其目标重写自带的纪元测试覆盖。测试 857 → 951（+94，绝大多数为对抗用例或 KAT）。诚实边界移动了但没有消失，清单在第十节如实更新：形状取证依旧拦不住可写日志上**形状合法**的追加——只有签名裁决能，而 v0.23 的赌注是：一扇永远被咨询的验证之门，胜过任何数量可能不被咨询的墙。
 
 ---
 
@@ -710,7 +726,7 @@ dsh-proof/
 │   │       ├── plugin.ts     # 运行时鸭子类型探测 tool.execute.before/after + chat.params，优雅降级
 │   │       └── vendor.ts     # 宿主 API 形状收窄器（探测不到 = 留空不炸宿主）
 │   └── vendor/dsh-tools.ts   # 契约快照（pinned to dsh v0.2.1-alpha.1）
-├── test/                     # 31 个测试文件（857 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心、类型化断言合约、证据分级 B/C、PTC 证据合成、覆盖感知证明、协议词表钉死、bundle 篡改矩阵、MCP 真子进程集成、适配器共享层字节对齐、Claude Code 真子进程协议、OpenCode 鸭子类型降级、透明日志 RFC 6962、PTL CLI、跨代理责任 DAG、agent-team 桥、训练数据飞轮、验证经济学、v0.22 对抗审计收口
+├── test/                     # 31 个测试文件（951 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心、类型化断言合约、证据分级 B/C、PTC 证据合成、覆盖感知证明、协议词表钉死、bundle 篡改矩阵、MCP 真子进程集成、适配器共享层字节对齐、Claude Code 真子进程协议、OpenCode 鸭子类型降级、透明日志 RFC 6962、PTL CLI、跨代理责任 DAG、agent-team 桥、训练数据飞轮、验证经济学、v0.22 对抗审计收口
 ├── PROTOCOL.md               # Agent Proof Protocol (APP/1.4) 开放标准（英文规范，十二节）
 ├── cordis.patch.yml          # bundle 层
 └── examples/
@@ -723,7 +739,7 @@ dsh-proof/
 **为什么领域核心不碰 `@deepseek-ai/*`：**
 
 1. DSH 是开发者预览版，破坏性变更频繁。核心逻辑与 harness 版本解耦 → 升级不重写。
-2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，857 个测试全绿。
+2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，951 个测试全绿。
 3. 同一个核心可以被别的宿主（CLI、CI、其他 harness）复用。
 
 **为什么 `vendor/dsh-tools.ts` 是契约快照而不是活依赖：**
@@ -833,7 +849,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit，离线可跑
-npm test              # 857 个测试（node:test）
+npm test              # 951 个测试（node:test）
 npm run build         # 产出 lib/
 npm run bundle:check  # 打包契约自检
 ```

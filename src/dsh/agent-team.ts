@@ -161,6 +161,17 @@ export interface TeamBridgeDeps {
   stderr?: (line: string) => void
   /** Best-effort observation marker onto the chain; absent = no chain access. */
   mark?: (label: string, payload: Record<string, unknown>) => Promise<void>
+  /**
+   * W7-M9 (v0.23): the bridge's own persisted id mappings, read back from the
+   * chain — the `agent-team/delegated` markers as (hostTaskId, engineTaskId)
+   * pairs. Consulted lazily, once, before the first parent-edge lookup: the
+   * mapping used to live only in bridge-private memory, so a restarted
+   * process (host reload, crash recovery) forgot every edge its predecessor
+   * minted and re-minted the affected delegations as roots — the mapping was
+   * persisted precisely so this read-back could happen. Absent = no chain
+   * read seam and the bridge keeps the historical amnesia.
+   */
+  mappings?: () => Promise<ReadonlyArray<{ readonly hostTaskId: string; readonly engineTaskId: string }>>
 }
 
 /**
@@ -221,6 +232,51 @@ export function createTeamBridge(deps: TeamBridgeDeps): {
   const seen = new WeakSet<object>()
   /** Host task id → engine task id, for every obligation this bridge minted. */
   const hostToEngine = new Map<string, string>()
+  /**
+   * W7-M9: one-shot rehydration of the persisted mappings. Mappings this
+   * process minted AFTER the reader's snapshot win (`set`-if-absent), so a
+   * re-read racing a fresh delegation never rolls a fresh edge back to a
+   * stale chain copy. A failed read rehydrates nothing and never throws —
+   * the bridge then behaves exactly as it did before the chain grew a
+   * memory.
+   */
+  let rehydrated: Promise<void> | undefined
+  const ensureMappings = (): Promise<void> => {
+    if (rehydrated === undefined) {
+      rehydrated = (async () => {
+        if (deps.mappings === undefined) return
+        try {
+          for (const pair of await deps.mappings()) {
+            if (!hostToEngine.has(pair.hostTaskId)) {
+              hostToEngine.set(pair.hostTaskId, pair.engineTaskId)
+            }
+          }
+        } catch {
+          /* an unreadable chain rehydrates nothing; see above */
+        }
+      })()
+    }
+    return rehydrated
+  }
+  /**
+   * W7-M10: a `mark` that rejects must not take the delegation down with it.
+   * Both marker writes used to sit inside the outer try — a rejecting chain
+   * write was swallowed by the blanket catch and the obligation lived on
+   * with NO chain fact and NO stderr line: a silent orphan. Degrade loudly
+   * instead; the delegation itself stands either way.
+   */
+  const markBestEffort = async (label: string, payload: Record<string, unknown>): Promise<void> => {
+    if (deps.mark === undefined) return
+    try {
+      await deps.mark(label, payload)
+    } catch (error) {
+      deps.stderr?.(
+        `dsh-proof: agent-team bridge could not record the ${label} observation marker `
+        + `(${error instanceof Error ? error.message : String(error)}) — the delegation stands, `
+        + 'but its chain fact is missing; re-check the obligation on the chain manually',
+      )
+    }
+  }
   return {
     seams: [...TEAM_EVENT_SEAMS],
     onEvent: async (raw: unknown): Promise<void> => {
@@ -233,6 +289,7 @@ export function createTeamBridge(deps: TeamBridgeDeps): {
         if (event === undefined) return
         const claim = claimOf(event)
         if (claim === undefined) return
+        await ensureMappings()
         const hostParentTaskId = typeof event.parentTaskId === 'string' && event.parentTaskId.length > 0
           ? event.parentTaskId
           : undefined
@@ -270,11 +327,11 @@ export function createTeamBridge(deps: TeamBridgeDeps): {
             + `${JSON.stringify(lostParent.hostParentTaskId)} (${lostParent.reason}) — the obligation below is `
             + `minted as a ROOT; re-link it manually if the parent edge matters`,
           )
-          await deps.mark?.('agent-team/parent-unmapped', {
-            hostParentTaskId: lostParent.hostParentTaskId,
-            reason: lostParent.reason,
-            claim: claim.slice(0, 200),
-          })
+        await markBestEffort('agent-team/parent-unmapped', {
+          hostParentTaskId: lostParent.hostParentTaskId,
+          reason: lostParent.reason,
+          claim: claim.slice(0, 200),
+        })
         }
         let minted: { taskId: string; obligationId: string; obligation: unknown }
         try {
@@ -288,10 +345,11 @@ export function createTeamBridge(deps: TeamBridgeDeps): {
         }
         // Record the namespace mapping so later host events (a grandchild, a
         // verdict) can find this obligation — and so the mapping itself is a
-        // chain fact, not bridge-private memory.
+        // chain fact, not bridge-private memory (W7-M9: a successor process
+        // reads exactly this marker back to re-adopt the edge).
         if (hostTaskId !== undefined) {
           hostToEngine.set(hostTaskId, minted.taskId)
-          await deps.mark?.('agent-team/delegated', {
+          await markBestEffort('agent-team/delegated', {
             hostTaskId,
             engineTaskId: minted.taskId,
             obligationId: minted.obligationId,

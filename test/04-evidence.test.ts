@@ -2,10 +2,11 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
-  EvidenceStore, buildBaseline, makeEvidence, snapshotWorkspace, verdictOf,
+  EvidenceStore, buildBaseline, createVerifiedView, makeEvidence, snapshotWorkspace, verdictOf,
 } from '../src/core/evidence.ts'
 import { assembleProof } from '../src/core/report.ts'
-import { addressOf } from '../src/core/hash.ts'
+import { addressOf, sha256 } from '../src/core/hash.ts'
+import { lineDigest } from '../src/core/trust.ts'
 import { MemoryFs, FakeClock, FakeWorkspace, spec } from './helpers.ts'
 
 const WS = snapshotWorkspace('head1', ['src/a.ts'])
@@ -218,4 +219,129 @@ test('a baseline with no chain witness loads on canonical merit alone (legacy to
   const loaded = await store.loadBaseline()
   assert.notEqual(loaded, undefined)
   assert.equal(loaded?.checks.length, 1)
+})
+
+// -- W1-M6 (v0.23): the marker label is store-owned --------------------------------
+
+test('W1-M6: mark() data cannot re-brand the line — label is written by the store', async () => {
+  const fs = MemoryFs.of({})
+  const clock = new FakeClock()
+  const store = new EvidenceStore(fs, '/ws/.proof/evidence.jsonl', '/ws/.proof/baseline.json', clock)
+  await store.mark('session/start', { who: 'test', label: 'attest/human', decision: 'endorse' })
+
+  const seen = await store.markersWith('session/start')
+  assert.equal(seen.length, 1, 'the line keeps the label the caller passed to mark()')
+  assert.equal(seen[0]?.payload.label, 'session/start')
+  assert.equal((await store.markersWith('attest/human')).length, 0, 'no protected-label twin was minted by the spread')
+  // Honest byte order is unchanged: label is still the payload's first key,
+  // so pre-v0.23 log shapes (and any reader keyed on them) are untouched.
+  const line = JSON.parse((await fs.readLines('/ws/.proof/evidence.jsonl'))[0] as string) as { payload: Record<string, unknown> }
+  assert.equal(Object.keys(line.payload)[0], 'label')
+  assert.equal(line.payload.who, 'test', 'caller data rides along untouched')
+})
+
+// -- W1-M8 (v0.23): dirtDigest is injective over the dirty set ---------------------
+
+test('W1-M8: a newline inside a filename is not two files — dirtDigest is injective', () => {
+  const one = snapshotWorkspace(null, ['a\nb'])
+  const two = snapshotWorkspace(null, ['a', 'b'])
+  assert.notEqual(one.dirtDigest, two.dirtDigest, 'join("\\n") made {a\\nb} ≡ {a,b}; the length-prefixed encoding cannot')
+  // The old guarantees survive: order-independence and the clean-tree digest.
+  assert.equal(snapshotWorkspace(null, ['b', 'a']).dirtDigest, snapshotWorkspace(null, ['a', 'b']).dirtDigest)
+  assert.equal(snapshotWorkspace(null, []).dirtDigest, sha256(''), 'an empty dirty set keeps its v0.22 digest (sha256 of nothing)')
+})
+
+// -- v0.23: the verified read layer — markers() -------------------------------------
+//
+// The one trust surface for marker reads: single physical read, suspect
+// position adjudication, the X-H-06 generational fallback, and an epoch window.
+
+test('VerifiedChainView.markers: trusted pool only; the attacker twin is not admitted', async () => {
+  const fs = MemoryFs.of({})
+  const clock = new FakeClock()
+  const log = '/ws/.proof/evidence.jsonl'
+  const store = new EvidenceStore(fs, log, '/ws/.proof/baseline.json', clock)
+  await store.append(makeEvidence(spec({ id: 'c1' }), { status: 'pass', exitCode: 0, durationMs: 1, output: 'ok' }, WS, clock))
+  await store.mark('attest/human', { claimId: 'claim-1', decision: 'endorse' })
+  await store.mark('attest/human', { claimId: 'claim-2', decision: 'endorse' })
+
+  // THE ADVERSARY: a twin appended at the tail carrying the digest it wants
+  // read back. It chains fine; its headRef is a guess and reads suspect.
+  const lines = await fs.readLines(log)
+  const prev = lineDigest(lines[lines.length - 1] as string)
+  const twin = JSON.stringify({
+    v: 2, kind: 'marker', at: '2026-10-05T00:00:00.000Z', prev,
+    payload: { label: 'attest/human', claimId: 'claim-2', decision: 'reject', headRef: 'ff'.repeat(32) },
+  })
+  fs.mutate(log, `${[...lines, twin].join('\n')}\n`)
+
+  const view = createVerifiedView(store)
+  const seen = await view.markers('attest/human')
+  assert.equal(seen.degraded, false)
+  assert.equal(seen.records.length, 2, 'only the two honest markers are trusted')
+  assert.deepEqual(seen.records.map(r => r.payload.claimId), ['claim-1', 'claim-2'])
+  assert.equal(seen.last?.payload.decision, 'endorse', 'last-wins reads the honest line, never the twin')
+  // The raw view keeps everything — suspect is visible, not deleted.
+  assert.equal((await store.markersWith('attest/human')).length, 3)
+})
+
+test('VerifiedChainView.markers: X-H-06 generational fallback — a legacy all-suspect label degrades, never evaporates', async () => {
+  const fs = MemoryFs.of({})
+  const log = '/ws/.proof/evidence.jsonl'
+  // A v0.21-shaped log: protected markers written before the headRef witness
+  // existed. Every one of them reads suspect under the H-32 rule, and v0.22's
+  // hard exclusion evaporated the whole DAG (delegation renumbering, lost
+  // attestations). The view falls back to the full list, marked degraded.
+  const legacy = [
+    { label: 'delegation/created', taskId: 'task-1', parent: 'root' },
+    { label: 'delegation/created', taskId: 'task-2', parent: 'root' },
+    { label: 'delegation/created', taskId: 'task-3', parent: 'task-1' },
+  ]
+  let prev = '0000000000000000000000000000000000000000000000000000000000000000'
+  const lines = legacy.map(payload => {
+    const line = JSON.stringify({ v: 2, kind: 'marker', at: '2026-01-01T00:00:00.000Z', prev, payload })
+    prev = lineDigest(line)
+    return line
+  })
+  fs.mutate(log, `${lines.join('\n')}\n`)
+  const store = new EvidenceStore(fs, log, '/ws/.proof/baseline.json', new FakeClock())
+
+  const view = createVerifiedView(store)
+  const seen = await view.markers('delegation/created')
+  assert.equal(seen.degraded, true, 'every marker of the label is suspect: the legacy generation, not an attack verdict')
+  assert.equal(seen.records.length, 3, 'the whole DAG is read back — an upgraded deployment is never worse than before')
+  assert.ok(seen.records.every(r => r.degraded === true), 'each record is marked degraded so consumers can refuse degraded trust')
+  assert.equal(seen.last?.payload.taskId, 'task-3', 'last-wins keeps the physically last record, lastBaselineDigest\'s rule')
+})
+
+test('VerifiedChainView.markers: the sinceLine epoch window and the mixed-generation rule', async () => {
+  const fs = MemoryFs.of({})
+  const clock = new FakeClock()
+  const log = '/ws/.proof/evidence.jsonl'
+  const store = new EvidenceStore(fs, log, '/ws/.proof/baseline.json', clock)
+  await store.mark('proof/verified', { grade: 'proven', gen: 1 })
+  const boundary = (await fs.readLines(log)).length // the generation boundary callers anchor on
+  await store.mark('proof/verified', { grade: 'stale', gen: 2 })
+
+  const view = createVerifiedView(store)
+  const all = await view.markers('proof/verified')
+  assert.equal(all.records.length, 2)
+  const since = await view.markers('proof/verified', { sinceLine: boundary })
+  assert.equal(since.records.length, 1, 'only markers at or after the boundary line are in the window')
+  assert.equal(since.records[0]?.payload.gen, 2)
+  assert.equal(since.last?.payload.gen, 2, 'last is last-wins within the window')
+
+  // Mixed generations: a suspect marker inside the window is EXCLUDED (not
+  // fallen back for) whenever the label has any non-suspect marker at all —
+  // the fallback is a property of the log's generation, not of the window.
+  const lines = await fs.readLines(log)
+  const prev = lineDigest(lines[lines.length - 1] as string)
+  const twin = JSON.stringify({
+    v: 2, kind: 'marker', at: '2026-10-05T00:00:00.000Z', prev,
+    payload: { label: 'proof/verified', grade: 'proven', gen: 2, headRef: '00'.repeat(32) },
+  })
+  fs.mutate(log, `${[...lines, twin].join('\n')}\n`)
+  const afterTwin = await view.markers('proof/verified', { sinceLine: boundary })
+  assert.deepEqual(afterTwin.records.map(r => r.payload.gen), [2], 'the twin stays out: a trusted generation excludes, never degrades')
+  assert.equal(afterTwin.degraded, false)
 })

@@ -1,18 +1,20 @@
 /**
  * OpenCode host adapter — the three things the MCP tool face cannot do alone.
  *
- * OpenCode consumes dsh-proof's five verification tools (`proof_status`,
- * `proof_baseline`, `proof_verify`, `proof_claim`, `proof_bundle`) through the
- * MCP server configured in `opencode.json` (see `examples/opencode.json`).
- * What MCP cannot give it is host-side enforcement, so this plugin hooks the
- * OpenCode plugin API for exactly three jobs:
+ * OpenCode consumes dsh-proof's verification tools — the thirteen frozen MCP
+ * names of the APP/1.4 contract (`MCP_TOOLS` in src/app/mcp-server.ts; the
+ * five-name APP/1.0 roster of proof_status/baseline/verify/claim/bundle grew
+ * eight more since) — through the MCP server configured in `opencode.json`
+ * (see `examples/opencode.json`). What MCP cannot give it is host-side
+ * enforcement, so this plugin hooks the OpenCode plugin API for exactly three
+ * jobs:
  *
  *   1. `tool.execute.before` — the front door: evidence-store guard + baseline
  *      gate (the same two gates the DSH adapter installs on `tools/pre-execute`).
  *   2. `tool.execute.after`  — post-observation: which files tool calls actually
  *      moved, fingerprinted for drift detection (provenance).
  *   3. `chat.params`         — policy injection: the `proof:policy` section plus
- *      the five MCP tool names, appended to the assembled chat parameters.
+ *      the MCP tool names, appended to the assembled chat parameters.
  *
  * The OpenCode plugin API is explicitly still evolving (upstream warns about
  * breaking changes), so the core design principle here is **runtime
@@ -45,7 +47,10 @@
  *     approval) cannot be expressed in OpenCode's before hook, so `ask` and
  *     `deny` both hold the call; `deny` additionally marks the reason as a
  *     refusal. There is no approval round-trip on this host — a held call is
- *     held, and the reason tells the model what to do instead.
+ *     held, and the reason tells the model what to do instead. The one carve-
+ *     out is the trusted MCP face: `proof_*` tool names never enter the
+ *     baseline ladder (see {@link isProofMcpToolName}), because holding the
+ *     only tool that can establish a baseline is a deadlock, not a gate.
  *
  * @module dsh-proof/adapters/opencode/plugin
  */
@@ -115,6 +120,13 @@ export interface OcAdapterEnv {
    * permanent exemption.
    */
   readonly surfacedDrift: Set<string>
+  /**
+   * W12-M4: has the "before payload shape not recognized" stderr line been
+   * spent for this plugin lifetime? The same unrecognized shape repeats on
+   * every call; the contract is ONE line, not one per call. Mutable state on
+   * an otherwise readonly record — same licence as `hasBaseline`.
+   */
+  shapeDriftWarned?: boolean
 }
 
 function normalizeStore(value: string | undefined): 'host' | 'workspace' {
@@ -136,8 +148,21 @@ const defaultReadFile = async (abs: string): Promise<string | undefined> => {
 }
 
 const defaultStderr = (line: string): void => {
-  process.stderr.write(`${line}\n`)
+  // W12-L11: a host that already closed its stderr pipe turns every write
+  // into a throw (or, async, an 'error' event) — a diagnostics sink must
+  // never take the handler down with it.
+  try {
+    process.stderr.write(`${line}\n`)
+  } catch {
+    /* nothing further to do */
+  }
 }
+// Same rule for the asynchronous arm: an unhandled 'error' event on stderr
+// would crash the host process for nothing the host can use. One no-op
+// listener, registered once at module load (this plugin shares the host's
+// process — the listener changes nothing except "unhandled" becoming
+// "handled"). Mirrors entry.ts's stdout/stderr posture on the Claude Code side.
+process.stderr.on('error', () => { /* the pipe is gone; nothing left to say */ })
 
 /**
  * Assemble the adapter environment. Environment variables honor the SAME
@@ -179,6 +204,7 @@ export function ocAdapterEnv(options: OcAdapterOptions, cwd: string): OcAdapterE
     stderr: options.stderr ?? defaultStderr,
     hasBaseline: false,
     surfacedDrift: new Set<string>(),
+    shapeDriftWarned: false,
   }
 }
 
@@ -226,12 +252,88 @@ export function guessToolCall(input: unknown): GuessedToolCall {
   }
 }
 
+/**
+ * Trusted-MCP-face test (W20-H4 / W12-F3): is this tool name one of dsh-proof's
+ * own `proof_*` MCP tools?
+ *
+ * CONTRACT with the observe classifier (G5's domain, src/dsh/observe.ts):
+ * `isMutationToolName` is being taught that `proof_`-prefixed names are NOT
+ * mutations — the MCP tools write through the server process, never through
+ * host tool arguments, so the mutation charge buys nothing there. Until (and
+ * after — this arm is the defense-in-depth) that lands, THIS consumer exempts
+ * them from the baseline ladder itself: `decidePreToolUse` is handed
+ * `hasBaseline: undefined` ("unknown") for a proof_* call, and the ask rule
+ * (rule 2) never fires on "unknown". The DENY arms (evidence-store guard,
+ * shell sweep) stay fully armed — the exemption opens the rescue hatch, not
+ * the door.
+ *
+ * Why the exemption must exist at all: on OpenCode the before hook sees EVERY
+ * tool call (no matcher), and `ask`/`deny` both HOLD. Under
+ * `requireBaseline:'ask'` with no baseline, `proof_baseline` itself was held
+ * by a gate whose hold reason said "Establish one first with the proof_baseline
+ * MCP tool" — the remedy held itself, and the agent could never self-rescue
+ * (only a human writing a baseline file outside the tools would release it,
+ * and in workspace mode even that route is command-swept). Claude Code does
+ * not deadlock this way (`ask` there is a real approval round-trip, and the
+ * example matchers keep MCP names out of the hook), which is why this fix is
+ * OpenCode-side only.
+ *
+ * Name matching: OpenCode spells MCP tools by their server-declared name
+ * (`proof_baseline`); a host that namespaces imported tools (Claude Code's
+ * `mcp__proof__proof_baseline`) carries the server-declared name as the last
+ * `__`-separated segment, so both spellings are honored.
+ */
+export function isProofMcpToolName(name: string): boolean {
+  const lastSegment = name.toLowerCase().split('__').at(-1) ?? ''
+  return lastSegment.startsWith('proof_')
+}
+
+/** A short, safe hint about an unrecognized payload's shape (keys or typeof) — diagnostic text only. */
+function payloadShapeHint(input: unknown): string {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) return typeof input
+  const keys = Object.keys(input).join(',')
+  return keys.length > 80 ? `${keys.slice(0, 80)}…` : keys
+}
+
+/**
+ * Host-render sanitization for any model-facing hold/block text (W12-M1).
+ *
+ * Drift narratives embed workspace FILE NAMES — attacker-controllable data —
+ * and a POSIX file name may legally contain newlines, so a crafted name used
+ * to arrive inside an authoritative-voice hold as its own forged instruction
+ * line. At this render point the text is one flat string, so the honest fix
+ * is structural: every original newline becomes a visible ' | ' separator (a
+ * forged "instruction line" can no longer occupy a line of its own), other
+ * C0 control characters and DEL are dropped, and any single over-long
+ * segment (a padded payload) is capped. The producing side (observe.ts's
+ * driftNarrative) is the classifier owner's domain; this is the host's
+ * defense-in-depth render rule. Mirrored in adapters/claude-code/hooks.ts —
+ * keep the two in lockstep.
+ */
+const HOST_RENDER_SEGMENT_CAP = 200
+
+export function sanitizeBlockForModel(text: string): string {
+  return text
+    .split(/\r?\n/)
+    .map(segment => {
+      const clean = segment.replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, '').trim()
+      return clean.length > HOST_RENDER_SEGMENT_CAP ? `${clean.slice(0, HOST_RENDER_SEGMENT_CAP)}…` : clean
+    })
+    .filter(segment => segment.length > 0)
+    .join(' | ')
+}
+
 // ---------------------------------------------------------------------------
 // Handlers — separated from registration so each is directly testable
 // ---------------------------------------------------------------------------
 
-function driftKey(drift: { readonly drifted: readonly string[] }): string {
-  return drift.drifted.join('\x00')
+function driftKey(drift: { readonly drifted: readonly string[]; readonly staleReads: readonly string[] }): string {
+  // W12-L6: staleReads join the fingerprint. staleReads ⊆ drifted, so the
+  // same drifted set can evolve from stale=[] to stale≠[] — a MORE severe
+  // narrative (the stale-reads section leads) — and the second hold must not
+  // be silently spent by the first. The \x01 separator keeps the two halves
+  // unforgeable by any path content (\x00 is the in-list separator).
+  return `${drift.drifted.join('\x00')}\x01${drift.staleReads.join('\x00')}`
 }
 
 /**
@@ -251,6 +353,22 @@ function driftKey(drift: { readonly drifted: readonly string[] }): string {
  */
 export async function ocBeforeHandler(env: OcAdapterEnv, input: unknown): Promise<{ block?: string } | undefined> {
   const call = guessToolCall(input)
+  if (call.tool === undefined) {
+    // W12-M4 (the M-40 family's silent twin): a payload that ARRIVED but whose
+    // tool name no spelling guess recognizes is a shape drift — the gate is
+    // idle for such calls while registration, log and posture all look
+    // healthy. "Registered, healthy, door open" is exactly the silent failure
+    // the duck-typing discipline ("every degradation says one stderr line")
+    // forbids. Once per plugin lifetime: the same shape repeats every call,
+    // and the contract is one line, not one per call. Behavior is unchanged —
+    // the call still passes through; only the silence was wrong.
+    if (env.shapeDriftWarned !== true) {
+      env.shapeDriftWarned = true
+      env.stderr(`dsh-proof: before payload shape not recognized (${payloadShapeHint(input)}); `
+        + 'the gate is idle for this call — if this persists, this OpenCode version moved the tool name '
+        + 'out of every spelling the adapter guesses')
+    }
+  }
   if (call.tool === undefined && call.sessionId === undefined) return undefined
 
   // (1) drift + one-time notices, ahead of the gate — advisory: a broken
@@ -329,7 +447,20 @@ export async function ocBeforeHandler(env: OcAdapterEnv, input: unknown): Promis
       } catch {
         /* keep the cached flag; a failed stat is not a policy input */
       }
-      const decision = decidePreToolUse(call.tool, call.args, env.paths.root, env.gate, env.hasBaseline)
+      // W20-H4: the trusted MCP face never enters the baseline ladder —
+      // `hasBaseline: undefined` means "unknown", and rule 2 only fires on
+      // `=== false`. The deny arms inside decidePreToolUse stay armed (see
+      // isProofMcpToolName for the contract with the observe classifier).
+      // Without this, requireBaseline:'ask' held proof_baseline itself, and
+      // the hold reason told the model to call the tool it had just been
+      // denied — a deadlock only a human could break.
+      const decision = decidePreToolUse(
+        call.tool,
+        call.args,
+        env.paths.root,
+        env.gate,
+        isProofMcpToolName(call.tool) ? undefined : env.hasBaseline,
+      )
       if (decision.action === 'deny') gateBlock = `denied — ${decision.reason}`
       else if (decision.action === 'ask') gateBlock = decision.reason
     } catch (error) {
@@ -419,18 +550,45 @@ export async function ocTurnEndHandler(env: OcAdapterEnv, sessionId: string | un
 // Prompt injection
 // ---------------------------------------------------------------------------
 
-/** One-line blurbs for the five frozen MCP tool names (APP/1.0 contract). */
+/**
+ * One-line blurbs for the frozen MCP tool names (APP/1.4 contract — thirteen
+ * tools; the list itself is `MCP_TOOLS`, the single source this map only
+ * decorates; an unblurbed name still renders, as its bare self).
+ */
 const TOOL_BLURB: Record<string, string> = {
   proof_status: 'read the current proof state — baseline? discovered checks? chain intact?',
   proof_baseline: 'establish or refresh the verification baseline, before the first edit',
   proof_verify: 're-run the objective checks this change set made stale; a check that passed at baseline and now fails is YOUR regression',
   proof_claim: 'state the exact completion claim and prove it in one call; proven only when nothing regressed',
   proof_bundle: 'export the tamper-evident evidence bundle for audit or hand-off',
+  proof_publish: 'publish the latest signed checkpoint to the public transparency log, minting a signed tree head over it',
+  proof_log_verify: 'audit the public log — root recompute, inclusion and consistency proofs; nothing the caller asserts is trusted',
+  proof_delegate: 'ORCHESTRATOR: delegate work as a signed obligation on the responsibility DAG; returns the taskId and the worker handoff text',
+  proof_delegate_submit: 'WORKER: submit your exported proof_bundle for a delegated task; the bundle is adjudicated from its own bytes',
+  proof_task: 'ORCHESTRATOR: inspect the responsibility DAG — whole-graph overview, or one task\'s composed verdict',
+  proof_training_export: 'export the workspace\'s machine-verified behavior data as a training dataset (privacy tier defaults to private)',
+  proof_economics: 'read what the last rate-carded verification COST, replayed verbatim off the chain\'s own boundary marker',
+  proof_sla_quote: 'price an SLA over a verification grade — the insurance reading of residual risk (proven: offer; regressed: refused)',
+}
+
+/**
+ * The concrete spelling of "the evidence store" for the DETECTED self-check,
+ * derived from the adapter's own paths (W12-M2) — never hardcoded. Workspace
+ * mode names the workspace-relative file the model can actually attempt; host
+ * mode names the absolute store under the trust root (a relative write there
+ * is not a store write at all, so the check must spell the absolute path —
+ * and that is exactly the absolute-path write the H-26 arm denies).
+ */
+function evidenceSelfCheckPath(paths: ProofPaths): string {
+  if (paths.evidenceStore === 'workspace') {
+    return paths.evidenceDir === '' ? 'evidence.jsonl in the workspace root' : `${paths.evidenceDir}/evidence.jsonl`
+  }
+  return paths.logPath
 }
 
 /**
  * The system-prompt addition: the canonical `proof:policy` section plus the
- * host-specific note that the five proof tools ride an MCP server here.
+ * host-specific note that the proof tools ride an MCP server here.
  * Injected through `chat.params` when that seam exists; exported regardless
  * so an e2e harness can assert what WOULD be injected.
  */
@@ -445,10 +603,18 @@ export function buildSystemPromptAddition(env: OcAdapterEnv): string {
   })
   const lines: string[] = [
     policy,
+    // W12-M15: the policy line above says "no objective checks are
+    // discovered in this workspace" — true of what THIS ADAPTER can see
+    // (nothing: discovery is the engine's, behind the MCP tools). Without
+    // this qualifier a model in a repo full of check scripts would take the
+    // line as a workspace fact and skip the baseline or go edit
+    // package.json.
+    'Check discovery does not run in this host adapter — the line above is the adapter\'s view, not the '
+    + 'workspace\'s. Ask `proof_status` for the live discovered set before concluding the workspace declares no checks.',
     '',
     '## Proof tools on this host (OpenCode + MCP)',
     '',
-    'This workspace runs the dsh-proof MCP server. Five tools, frozen contract:',
+    `This workspace runs the dsh-proof MCP server. ${MCP_TOOLS.length} tools, frozen contract (APP/1.4):`,
     ...MCP_TOOLS.map(name => `- \`${name}\` — ${TOOL_BLURB[name] ?? name}`),
     '',
     'Before editing: `proof_baseline`. Before saying work is done: `proof_claim` — a prose assertion is not evidence.',
@@ -456,7 +622,8 @@ export function buildSystemPromptAddition(env: OcAdapterEnv): string {
     '',
     'Enforcement wiring: the gates above ride host plugin hooks (tool.execute.before / after) that this prompt '
     + 'cannot verify are registered — plugin wiring supplied by the repository travels with the repository. '
-    + 'Treat enforcement as DETECTED, not guaranteed: if a write into the evidence store (.proof/evidence.jsonl) '
+    + 'Treat enforcement as DETECTED, not guaranteed: if a write into the evidence store '
+    + `(${evidenceSelfCheckPath(env.paths)}) `
     + 'is not held, report the guard as absent instead of assuming oversight.',
   ]
   return lines.join('\n')
@@ -531,7 +698,11 @@ export function createOpencodePlugin(options: OcAdapterOptions = {}): (ctx: unkn
           // OpenCode's before-hook interception shape is not stable across
           // releases; `{ error: { message } }` is the most commonly documented
           // form. The stderr line above covers hosts that report differently.
-          return { error: { message: decision.block } }
+          // W12-M1: the message is sanitized at this render point — drift
+          // narratives embed workspace file names (attacker-controllable;
+          // POSIX names may contain newlines), and the hold text speaks with
+          // the plugin's authoritative voice.
+          return { error: { message: sanitizeBlockForModel(decision.block) } }
         }
         return undefined
       } catch (error) {
@@ -541,7 +712,7 @@ export function createOpencodePlugin(options: OcAdapterOptions = {}): (ctx: unkn
         // adapter's `ask` on internal error. Hold, say why, fail closed.
         const message = `denied — dsh-proof: gate internal error (${errorMessage(error)}); the call is held rather than waved through`
         stderr(`dsh-proof: before hook failed; holding the call (${errorMessage(error)})`)
-        return { error: { message } }
+        return { error: { message: sanitizeBlockForModel(message) } }
       }
     }
 
@@ -569,7 +740,18 @@ export function createOpencodePlugin(options: OcAdapterOptions = {}): (ctx: unkn
         if (typeof record.system === 'string') {
           record.system = record.system.length > 0 ? `${record.system}\n\n${addition}` : addition
         } else if (Array.isArray(record.system)) {
-          record.system = [...record.system, addition]
+          // W12-L13: hosts assemble `system` either as plain strings or as
+          // part objects ({type:'text',…}). Appending a bare string to a
+          // parts array could be silently dropped by the host — the policy
+          // evaporating without a sound. Probe the element shape: an all-
+          // objects array gets a text PART; everything else (all strings,
+          // mixed, empty — no signal) keeps the historical string append.
+          const parts = record.system
+          const allParts = parts.length > 0
+            && parts.every(p => typeof p === 'object' && p !== null && !Array.isArray(p))
+          record.system = allParts
+            ? [...parts, { type: 'text', text: addition }]
+            : [...parts, addition]
         }
         // No recognizable `system` member: leave the parameters untouched
         // rather than inventing a key the host might not read.

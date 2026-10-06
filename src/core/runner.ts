@@ -177,6 +177,14 @@ export class VerificationRunner {
     const controller = new AbortController()
     const onAbort = () => controller.abort()
     signal?.addEventListener('abort', onAbort, { once: true })
+    // W15-L8(a): registration and check are one atomic step. An outer signal
+    // that aborted BETWEEN the worker-loop's top-of-iteration check and this
+    // registration never fires the listener (an aborted signal is silent to
+    // new subscribers), the inner controller the port sees never aborts, and
+    // the check ran to its own full timeout as ordinary evidence instead of
+    // `aborted`. Re-checking synchronously here closes the window: the signal
+    // either fires the listener or is already set — never neither.
+    if (signal?.aborted) controller.abort()
     try {
       const result = await this.commands.run(spec.command, {
         // Monorepo checks execute inside the subpackage that declares them;
