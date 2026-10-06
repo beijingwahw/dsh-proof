@@ -21,7 +21,7 @@ dsh plugin --profile web add ./dsh-proof      # from a local checkout
 
 📖 **[中文文档](./README.zh.md)** — full gap analysis, architecture and configuration reference.
 
-As of v0.14 the core is more than a plugin: it is an open standard plus a standalone server. The **Agent Proof Protocol (APP/1.0)** — see **[PROTOCOL.md](./PROTOCOL.md)** — pins the vocabulary, the content addressing, the signed chain and a portable bundle exchange format, and the package ships a **Proof MCP Server**: any agent on any harness (Claude Desktop, Cursor, anything speaking MCP) can call `proof_verify` against a workspace that has never installed DSH.
+As of v0.15 the core is more than a plugin: it is an open standard, a standalone server, and host adapters — common infrastructure for any agent. The **Agent Proof Protocol (APP/1.0)** — see **[PROTOCOL.md](./PROTOCOL.md)** — pins the vocabulary, the content addressing, the signed chain and a portable bundle exchange format; the package ships a **Proof MCP Server** (any agent on any harness — Claude Desktop, Cursor, anything speaking MCP — can call `proof_verify` against a workspace that has never installed DSH) and, since v0.15, **host adapters** for Claude Code and OpenCode that enforce, at the tool-call seam, what no server can.
 
 ---
 
@@ -226,6 +226,66 @@ The server reads **no `cordis.yml`** — every knob is an environment variable: 
 
 Note: the testimony and synthesis tools are deliberately **not** on the MCP face — `proof_jury`, `proof_endorse` and `proof_conjure` need a host-held human approval seam and session context an open server cannot assume; those live in the DSH plugin, where the approval prompt belongs to the host.
 
+## Host adapters (v0.15): common infrastructure for every agent
+
+v0.14 made the verification core *speakable* by any harness; v0.15 completes the repositioning from "a plugin for DSH" to **common infrastructure for every agent**. Any host now integrates on three faces, each doing only what it can: the **tools face** is `dsh-proof-mcp` — the MCP server above, five frozen tools, nothing else required; the **enforcement face** is a host adapter — the pre-tool gate (the evidence-store guard as a hard `deny`, the baseline gate as `ask`/`warn`), post-tool observation (which files tool calls actually moved, fingerprinted at observation time — provenance), and turn/drift detection at the turn boundary (files changed outside the tool stream are intercepted and named, plus one-shot baseline/verify reminders); the **context face** is injection (SessionStart / `chat.params`) of the `proof:policy` section and the tool guidance, so the model knows the rules before its first mistake. A tool server can run checks; it cannot hold a tool call, watch one land, or stop a turn — that gap is exactly what the adapter layer fills.
+
+`src/adapters/shared/` is the host-agnostic core, three modules. **`paths.ts`** derives every artifact location (log, baseline, anchor, session dir) by mirroring the engine's private derivations verbatim — adapter hooks and the MCP server never share an address space (every hook invocation is its own process), so byte-parity of the derivation rules is the only way both sides agree on where the evidence lives — and it closes the H10 hole the DSH adapter never did: the evidence-store guard here compares paths case-insensitively (on Windows `.PROOF/evidence.jsonl` names the same file as `.proof/evidence.jsonl`; an over-deny costs one blocked call, an under-deny costs the chain). **`session.ts`** re-expresses the DSH watcher as a serialisable snapshot — touched/read/fingerprints as load-apply-save values with atomic persistence, because "one long-lived object per plugin" is a home DSH gives you and a per-hook process model is not; the drift rules mirror `observe.ts` case for case. **`gates.ts`** holds the three decisions every host needs as pure functions (pre-tool, baseline probe, turn-end evaluation), mirroring the DSH adapter's semantics where they transfer and deviating deliberately where a real host seam is stronger — a genuine `deny`, not just an `ask`.
+
+Two adapters ship. The **Claude Code adapter** is the `dsh-proof-cc` bin (`dsh-proof-cc <pre-tool-use|post-tool-use|stop|session-start>`), wired through `.claude/settings.json` hooks ([examples/claude-code.settings.json](./examples/claude-code.settings.json) is paste-ready): PreToolUse answers as a `permissionDecision` of `ask`/`deny`, Stop answers `{decision:'block'}` with the reason fed back to the model (drift re-arms every stop; the baseline/verify reminders are one-shot per session), SessionStart injects `additionalContext`; the tool face rides `claude mcp add proof -- dsh-proof-mcp`. The **OpenCode adapter** is a plugin (`lib/adapters/opencode/plugin.js`, named in `opencode.json`'s `plugin` array) that duck-types its surfaces at runtime — `tool.execute.before/after` plus `chat.params` — and degrades gracefully while that API keeps evolving: a surface that does not probe into a known shape stays idle with one stderr line, and the MCP tools keep working regardless. OpenCode has no Stop hook, so drift is anchored at the **next tool call** (the first call after external changes is held with the drift narrative; each distinct drift set surfaces at most once per plugin lifetime), and a held call takes the `{error:{message}}` shape. Known blind spots, stated honestly: paths inside a shell command string cannot be extracted on *any* host (DSH included) — shell-made changes fall back to drift detection — and OpenCode has no turn-end seam at all. Tests 424 → 493 (`test/24-adapters-shared` 27 — derivation parity against a real engine, the case-variant hole, session-as-value, atomic persistence; `test/25-cc` 23 — handlers over real directories plus the real protocol over **real subprocesses**; `test/26-opencode` 19 — the duck-typing matrix, the next-call drift anchor, hostile contexts that must never throw into the host); `src/adapters/` adds three directories — `shared/`, `claude-code/`, `opencode/`.
+
+### Adapters: Claude Code & OpenCode
+
+The MCP quickstart above gives any host the five tools. What MCP cannot give is enforcement — holding a tool call, observing what it moved, stopping a turn — so v0.15 ships two host adapters.
+
+**Claude Code** — register the tool face once per project, then paste the hooks object into `.claude/settings.json` (project) or `~/.claude/settings.json` (user); the full file with matchers, every documented knob and a comment block lives at [examples/claude-code.settings.json](./examples/claude-code.settings.json):
+
+```sh
+claude mcp add proof -- dsh-proof-mcp
+```
+
+```json
+{
+  "hooks": {
+    "PreToolUse":  [{ "matcher": ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"],
+                      "hooks": [{ "type": "command", "command": "dsh-proof-cc pre-tool-use" }] }],
+    "PostToolUse": [{ "matcher": ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "Read"],
+                      "hooks": [{ "type": "command", "command": "dsh-proof-cc post-tool-use" }] }],
+    "Stop":        [{ "hooks": [{ "type": "command", "command": "dsh-proof-cc stop" }] }],
+    "SessionStart":[{ "hooks": [{ "type": "command", "command": "dsh-proof-cc session-start" }] }]
+  }
+}
+```
+
+**OpenCode** — merge into your project's `opencode.json` (full file at [examples/opencode.json](./examples/opencode.json)); from a checkout, run `npm run build` first and point `plugin` at the compiled file inside it:
+
+```json
+{
+  "plugin": ["dsh-proof/lib/adapters/opencode/plugin.js"],
+  "mcp": {
+    "proof": {
+      "type": "local",
+      "command": ["dsh-proof-mcp"],
+      "environment": { "DSH_PROOF_EVIDENCE_STORE": "host" }
+    }
+  }
+}
+```
+
+Both adapters (and the MCP server) are configured through the same environment variables, so gates and tools always guard the same store:
+
+| variable | meaning | default |
+|---|---|---|
+| `DSH_PROOF_ROOT` | workspace root to verify | the hook's cwd (the project dir) |
+| `DSH_PROOF_TRUST_DIR` | trust root — keys, anchors, adapter sessions | `$DSH_HOME/proof` |
+| `DSH_PROOF_EVIDENCE_STORE` | `host` (store outside the workspace) \| `workspace` (`.proof`, guarded) | `host` |
+| `DSH_PROOF_EVIDENCE_DIR` | workspace-relative evidence dir (workspace mode only) | `.proof` |
+| `DSH_PROOF_REQUIRE_BASELINE` | baseline gate: `off` \| `warn` \| `ask` | `warn` |
+| `DSH_PROOF_DRIFT` | `0` disables drift detection | on |
+| `DSH_PROOF_ENFORCE_TURN_END` | `0` disables the turn-end reminder | on |
+
+**Writing another adapter** — `src/adapters/shared/` *is* the adapter cookbook: `paths.ts` (where everything lives, engine-parity guaranteed), `session.ts` (observation as a value, one snapshot per session id) and `gates.ts` (the three decisions as pure functions). Host-specific code stays thin by design — translate your host's hook payload, call the shared functions, render your host's answer shape — and the two shipped adapters are the reference implementations: copy the one whose host looks like yours.
+
 ## Architecture
 
 ```
@@ -233,6 +293,7 @@ src/core/*      pure domain — zero @deepseek-ai/* imports, all I/O through por
 src/engine.ts   ProofEngine — the imperative façade hosts call
 src/dsh/*       thin Cordis adapter — tools, hooks, prompt section
 src/app/*       APP/1.0 open-standard layer — protocol constants, bundle, MCP server
+src/adapters/*  host adapters — shared host-agnostic core + Claude Code + OpenCode
 src/vendor/     contract snapshot pinned to dsh v0.2.1-alpha.1
 ```
 
@@ -243,12 +304,12 @@ The domain core is framework-free on purpose: it is fully unit-testable offline,
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit
-npm test              # 424 tests, node:test
+npm test              # 493 tests, node:test
 npm run build
 npm run bundle:check  # packaging contract self-check
 ```
 
-The suite includes a **real-shell integration test** (`test/07-integration.test.ts`): it builds a throwaway project, actually runs `npm run --silent test`, breaks something, and asserts the pipeline reports `regressed` with the offending file attributed. Since v0.14 it also includes a **real-subprocess MCP integration test** (`test/23-mcp.test.ts`): it spawns the server over stdio, handshakes, and drives the whole baseline → verify → status → bundle chain with real npm runs — nothing stubbed.
+The suite includes a **real-shell integration test** (`test/07-integration.test.ts`): it builds a throwaway project, actually runs `npm run --silent test`, breaks something, and asserts the pipeline reports `regressed` with the offending file attributed. Since v0.14 it also includes a **real-subprocess MCP integration test** (`test/23-mcp.test.ts`): it spawns the server over stdio, handshakes, and drives the whole baseline → verify → status → bundle chain with real npm runs — nothing stubbed. Since v0.15 the adapter layer has the same discipline (`test/24-26`): `24-adapters-shared` checks the adapter path derivations against where a **real engine** actually writes, `25-cc` drives the real Claude Code hook protocol over real subprocesses (one process per event, sharing only the session file), and `26-opencode` pins the duck-typed plugin surface including hostile contexts that must never throw into the host.
 
 ## Configuration
 
@@ -296,6 +357,8 @@ Every tunable is a `cordis.yml` field — no hardcoded knobs. See [README.zh.md 
 - The MCP face is the five conformance tools only (v0.14): `proof_jury`, `proof_jury_submit`, `proof_endorse`, `proof_conjure` and `proof_conjure_run` are deliberately not exposed over MCP — they lean on host-held seams (a human approval prompt, session context, an isolated deliberation model) an open server cannot assume. A client wanting testimony or synthesis runs the plugin inside DSH, where the approval seam lives.
 - Bundle verification is not a substitute for local audit (v0.14): a verifying party re-derives everything from the bundle's own bytes — file digests, chain linkage, per-record self-addressing, the baseline digest — but checkpoint signatures can be adjudicated only when the verifier holds (or is handed) the named key, and anchor monotonicity only when the anchor file is available. A missing adjudication capability is recorded as such, never rounded up to a forgery charge; an anchor-less bundle keeps its chain and addressing guarantees but loses rewind cover.
 - Checkpoint counts are normative as of v0.14 (H1): a checkpoint whose `count` is not a safe integer equal to the walked record count lands in `malformedCheckpoints` no matter who signed it, and the anchor comparison credits only checkpoints signed by the anchor's own key — a forged checkpoint (foreign keyId, inflated count) can no longer launder a truncation. The flip side is symmetric: an honest-but-buggy producer with a miscounted checkpoint is rejected the same way, and there is no override.
+- Shell command strings are a path blind spot on every host (v0.15): a `Bash`/shell tool names no structured path, so a command like `sed -i … src/a.ts` extracts nothing for provenance — DSH, Claude Code and OpenCode share this hole by design (mining a command line for path-shaped words would fingerprint noise). A shell-written file gets no fingerprint and no touch attribution; the safety net is drift detection, which still catches a shell changing a previously observed file (the bytes no longer match the recorded fingerprint). Only the attribution of *brand-new* shell-made files escapes — prefer Write/Edit for changes you want charged and attributed.
+- OpenCode has no turn-end seam (v0.15): with no Stop hook and an unstable event bus, drift and the one-time baseline/verify notices anchor on the next tool call instead — the first call after external changes is held with the drift narrative, and each distinct drift set surfaces at most once per plugin lifetime (an ignored message must not hold every future call). The `ask` decision cannot round-trip a user approval on this host either: `ask` and `deny` both hold the call, the reason saying what to do instead.
 - Checkpoint cadence leaves a window (v0.2): records after the last signed checkpoint are chain-covered but not checkpoint-covered. The window is bounded by `checkpointEvery`, closed at every baseline/verify/claim boundary, and *visible* — `proof_status` reports `tailRecords`, the count of records since the last checkpoint. The anchor protects against the audited agent, not against a fully compromised host.
 - On machines without the signing key, signed checkpoints cannot be adjudicated locally: the audit reports them as `unverifiableCheckpoints` (a missing capability, not a forgery charge — the audit does not fail on it; anchor count/head comparison still bounds rewind).
 - `proven` permits pre-existing red checks — they are reported prominently but not charged to the session. Deliberate, not a hole.

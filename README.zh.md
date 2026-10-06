@@ -20,7 +20,7 @@ dsh plugin --profile web add dsh-proof
 dsh plugin --profile web add ./dsh-proof
 ```
 
-v0.14 起，核心不再只是一个插件：它同时是一个开放标准加一台独立服务器。**Agent Proof Protocol（APP/1.0）**（见 **[PROTOCOL.md](./PROTOCOL.md)**）把词表、内容寻址、签名链与可携带的 bundle 交换格式固化为任何实现都能说的规范，包内并随附 **Proof MCP Server**——任何 harness 上的任何 agent（Claude Desktop、Cursor、一切会说 MCP 的宿主）都能对着一个从未装过 DSH 的工作区调 `proof_verify`。
+v0.15 起，核心不再只是一个插件：它是一个开放标准、一台独立服务器，加上宿主适配器——**所有 agent 的公共基础设施**。**Agent Proof Protocol（APP/1.0）**（见 **[PROTOCOL.md](./PROTOCOL.md)**）把词表、内容寻址、签名链与可携带的 bundle 交换格式固化为任何实现都能说的规范；包内随附 **Proof MCP Server**——任何 harness 上的任何 agent（Claude Desktop、Cursor、一切会说 MCP 的宿主）都能对着一个从未装过 DSH 的工作区调 `proof_verify`；v0.15 起另有 **Claude Code 与 OpenCode 宿主适配器**，在工具调用的缝隙上执行一台服务器永远做不到的强制。
 
 ---
 
@@ -223,7 +223,7 @@ v0.6 在 `normalizeOutput` 落地双层归一：**root → `$WORKSPACE`（先具
 
 **信任三态**。audit 的签名裁定从二态改为三态。旧逻辑在**没有 signer 的机器**上（密钥丢失、换机器审计）会把带签名的检查点误读成可疑；现在只有本机实际持有的密钥、面对点名该密钥的检查点，才有资格**驳斥**（`badCheckpoints`，真正的伪造指控）；本机无法裁定的（`unverifiableCheckpoints`）是**能力缺失而非指控**，不再使 audit 失败。锚文件自身的签名现在也会被验证（`anchorForged`），且锚携带 `workspaceKey`——审计可以仅凭锚文件重导出被签名的字节。
 
-**引擎的诚实边界**。git 不可用时（WorkspacePort 新可选能力 `gitAvailable?()`），每条 git 查询各自失败返回空集——"什么都看不见"曾被吞成"什么都没变"，增量选择悄悄缩成空。现在变更集显式标记 `degraded`，引擎**强制全量跑**并在 `VerifyOutcome.degraded` 透出。中止的基线不再落盘——abort 的基线曾照常写盘，之后的回归判定对着半成品真值运行；现在已观测的证据仍全部入链、落 `baseline/aborted` 标记、检查点窗口照常闭合，返回值携带 `aborted` 标志，下一次 verify 诚实报告 `no-baseline`。signer 加载失败大声降级：链内 `trust/signer-unavailable` marker + verbose 日志——静默降级与诚实的 unsigned 部署从此可区分。`requireBaseline: 'warn'` 从"配置了但没接线"变成真通知：本轮动了工作区而没有基线时，回合结束经 `agent.inject` 注入纠正性提示。死配置 `driftNoticeMs` 删除（配置降至 22 项，v0.9 增至 24 项，v0.10 增至 26 项，v0.11 增至 28 项，v0.12 增至 31 项，v0.13 增至 32 项，v0.14 维持 32 项——MCP 服务器不读配置，走环境变量，见 §五·十八）。
+**引擎的诚实边界**。git 不可用时（WorkspacePort 新可选能力 `gitAvailable?()`），每条 git 查询各自失败返回空集——"什么都看不见"曾被吞成"什么都没变"，增量选择悄悄缩成空。现在变更集显式标记 `degraded`，引擎**强制全量跑**并在 `VerifyOutcome.degraded` 透出。中止的基线不再落盘——abort 的基线曾照常写盘，之后的回归判定对着半成品真值运行；现在已观测的证据仍全部入链、落 `baseline/aborted` 标记、检查点窗口照常闭合，返回值携带 `aborted` 标志，下一次 verify 诚实报告 `no-baseline`。signer 加载失败大声降级：链内 `trust/signer-unavailable` marker + verbose 日志——静默降级与诚实的 unsigned 部署从此可区分。`requireBaseline: 'warn'` 从"配置了但没接线"变成真通知：本轮动了工作区而没有基线时，回合结束经 `agent.inject` 注入纠正性提示。死配置 `driftNoticeMs` 删除（配置降至 22 项，v0.9 增至 24 项，v0.10 增至 26 项，v0.11 增至 28 项，v0.12 增至 31 项，v0.13 增至 32 项，v0.14 维持 32 项——MCP 服务器不读配置，走环境变量，见 §五·十八；v0.15 亦维持 32 项——宿主适配器同样只走环境变量，见 §五·十九与 §五·二十）。
 
 **正确性收口（soundness closure）**。monorepo workspace 子包检查不再丢失：CheckSpec 新增 `cwd`（相对 root），子包检查真正在子包目录执行、id 含 cwd（cwd 缺省时 checkId 与旧格式逐字节一致），`packages/*` 单层 glob 现在真正展开——同 argv 的兄弟包检查不再互相顶替。影响图补盲：动态 `import('...')` 与多行 ESM import 现在产生边；Python dotted import（`pkg.mod`）在扫描集内尝试解析——多出的边只造成过选，绝不漏选。`git status --porcelain -z` 的 rename 条目解析修正（旧路径曾被截掉 3 个字符成为幻影路径；解析提为纯函数 `parsePorcelainZ`）。Windows 盘符绝对路径（`C:\...`）统一进路径域：observe 的 touched 归类、LSP root 前缀比较（大小写不敏感）、证据库守卫均修正。EvidenceStore 写入改单飞队列——并发的 append/mark/checkpoint 曾可能都链到同一个 tail，后一条的 `prev` 指向一条已不存在的行：**正确代码与它自己的竞态**。证据输出捕获改用 StringDecoder，多字节字符跨 chunk 边界不再碎成 U+FFFD。工程卫生：CI 改 `npm ci` 并加 windows 矩阵；`check-bundle` 错误路径不再崩溃；`untouchedChecks` 输出修正。
 
@@ -505,6 +505,66 @@ node --experimental-strip-types src/app/mcp-entry.ts
 
 注意：证词与合成工具**刻意不在 MCP 面上**——`proof_jury`、`proof_endorse`、`proof_conjure` 需要宿主持有的人工审批 seam 与会话上下文，开放服务器无法假设；它们留在 DSH 插件里，审批提示归宿主。
 
+## 五·十九、宿主适配器（v0.15.0）：所有 agent 的公共基础设施
+
+v0.14 让验证核心可以被任何 harness **说**；v0.15 补完定位升维——从「DSH 的一个插件」到**所有 agent 的公共基础设施**。任何宿主现在按三层接入，每层只做它做得动的事：**工具面 = `dsh-proof-mcp`**（上面的 MCP 服务器，五个冻结工具，仅此而已）；**执行面 = 宿主适配器**——pre 工具门（证据库守卫给出货真价实的 `deny`，基线门 `ask`/`warn`）、post 工具观察（工具调用实际动了哪些文件，观察时即留指纹——溯源）、回合/漂移检测（回合边界上拦截并点名工具流之外的改动，外加一次性的 baseline/verify 提醒）；**上下文面 = 注入**（SessionStart / `chat.params`）`proof:policy` 段落与工具指引——模型在第一次犯错之前就知道规则存在。工具服务器能跑检查；它拦不住一次工具调用、看不见调用落地、停不下一个回合——这道缝正是适配层补上的。
+
+`src/adapters/shared/` 是宿主无关核心，三个模块。**`paths.ts`** 逐字镜像 engine 的私有推导，导出适配器需要的全部工件位置（日志、基线、锚点、会话目录）——适配器钩子与 MCP 服务器不共享地址空间（每次钩子调用都是一个独立进程），双方对「证据住在哪」的一致，只能靠推导规则的字节级相同；并顺手关闭 DSH 适配器一直没关的 H10 洞：这里的证据库守卫按**大小写不敏感**比较路径（Windows 上 `.PROOF/evidence.jsonl` 与 `.proof/evidence.jsonl` 指同一个文件；多拦一次调用，好过放走整条证据链）。**`session.ts`** 把 DSH 的观察器重写为可序列化快照——touched/read/指纹以 load-apply-save 的值形态存在、原子化落盘，因为「每个插件一个长寿对象」是 DSH 给你的家，逐钩子独立进程的宿主没有；漂移规则与 `observe.ts` 逐 case 对齐。**`gates.ts`** 把每个宿主都需要的三种判定收为纯函数（pre 工具、基线探测、回合结束评估），语义在能迁移处镜像 DSH 适配器、在宿主 seam 更强处刻意偏离——真实的 `deny`，而不只是 `ask`。
+
+本版随附两个适配器。**Claude Code 适配器**是 `dsh-proof-cc` bin（`dsh-proof-cc <pre-tool-use|post-tool-use|stop|session-start>`），经 `.claude/settings.json` 钩子接线（[examples/claude-code.settings.json](./examples/claude-code.settings.json) 可直接粘贴）：PreToolUse 以 `permissionDecision` 的 `ask`/`deny` 应答，Stop 以 `{decision:'block'}` 应答、理由喂回模型（漂移每次 stop 重新武装，baseline/verify 提醒每会话一次性），SessionStart 注入 `additionalContext`；工具面经 `claude mcp add proof -- dsh-proof-mcp` 登记。**OpenCode 适配器**是一个 plugin（`lib/adapters/opencode/plugin.js`，由 `opencode.json` 的 `plugin` 数组点名），运行时鸭子类型探测自己的接入面——`tool.execute.before/after` 加 `chat.params`——并在该 API 持续演进期间优雅降级：探测不成已知形状的面留空、打一行 stderr，MCP 工具照常工作。OpenCode 没有 Stop 钩子，漂移锚定在**下一次工具调用**（外部改动后的第一个调用被持起并给出漂移叙事；每个不同漂移集每个插件生命周期至多浮出一次），持起形态为 `{error:{message}}`。已知盲区，如实说明：shell 命令字符串里的路径在任何宿主上都**不可提取**（DSH 也一样）——shell 造成的改动靠漂移检测兜底；OpenCode 没有回合结束 seam。测试 424 → 493（`test/24-adapters-shared` 27 例——对真实 engine 的推导字节对齐、大小写变体洞、会话即值、原子落盘；`test/25-cc` 23 例——真实目录上的处理器 + **真实子进程**上的真实协议；`test/26-opencode` 19 例——鸭子类型矩阵、下次调用漂移锚点、绝不向宿主抛异常的敌意上下文）；`src/adapters/` 新增三个目录——`shared/`、`claude-code/`、`opencode/`。
+
+## 五·二十、适配器快速上手：Claude Code 与 OpenCode
+
+上面的 MCP 快速上手给了任何宿主五个工具。MCP 给不了的是强制——拦住一次工具调用、观察它动了什么、停下一个回合——所以 v0.15 随附两个宿主适配器。
+
+**Claude Code**——每项目登记一次工具面，然后把 hooks 对象粘贴进 `.claude/settings.json`（项目级）或 `~/.claude/settings.json`（用户级）；带 matcher、全部可配置项与注释块的完整文件在 [examples/claude-code.settings.json](./examples/claude-code.settings.json)：
+
+```sh
+claude mcp add proof -- dsh-proof-mcp
+```
+
+```json
+{
+  "hooks": {
+    "PreToolUse":  [{ "matcher": ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"],
+                      "hooks": [{ "type": "command", "command": "dsh-proof-cc pre-tool-use" }] }],
+    "PostToolUse": [{ "matcher": ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "Read"],
+                      "hooks": [{ "type": "command", "command": "dsh-proof-cc post-tool-use" }] }],
+    "Stop":        [{ "hooks": [{ "type": "command", "command": "dsh-proof-cc stop" }] }],
+    "SessionStart":[{ "hooks": [{ "type": "command", "command": "dsh-proof-cc session-start" }] }]
+  }
+}
+```
+
+**OpenCode**——合并进项目的 `opencode.json`（完整文件见 [examples/opencode.json](./examples/opencode.json)）；从检出目录接入请先 `npm run build`，再把 `plugin` 指向检出目录里的编译产物：
+
+```json
+{
+  "plugin": ["dsh-proof/lib/adapters/opencode/plugin.js"],
+  "mcp": {
+    "proof": {
+      "type": "local",
+      "command": ["dsh-proof-mcp"],
+      "environment": { "DSH_PROOF_EVIDENCE_STORE": "host" }
+    }
+  }
+}
+```
+
+两个适配器（连同 MCP 服务器）都经同一组环境变量配置，门与工具永远守同一份证据库：
+
+| 环境变量 | 含义 | 默认 |
+|---|---|---|
+| `DSH_PROOF_ROOT` | 要验证的工作区根 | 钩子进程的 cwd（即项目目录） |
+| `DSH_PROOF_TRUST_DIR` | 信任根——密钥、锚点、适配器会话 | `$DSH_HOME/proof` |
+| `DSH_PROOF_EVIDENCE_STORE` | `host`（证据放工作区外）\| `workspace`（`.proof`，受守卫） | `host` |
+| `DSH_PROOF_EVIDENCE_DIR` | 工作区相对证据目录（仅 workspace 模式） | `.proof` |
+| `DSH_PROOF_REQUIRE_BASELINE` | 基线门：`off` \| `warn` \| `ask` | `warn` |
+| `DSH_PROOF_DRIFT` | `0` 关闭漂移检测 | 开 |
+| `DSH_PROOF_ENFORCE_TURN_END` | `0` 关闭回合结束提醒 | 开 |
+
+**再写一个适配器**——`src/adapters/shared/` 本身就是适配器 cookbook：`paths.ts`（一切工件住在哪，engine 字节对齐保证）、`session.ts`（观察即值，每个会话 id 一份快照）、`gates.ts`（三种判定的纯函数）。宿主特定代码刻意保持薄——翻译你宿主的钩子载荷、调用共享函数、渲染你宿主的应答形状——已随附的两个适配器就是参考实现：哪个宿主长得像你的，就抄哪个。
+
 ---
 
 ## 六、架构：领域核心 + 薄适配层
@@ -547,17 +607,31 @@ dsh-proof/
 │   │   ├── mcp-server.ts     # 手写 MCP JSON-RPC 2.0 服务器（恰好 5 工具，零新增依赖）
 │   │   ├── mcp-entry.ts      # 独立进程入口：环境变量装配引擎，stdio 收发
 │   │   └── index.ts          # 桶导出（protocol + bundle + MCP 契约，供 lib 使用方）
+│   ├── adapters/             ← 宿主适配层（三目录七文件，零 @deepseek-ai/* 依赖）
+│   │   ├── shared/           # 宿主无关核心：paths / session / gates
+│   │   │   ├── paths.ts      # 工件位置推导（与 engine 逐字镜像；证据库守卫关 H10 大小写洞）
+│   │   │   ├── session.ts    # 可序列化会话快照（逐钩子独立进程的观察语义；原子落盘）
+│   │   │   └── gates.ts      # 纯函数门：pre 工具（deny/ask）+ 基线探测 + 回合结束评估
+│   │   ├── claude-code/      # Claude Code 钩子适配器
+│   │   │   ├── entry.ts      # dsh-proof-cc bin：<pre-tool-use|post-tool-use|stop|session-start>
+│   │   │   └── hooks.ts      # 四个钩子处理器（许可决策/溯源观察/漂移+一次性提醒/上下文注入）
+│   │   └── opencode/         # OpenCode 插件适配器
+│   │       ├── plugin.ts     # 运行时鸭子类型探测 tool.execute.before/after + chat.params，优雅降级
+│   │       └── vendor.ts     # 宿主 API 形状收窄器（探测不到 = 留空不炸宿主）
 │   └── vendor/dsh-tools.ts   # 契约快照（pinned to dsh v0.2.1-alpha.1）
-├── test/                     # 23 个测试文件（424 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心、类型化断言合约、证据分级 B/C、PTC 证据合成、覆盖感知证明、协议词表钉死、bundle 篡改矩阵、MCP 真子进程集成
+├── test/                     # 26 个测试文件（493 个测试）：真实 shell 集成、信任对抗、变更集溯源、LSP 影响融合、智能摘录、位置无关寻址、Node 适配层、runner 直测、贝叶斯调度核心、类型化断言合约、证据分级 B/C、PTC 证据合成、覆盖感知证明、协议词表钉死、bundle 篡改矩阵、MCP 真子进程集成、适配器共享层字节对齐、Claude Code 真子进程协议、OpenCode 鸭子类型降级
 ├── PROTOCOL.md               # Agent Proof Protocol (APP/1.0) 开放标准（英文规范，八节）
 ├── cordis.patch.yml          # bundle 层
-└── examples/cordis.yml       # --patch 本地调试
+└── examples/
+    ├── cordis.yml               # --patch 本地调试
+    ├── claude-code.settings.json # Claude Code 钩子接线（可粘贴进 .claude/settings.json）
+    └── opencode.json            # OpenCode 接入（plugin 数组 + mcp.local 配置）
 ```
 
 **为什么领域核心不碰 `@deepseek-ai/*`：**
 
 1. DSH 是开发者预览版，破坏性变更频繁。核心逻辑与 harness 版本解耦 → 升级不重写。
-2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，424 个测试全绿。
+2. **可测性**：`test/` 用内存 Fs、假命令端口、假时钟就能覆盖全部判定逻辑；`test/07-integration.test.ts` 再用**真实 shell** 跑一遍，493 个测试全绿。
 3. 同一个核心可以被别的宿主（CLI、CI、其他 harness）复用。
 
 **为什么 `vendor/dsh-tools.ts` 是契约快照而不是活依赖：**
@@ -656,7 +730,7 @@ DSH 官方原话：「一定会有破坏兼容性的变更」。把用到的契�
 ```sh
 npm install
 npm run typecheck     # tsc --noEmit，离线可跑
-npm test              # 424 个测试（node:test）
+npm test              # 493 个测试（node:test）
 npm run build         # 产出 lib/
 npm run bundle:check  # 打包契约自检
 ```
@@ -683,6 +757,9 @@ npm run bundle:check  # 打包契约自检
 - `21` —— **协议词表（APP/1.0）**：`src/app/protocol.ts` 的五张词表逐字钉死，并与核心实际产出交叉核对——verdict 对 `verdictOf` 全真值表、grade 对五个行为夹具、chain mode 对 `walkChain`、status 对决定性/非决定性划分；常量声称一个核心产不出的值、或核心长出一个常量没钉住的值，都必须在这里失败
 - `22` —— **bundle 篡改矩阵**：用真实 `EvidenceStore`（内存 Fs，`09` 同款 fakes）铸造诚实 bundle，再按伪造者的方式逐个攻击——改日志一字节、调包基线、虚报锚点、改写 manifest 方言（appFingerprint 不匹配即拒）；全程 MemoryFs，不碰真实磁盘
 - `23` —— **MCP 真子进程集成**：spawn `node --experimental-strip-types src/app/mcp-entry.ts`，经 stdio 上的换行分隔 JSON-RPC 2.0 驱动握手与协议版本协商、五工具契约、baseline → verify → status → bundle 全链（真实 `npm test`、真实证据、真实 Ed25519 链）与错误路径（未知工具、非法 kind、畸形 JSON 行）——零 stub，证明任何外来 harness 都能端到端驱动证明协议
+- `24` —— **适配器共享层（27 例）**：推导字节对齐的旗舰纪律——跑一个**真实 ProofEngine**，核对文件落点与 `deriveProofPaths` 所说分毫不差；H10 大小写变体洞（`.PROOF/evidence.jsonl` 守卫必须拦）、会话即值（观察/漂移/窗口推进）、跨进程原子持久化、pre 工具门与回合结束门的优先级矩阵
+- `25` —— **Claude Code 适配器（23 例）**：处理器单测（真实目录上的许可决策/观察落盘/漂移+一次性提醒/SessionStart 上下文）、入口**真子进程**（向 stdin 喂 JSON，断言单行 JSON 应答；post→mutate→stop 全程每步独立进程、只共享会话文件）、坏输入（不可解析的 PreToolUse 答 `ask`；未知事件名静默退出 0）；外加 `examples/claude-code.settings.json` 的纯 JSON 与 matcher 形状钉死
+- `26` —— **OpenCode 适配器（19 例）**：vendor 收窄矩阵、before 门的证据库守卫/ask 基线门/warn 默认放行、**漂移锚点**（无 Stop 钩子——after 观察到的漂移在下一次工具调用持起并点名文件）、after 观察跨三种真实载荷形状持久化、合成上下文上的注册与端到端持起（`{error:{message}}` 形态）、chat.params 注入、无面上下文降级为 no-op、抛异常/返回垃圾的注册器绝不炸宿主
 
 本地调试：
 
@@ -721,6 +798,8 @@ pnpm dsh web --patch /absolute/path/to/dsh-proof/examples/cordis.yml
 - **MCP 面只有五个一致性工具（v0.14）。** `proof_jury` / `proof_jury_submit` / `proof_endorse` / `proof_conjure` / `proof_conjure_run` 刻意不经 MCP 暴露——它们依赖宿主持有的 seam（人工审批提示、会话上下文、隔离的审议模型），开放服务器无法假设。想要证词与合成的客户端请在 DSH 内跑插件，审批 seam 在那里。
 - **bundle 验证不替代本地审计（v0.14）。** 验证方从 bundle 自己的字节重导出一切——文件摘要、链链接、逐条自寻址、基线摘要——但检查点签名只在验证方持有（或被交给）点名密钥时可裁定，锚单调性只在锚文件可用时才检查；裁定的能力缺失如实记录，绝不四舍五入成伪造指控。没有锚的 bundle 保得住链与寻址保证，丢掉的是回滚覆盖。
 - **检查点 count 自 v0.14 起是规范性的（H1）。** `count` 不是安全整数、或不等于走链实数记录数的检查点，无论谁签，一律进 `malformedCheckpoints`；锚比较只采信锚 keyId 匹配的检查点——伪造检查点（外来 keyId、虚报 count）不再能洗白截断。反面同样对称：一个诚实但数错了 count 的有 bug 生产方会被同样拒绝，没有豁免通道。
+- **shell 命令字符串是所有宿主共有的路径盲区（v0.15）。** Bash/shell 类工具不携带结构化路径——`sed -i … src/a.ts` 这样的命令对溯源什么都提取不出来，DSH、Claude Code、OpenCode 三个宿主同此洞，且是刻意为之（在命令行里挖「长得像路径的词」只会指纹出噪声）。shell 写出的文件没有指纹、没有触达归因；兜底是漂移检测——shell 改动先前观察过的文件仍会被抓到（字节与记录的指纹不再匹配）。逃逸的只有**全新** shell 建立的文件的归因——想要被记账与归因的改动，请用 Write/Edit。
+- **OpenCode 没有回合结束 seam（v0.15）。** 没有 Stop 钩子、事件总线形状不稳，漂移与一次性 baseline/verify 提醒只能锚定在下一次工具调用上——外部改动后的第一个调用被持起并给出漂移叙事，且每个不同漂移集每个插件生命周期至多浮出一次（被无视的消息不能永远扣押后续调用）。`ask` 判定在这个宿主上也走不了用户审批往返：`ask` 与 `deny` 都持起调用，理由说明该改做什么。
 - **`proven` 允许存在预置红灯。** 一个本来就红的仓库不该让 Agent 无法工作。预置失败会在报告里显著列出，但不计入本次会话的责任。这是刻意设计，不是漏洞。
 - **它不替代测试本身。** `dsh-proof` 编排并归因你已有的客观检查。v0.12 的证据合成也不改变这条边界：断言由 agent 起草，插件只冻结脚手架、筛检、执行，并把结果折价记账为弱于任何独立检查的证据。
 - **DSH 是 v0.1/0.2 开发者预览版。** 插件契约会变。本插件已把依赖面最小化并钉死契约快照（`src/vendor/dsh-tools.ts`），但上游变更时仍需重新对齐。

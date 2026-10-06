@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "_comment": [
+    "dsh-proof x Claude Code — hook wiring for the evidence-driven completion proof.",
+    "Paste the `hooks` object into .claude/settings.json (project) or ~/.claude/settings.json (user);",
+    "keep this file pure JSON — JSON has no comment syntax, so guidance lives here in _comment (an",
+    "unknown key the schema ignores) instead.",
+    "",
+    "The tool surface (proof_status, proof_baseline, proof_verify, proof_claim, proof_bundle) does NOT",
+    "ride these hooks — register it once per project with MCP instead:",
+    "  claude mcp add proof -- dsh-proof-mcp",
+    "",
+    "The hooks below add what MCP cannot give: the PreToolUse gates (evidence-store guard + baseline",
+    "gate), PostToolUse provenance observation, Stop drift detection with a one-shot no-baseline",
+    "reminder, and SessionStart policy context. They assume `dsh-proof-cc <event>` resolves on PATH;",
+    "until the package ships that bin, substitute the explicit node invocation, e.g.:",
+    "  node /path/to/dsh-proof/src/adapters/claude-code/entry.ts pre-tool-use",
+    "",
+    "Matched tools: Write/Edit/MultiEdit/NotebookEdit mutate via tool_input.file_path; Read reads via",
+    "file_path. Bash is matched so the gates can classify it, but a shell command names no path — a",
+    "Bash-written file is a deliberate path blind spot (no fingerprint, no drift attribution); prefer",
+    "Write/Edit for changes you want attributed.",
+    "",
+    "Configuration (environment of the hook process):",
+    "  DSH_PROOF_ROOT             workspace root (default: the hook's cwd, i.e. the project dir)",
+    "  DSH_PROOF_TRUST_DIR        trust root for keys/anchors (default: $DSH_HOME/proof)",
+    "  DSH_PROOF_EVIDENCE_STORE   'host' (default, store outside the workspace) | 'workspace' (.proof)",
+    "  DSH_PROOF_EVIDENCE_DIR     workspace-relative evidence dir (default '.proof')",
+    "  DSH_PROOF_REQUIRE_BASELINE 'off' | 'warn' (default) | 'ask'",
+    "  DSH_PROOF_DRIFT            '0' disables Stop drift detection (default: on)",
+    "  DSH_PROOF_ENFORCE_TURN_END '0' disables the turn-end reminder (default: on)",
+    "Set them per project via the `command` strings, e.g. `DSH_PROOF_EVIDENCE_STORE=workspace dsh-proof-cc stop`."
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"],
+        "hooks": [
+          {
+            "type": "command",
+            "command": "dsh-proof-cc pre-tool-use"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "Read"],
+        "hooks": [
+          {
+            "type": "command",
+            "command": "dsh-proof-cc post-tool-use"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "dsh-proof-cc stop"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "dsh-proof-cc session-start"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,235 @@
+/**
+ * The adapter watcher's session state, as a value.
+ *
+ * `WorkspaceWatch` (dsh/observe.ts) is a long-lived object: one instance per
+ * DSH plugin, mutated in place, memory is the truth. Adapter hosts give us no
+ * such home — every hook invocation is a separate process that starts with
+ * nothing — so the same semantics (touched / read / fingerprints, drift
+ * detection) are re-expressed here as a plain serialisable snapshot plus pure
+ * functions: load it, apply one observation, save it back. The drift rules
+ * mirror observe.ts:184-214 case for case; where this file diverges it says so
+ * and why in a comment.
+ *
+ * @module dsh-proof/adapters/shared/session
+ */
+
+import * as fsp from 'node:fs/promises'
+
+import { sha256 } from '../../core/hash.ts'
+import { SHELL_TOOL_RE, WorkspaceWatch, isMutationToolName, toWorkspaceRelative } from '../../dsh/observe.ts'
+
+/**
+ * Everything the watcher knows about one session, in JSON.
+ *
+ * - `touched`/`read` are workspace-relative paths, session-cumulative,
+ *   de-duplicated, insertion-ordered.
+ * - `fingerprints` records the LAST bytes a tool call observed per path —
+ *   the anchor drift detection compares the disk against. It survives
+ *   `windowStart` (bytes do not become un-seen because a turn ended).
+ */
+export interface AdapterSession {
+  readonly touched: string[]
+  readonly read: string[]
+  readonly fingerprints: Record<string, string>
+  readonly windowStartedAt: string
+  /** One-time notice ids already fired ('baseline' | 'verify'); reset never happens implicitly. */
+  readonly firedNotices: string[]
+}
+
+/** A fresh session: nothing observed, window starting now. */
+export function emptySession(nowIso: string): AdapterSession {
+  return { touched: [], read: [], fingerprints: {}, windowStartedAt: nowIso, firedNotices: [] }
+}
+
+/** Append without duplicates, preserving first-seen order (Set semantics as a value). */
+function withPath(paths: readonly string[], rel: string): string[] {
+  return paths.includes(rel) ? [...paths] : [...paths, rel]
+}
+
+/**
+ * Record one completed tool call against a session. Pure: returns a new
+ * session (or the same reference when the call contributes nothing).
+ *
+ * Classification is the two-way split the adapter contract fixes:
+ * mutation-name → touched, everything else with paths → read. observe.ts's
+ * third bucket (unknown-but-not-whitelisted → mutation, DSH tool names) is a
+ * host-tool-name heuristic that does not transfer; the two-way split is the
+ * part both adapters can name identically.
+ *
+ * Shell tools are a documented blind spot and deliberately record NOTHING:
+ * a command line carries no structured paths, and mining one for
+ * path-shaped words would fingerprint noise. The safety net is that drift
+ * detection still catches a shell changing a previously observed file — the
+ * bytes no longer match the recorded fingerprint and no tool claimed the
+ * touch — so a shell cannot silently invalidate what the session already
+ * knows; only attribution of brand-new files escapes.
+ */
+export async function applyObservation(
+  session: AdapterSession,
+  toolName: string,
+  toolInput: unknown,
+  root: string,
+  readFile: (abs: string) => Promise<string | undefined>,
+): Promise<AdapterSession> {
+  if (SHELL_TOOL_RE.test(toolName)) return session
+  // Observer view (no contentKeys): 'source' stays out because in tool
+  // arguments it far more often carries content than a path. The evidence
+  // guard in gates.ts uses its own over-detecting view on purpose.
+  const rels = WorkspaceWatch.pathsIn(toolInput)
+    .map(raw => toWorkspaceRelative(raw, root))
+    .filter((rel): rel is string => rel !== undefined)
+  if (rels.length === 0) return session
+
+  const mutation = isMutationToolName(toolName)
+  let touched = session.touched
+  let read = session.read
+  const fingerprints = { ...session.fingerprints }
+  for (const rel of rels) {
+    if (mutation) touched = withPath(touched, rel)
+    else read = withPath(read, rel)
+    // observe.ts's rule: fingerprint what the tool just saw, keep the old
+    // record when the read fails (a file that no longer exists still has a
+    // useful last-seen fingerprint — its disappearance IS drift signal).
+    const content = await readFile(`${root}/${rel}`)
+    if (content !== undefined) fingerprints[rel] = sha256(content)
+  }
+  return { ...session, touched, read, fingerprints }
+}
+
+/** What `computeDrift` found on the disk versus what tools claimed. */
+export interface DriftResult {
+  readonly drifted: string[]
+  readonly staleReads: string[]
+}
+
+/**
+ * Compare the filesystem against the session's recorded fingerprints.
+ *
+ * Mirrors WorkspaceWatch.detectDrift (observe.ts:184-214), case for case:
+ * - on disk ≠ recorded, and no tool touched it → drifted (external change);
+ * - a drifted file the agent had READ → also staleReads (its in-context copy
+ *   is now wrong — the corruption that matters most);
+ * - file gone though once recorded → drifted (deletion is a change);
+ * - on disk but never recorded (a read whose fingerprint failed) and not
+ *   touched → drifted (arrived from outside the tool stream);
+ * - a touched file never counts as drift, however its bytes moved — the
+ *   agent's own work is exactly what drift must NOT cry wolf about.
+ */
+export async function computeDrift(
+  session: AdapterSession,
+  root: string,
+  readFile: (abs: string) => Promise<string | undefined>,
+): Promise<DriftResult> {
+  const touched = new Set(session.touched)
+  const read = new Set(session.read)
+  const drifted: string[] = []
+  const staleReads: string[] = []
+  // Candidate set = every fingerprint plus every read (a read without a
+  // fingerprint is still worth one honest look at the disk).
+  const candidates = [...new Set([...Object.keys(session.fingerprints), ...session.read])]
+  for (const rel of candidates) {
+    const content = await readFile(`${root}/${rel}`)
+    const current = content === undefined ? undefined : sha256(content)
+    const recorded = session.fingerprints[rel]
+    if (current === undefined) {
+      if (recorded !== undefined) {
+        // File disappeared under us.
+        drifted.push(rel)
+        if (read.has(rel) && !touched.has(rel)) staleReads.push(rel)
+      }
+      continue
+    }
+    if (recorded === undefined) {
+      // Never fingerprinted through a tool: present on disk but not claimed.
+      if (!touched.has(rel)) drifted.push(rel)
+      continue
+    }
+    if (current !== recorded && !touched.has(rel)) {
+      drifted.push(rel)
+      if (read.has(rel)) staleReads.push(rel)
+    }
+  }
+  return {
+    drifted: [...new Set(drifted)].sort(),
+    staleReads: [...new Set(staleReads)].sort(),
+  }
+}
+
+/**
+ * Open a new drift window at a turn boundary: this-window touches reset (the
+ * next turn's mutations start from zero), while fingerprints, reads and
+ * fired notices survive — last-seen bytes and one-time notices are session
+ * facts, not per-turn ones.
+ */
+export function windowStart(session: AdapterSession, nowIso: string): AdapterSession {
+  return { ...session, touched: [], windowStartedAt: nowIso }
+}
+
+/**
+ * Where a session's snapshot lives. The session id is host-supplied (a
+ * conversation id, anything), so every character outside [A-Za-z0-9._-] is
+ * replaced with '_' before it ever touches the filesystem — '../../x' becomes
+ * '.._.._x', a filename inside the session dir, not a walk out of it. Dots
+ * survive but cannot traverse alone: a path segment needs a separator to
+ * escape, and separators are exactly what is sanitised away.
+ */
+export function sessionPath(dir: string, sessionId: string): string {
+  const safe = sessionId.replace(/[^A-Za-z0-9._-]/g, '_')
+  return `${dir.replace(/\/+$/, '')}/${safe}.json`
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(item => typeof item === 'string')
+}
+
+/** Structural guard: a file that is not shaped like a session is not a session. */
+function isAdapterSession(value: unknown): value is AdapterSession {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  const v = value as Record<string, unknown>
+  const fingerprints = v.fingerprints
+  return isStringArray(v.touched)
+    && isStringArray(v.read)
+    && isStringArray(v.firedNotices)
+    && typeof v.windowStartedAt === 'string'
+    && typeof fingerprints === 'object' && fingerprints !== null && !Array.isArray(fingerprints)
+    && Object.values(fingerprints).every(h => typeof h === 'string')
+}
+
+/**
+ * Load a session snapshot; undefined when it does not exist, fails to parse,
+ * or does not look like a session. The next hook process is the reader this
+ * function serves — it must never crash on a half-written or foreign file,
+ * it must just start over (an empty session re-learns the workspace in one
+ * turn of observation).
+ */
+export async function loadSession(dir: string, sessionId: string): Promise<AdapterSession | undefined> {
+  let raw: string | undefined
+  try {
+    raw = await fsp.readFile(sessionPath(dir, sessionId), 'utf8')
+  } catch {
+    return undefined
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    return isAdapterSession(parsed) ? parsed : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Persist a session snapshot atomically: write a temp file beside the target,
+ * then rename over it. A torn write is not hypothetical here — the writer and
+ * the reader are different processes racing across hook invocations, and a
+ * crash mid-write would otherwise hand the next hook a truncated JSON that
+ * (at best) resets the watcher blind. Rename-on-POSIX and MoveFileEx on
+ * Windows both make the replace all-or-nothing, so a reader sees the old or
+ * the new snapshot, never half of either.
+ */
+export async function saveSession(dir: string, sessionId: string, session: AdapterSession): Promise<void> {
+  const target = sessionPath(dir, sessionId)
+  await fsp.mkdir(dir, { recursive: true })
+  const temp = `${target}.${process.pid}.tmp`
+  await fsp.writeFile(temp, `${JSON.stringify(session, null, 2)}\n`, 'utf8')
+  await fsp.rename(temp, target)
+}

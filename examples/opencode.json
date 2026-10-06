@@ -1,0 +1,25 @@
+{
+  "_comment": [
+    "dsh-proof on OpenCode — copy into your project as opencode.json, or merge the keys into an existing one. JSON has no comments, hence this key; OpenCode ignores unknown keys.",
+    "Two pieces cooperate:",
+    "1) 'plugin' loads the OpenCode adapter (dsh-proof/lib/adapters/opencode/plugin.js in the npm-installed form used below). It enforces what MCP cannot: the evidence-store guard and baseline gate hold risky tool calls via tool.execute.before, tool.execute.after fingerprints what tool calls actually moved (drift detection), and chat.params appends the proof:policy system-prompt section. The adapter probes each surface at runtime and degrades to a no-op with one stderr line when OpenCode's API shifts — the MCP tools below are unaffected.",
+    "2) 'mcp.proof' spawns the dsh-proof MCP stdio server (the package's dsh-proof-mcp bin) exposing the five frozen tools: proof_status, proof_baseline, proof_verify, proof_claim, proof_bundle.",
+    "Checkout instead of npm install: point 'plugin' at the compiled file inside your dsh-proof checkout, e.g. \"./tools/dsh-proof/lib/adapters/opencode/plugin.js\" (run `npm run build` there first — OpenCode loads compiled JS, not the .ts sources).",
+    "The MCP server verifies the project it is spawned in: root defaults to its working directory, i.e. this project. Set DSH_PROOF_ROOT / DSH_PROOF_TRUST_DIR / DSH_PROOF_EVIDENCE_STORE in 'environment' to move evidence elsewhere; the plugin honors the same variables, so gates and tools always guard the same store.",
+    "Baseline policy defaults to warn (mutation tools pass, model gets a corrective notice). Set DSH_PROOF_REQUIRE_BASELINE=ask to hold baseline-less mutations instead — see the adapter's README section for every option."
+  ],
+  "plugin": [
+    "dsh-proof/lib/adapters/opencode/plugin.js"
+  ],
+  "mcp": {
+    "proof": {
+      "type": "local",
+      "command": [
+        "dsh-proof-mcp"
+      ],
+      "environment": {
+        "DSH_PROOF_EVIDENCE_STORE": "host"
+      }
+    }
+  }
+}
